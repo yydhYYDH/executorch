@@ -100,6 +100,26 @@ cmake -S backends/hexagon/skel -B build-skel \
   -DSKEL_ARCH=v79 -DIDL_DIR=${IDL_DIR}
 ```
 
+## The skel must be built with optimization
+
+`skel/CMakeLists.txt` sets `-O2`, and it is not a performance preference. The
+DSP kernels are written as one function per operator kind carrying every branch
+of that kind inline, and unoptimized every temporary they would keep in a
+register is spilled to the stack instead: a single fp16 branch chain asks for a
+14848-byte frame (`allocframe(#0x3a00)`), which does not fit the RPC thread's
+stack. The fault is in the prologue, so it happens before the kernel reads a
+byte, reports as `0x8000040d` from `remote_handle64_invoke`, and takes the
+whole user PD down with it. Nothing about it points at the build.
+
+Two things made that hard to see, and both are worth remembering:
+
+- `-fstack-usage` on the file compiled standalone reports 512 bytes, not 14848.
+  `hexagon-llvm-objdump -d` on the built `.so` tells the truth. When the frame
+  size is the question, read the disassembly.
+- more stack is genuinely available than the failing frame needs at first glance,
+  so measuring headroom is not enough on its own: 4608 bytes of recursion
+  succeed one call below a frame that wants 14848.
+
 ## Op contracts, and the traps in them
 
 Parameters are positional and unchecked: a wrong order or a wrong tensor count

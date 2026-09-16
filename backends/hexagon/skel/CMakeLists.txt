@@ -41,6 +41,11 @@ if(SKEL_ARCH_NUM LESS 79)
 endif()
 add_compile_options(${SKEL_ARCH_FLAGS})
 
+# The kernels are unusably stack hungry unoptimized: at -O0 a single fp16 branch
+# chain allocates a 14 KB frame, which overflows the DSP RPC thread's stack and
+# surfaces as a 0x8000040d from execute_command_group.
+add_compile_options(-O2)
+
 if(NOT DEFINED HEXAGON_FLATBUFFERS_ROOT)
   set(HEXAGON_FLATBUFFERS_ROOT ${MNN_OPS_ROOT}/flatbuffers)
 endif()
