@@ -13,13 +13,19 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 """
 
 import struct
-from typing import Dict
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
+from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
+from executorch.backends.hexagon.rms_norm import RMS_NORM
+
+# After rms_norm, which opens the et_hexagon namespace this fragment joins.
+from executorch.backends.hexagon.mul_silu import MUL_SILU
 from executorch.backends.hexagon.serialization.blob import ABSENT, Op, TensorRef
 from executorch.exir.dialects._ops import ops as exir_ops
 
 # DSPOpType, from third-party/mnn-htp-ops/include/htp_command.h.
+DSP_OP_RASTER_BLIT = 3
 DSP_OP_UNARY = 4
 DSP_OP_LAYER_NORM = 8
 DSP_OP_BINARY_ELEMENTWISE = 19
@@ -89,6 +95,327 @@ def _float_bits(value: float) -> int:
     pattern rather than a rounded integer.
     """
     return struct.unpack("<i", struct.pack("<f", value))[0]
+
+
+class SliceRegion(NamedTuple):
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz].
+    # The offsets are in elements, and the source's layout is the caller's own.
+    region: List[int]
+    # The value the start row is read from when the caller only knows it at run
+    # time, and what one row of the sliced dimension is worth in elements. Both
+    # are None and 1 when the region is complete as it stands.
+    patch_source: Optional[torch.fx.Node] = None
+    patch_scale: int = 1
+
+
+def slice_region(node: torch.fx.Node) -> Optional[SliceRegion]:
+    """The blit region for a narrowing slice, or None when it is not one.
+
+    Both the support check and the emitter call this, so they cannot disagree
+    about which slices the DSP can run -- a node the emitter would refuse has to
+    be refused here instead, or the whole export fails rather than falling back.
+
+    A run per row is what a region describes, so a step is out. The extent comes
+    from the result rather than from the end argument: they are the same number,
+    the result's is the one that has to fit the buffer that was allocated, and
+    taking it from there means an end the caller computes cannot disagree with
+    the shape. A start the caller computes is the one part that cannot be known
+    here, and it is a single word -- the source offset -- which the patch
+    mechanism already knows how to fill at run time. That is what the RoPE
+    frequency tables need: a table of 256 rows cut to the prompt, where the
+    extent is fixed and only the row it starts at moves.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node) or len(node.args) < 4:
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    dim, start = node.args[1], node.args[2]
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        return None
+    if len(node.args) > 4 and node.args[4] not in (None, 1):
+        return None
+    shape = list(source_value.shape)
+    result = list(result_value.shape)
+    if dim < 0:
+        dim += len(shape)
+    if not 0 <= dim < len(shape) or len(result) != len(shape):
+        return None
+    if any(result[d] != shape[d] for d in range(len(shape)) if d != dim):
+        return None
+
+    inner = 1
+    for size in shape[dim + 1 :]:
+        inner *= size
+    rows = 1
+    for size in shape[:dim]:
+        rows *= size
+
+    patch_source = None
+    if isinstance(start, torch.fx.Node):
+        patch_source = _scalar_source(start)
+        if not isinstance(patch_source, torch.fx.Node):
+            return None
+        offset = 0
+    elif isinstance(start, int) and not isinstance(start, bool):
+        start = max(start, 0)
+        if start + result[dim] > shape[dim]:
+            return None
+        offset = start * inner
+    else:
+        return None
+
+    run = result[dim] * inner
+    return SliceRegion(
+        [0, offset, 0, 1, rows, run, 0, shape[dim] * inner, 1, 0, run, 1],
+        patch_source,
+        inner,
+    )
+
+
+def select_region(node: torch.fx.Node):
+    """The blit region for a select_copy that narrows, or None.
+
+    `select_copy(source, dim, index)` picks one entry along `dim`, which is the
+    slice `[index, index + 1)` and nothing else, so it copies the same run a
+    narrowing slice does. When the source is one wide along `dim` the result
+    holds the operand's bytes and the alias path is the right one, so this
+    returns None there and `_alias_keeps_the_same_bytes` decides.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node) or len(node.args) < 3:
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    dim, index = node.args[1], node.args[2]
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (dim, index)):
+        return None
+    shape = list(source_value.shape)
+    if dim < 0:
+        dim += len(shape)
+    if index < 0:
+        index += shape[dim]
+    if not 0 <= index < shape[dim]:
+        return None
+    if shape[dim] == 1 or source_value.numel() == result_value.numel():
+        return None
+
+    inner = 1
+    for size in shape[dim + 1 :]:
+        inner *= size
+    rows = 1
+    for size in shape[:dim]:
+        rows *= size
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [0, index * inner, 0, 1, rows, inner, 0, shape[dim] * inner, 1, 0, inner, 1]
+
+
+def _emit_select_copy(node: torch.fx.Node, ctx) -> TensorRef:
+    """A select that narrows writes a buffer; one that does not re-points.
+
+    Both forms reach the same target, so the two decisions are made here rather
+    than by splitting the target in the op table.
+    """
+    region = select_region(node)
+    if region is None:
+        return _emit_alias(node, ctx)
+    out = ctx.result_for(node, _numel(node))
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + region,
+        )
+    )
+    return ctx.record(node, out)
+
+
+def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
+    """A narrowing slice cannot re-point its operand the way an alias does.
+
+    The result holds fewer elements than the operand, so the kernel writes the
+    selected run into a buffer of its own. When the start row is a run-time
+    value it rides along as an extra input the blit never reads, and the runtime
+    writes it into the region's source offset on the way in, scaled by what one
+    row is worth in elements.
+    """
+    region = slice_region(node)
+    inputs = [ctx.operand(node.args[0])]
+    patch = None
+    if region.patch_source is not None:
+        inputs.append(ctx.operand(region.patch_source))
+        patch = (_SLICE_OFFSET_PARAM, len(inputs) - 1)
+    out = ctx.result_for(node, _numel(node))
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=inputs,
+            outputs=[out],
+            # region count, element bytes, source count, then the region.
+            params=[1, FP16_BYTES, 1] + region.region,
+            patch=patch,
+            patch_scale=region.patch_scale,
+        )
+    )
+    return ctx.record(node, out)
+
+
+# The region's source offset, counted from the start of the params vector: the
+# blit header is three ints, then srcIndex, then srcOffset.
+_SLICE_OFFSET_PARAM = 4
+
+# A blit header is three ints and each region twelve, and an op's params vector
+# holds blob.MAX_OP_PARAMS (40) of them, which leaves room for three inputs.
+MAX_CAT_INPUTS = 3
+
+
+def cat_region(node: torch.fx.Node):
+    """The blit parameters for a concatenation along one axis, or None.
+
+    Each input becomes one region writing into its own slice of the result, which
+    is what a RoPE rejoin needs: two 64-element halves becoming one 128-element
+    row. The region list is fixed when the command is built, so the split has to
+    be known here -- a concatenation whose lengths are only known at the call
+    cannot be described by it.
+    """
+    if not node.args or len(node.args) > 2:
+        return None
+    tensors = node.args[0]
+    dim = node.args[1] if len(node.args) > 1 else 0
+    if not isinstance(tensors, (list, tuple)):
+        return None
+    if not isinstance(dim, int) or isinstance(dim, bool):
+        return None
+    if not 1 <= len(tensors) <= MAX_CAT_INPUTS:
+        return None
+    if not all(isinstance(tensor, torch.fx.Node) for tensor in tensors):
+        return None
+
+    result = node.meta.get("val")
+    values = [tensor.meta.get("val") for tensor in tensors]
+    if not isinstance(result, torch.Tensor) or not all(
+        isinstance(value, torch.Tensor) for value in values
+    ):
+        return None
+    if not result.is_contiguous() or not all(value.is_contiguous() for value in values):
+        return None
+    if any(value.dtype is not torch.float16 for value in values):
+        return None
+
+    shape = list(result.shape)
+    if dim < 0:
+        dim += len(shape)
+    if any(len(value.shape) != len(shape) for value in values):
+        return None
+    # Only the concatenated axis may differ, and it has to add up.
+    if any(
+        value.shape[other] != shape[other]
+        for value in values
+        for other in range(len(shape))
+        if other != dim
+    ):
+        return None
+    if sum(value.shape[dim] for value in values) != shape[dim]:
+        return None
+
+    inner = 1
+    for size in shape[dim + 1 :]:
+        inner *= size
+    rows = 1
+    for size in shape[:dim]:
+        rows *= size
+    combined = shape[dim] * inner
+
+    params = [len(values), FP16_BYTES, len(values)]
+    offset = 0
+    for index, value in enumerate(values):
+        run = value.shape[dim] * inner
+        # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+        params += [index, 0, offset * inner, 1, rows, run, 0, run, 1, 0, combined, 1]
+        offset += value.shape[dim]
+    return params
+
+
+def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
+    """Each operand is copied into its own slice of a fresh buffer."""
+    tensors = node.args[0]
+    out = ctx.result_for(node, _numel(node))
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(tensor) for tensor in tensors],
+            outputs=[out],
+            params=cat_region(node),
+        )
+    )
+    return ctx.record(node, out)
+
+
+def permute_region(node: torch.fx.Node):
+    """The blit region for a transpose of the last two axes, or None.
+
+    Every `permute_copy` in the graph is `permute(w, [1, 0])` between a weight
+    and its `mm`, so it is one matrix transpose per outer index. A region
+    describes that exactly -- the inner run reads a contiguous source row and
+    writes a strided destination column -- and it is the shape
+    `htp_ops_prepare_transpose` recognises and routes to the HVX transpose.
+
+    A permutation that moves any other axis is refused rather than approximated:
+    the row index stops being linear in the destination, which a single region
+    cannot describe.
+    """
+    if len(node.args) < 2 or not isinstance(node.args[0], torch.fx.Node):
+        return None
+    source_value = node.args[0].meta.get("val")
+    result_value = node.meta.get("val")
+    dims = node.args[1]
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    if not isinstance(dims, (list, tuple)):
+        return None
+    if source_value.dtype is not torch.float16:
+        return None
+    if not source_value.is_contiguous() or not result_value.is_contiguous():
+        return None
+
+    rank = len(source_value.shape)
+    if rank < 2 or sorted(dims) != list(range(rank)):
+        return None
+    if list(dims) != list(range(rank - 2)) + [rank - 1, rank - 2]:
+        return None
+
+    rows = int(source_value.shape[rank - 2])
+    cols = int(source_value.shape[rank - 1])
+    outer = 1
+    for size in source_value.shape[: rank - 2]:
+        outer *= size
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [0, 0, 0, outer, rows, cols, rows * cols, cols, 1, rows * cols, 1, rows]
+
+
+def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
+    """A transpose is a strided read and a strided write, which is one region."""
+    out = ctx.result_for(node, _numel(node))
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + permute_region(node),
+        )
+    )
+    return ctx.record(node, out)
 
 
 def _unary(op_name: str):
@@ -218,6 +545,117 @@ def _loop_param(
     return list(struct.unpack("<25i", packed))
 
 
+def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
+    """A node that only re-reads its operand's bytes emits no command.
+
+    Sharing one TensorRef is what a view is: the kernels index the same buffer
+    under a different shape. The support check admits a node here only when the
+    operand and the result are both contiguous with the same element count, so
+    the bytes are already in the order the result describes.
+    """
+    source = ctx.operand(node.args[0])
+    if not ctx.is_method_output(node):
+        return ctx.record(node, source)
+
+    # An output slot is read as a buffer of its own, so re-pointing the operand
+    # is not enough here: the bytes have to be written out.
+    numel = _numel(node)
+    out = ctx.result_for(node, numel)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[source],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1, 0, 0, 0, 1, 1, numel, 0, 0, 1, 0, 0, 1],
+        )
+    )
+    return ctx.record(node, out)
+
+
+def update_cache_layout(node: torch.fx.Node):
+    """The cache-advance lowering's operands and geometry, or None.
+
+    Shared by the support predicate and the emitter, so a node the predicate
+    accepts cannot reach an emitter that does not know what to do with it.
+    """
+    if node.target is not UPDATE_CACHE:
+        return None
+    cache, value, position = node.args[0], node.args[1], node.args[2]
+    if not all(isinstance(part, torch.fx.Node) for part in (cache, value, position)):
+        return None
+    cache_val, value_val = cache.meta["val"], value.meta["val"]
+    if cache_val.dtype != torch.float16 or value_val.dtype != torch.float16:
+        return None
+    if not (cache_val.is_contiguous() and value_val.is_contiguous()):
+        return None
+    if cache_val.dim() < 3 or value_val.dim() != cache_val.dim():
+        return None
+    # Only the sequence axis may differ: the cache is written a position at a
+    # time, so a head or a head width that does not line up is a different op.
+    if value_val.shape[2:] != cache_val.shape[2:]:
+        return None
+    run = cache_val.shape[-1]
+    inner = cache_val.numel() // cache_val.shape[-3]
+    rows = value_val.numel() // run
+    if inner % run:
+        return None
+    return cache, value, position, run, inner, rows
+
+
+def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
+    """Advances a KV cache, as two blits.
+
+    The graph reads the cache back whole, so an output has to hold all of it
+    either way. Copying it out and writing the new rows into the copy is what
+    this does; mutating the input and handing that back would move the same
+    bytes twice, which is what in_place exists for and not what this needs.
+    """
+    cache_node, value_node, pos_node, run, inner, rows = update_cache_layout(node)
+    cache = ctx.operand(cache_node)
+    value = ctx.operand(value_node)
+    pos = ctx.operand(pos_node)
+
+    numel = _numel(node)
+    out = ctx.result_for(node, numel)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[cache],
+            outputs=[out],
+            params=[
+                1,
+                FP16_BYTES,
+                1,
+                0,
+                0,
+                0,
+                1,
+                numel // run,
+                run,
+                0,
+                run,
+                1,
+                0,
+                run,
+                1,
+            ],
+        )
+    )
+    # dstOffset is the token position times one whole cached position, which is
+    # what patch_scale is for. dst is the output, at index 3.
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[value, cache, pos],
+            outputs=[out],
+            params=[1, FP16_BYTES, 3, 0, 0, 0, 1, rows, run, 0, run, 1, 0, run, 1],
+            patch=(5, 2),
+            patch_scale=inner,
+        )
+    )
+    return ctx.record(node, out)
+
+
 def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
     """aten.mm as BATCH_MATMUL with a single loop iteration.
 
@@ -321,6 +759,31 @@ def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
             # The DSP reduces the middle axis of an [outside][channel][inside]
             # view, so the reduction dim is described by its strides.
             params=[outside, channel, inside, FP16_BYTES],
+        )
+    )
+    return ctx.record(node, out)
+
+
+def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
+    """One command for the whole norm, which is what the DSP kernel wants.
+
+    The kernel reads fp16 activations and fp32 gamma and accumulates in fp32,
+    which is the arithmetic norm.py asks for. beta is ABSENT rather than a
+    zero-size tensor: RMSNorm has no bias, and a zero-size operand still maps to
+    a live address the kernel would read as data.
+    """
+    source, eps = node.args
+    _require_fp16(node, "rms_norm input")
+    inner = int(node.meta["val"].shape[-1])
+    out = ctx.result_for(node, _numel(node))
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_LAYER_NORM,
+            # gamma and beta are both ABSENT: the scale is a separate multiply,
+            # and the kernel skips the affine step when gamma is null.
+            inputs=[ctx.operand(source), ABSENT, ABSENT],
+            outputs=[out],
+            params=[_numel(node) // inner, inner, _float_bits(float(eps)), 1],
         )
     )
     return ctx.record(node, out)
@@ -474,6 +937,18 @@ EMITTERS = {
     exir_ops.edge.aten.layer_norm.default: _emit_layer_norm,
     exir_ops.edge.aten.mm.default: _emit_mm,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
+    exir_ops.edge.aten.alias_copy.default: _emit_alias,
+    exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
+    exir_ops.edge.aten.view_copy.default: _emit_alias,
+    exir_ops.edge.aten.select_copy.int: _emit_select_copy,
+    exir_ops.edge.aten._to_copy.default: _emit_alias,
+    exir_ops.edge.aten.to.dtype: _emit_alias,
+    exir_ops.edge.aten.slice_copy.Tensor: _emit_slice_copy,
+    exir_ops.edge.aten.cat.default: _emit_cat,
+    exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
+    UPDATE_CACHE: _emit_update_cache,
+    RMS_NORM: _emit_rms_norm,
+    MUL_SILU: _binary("mul_silu"),
 }
 
 # Ops whose operands must match the output's shape or be scalar. The support
@@ -487,6 +962,7 @@ BINARY_TARGETS = frozenset(
         exir_ops.edge.aten.div.Tensor,
         exir_ops.edge.aten.maximum.default,
         exir_ops.edge.aten.minimum.default,
+        MUL_SILU,
     }
 )
 
@@ -496,6 +972,41 @@ MM_TARGETS = frozenset({exir_ops.edge.aten.mm.default})
 
 # REDUCTION collapses one contiguous span, so the reduced dims must be adjacent.
 MEAN_TARGETS = frozenset({exir_ops.edge.aten.mean.dim})
+
+# Views: the operand's bytes read under another shape. Only the forms that
+# keep a contiguous layout are listed -- select_copy's other overload reads the
+# int64 position tensor down to a scalar, which is not a view of this kind and
+# has to stay where the patch mechanism can reach it.
+SLICE_TARGETS = frozenset({exir_ops.edge.aten.slice_copy.Tensor})
+
+# Reaches _emit_select_copy, which takes the narrowing form as a blit and leaves
+# the same-bytes form to the alias path.
+SELECT_TARGETS = frozenset({exir_ops.edge.aten.select_copy.int})
+
+CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
+
+PERMUTE_TARGETS = frozenset({exir_ops.edge.aten.permute_copy.default})
+
+ALIAS_TARGETS = frozenset(
+    {
+        exir_ops.edge.aten.alias_copy.default,
+        exir_ops.edge.aten.unsqueeze_copy.default,
+        exir_ops.edge.aten.view_copy.default,
+        exir_ops.edge.aten.select_copy.int,
+    }
+)
+
+# A cast between the two widths the arena already offers emits nothing: every
+# kernel reads and writes fp16, the runtime narrows a fp32 operand on the way in
+# and widens a fp32 result on the way out, and both directions are exact. So
+# delegating one joins the partition on either side of it instead of cutting the
+# graph there. Only fp16 and fp32: a cast from int64 is a real conversion.
+CAST_TARGETS = frozenset(
+    {
+        exir_ops.edge.aten._to_copy.default,
+        exir_ops.edge.aten.to.dtype,
+    }
+)
 
 # The fused attention belongs to the LLM extension, whose schema only appears
 # once that extension registers its ops -- which happens after this module is

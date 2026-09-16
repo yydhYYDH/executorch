@@ -17,7 +17,9 @@ from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
 
 BLOB_MAGIC = 0x4E584748  # 'HXGN'
-BLOB_VERSION = 1
+# Bumped with the HexagonOp layout, which patch_scale changed from 476 bytes to
+# 480. A v1 blob read as v2 would take an in_place bit for a scale.
+BLOB_VERSION = 2
 ALIGNMENT = 128
 MAX_OP_INPUTS = 8
 MAX_OP_OUTPUTS = 4
@@ -39,7 +41,7 @@ class TensorSpace(IntEnum):
 
 _HEADER = struct.Struct("<9I")
 _TENSOR_REF = struct.Struct("<IIQQ")
-_OP_PREFIX = struct.Struct("<IIII" + "i" * MAX_OP_PARAMS + "III")
+_OP_PREFIX = struct.Struct("<IIII" + "i" * MAX_OP_PARAMS + "IIII")
 
 #: patch slot meaning the emitter already knows every param.
 NO_PATCH = 0xFFFFFFFF
@@ -87,6 +89,9 @@ class Op:
     # overwrites that param with the first element of that input. Some DSP
     # values, such as a KV cache position, only exist once the graph runs.
     patch: Optional[Tuple[int, int]] = None
+    # Multiplies the patched value on its way into the param, so a token
+    # position can index a row of a multi-headed cache.
+    patch_scale: int = 1
     # Bit j marks inputs[j] as mutated in place, so the runtime copies it back
     # to the caller once the command group has run.
     in_place: int = 0
@@ -120,6 +125,7 @@ class Op:
                 *params,
                 patch_param,
                 patch_input,
+                self.patch_scale,
                 self.in_place,
             )
             + b"".join(ref.pack() for ref in refs)

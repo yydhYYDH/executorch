@@ -115,6 +115,10 @@ class BlobContext:
             return self.builder.method_output(index, bytes_for(numel, dtype))
         return self.builder.add_activation(bytes_for(numel, dtype))
 
+    def is_method_output(self, node: torch.fx.Node) -> bool:
+        """Whether the caller reads this node from an output slot of its own."""
+        return node in self._output_index
+
     def record(self, node: torch.fx.Node, ref: TensorRef) -> TensorRef:
         self.producer[node] = ref
         return ref
@@ -169,6 +173,16 @@ class HexagonBackend(BackendDetails):
                     "should not have delegated it"
                 )
             emitter(node, context)
+
+        # Every output index needs a slot, and only an emitter or a placeholder
+        # can give it one. Catching it here names the node; `build` can only
+        # report the index.
+        for node, index in outputs:
+            if node not in context.producer:
+                raise RuntimeError(
+                    f"hexagon: subgraph output {index} is {node.name} "
+                    f"({node.op}: {node.target}), which no emitter produced"
+                )
 
         return PreprocessResult(processed_bytes=context.builder.build())
 

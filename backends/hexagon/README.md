@@ -171,7 +171,7 @@ Working and verified without a device:
   `matmul_q4a16_fp16`, `flash_attn`, `layer_norm` and `rope`;
 - the host driver compiles clean under `-Wall -Wextra`;
 - the AOT blob layout is byte-identical between the C++ reader and the Python
-  writer: `sizeof(HexagonBlobHeader)` is 36, `sizeof(HexagonOp)` 476 and
+  writer: `sizeof(HexagonBlobHeader)` is 36, `sizeof(HexagonOp)` 480 and
   `sizeof(HexagonTensorRef)` 24, pinned by `static_assert` in the header and
   compared against `blob.OP_SIZE` by `test/test_blob_roundtrip.py`;
 - the FlatBuffers commands the runtime builds decode back to exactly the type,
@@ -182,23 +182,34 @@ Working and verified without a device:
   64 elements, a flat binary multiply whose scalar operand is materialized as a
   one-element buffer, and a softmax reduced over `[1][64][1]` — with the last
   command writing straight into the output slot;
-- on Qwen3-0.6B the partitioner takes 646 nodes and leaves 3383 on the portable
-  kernels, including all 28 attention nodes. `STATUS.md` has the per-op table.
+- on Qwen3-0.6B the partitioner takes 1967 nodes into 29 subgraphs -- one per
+  layer, with all 28 attention nodes among them -- and leaves 825 on the
+  portable kernels, 711 of which are shape guards. `STATUS.md` has the per-op
+  table, what the views, norms and strided copies cost to get, and the same
+  measurement with the fusion passes switched off, where the export splits into
+  169 subgraphs and leaves 2121 nodes behind.
 
 Not done yet:
 
-- an end-to-end run on a device, and numeric parity against the CPU reference.
-  Every kernel checked so far was verified by transcribing it and comparing
-  against torch, which is not the same thing;
-- of the 20 registered emitters only `mm`, `mul`, `add`, `neg` and
-  `custom_sdpa` have produced a command on a real graph;
+- an end-to-end run on a device. A kernel is checked by building a real blob,
+  running it on hexagon-sim and comparing the result three ways against torch and
+  a host model of the same command stream. The simulator is a functional model,
+  so it says what the kernels compute and nothing about what the DSP costs or
+  whether the FastRPC path and the skeleton deployment work. `STATUS.md` lists
+  what that leaves unverified;
+- of the 20 registered emitters, the ones that have produced a command on a real
+  graph are `mm`, the binary and unary families, `custom_sdpa`, `rms_norm`,
+  `mul_silu`, `update_cache` and the narrowing blits. The view and cast
+  emitters have run as well but emit nothing by design, which `STATUS.md`
+  explains;
 - attention delegates on fp32 operands that the runtime narrows to fp16 on the
   way into the arena, so the DSP runs fp16 attention. That trade is deliberate
   but unmeasured, and it means a working delegation is not yet a correct one;
-- the fp32 normalisation segment — `mean`, `rsqrt`, `sigmoid` and the `_to_copy`
-  nodes around them — stays on the CPU, because the vendored kernels take fp16
-  in and out. `STATUS.md` records the measured kernel limits and why the fix is
-  a fused RMSNorm kernel rather than more emitters;
+- the fp32 normalisation segment is gone from the delegated graphs: the
+  `mean`/`rsqrt`/`sigmoid` chain is fused into an `rms_norm` op and the casts
+  around it are absorbed, since the arena holds fp16 and the vendored kernels
+  take fp16 in and out. `STATUS.md` has the measurements and the limits of what
+  the cast absorption covers;
 - the quantized matmul path, which needs the pack64 repack described above;
 - layer norm is not reachable yet: `to_edge` turns it into
   `native_layer_norm`, which returns three tensors, so it needs the aliasing

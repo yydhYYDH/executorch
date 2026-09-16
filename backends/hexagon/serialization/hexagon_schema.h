@@ -26,7 +26,9 @@
 namespace executorch::backends::hexagon {
 
 constexpr uint32_t kHexagonBlobMagic = 0x4E584748; // 'HXGN'
-constexpr uint32_t kHexagonBlobVersion = 1;
+// Bumped with the HexagonOp layout, which patch_scale changed from 476 bytes
+// to 480. A v1 blob read as v2 would take an in_place bit for a scale.
+constexpr uint32_t kHexagonBlobVersion = 2;
 
 constexpr uint32_t kMaxOpInputs = 8;
 constexpr uint32_t kMaxOpOutputs = 4;
@@ -70,10 +72,14 @@ struct HexagonOp {
   uint32_t n_params;
   int32_t params[kMaxOpParams];
   // Before issuing the command the runtime overwrites params[patch_param] with
-  // the first element of inputs[patch_input], or leaves params alone when
-  // patch_param is kNoOpPatch.
+  // the first element of inputs[patch_input] times patch_scale, or leaves
+  // params alone when patch_param is kNoOpPatch.
   uint32_t patch_param;
   uint32_t patch_input;
+  // A token position indexes a row of a multi-headed cache, and a row is a
+  // whole number of operands, so the position reaches the param scaled. One
+  // leaves the value alone.
+  uint32_t patch_scale;
   // Bit j is set when inputs[j] is mutated in place and has to be copied back
   // to the caller after the command group runs.
   uint32_t in_place;
@@ -101,11 +107,12 @@ struct HexagonBlobHeader {
 // of a blob the runtime silently misreads.
 static_assert(sizeof(HexagonBlobHeader) == 36);
 static_assert(sizeof(HexagonTensorRef) == 24);
-static_assert(sizeof(HexagonOp) == 476);
+static_assert(sizeof(HexagonOp) == 480);
 static_assert(offsetof(HexagonOp, params) == 16);
 static_assert(offsetof(HexagonOp, patch_param) == 176);
-static_assert(offsetof(HexagonOp, in_place) == 184);
-static_assert(offsetof(HexagonOp, inputs) == 188);
+static_assert(offsetof(HexagonOp, patch_scale) == 184);
+static_assert(offsetof(HexagonOp, in_place) == 188);
+static_assert(offsetof(HexagonOp, inputs) == 192);
 
 // Layout: header, then n_ops of HexagonOp, then the four sections back to back,
 // each starting 128-byte aligned.

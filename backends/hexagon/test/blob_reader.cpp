@@ -69,12 +69,16 @@ int main(int argc, char** argv) {
   std::printf("size HexagonBlobHeader %zu\n", sizeof(HexagonBlobHeader));
   std::printf("size HexagonTensorRef %zu\n", sizeof(HexagonTensorRef));
   std::printf("size HexagonOp %zu\n", sizeof(HexagonOp));
+  // Anything but a multiple of the Python struct would mean the two writers
+  // disagree about padding before a single field is compared.
+  static_assert(sizeof(HexagonOp) == 480, "HexagonOp layout drifted");
   const auto offset_of = [](const char* field, size_t value) {
     std::printf("offsetof HexagonOp %s %zu\n", field, value);
   };
   offset_of("params", offsetof(HexagonOp, params));
   offset_of("patch_param", offsetof(HexagonOp, patch_param));
   offset_of("patch_input", offsetof(HexagonOp, patch_input));
+  offset_of("patch_scale", offsetof(HexagonOp, patch_scale));
   offset_of("in_place", offsetof(HexagonOp, in_place));
   offset_of("inputs", offsetof(HexagonOp, inputs));
   offset_of("outputs", offsetof(HexagonOp, outputs));
@@ -114,6 +118,7 @@ int main(int argc, char** argv) {
     }
     std::printf("op %u patch_param %u\n", i, op.patch_param);
     std::printf("op %u patch_input %u\n", i, op.patch_input);
+    std::printf("op %u patch_scale %u\n", i, op.patch_scale);
     std::printf("op %u in_place %u\n", i, op.in_place);
     for (uint32_t j = 0; j < kMaxOpInputs; j++) {
       std::printf(

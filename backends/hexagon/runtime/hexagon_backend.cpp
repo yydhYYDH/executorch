@@ -83,6 +83,36 @@ uint16_t float_to_half_bits(float value) {
       sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
 }
 
+// The inverse of the narrowing above. The algorithm was checked against numpy
+// over every finite fp16 pattern before it was written down here.
+float half_bits_to_float(uint16_t bits) {
+  const uint32_t sign = static_cast<uint32_t>(bits & 0x8000u) << 16;
+  const uint32_t biased = (bits >> 10) & 0x1Fu;
+  const uint32_t mantissa = bits & 0x3FFu;
+  uint32_t out = 0;
+  if (biased == 0) {
+    if (mantissa == 0) {
+      out = sign;
+    } else {
+      // Subnormal: shift the leading bit up to where the implicit one sits.
+      uint32_t value = mantissa;
+      uint32_t shift = 0;
+      while ((value & 0x400u) == 0) {
+        value <<= 1;
+        ++shift;
+      }
+      out = sign | ((113u - shift) << 23) | ((value & 0x3FFu) << 13);
+    }
+  } else if (biased == 0x1Fu) {
+    out = sign | 0x7F800000u | (mantissa != 0 ? 0x400000u : 0u);
+  } else {
+    out = sign | ((biased - 15u + 127u) << 23) | (mantissa << 13);
+  }
+  float result = 0.0f;
+  std::memcpy(&result, &out, sizeof(result));
+  return result;
+}
+
 struct Region {
   size_t offset = 0;
   size_t size = 0;
@@ -118,6 +148,7 @@ struct HexagonDelegate {
   struct Patch {
     size_t param_offset; // arena location of the param slot to overwrite
     size_t input_offset; // arena location the value is read from
+    uint32_t scale; // multiplier between the two
   };
   std::vector<Patch> patches;
 
@@ -437,7 +468,8 @@ Result<DelegateHandle*> HexagonBackend::init(
       delegate->patches.push_back(
           {command_cursor + delta,
            SectionBase(*delegate, static_cast<HexagonTensorSpace>(src.space)) +
-               src.offset});
+               src.offset,
+           op.patch_scale});
     }
 
     if (command_cursor + size >
@@ -578,6 +610,9 @@ Error HexagonBackend::execute(
   for (const auto& patch : delegate->patches) {
     int32_t value = 0;
     std::memcpy(&value, base + patch.input_offset, sizeof(value));
+    // Widened before scaling: a position times a cache row is still a byte
+    // offset, and it overflows int32 well before either factor does.
+    value = static_cast<int32_t>(static_cast<int64_t>(value) * patch.scale);
     std::memcpy(base + patch.param_offset, &value, sizeof(value));
   }
 
@@ -614,6 +649,23 @@ Error HexagonBackend::execute(
   for (size_t i = 0; i < delegate->outputs.size(); i++) {
     const auto& out = delegate->outputs[i];
     auto& tensor = args[delegate->inputs.size() + i]->toTensor();
+    // The mirror of the narrow on the way in: a subgraph whose declared result
+    // is fp32 still writes fp16, because that is what the kernels produce. Its
+    // slot is half the caller's buffer, and the bytes have to be widened back
+    // or the caller reads fp16 patterns as floats. attention is the op that
+    // lands here today.
+    const size_t elements = static_cast<size_t>(tensor.numel());
+    if (tensor.scalar_type() == runtime::etensor::ScalarType::Float &&
+        out.size == elements * 2) {
+      const uint16_t* const from =
+          reinterpret_cast<const uint16_t*>(base + out.offset);
+      float* const to = static_cast<float*>(tensor.mutable_data_ptr());
+      for (size_t element = 0; element < elements; element++) {
+        to[element] = half_bits_to_float(from[element]);
+      }
+      continue;
+    }
+
     if (tensor.nbytes() > out.size) {
       ET_LOG(
           Error,
