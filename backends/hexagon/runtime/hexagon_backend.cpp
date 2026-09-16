@@ -277,8 +277,11 @@ Result<DelegateHandle*> HexagonBackend::init(
       sizeof(HexagonBlobHeader));
   const uint8_t* blob = reinterpret_cast<const uint8_t*>(processed->data());
   const size_t weights_blob_offset = sizeof(HexagonBlobHeader) + ops_bytes;
+  // Only the weights and activations live in the blob; the input and output
+  // sizes are arena budgets the runtime allocates against, so counting them
+  // here overstates the blob and rejects every delegate that has an input.
   const size_t sections_total = static_cast<size_t>(header->weights_bytes) +
-      header->inputs_bytes + header->activations_bytes + header->outputs_bytes;
+      header->activations_bytes;
   if (weights_blob_offset + sections_total > processed->size()) {
     ET_LOG(Error, "hexagon: tensor sections out of bounds");
     return Error::DelegateInvalidCompatibility;
@@ -374,6 +377,11 @@ Result<DelegateHandle*> HexagonBackend::init(
   for (uint32_t i = 0; i < header->n_ops; i++) {
     const HexagonOp& op = ops[i];
 
+    // Reset before the tensors are built, not after: the offsets they return
+    // index into this builder, so clearing later leaves CreateCommand holding
+    // offsets into a buffer that no longer exists.
+    builder.Clear();
+
     std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> inputs;
     inputs.reserve(op.n_inputs);
     for (uint32_t j = 0; j < op.n_inputs; j++) {
@@ -402,7 +410,6 @@ Result<DelegateHandle*> HexagonBackend::init(
       delegate->in_place_inputs.push_back(op.inputs[j].index);
     }
 
-    builder.Clear();
     builder.Finish(DSPCOMMAND::CreateCommand(
         builder,
         (int32_t)op.type,
@@ -453,11 +460,13 @@ Result<DelegateHandle*> HexagonBackend::init(
         builder.GetBufferPointer(),
         size);
 
-    group[1 + i * 3 + 0] = delegate->arena_fd;
-    group[1 + i * 3 + 1] = (int32_t)(command_cursor + delegate->arena_bias);
+    // The DSP reads entries from group_ptr + 8, so they start at int index 2,
+    // not 1; anywhere else shifts every (fd, offset) pair by four bytes.
+    group[2 + i * 3 + 0] = delegate->arena_fd;
+    group[2 + i * 3 + 1] = (int32_t)(command_cursor + delegate->arena_bias);
     // size <= 0 tells the DSP to invalidate the descriptor before reading it,
     // which is right: the host wrote it once and never touches it again.
-    group[1 + i * 3 + 2] = 0;
+    group[2 + i * 3 + 2] = 0;
 
     command_cursor = AlignUp(command_cursor + size, kHexagonAlignment);
   }
@@ -465,6 +474,12 @@ Result<DelegateHandle*> HexagonBackend::init(
   // The sync group names everything the DSP invalidates on the way in and
   // flushes on the way out.
   {
+    // Reset before the tensors are built, for the same reason as the command
+    // loop: CreateSyncGroup takes offsets into this builder, and a later Clear
+    // leaves them dangling, which silently corrupts the cache maintenance the
+    // DSP derives from this group.
+    builder.Clear();
+
     std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
     std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
     // Only real buffers need invalidating or flushing; an absent operand has
@@ -482,7 +497,6 @@ Result<DelegateHandle*> HexagonBackend::init(
       }
     }
 
-    builder.Clear();
     builder.Finish(DSPCOMMAND::CreateSyncGroup(
         builder, builder.CreateVector(sync_in), builder.CreateVector(sync_out)));
 
