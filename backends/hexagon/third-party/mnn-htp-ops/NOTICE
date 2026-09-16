@@ -1,0 +1,20 @@
+mnn-htp-ops
+===========
+
+This directory contains a vendored copy of the Hexagon DSP operator library from
+MNN.
+
+    Copyright [2018] [Alibaba Group]
+    Licensed under the Apache License, Version 2.0 (the "License");
+    you may not use this file except in compliance with the License.
+    You may obtain a copy of the License at
+
+        http://www.apache.org/licenses/LICENSE-2.0
+
+    Upstream: https://github.com/alibaba/MNN
+    Path:     source/backend/hexagon/htp-ops-lib
+    Revision: b8c533a58926a45d9e893565958701db2c7f09fe
+    Copied:   2026-09-15
+
+A copy of the License is in the LICENSE file next to this notice. The
+modifications made to the vendored code are listed in VENDORING.md.

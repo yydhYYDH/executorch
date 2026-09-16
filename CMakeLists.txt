@@ -1570,6 +1570,11 @@ if(EXECUTORCH_BUILD_VULKAN)
   list(APPEND _executorch_backends vulkan_backend vulkan_schema)
 endif()
 
+if(EXECUTORCH_BUILD_HEXAGON)
+  add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/hexagon)
+  list(APPEND _executorch_backends hexagon_backend)
+endif()
+
 if(EXECUTORCH_BUILD_WEBGPU)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/backends/webgpu)
   list(APPEND _executorch_backends webgpu_backend)
