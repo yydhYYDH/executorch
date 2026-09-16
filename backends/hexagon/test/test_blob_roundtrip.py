@@ -33,12 +33,13 @@ _SCHEMA_INC = _HEXAGON_DIR / "serialization"
 # Offsets the C++ side must report, derived here from the Python struct formats
 # rather than restated: two independent derivations are the whole point.
 _FIELD_BYTES = 4 * 4  # type, n_inputs, n_outputs, n_params
-_TRAILER_BYTES = 3 * 4  # patch_param, patch_input, in_place
+_TRAILER_BYTES = 4 * 4  # patch_param, patch_input, patch_scale, in_place
 _EXPECTED_OP_OFFSETS = {
     "params": _FIELD_BYTES,
     "patch_param": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS,
     "patch_input": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS + 4,
-    "in_place": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS + 8,
+    "patch_scale": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS + 8,
+    "in_place": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS + 12,
     "inputs": _FIELD_BYTES + 4 * B.MAX_OP_PARAMS + _TRAILER_BYTES,
     "outputs": _FIELD_BYTES
     + 4 * B.MAX_OP_PARAMS
@@ -82,6 +83,7 @@ def _build_blob():
             outputs=[out0, out1],
             params=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             patch=(1, 2),
+            patch_scale=1024,
             in_place=0b101,
         ),
         # The other extreme: no params, no patch, weights and scratch only.
@@ -93,6 +95,7 @@ def _build_blob():
             outputs=[out0, out1, a0, a1],
             params=list(range(B.MAX_OP_PARAMS)),
             patch=(B.MAX_OP_PARAMS - 1, B.MAX_OP_INPUTS - 1),
+            patch_scale=0xFFFFFFFF,
             in_place=0xFFFFFFFF,
         ),
     ]
@@ -219,6 +222,7 @@ def test_blob_roundtrip(tmp_path):
         patch_param, patch_input = written.patch or (B.NO_PATCH, 0)
         assert seen["patch_param"] == patch_param, f"op {index} patch_param"
         assert seen["patch_input"] == patch_input, f"op {index} patch_input"
+        assert seen["patch_scale"] == written.patch_scale, f"op {index} patch_scale"
         assert seen["in_place"] == written.in_place, f"op {index} in_place"
 
         assert seen["input"] == _expected_slots(

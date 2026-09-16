@@ -4,17 +4,29 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, final
+from typing import Dict, final, Set
 
 import torch
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend, SUPPORTED_TARGETS
 from executorch.backends.hexagon.hexagon_ops import (
     _scalar_source,
+    ALIAS_TARGETS,
+    CAST_TARGETS,
     BINARY_TARGETS,
     MEAN_TARGETS,
+    cat_region,
+    CAT_TARGETS,
     MM_TARGETS,
+    permute_region,
+    PERMUTE_TARGETS,
+    select_region,
+    SELECT_TARGETS,
+    slice_region,
+    SLICE_TARGETS,
     sdpa_targets,
+    update_cache_layout,
 )
+from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
     generate_partitions_from_list_of_nodes,
 )
@@ -109,6 +121,51 @@ def _mean_reduces_one_span(node: torch.fx.Node) -> bool:
     return norm == list(range(norm[0], norm[0] + len(norm)))
 
 
+def _cast_stays_in_fp16(node: torch.fx.Node) -> bool:
+    """Whether this cast is between the two widths the arena already holds.
+
+    A cast from int64 is a conversion the kernels cannot do and must not be
+    absorbed; one between fp16 and fp32 is the runtime's job on whichever side
+    of the boundary it lands.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return False
+    return {_dtype_of(source), _dtype_of(node)} <= {torch.float16, torch.float32}
+
+
+def _emits_no_command(node: torch.fx.Node) -> bool:
+    """Whether this node's emitter only re-points its operand's TensorRef."""
+    if node.target in ALIAS_TARGETS:
+        return True
+    return node.target in CAST_TARGETS and _cast_stays_in_fp16(node)
+
+
+def _alias_keeps_the_same_bytes(node: torch.fx.Node) -> bool:
+    """True when the result is the operand's bytes in the same order.
+
+    A contiguous operand and a contiguous result of the same element count is
+    the whole condition: the emitter then re-points the operand's TensorRef, so
+    whichever way the kernels walk the buffer they see the same numbers. A
+    slice of the inner dimension fails it, because the result would skip bytes
+    the layout it describes does not mention.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return False
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return False
+    return (
+        source_value.is_contiguous()
+        and result_value.is_contiguous()
+        and source_value.numel() == result_value.numel()
+    )
+
+
 class HexagonOperatorSupport(OperatorSupportBase):
     """Accepts the ops the DSP has a kernel for, at a dtype it can run.
 
@@ -119,7 +176,15 @@ class HexagonOperatorSupport(OperatorSupportBase):
     whereas one rejected while emitting fails the whole export.
     """
 
+    def __init__(self) -> None:
+        # Views that a partition would have to hand out, recorded by the
+        # partitioner once the consumers are known. Empty means the per-node
+        # answer, which is all this check can reach on its own.
+        self.boundary_views: Set[torch.fx.Node] = set()
+
     def is_node_supported(self, _submodules, node: torch.fx.Node) -> bool:
+        if node in self.boundary_views:
+            return False
         if node.op != "call_function":
             return False
         # Resolving the attention overloads also registers their emitter, and the
@@ -131,7 +196,12 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if dtype is not torch.float16:
             # Attention is the one op whose fp32 operands are narrowed to fp16
             # on the way into the arena, so it is the one op that may be fp32.
-            if dtype is not torch.float32 or node.target not in sdpa:
+            # A cast between the two widths is the other: the runtime performs it
+            # on whichever side of the boundary the cast ends up.
+            absorbed = node.target in sdpa or (
+                node.target in CAST_TARGETS and _cast_stays_in_fp16(node)
+            )
+            if dtype is not torch.float32 or not absorbed:
                 return False
         if node.target in sdpa and not _sdpa_fits_dsp_limits(node):
             return False
@@ -140,6 +210,19 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in MM_TARGETS and not _mm_operands_fit_flat_path(node):
             return False
         if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
+            return False
+        if _emits_no_command(node) and not _alias_keeps_the_same_bytes(node):
+            # A narrowing select reaches the same emitter through its own region
+            # rather than by re-pointing, so the alias test is not the last word.
+            if node.target not in SELECT_TARGETS or select_region(node) is None:
+                return False
+        if node.target in SLICE_TARGETS and slice_region(node) is None:
+            return False
+        if node.target in CAT_TARGETS and cat_region(node) is None:
+            return False
+        if node.target in PERMUTE_TARGETS and permute_region(node) is None:
+            return False
+        if node.target is UPDATE_CACHE and update_cache_layout(node) is None:
             return False
         return all(
             isinstance(arg, torch.fx.Node)
@@ -171,6 +254,27 @@ class HexagonPartitioner(Partitioner):
             for node in graph_module.graph.nodes
             if support.is_node_supported(None, node)
         ]
+
+        # A view re-points its operand's TensorRef and emits no command, so a
+        # partition that has to hand one out would have nothing to fill the
+        # output slot with. One whose consumers are all delegated stays inside
+        # its partition; one that is a boundary keeps its own result instead.
+        # Who the consumers are is only known here, so the question is asked
+        # here rather than in the support check.
+        # Reversed, because dropping a view makes the view feeding it a
+        # boundary as well, and graph.nodes is topological, so walking backwards
+        # settles every consumer before its producer. The answer is recorded on
+        # the support object as well as removed from this list, because
+        # generate_partitions_from_list_of_nodes asks the support object again
+        # instead of trusting the list.
+        supported_set = set(supported)
+        for node in reversed(list(supported)):
+            if _emits_no_command(node) and any(
+                user not in supported_set for user in node.users
+            ):
+                supported.remove(node)
+                supported_set.discard(node)
+                support.boundary_views.add(node)
 
         partition_tags: Dict[str, DelegationSpec] = {}
         if not supported:
