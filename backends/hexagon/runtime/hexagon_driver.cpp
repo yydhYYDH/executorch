@@ -35,9 +35,26 @@ constexpr const char* kSkelUriSuffix = "?htp_ops_skel_handle_invoke&_modver=1.0"
 constexpr const char* kSkelNameFormat = "libhex-htp-skel-v%02X.so";
 constexpr const char* kDsprpcLib = "libcdsprpc.so";
 
+// FastRPC's default is no RPC timeout, which is what turns a DSP-side hang into
+// an unkillable wait: the invoke never returns, so no error ever reaches the
+// caller. Registering the v2 notification struct arms a per-PD timeout so the
+// same hang comes back as AEE_EEXPIRED. 10 s sits above a slow but legitimate
+// first prefill, so only a real hang trips it.
+constexpr uint32_t kRpcTimeoutMs = 10000;
+// AEE_EOFFSET is 0 on HLOS, so a DSP-side code that reaches us unscaled does
+// not compare equal to its AEE_EEXPIRED spelling.
+constexpr AEEResult kAeeExpiredDsp = static_cast<AEEResult>(0x8000040cu);
+
 Error ToError(AEEResult err, const char* what) {
   if (err == AEE_SUCCESS) {
     return Error::Ok;
+  }
+  if (err == AEE_EEXPIRED || err == kAeeExpiredDsp) {
+    std::fprintf(
+        stderr,
+        "[hexagon] %s exceeded the %u ms RPC timeout (AEE_EEXPIRED)\n",
+        what,
+        (unsigned)kRpcTimeoutMs);
   }
   std::fprintf(stderr, "[hexagon] %s failed: 0x%08x\n", what, (unsigned)err);
   return Error::Internal;
@@ -65,6 +82,165 @@ std::string SelectSkel(int domain_id, uint32_t* expected_arch) {
   char name[64];
   std::snprintf(name, sizeof(name), kSkelNameFormat, arch);
   return name;
+}
+
+const char* StatusName(remote_rpc_status_flags_t status) {
+  switch (status) {
+    case FASTRPC_USER_PD_UP:
+      return "USER_PD_UP";
+    case FASTRPC_USER_PD_EXIT:
+      return "USER_PD_EXIT";
+    case FASTRPC_USER_PD_FORCE_KILL:
+      return "USER_PD_FORCE_KILL";
+    case FASTRPC_USER_PD_EXCEPTION:
+      return "USER_PD_EXCEPTION";
+    case FASTRPC_DSP_SSR:
+      return "DSP_SSR";
+    case FASTRPC_INTERNAL_STATUS_RESERVED_1:
+      return "INTERNAL_STATUS_RESERVED_1";
+    case FASTRPC_USERPD_TIMEOUT:
+      return "USERPD_TIMEOUT";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+// Called by FastRPC on its own thread: print and return. Blocking here, or
+// re-entering FastRPC from here, would wedge a thread the library owns.
+int RpcStatusNotify(
+    void* context,
+    int domain,
+    int session,
+    remote_rpc_status_flags_t status) {
+  (void)context;
+  std::fprintf(
+      stderr,
+      "[hexagon] pd notification: domain=%d session=%d status=%s(%d)\n",
+      domain,
+      session,
+      StatusName(status),
+      (int)status);
+  return AEE_SUCCESS;
+}
+
+// Returns whether the timeout is armed. The caller continues either way: on a
+// kernel that does not implement the v2 struct, the failure code is the answer.
+bool ArmRpcTimeout(int domain_id) {
+  struct remote_rpc_notif_register_v2 notif;
+  notif.context = nullptr;
+  notif.domain = domain_id;
+  notif.notifier_fn = RpcStatusNotify;
+  notif.timeout = kRpcTimeoutMs;
+
+  const AEEResult err = remote_session_control(
+      FASTRPC_REGISTER_STATUS_NOTIFICATIONS, &notif, sizeof(notif));
+  if (err != AEE_SUCCESS) {
+    std::fprintf(
+        stderr,
+        "[hexagon] rpc timeout NOT armed: registering status notifications "
+        "with a %u ms timeout on domain %d failed: 0x%08x\n",
+        (unsigned)kRpcTimeoutMs,
+        domain_id,
+        (unsigned)err);
+    return false;
+  }
+  std::fprintf(
+      stderr,
+      "[hexagon] rpc timeout armed on domain %d: %u ms\n",
+      domain_id,
+      (unsigned)kRpcTimeoutMs);
+  return true;
+}
+
+// Runs after an RPC call timed out, to answer one question: is the session still
+// usable, or does it have to be rebuilt? A wedged session makes any later invoke
+// hang too, so this is only safe to attempt *because* Open() armed the RPC
+// timeout: each probe call is bounded by kRpcTimeoutMs instead of blocking
+// forever. Worst case is two extra timeouts on top of the one that just expired.
+//
+// htp_ops_getInfo (IDL method 6) is the probe of choice: it takes no VTCM guard
+// and only reads VTCM/HVX numbers back, so it cannot repeat the work of the call
+// that hung and cannot double-apply a stateful operation.
+//
+// The second probe opens a new handle instead of closing the first: Close() frees
+// every live arena and would corrupt the caller's bookkeeping in the middle of a
+// failure, while a second handle in the same PD answers the same question -- does
+// a fresh session work? -- and is closed again immediately.
+void ProbeAfterTimeout(
+    HexagonDriver& driver,
+    int domain_id,
+    uint64_t wedged_handle,
+    AEEResult original) {
+  auto scratch = driver.Alloc(4096);
+  if (!scratch.ok()) {
+    std::fprintf(stderr, "[hexagon] post-timeout probe: no scratch buffer\n");
+    return;
+  }
+  const int fd = scratch->fd;
+  const int offset = (int)scratch->bias;
+
+  const AEEResult same = htp_ops_getInfo(wedged_handle, fd, offset);
+  std::fprintf(
+      stderr,
+      "[hexagon] post-timeout probe 1/2 (same handle): getInfo -> 0x%08x%s\n",
+      (unsigned)same,
+      (same == AEE_EEXPIRED || same == kAeeExpiredDsp)
+          ? "  [timed out: this session is wedged]"
+          : "");
+
+  // Probe 2 runs unconditionally. Probe 1 only says whether *this* handle is
+  // still alive, while probe 2 answers the question the probe exists for: does a
+  // fresh session work, i.e. can a reboot be avoided? A wedged handle is exactly
+  // when that answer matters, and every probe call is bounded by the timeout.
+  AEEResult fresh = AEE_SUCCESS;
+  bool ran_fresh = false;
+  {
+    uint32_t probe_arch = 0;
+    domain* probe_domain = get_domain(domain_id);
+    const std::string skel_name = SelectSkel(domain_id, &probe_arch);
+    if (probe_domain == nullptr || skel_name.empty()) {
+      std::fprintf(
+          stderr,
+          "[hexagon] post-timeout probe 2/2: cannot rebuild the skel URI\n");
+    } else {
+      // The URI Open() built: same skel, same domain, so the same PD.
+      const std::string uri = std::string(kSkelUriPrefix) + skel_name +
+          kSkelUriSuffix + probe_domain->uri;
+      uint64_t fresh_handle = 0;
+      fresh = htp_ops_open(uri.c_str(), &fresh_handle);
+      ran_fresh = true;
+      if (fresh == AEE_SUCCESS) {
+        fresh = htp_ops_getInfo(fresh_handle, fd, offset);
+        // The wedged handle stays open: Close() owns it.
+        htp_ops_close(fresh_handle);
+      }
+      std::fprintf(
+          stderr,
+          "[hexagon] post-timeout probe 2/2 (fresh session on the same PD): "
+          "open+getInfo -> 0x%08x%s\n",
+          (unsigned)fresh,
+          fresh == AEE_SUCCESS ? "  [a fresh session works: no reboot needed]"
+                               : "");
+    }
+  }
+
+  if (ran_fresh) {
+    std::fprintf(
+        stderr,
+        "[hexagon] post-timeout probe: original=0x%08x same_handle=0x%08x "
+        "fresh_session=0x%08x\n",
+        (unsigned)original,
+        (unsigned)same,
+        (unsigned)fresh);
+  } else {
+    std::fprintf(
+        stderr,
+        "[hexagon] post-timeout probe: original=0x%08x same_handle=0x%08x "
+        "fresh_session=unavailable\n",
+        (unsigned)original,
+        (unsigned)same);
+  }
+  driver.Free(scratch->ptr);
 }
 
 } // namespace
@@ -124,6 +300,10 @@ Error HexagonDriver::Open() {
       return Error::Internal;
     }
   }
+
+  // Arming the RPC timeout is deliberately unconditional: it is the only way
+  // a DSP-side hang can surface as an error instead of an infinite wait.
+  ArmRpcTimeout(domain_id_);
 
   AEEResult err = htp_ops_open(uri.c_str(), &handle_);
   if (err != AEE_SUCCESS) {
@@ -211,7 +391,7 @@ HexagonDriver& HexagonDriver::operator=(HexagonDriver&& other) noexcept {
   return *this;
 }
 
-Result<void*> HexagonDriver::Alloc(size_t bytes, size_t alignment) {
+Result<Arena> HexagonDriver::Alloc(size_t bytes, size_t alignment) {
   if (handle_ == 0) {
     return Error::InvalidState;
   }
@@ -249,7 +429,12 @@ Result<void*> HexagonDriver::Alloc(size_t bytes, size_t alignment) {
       ~(static_cast<uintptr_t>(alignment) - 1));
 
   allocations_.emplace(aligned, Allocation{base, total, fd});
-  return aligned;
+  return Arena{
+      aligned,
+      bytes,
+      fd,
+      static_cast<uint64_t>(
+          reinterpret_cast<uintptr_t>(aligned) - reinterpret_cast<uintptr_t>(base))};
 }
 
 void HexagonDriver::Free(void* ptr) {
@@ -263,24 +448,6 @@ void HexagonDriver::Free(void* ptr) {
   fastrpc_munmap(domain_id_, it->second.fd, it->second.base, it->second.size);
   rpcmem_free(it->second.base);
   allocations_.erase(it);
-}
-
-Result<int> HexagonDriver::ToFd(void* ptr) {
-  auto it = allocations_.find(ptr);
-  if (it == allocations_.end()) {
-    return Error::InvalidArgument;
-  }
-  return it->second.fd;
-}
-
-Result<uint64_t> HexagonDriver::MappingOffset(void* ptr) {
-  auto it = allocations_.find(ptr);
-  if (it == allocations_.end()) {
-    return Error::InvalidArgument;
-  }
-  return static_cast<uint64_t>(
-      reinterpret_cast<uintptr_t>(ptr) -
-      reinterpret_cast<uintptr_t>(it->second.base));
 }
 
 Error HexagonDriver::Flush(void* ptr, size_t bytes) {
@@ -307,16 +474,80 @@ Error HexagonDriver::ExecuteCommandGroup(
   if (handle_ == 0) {
     return Error::InvalidState;
   }
-  return ToError(
-      htp_ops_execute_command_group(
-          handle_,
-          group_fd,
-          group_offset,
-          (int)count,
-          sync_fd,
-          sync_offset,
-          sync_size),
-      "execute_command_group");
+  const AEEResult code = htp_ops_execute_command_group(
+      handle_,
+      group_fd,
+      group_offset,
+      (int)count,
+      sync_fd,
+      sync_offset,
+      sync_size);
+  if (code == AEE_EEXPIRED || code == kAeeExpiredDsp) {
+    ProbeAfterTimeout(*this, domain_id_, handle_, code);
+  }
+  return ToError(code, "execute_command_group");
+}
+
+Error HexagonDriver::ExecuteCommandGroupTraced(
+    int group_fd,
+    int group_offset,
+    uint32_t count,
+    int sync_fd,
+    int sync_offset,
+    int sync_size,
+    int profile_fd,
+    int profile_offset,
+    int profile_size) {
+  if (handle_ == 0) {
+    return Error::InvalidState;
+  }
+  const AEEResult code = htp_ops_execute_command_group_profile(
+      handle_,
+      group_fd,
+      group_offset,
+      (int)count,
+      sync_fd,
+      sync_offset,
+      sync_size,
+      profile_fd,
+      profile_offset,
+      profile_size);
+  if (code == AEE_EEXPIRED || code == kAeeExpiredDsp) {
+    ProbeAfterTimeout(*this, domain_id_, handle_, code);
+  }
+  return ToError(code, "execute_command_group_profile");
+}
+
+SharedArenaPool& SharedArenaPool::Get() {
+  static SharedArenaPool pool;
+  return pool;
+}
+
+Result<Arena> SharedArenaPool::Acquire(size_t bytes) {
+  const auto existing = arenas_.find(bytes);
+  if (existing != arenas_.end()) {
+    return existing->second;
+  }
+
+  if (driver_ == nullptr) {
+    auto driver = HexagonDriver::Create();
+    if (!driver.ok()) {
+      return driver.error();
+    }
+    driver_ = std::make_unique<HexagonDriver>(std::move(driver.get()));
+  }
+
+  auto arena = driver_->Alloc(bytes);
+  if (!arena.ok()) {
+    return arena.error();
+  }
+  std::fprintf(
+      stderr, "[hexagon] pool: new block %zu bytes (#%zu)\n", bytes, arenas_.size() + 1);
+  // The heap hands back whatever was there before, and the first execute of a
+  // model expects the zeroed scratch every delegate used to get of its own.
+  std::memset(arena.get().ptr, 0, bytes);
+  arenas_.emplace(bytes, arena.get());
+  return arena.get();
 }
 
 Error HexagonDriver::PowerAcquire() {

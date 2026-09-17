@@ -9,8 +9,12 @@
 #include <executorch/backends/hexagon/runtime/hexagon_backend.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #include <flatbuffers/flatbuffers.h>
@@ -40,6 +44,62 @@ using runtime::FreeableBuffer;
 using runtime::MemoryAllocator;
 using runtime::Result;
 using runtime::Span;
+
+// Diagnostic knobs, all off unless set in the environment:
+//   HEXAGON_TRACE=1        print the per-command trace
+//   HEXAGON_DELEGATE=n     which delegate, by execute order (-1 = every one)
+//   HEXAGON_CMD_START=s    first command of that delegate to run
+//   HEXAGON_CMD_LIMIT=k    how many commands to run from there
+//   HEXAGON_STOP_AFTER=n   exit once delegate n has run
+//   HEXAGON_FAKE_CACHE=1   fill an empty attention past-key/value operand from
+//                          the key and value operands, which is what the fixed
+//                          emitter does, so the null-pointer write can be
+//                          isolated from every other defect in the same blob
+// start/limit cut the group array at a command boundary, the cheapest way to
+// bracket the command that kills the DSP without touching the exported blob. A
+// suffix (start > 0) is how one command is run on its own.
+struct TraceConfig {
+  bool trace = false;
+  int delegate = -1;
+  int start = 0;
+  int limit = 0;
+  int stop_after = -1;
+  bool fake_cache = false;
+};
+
+int EnvInt(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? fallback : std::atoi(value);
+}
+
+const TraceConfig& Trace() {
+  static const TraceConfig config = [] {
+    TraceConfig c;
+    c.trace = EnvInt("HEXAGON_TRACE", 0) != 0;
+    c.delegate = EnvInt("HEXAGON_DELEGATE", -1);
+    c.start = EnvInt("HEXAGON_CMD_START", 0);
+    c.limit = EnvInt("HEXAGON_CMD_LIMIT", 0);
+    c.stop_after = EnvInt("HEXAGON_STOP_AFTER", -1);
+    c.fake_cache = EnvInt("HEXAGON_FAKE_CACHE", 0) != 0;
+    return c;
+  }();
+  return config;
+}
+
+// Layout owned by execute_command.cc: four header ints at kProbeBaseInts inside
+// the profile buffer, then one eight-int record per command index.
+constexpr int kProbeBaseInts = 1024;
+constexpr int kProbeHeaderInts = 4;
+constexpr int kProbeRecordInts = 8;
+constexpr int kProbeRecords = 508;
+// Sixteen stage records after the command records, four ints each.
+constexpr int kProbeStages = 80;
+constexpr int kProbeBytes =
+    (kProbeBaseInts + kProbeHeaderInts + kProbeRecords * kProbeRecordInts + kProbeStages * 4) * 4;
+constexpr int32_t kProbeMagic = 0x48455850; // "HEXP"
+
+// DSP_OP_FLASH_ATTN, the one command whose empty cache slots are fatal.
+constexpr int32_t kFlashAttnOp = 18;
 
 // A run of bytes inside the arena.
 // Round-to-nearest-even fp32 to fp16, matching what a __fp16 cast produces on
@@ -120,42 +180,265 @@ struct Region {
 
 struct HexagonDelegate {
   HexagonDriver driver;
-  void* arena = nullptr;
-  int arena_fd = -1;
-  size_t arena_bytes = 0;
-  // Where the arena starts inside its FastRPC mapping. The DSP resolves the fd
-  // to the mapping's base, so every offset it is given is biased by this.
-  uint64_t arena_bias = 0;
+  // Written once at init and read on every execute: the command descriptors,
+  // the sync group, the command group and the weights. Private to this
+  // delegate.
+  Arena resident;
+  // The per-execute half: the method inputs, the activations and the method
+  // outputs. Shared through the pool with every delegate of the same size,
+  // because nothing written here outlives an execute.
+  Arena scratch;
 
   // Host-written once at init.
   Region group; // command group array
   Region commands; // the command descriptors
   Region sync; // SyncGroup flatbuffer
 
-  // The four tensor sections, in blob order.
+  // The four tensor sections, in blob order. An offset is measured from the
+  // start of the block its section lives in: weights in resident, the other
+  // three in scratch.
   Region weights;
   Region input_section;
   Region activations;
   Region output_section;
 
   uint32_t n_ops = 0;
-  // Absolute arena location of each method input/output, in signature order.
+  uint32_t activations_bytes = 0;
+  // Order this delegate was created in, for the trace only.
+  int index = 0;
+  // Host-visible landing zone for the DSP-side per-command trace. Empty unless
+  // the environment asked for a trace.
+  Arena probe;
+  // Block-relative location of each method input/output, in signature order.
   std::vector<Region> inputs;
   std::vector<Region> outputs;
 
   // Params the emitter could not know, resolved from an input on every
   // execute. Only ops with HexagonOp::patch_param set appear here.
   struct Patch {
-    size_t param_offset; // arena location of the param slot to overwrite
-    size_t input_offset; // arena location the value is read from
+    uint8_t* slot; // param slot to overwrite, in the resident block
+    const uint8_t* source; // where the value is read from, in either block
     uint32_t scale; // multiplier between the two
   };
   std::vector<Patch> patches;
 
-  // Method inputs the subgraph writes to, by signature index. Their arena slots
-  // are copied back to the caller once the command group has run.
+  // Method inputs the subgraph writes to, by signature index. Their scratch
+  // slots are copied back to the caller once the command group has run.
   std::vector<uint32_t> in_place_inputs;
 };
+
+// Read back what the DSP managed to write before it faulted. Phase 0 on the
+// last written record is the crash signature: the command was entered and never
+// returned from.
+void PrintProbe(const HexagonDelegate& delegate) {
+  if (delegate.probe.ptr == nullptr) {
+    return;
+  }
+  const int32_t* probe = static_cast<const int32_t*>(delegate.probe.ptr);
+  const int32_t* header = probe + kProbeBaseInts;
+  if (header[0] != kProbeMagic) {
+    std::fprintf(
+        stderr,
+        "[hexagon] probe d%d: no record; the fault came before the command loop\n",
+        delegate.index);
+    return;
+  }
+  std::fprintf(stderr, "[hexagon] probe d%d: sent count=%d last=%d\n", delegate.index, header[1], header[3]);
+  for (int i = 0; i < header[1] && i < kProbeRecords; i++) {
+    const int32_t* rec = probe + kProbeBaseInts + kProbeHeaderInts + i * kProbeRecordInts;
+    if (rec[0] != i + 1) {
+      continue;
+    }
+    const char* phase = rec[1] == 0 ? "ENTER (no return)" : (rec[1] == 1 ? "done" : "failed");
+    std::fprintf(
+        stderr,
+        "[hexagon] probe d%d cmd %d: op=%d fd=%d off=%d size=%d %s ret=%d\n",
+        delegate.index,
+        i,
+        rec[5],
+        rec[2],
+        rec[3],
+        rec[4],
+        phase,
+        rec[6]);
+  }
+}
+
+// How far inside the kernel the crash happened. A stage is written by the kernel
+// itself and flushed, so the last one present is where it was when it died.
+const char* StageName(int stage) {
+  switch (stage) {
+    case 1: return "flash_attn entered";
+    case 2: return "pre push_kv";
+    case 3: return "post push_kv";
+    case 4: return "pre sync_attention";
+    case 5: return "post sync_attention";
+    case 6: return "push_kv entered";
+    case 7: return "push_kv pre-write";
+    case 8: return "push_kv post-write";
+    case 9: return "past push block";
+    case 10: return "push_kv vtcm reserved";
+    case 11: return "push_kv jobs submitted";
+    case 12: return "push_kv jobs done";
+    case 13: return "chunk entered";
+    case 14: return "chunk K written";
+    case 15: return "chunk V written";
+    case 16: return "pre clear v tail";
+    case 17: return "chunk enter";
+    case 18: return "chunk K done";
+    case 19: return "chunk V done";
+    case 20: return "chunk exit";
+    case 21: return "worker loop exit";
+    case 22: return "rpc stack left";
+    case 23: return "worker stack left";
+    case 24: return "push_kv tasks";
+    case 25: return "push_kv heads/dim/maxkv";
+    case 26: return "push_kv icP/ocP/chunks";
+    case 27: return "push_kv c4/tokoff/seqlen";
+    case 28: return "push_kv pastK/K/stride";
+    case 29: return "cache write maxK/maxV/cap";
+    case 30: return "clamp build";
+    case 31: return "dsp worker pool state";
+    case 32: return "attn run_tasks entered";
+    case 33: return "pre hmx_queue_begin";
+    case 34: return "post hmx_queue_begin";
+    case 35: return "attn submits done";
+    case 36: return "pre synctoken wait";
+    case 37: return "post synctoken wait";
+    case 38: return "post hmx_queue_end";
+    case 39: return "process_head entered";
+    case 40: return "pre causal QK";
+    case 41: return "post causal QK";
+    case 42: return "post causal softmax";
+    case 43: return "pre causal SV";
+    case 44: return "post causal SV";
+    case 45: return "attn worker exit";
+    case 47: return "attn_hmx_matmul entered";
+    case 48: return "matmul vtcm sized";
+    case 49: return "matmul pre compute";
+    case 50: return "matmul post store";
+    case 51: return "matmul exit";
+    case 52: return "queue thread job start";
+    case 53: return "queue thread job end";
+    case 54: return "pre hmx resource lock";
+    case 55: return "post hmx resource lock";
+    case 56: return "hmx resource end";
+    case 57: return "submit blocking wait";
+    case 64: return "matmul enters";
+    case 65: return "matmul exits";
+    case 66: return "queue idle wakes";
+    case 67: return "queue jobs done";
+    case 68: return "submit completions";
+    case 69: return "submit sem acquires";
+    case 70: return "worker loop iters";
+    case 71: return "worker exits";
+    default: return "unknown";
+  }
+}
+
+void PrintStages(const HexagonDelegate& delegate) {
+  if (delegate.probe.ptr == nullptr) {
+    return;
+  }
+  const int32_t* probe = static_cast<const int32_t*>(delegate.probe.ptr);
+  const int32_t* base =
+      probe + kProbeBaseInts + kProbeHeaderInts + kProbeRecords * kProbeRecordInts;
+  for (int i = 0; i < kProbeStages; i++) {
+    const int32_t* rec = base + i * 4;
+    if (rec[0] != i + 1) {
+      continue;
+    }
+    std::fprintf(
+        stderr,
+        "[hexagon] stage d%d %d %s: (%d, %d, %d)\n",
+        delegate.index,
+        i + 1,
+        StageName(i + 1),
+        rec[1],
+        rec[2],
+        rec[3]);
+  }
+}
+
+// A blocked invoke never returns, and nothing can interrupt the DSP once its side stops
+// answering: the calling thread sits in fastrpc_wait_for_completion until the process dies.
+// Whatever the DSP already wrote into the probe ring is then the only evidence left, so read
+// it out on a timer instead of after the return. HEXAGON_WATCHDOG_SECONDS (default 15, 0
+// disables) sets the interval; only a traced delegate has a probe ring to read.
+class ProbeWatchdog {
+ public:
+  ProbeWatchdog(const HexagonDelegate* delegate, bool traced) : delegate_(delegate) {
+    const char* env = std::getenv("HEXAGON_WATCHDOG_SECONDS");
+    seconds_ = env != nullptr ? std::atoi(env) : 15;
+    if (!traced || seconds_ <= 0 || delegate_->probe.ptr == nullptr) {
+      return;
+    }
+    thread_ = std::thread([this] { Loop(); });
+  }
+  ~ProbeWatchdog() {
+    stop_.store(true);
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+ private:
+  void Loop() {
+    for (int elapsed = seconds_; !stop_.load(); elapsed += seconds_) {
+      for (int tick = 0; tick < seconds_ * 10 && !stop_.load(); ++tick) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (stop_.load()) {
+        return;
+      }
+      std::fprintf(
+          stderr,
+          "[hexagon] watchdog d%d: still inside the command group after %d s, DSP trace so far:\n",
+          delegate_->index,
+          elapsed);
+      PrintProbe(*delegate_);
+      PrintStages(*delegate_);
+      std::fflush(nullptr);
+    }
+  }
+
+  const HexagonDelegate* delegate_;
+  std::atomic<bool> stop_{false};
+  int seconds_ = 15;
+  std::thread thread_;
+};
+
+// The operand list of every command in the group, read back out of the
+// descriptors the DSP is handed, so the crashing command can be named exactly.
+void PrintCommands(const HexagonDelegate& delegate) {
+  const uint8_t* resident = static_cast<const uint8_t*>(delegate.resident.ptr);
+  const int32_t* group = reinterpret_cast<const int32_t*>(resident + delegate.group.offset);
+  for (uint32_t i = 0; i < delegate.n_ops; i++) {
+    const int32_t* entry = group + 2 + i * 3;
+    const auto* command = flatbuffers::GetRoot<DSPCOMMAND::Command>(
+        resident + entry[1] - (int32_t)delegate.resident.bias);
+    if (command == nullptr) {
+      continue;
+    }
+    std::fprintf(stderr, "[hexagon] cmd d%d %u: type=%d", delegate.index, i, command->type());
+    const auto* inputs = command->inputs();
+    for (uint32_t j = 0; inputs != nullptr && j < inputs->size(); j++) {
+      const auto* tensor = inputs->Get(j);
+      std::fprintf(stderr, " in%u=(fd%d,%d,%d)", j, tensor->fd(), tensor->offset(), tensor->size());
+    }
+    const auto* outputs = command->outputs();
+    for (uint32_t j = 0; outputs != nullptr && j < outputs->size(); j++) {
+      const auto* tensor = outputs->Get(j);
+      std::fprintf(stderr, " out%u=(fd%d,%d,%d)", j, tensor->fd(), tensor->offset(), tensor->size());
+    }
+    const auto* params = command->params();
+    std::fprintf(stderr, " params=[");
+    for (uint32_t j = 0; params != nullptr && j < params->size(); j++) {
+      std::fprintf(stderr, "%s%d", j == 0 ? "" : ",", params->Get(j));
+    }
+    std::fprintf(stderr, "]\n");
+  }
+}
 
 size_t AlignUp(size_t value, size_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -179,6 +462,13 @@ size_t SectionBase(const HexagonDelegate& delegate, HexagonTensorSpace space) {
   return 0;
 }
 
+// Weights are resident and private to the delegate; every other operand is
+// scratch, and is addressed through the pooled block's fd.
+const Arena& BlockOf(const HexagonDelegate& delegate, HexagonTensorSpace space) {
+  return space == HexagonTensorSpace::kWeights ? delegate.resident
+                                               : delegate.scratch;
+}
+
 bool IsKnownSpace(uint32_t space) {
   return space <= static_cast<uint32_t>(HexagonTensorSpace::kActivation) ||
       space == static_cast<uint32_t>(HexagonTensorSpace::kAbsent);
@@ -199,11 +489,9 @@ flatbuffers::Offset<DSPCOMMAND::Tensor> MakeTensor(
   }
   const size_t base =
       SectionBase(delegate, (HexagonTensorSpace)ref.space) + ref.offset;
+  const Arena& block = BlockOf(delegate, (HexagonTensorSpace)ref.space);
   return DSPCOMMAND::CreateTensor(
-      builder,
-      delegate.arena_fd,
-      (int32_t)(base + delegate.arena_bias),
-      (int32_t)ref.size);
+      builder, block.fd, (int32_t)(base + block.bias), (int32_t)ref.size);
 }
 
 } // namespace
@@ -270,38 +558,48 @@ Result<DelegateHandle*> HexagonBackend::init(
       (header->n_ops * (kMaxOpInputs + kMaxOpOutputs) + 16) * 32, kHexagonAlignment);
   const size_t group_bytes = 8 + header->n_ops * 3 * sizeof(int32_t);
 
-  size_t total = command_budget + sync_budget + group_bytes;
-  total = AlignUp(total + header->weights_bytes, kHexagonAlignment);
-  total = AlignUp(total + header->inputs_bytes, kHexagonAlignment);
-  total = AlignUp(total + header->activations_bytes, kHexagonAlignment);
-  total = AlignUp(total + header->outputs_bytes, kHexagonAlignment);
+  size_t resident_bytes = command_budget + sync_budget;
+  resident_bytes = AlignUp(resident_bytes + header->weights_bytes, kHexagonAlignment);
+  resident_bytes = AlignUp(resident_bytes + group_bytes, kHexagonAlignment);
+
+  size_t scratch_bytes = 0;
+  scratch_bytes = AlignUp(scratch_bytes + header->inputs_bytes, kHexagonAlignment);
+  scratch_bytes = AlignUp(scratch_bytes + header->activations_bytes, kHexagonAlignment);
+  scratch_bytes = AlignUp(scratch_bytes + header->outputs_bytes, kHexagonAlignment);
+  // rpcmem rejects a zero-length request, and a subgraph with no operand of its
+  // own is still a legal subgraph.
+  scratch_bytes = scratch_bytes == 0 ? kHexagonAlignment : scratch_bytes;
 
   std::fprintf(
       stderr,
-      "[hexagon] arena request: %zu bytes (weights %zu, activations %zu)\n",
-      total,
+      "[hexagon] arena: resident %zu, scratch %zu (weights %zu, activations %zu)\n",
+      resident_bytes,
+      scratch_bytes,
       (size_t)header->weights_bytes,
       (size_t)header->activations_bytes);
-  auto arena = delegate->driver.Alloc(total);
+  auto arena = delegate->driver.Alloc(resident_bytes);
   if (!arena.ok()) {
     std::fprintf(stderr, "[hexagon] rpcmem allocation failed\n");
     return arena.error();
   }
-  delegate->arena = arena.get();
-  delegate->arena_bytes = total;
-  std::memset(delegate->arena, 0, total);
+  delegate->resident = arena.get();
+  std::memset(delegate->resident.ptr, 0, resident_bytes);
 
-  auto fd = delegate->driver.ToFd(delegate->arena);
-  if (!fd.ok()) {
-    return fd.error();
+  auto pooled = SharedArenaPool::Get().Acquire(scratch_bytes);
+  if (!pooled.ok()) {
+    std::fprintf(stderr, "[hexagon] rpcmem allocation failed\n");
+    return pooled.error();
   }
-  delegate->arena_fd = fd.get();
+  delegate->scratch = pooled.get();
 
-  auto bias = delegate->driver.MappingOffset(delegate->arena);
-  if (!bias.ok()) {
-    return bias.error();
+  const TraceConfig& config = Trace();
+  if (config.trace || config.delegate >= 0) {
+    auto probe = delegate->driver.Alloc(kProbeBytes);
+    if (probe.ok()) {
+      delegate->probe = probe.get();
+      std::memset(delegate->probe.ptr, 0, kProbeBytes);
+    }
   }
-  delegate->arena_bias = bias.get();
 
   const auto* ops = reinterpret_cast<const HexagonOp*>(
       reinterpret_cast<const uint8_t*>(processed->data()) +
@@ -335,29 +633,40 @@ Result<DelegateHandle*> HexagonBackend::init(
     cursor = AlignUp(cursor + bytes, kHexagonAlignment);
   };
   place(delegate->weights, header->weights_bytes);
-  place(delegate->input_section, header->inputs_bytes);
-  place(delegate->activations, header->activations_bytes);
-  place(delegate->output_section, header->outputs_bytes);
-
-  std::memcpy(
-      static_cast<uint8_t*>(delegate->arena) + delegate->weights.offset,
-      blob + weights_blob_offset,
-      header->weights_bytes);
 
   // The group array the DSP walks: a header then 3 int32 per command.
   delegate->group.offset = cursor;
   delegate->group.size = group_bytes;
-  auto* group =
-      reinterpret_cast<int32_t*>(static_cast<uint8_t*>(delegate->arena) + cursor);
+  auto* group = reinterpret_cast<int32_t*>(
+      static_cast<uint8_t*>(delegate->resident.ptr) + cursor);
   std::memset(group, 0, delegate->group.size);
   cursor = AlignUp(cursor + delegate->group.size, kHexagonAlignment);
 
-  if (cursor > delegate->arena_bytes) {
+  if (cursor > delegate->resident.bytes) {
     ET_LOG(
         Error,
-        "hexagon: layout needs %zu bytes, arena has %zu",
+        "hexagon: layout needs %zu bytes, resident block has %zu",
         cursor,
-        delegate->arena_bytes);
+        delegate->resident.bytes);
+    return Error::Internal;
+  }
+
+  std::memcpy(
+      static_cast<uint8_t*>(delegate->resident.ptr) + delegate->weights.offset,
+      blob + weights_blob_offset,
+      header->weights_bytes);
+
+  cursor = 0;
+  place(delegate->input_section, header->inputs_bytes);
+  place(delegate->activations, header->activations_bytes);
+  place(delegate->output_section, header->outputs_bytes);
+
+  if (cursor > delegate->scratch.bytes) {
+    ET_LOG(
+        Error,
+        "hexagon: scratch needs %zu bytes, pooled block has %zu",
+        cursor,
+        delegate->scratch.bytes);
     return Error::Internal;
   }
 
@@ -406,7 +715,17 @@ Result<DelegateHandle*> HexagonBackend::init(
   size_t command_cursor = delegate->commands.offset;
 
   for (uint32_t i = 0; i < header->n_ops; i++) {
-    const HexagonOp& op = ops[i];
+    HexagonOp op = ops[i];
+    // HEXAGON_FAKE_CACHE: an attention command emitted before the emitter was
+    // fixed still points its past key and value slots at fd -1, which the
+    // dispatcher turns into the null pointers htp_ops_push_kv writes through.
+    // Substituting the key and value operands is what the fixed emitter does.
+    if (config.fake_cache && op.type == kFlashAttnOp && op.n_inputs >= 6 &&
+        IsAbsent(op.inputs[4]) && IsAbsent(op.inputs[5])) {
+      op.inputs[4] = op.inputs[1];
+      op.inputs[5] = op.inputs[2];
+      std::fprintf(stderr, "[hexagon] d%d op %u: past K/V filled from K/V\n", delegate->index, i);
+    }
 
     // Reset before the tensors are built, not after: the offsets they return
     // index into this builder, so clearing later leaves CreateCommand holding
@@ -472,10 +791,11 @@ Result<DelegateHandle*> HexagonBackend::init(
         ET_LOG(Error, "hexagon: op %u patch input has space %u", i, src.space);
         return Error::DelegateInvalidCompatibility;
       }
+      const auto space = static_cast<HexagonTensorSpace>(src.space);
       delegate->patches.push_back(
-          {command_cursor + delta,
-           SectionBase(*delegate, static_cast<HexagonTensorSpace>(src.space)) +
-               src.offset,
+          {static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor + delta,
+           static_cast<const uint8_t*>(BlockOf(*delegate, space).ptr) +
+               SectionBase(*delegate, space) + src.offset,
            op.patch_scale});
     }
 
@@ -488,14 +808,14 @@ Result<DelegateHandle*> HexagonBackend::init(
       return Error::Internal;
     }
     std::memcpy(
-        static_cast<uint8_t*>(delegate->arena) + command_cursor,
+        static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor,
         builder.GetBufferPointer(),
         size);
 
     // The DSP reads entries from group_ptr + 8, so they start at int index 2,
     // not 1; anywhere else shifts every (fd, offset) pair by four bytes.
-    group[2 + i * 3 + 0] = delegate->arena_fd;
-    group[2 + i * 3 + 1] = (int32_t)(command_cursor + delegate->arena_bias);
+    group[2 + i * 3 + 0] = delegate->resident.fd;
+    group[2 + i * 3 + 1] = (int32_t)(command_cursor + delegate->resident.bias);
     // size <= 0 tells the DSP to invalidate the descriptor before reading it,
     // which is right: the host wrote it once and never touches it again.
     group[2 + i * 3 + 2] = 0;
@@ -542,25 +862,43 @@ Result<DelegateHandle*> HexagonBackend::init(
     }
     delegate->sync.size = builder.GetSize();
     std::memcpy(
-        static_cast<uint8_t*>(delegate->arena) + delegate->sync.offset,
+        static_cast<uint8_t*>(delegate->resident.ptr) + delegate->sync.offset,
         builder.GetBufferPointer(),
         delegate->sync.size);
   }
 
   delegate->n_ops = header->n_ops;
+  delegate->activations_bytes = header->activations_bytes;
+  {
+    static int next_delegate = 0;
+    delegate->index = next_delegate++;
+  }
+
+  if (config.trace) {
+    std::fprintf(
+        stderr,
+        "[hexagon] init d%d: ops=%u act=%u types=",
+        delegate->index,
+        delegate->n_ops,
+        delegate->activations_bytes);
+    for (uint32_t i = 0; i < delegate->n_ops; i++) {
+      std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)ops[i].type);
+    }
+    std::fprintf(stderr, "\n");
+  }
 
   // The command group, descriptors, sync group and weights are all host-written
   // and never touched again, so one flush at init covers them.
-  ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
-      delegate->arena, delegate->sync.offset + delegate->sync.size));
+  ET_CHECK_OK_OR_RETURN_ERROR(
+      delegate->driver.Flush(delegate->resident.ptr, delegate->resident.bytes));
 
   ET_LOG(
       Info,
-      "hexagon: ready, %u ops, %u in, %u out, arena %zu bytes",
+      "hexagon: ready, %u ops, %u in, %u out, resident %zu bytes",
       delegate->n_ops,
       header->n_inputs,
       header->n_outputs,
-      delegate->arena_bytes);
+      delegate->resident.bytes);
 
   return delegate;
 }
@@ -584,12 +922,35 @@ Error HexagonBackend::execute(
     return Error::InvalidArgument;
   }
 
-  auto* base = static_cast<uint8_t*>(delegate->arena);
+  auto* const resident = static_cast<uint8_t*>(delegate->resident.ptr);
+  auto* const scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
 
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
+    // Not every method input is a tensor: a graph can hand a subgraph an int it
+    // never reads. Nothing in the blob addresses it, so there is nothing to
+    // copy.
+    if (!args[i]->isTensor()) {
+      continue;
+    }
     const auto& tensor = args[i]->toTensor();
     const size_t nbytes = tensor.nbytes();
-    uint8_t* const dst = base + delegate->inputs[i].offset;
+
+    // A tensor no command reads gets no slot either. The blob carries an input's
+    // offset and size inside its operand references and nowhere else, so an
+    // input the emitter folded away -- addmm with beta=0 drops its bias -- is
+    // one the blob does not describe: there is no offset to copy to and no size
+    // to respect. Skipping is the only answer, and it is not an error: the value
+    // could never reach the graph anyway. A slot that exists but is too small is
+    // a different case and still fails below.
+    if (delegate->inputs[i].size == 0) {
+      ET_LOG(
+          Info,
+          "hexagon: input %zu is %zu bytes, no slot in the blob (no command reads it); skipped",
+          i,
+          nbytes);
+      continue;
+    }
+    uint8_t* const dst = scratch + delegate->inputs[i].offset;
 
     // Every tensor in the command is described as 2 bytes per element, because
     // the kernels are fp16. A fp32 input whose slot is exactly half its size is
@@ -623,29 +984,98 @@ Error HexagonBackend::execute(
   // the caller just handed us. This has to precede the flush below.
   for (const auto& patch : delegate->patches) {
     int32_t value = 0;
-    std::memcpy(&value, base + patch.input_offset, sizeof(value));
+    std::memcpy(&value, patch.source, sizeof(value));
     // Widened before scaling: a position times a cache row is still a byte
     // offset, and it overflows int32 well before either factor does.
     value = static_cast<int32_t>(static_cast<int64_t>(value) * patch.scale);
-    std::memcpy(base + patch.param_offset, &value, sizeof(value));
+    std::memcpy(patch.slot, &value, sizeof(value));
   }
 
   // The inputs are one contiguous section, so one flush covers them all. The
   // patched slots live in the command section, so flush that as well.
   ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
-      base + delegate->input_section.offset, delegate->input_section.size));
+      scratch + delegate->input_section.offset, delegate->input_section.size));
   if (!delegate->patches.empty()) {
     ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
-        base + delegate->commands.offset, delegate->commands.size));
+        resident + delegate->commands.offset, delegate->commands.size));
   }
 
-  ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.ExecuteCommandGroup(
-      delegate->arena_fd,
-      (int)(delegate->group.offset + delegate->arena_bias),
+  const TraceConfig& config = Trace();
+  static int next_execute = 0;
+  const int exec_index = next_execute++;
+  const bool traced = config.trace && (config.delegate < 0 || config.delegate == exec_index);
+  uint32_t first = 0;
+  uint32_t count = delegate->n_ops;
+  if (config.delegate < 0 || config.delegate == exec_index) {
+    first = (uint32_t)std::min<int>(std::max(config.start, 0), (int)delegate->n_ops);
+    count = delegate->n_ops - first;
+    if (config.limit > 0) {
+      count = (uint32_t)std::min<int>(config.limit, (int)count);
+    }
+  }
+  const int32_t group_offset = (int32_t)(
+      delegate->group.offset + delegate->resident.bias + first * 3 * (int)sizeof(int32_t));
+
+  std::fprintf(
+      stderr,
+      "[hexagon] enter d%d: ops=%u act=%u first=%u count=%u\n",
+      exec_index,
       delegate->n_ops,
-      delegate->arena_fd,
-      (int)(delegate->sync.offset + delegate->arena_bias),
-      (int)delegate->sync.size));
+      delegate->activations_bytes,
+      first,
+      count);
+  if (traced) {
+    PrintCommands(*delegate);
+  }
+
+  Error group_error = Error::Ok;
+  {
+    ProbeWatchdog watchdog(delegate, traced);
+    if (traced && delegate->probe.ptr != nullptr) {
+      group_error = delegate->driver.ExecuteCommandGroupTraced(
+          delegate->resident.fd,
+          group_offset,
+          count,
+          delegate->resident.fd,
+          (int)(delegate->sync.offset + delegate->resident.bias),
+          (int)delegate->sync.size,
+          delegate->probe.fd,
+          (int)delegate->probe.bias,
+          kProbeBytes);
+    } else {
+      group_error = delegate->driver.ExecuteCommandGroup(
+          delegate->resident.fd,
+          group_offset,
+          count,
+          delegate->resident.fd,
+          (int)(delegate->sync.offset + delegate->resident.bias),
+          (int)delegate->sync.size);
+    }
+  }
+
+  std::fprintf(
+      stderr,
+      "[hexagon] exit d%d: %s\n",
+      exec_index,
+      group_error == Error::Ok ? "ok" : "failed");
+  if (traced) {
+    PrintProbe(*delegate);
+    PrintStages(*delegate);
+  }
+  if (config.stop_after == exec_index) {
+    std::fprintf(stderr, "[hexagon] stopping after d%d by request\n", exec_index);
+    std::fflush(nullptr);
+    std::exit(0);
+  }
+  if (group_error != Error::Ok) {
+    // A failed group leaves the DSP side of this session unusable, and the
+    // caller may abort before destroy() runs, so the session is released here:
+    // the skel's global backend keeps its VTCM context until htp_ops_close.
+    // Close() is idempotent, so the later destroy() on the normal path is fine.
+    // This invoke can block, so it relies on the driver arming an RPC timeout.
+    delegate->driver.Close();
+  }
+  ET_CHECK_OK_OR_RETURN_ERROR(group_error);
 
   // A subgraph that advances a KV cache in place has to hand the updated buffer
   // back, or the next execute() copies the old one in and every step after the
@@ -653,16 +1083,20 @@ Error HexagonBackend::execute(
   for (const uint32_t index : delegate->in_place_inputs) {
     std::memcpy(
         args[index]->toTensor().mutable_data_ptr(),
-        base + delegate->inputs[index].offset,
+        scratch + delegate->inputs[index].offset,
         delegate->inputs[index].size);
   }
 
   ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Invalidate(
-      base + delegate->output_section.offset, delegate->output_section.size));
+      scratch + delegate->output_section.offset, delegate->output_section.size));
 
   for (size_t i = 0; i < delegate->outputs.size(); i++) {
     const auto& out = delegate->outputs[i];
-    auto& tensor = args[delegate->inputs.size() + i]->toTensor();
+    auto* arg = args[delegate->inputs.size() + i];
+    if (!arg->isTensor()) {
+      continue;
+    }
+    auto& tensor = arg->toTensor();
     // The mirror of the narrow on the way in: a subgraph whose declared result
     // is fp32 still writes fp16, because that is what the kernels produce. Its
     // slot is half the caller's buffer, and the bytes have to be widened back
@@ -672,7 +1106,7 @@ Error HexagonBackend::execute(
     if (tensor.scalar_type() == runtime::etensor::ScalarType::Float &&
         out.size == elements * 2) {
       const uint16_t* const from =
-          reinterpret_cast<const uint16_t*>(base + out.offset);
+          reinterpret_cast<const uint16_t*>(scratch + out.offset);
       float* const to = static_cast<float*>(tensor.mutable_data_ptr());
       for (size_t element = 0; element < elements; element++) {
         to[element] = half_bits_to_float(from[element]);
@@ -689,7 +1123,8 @@ Error HexagonBackend::execute(
           out.size);
       return Error::InvalidArgument;
     }
-    std::memcpy(tensor.mutable_data_ptr(), base + out.offset, tensor.nbytes());
+    std::memcpy(
+        tensor.mutable_data_ptr(), scratch + out.offset, tensor.nbytes());
   }
 
   return Error::Ok;
@@ -700,12 +1135,25 @@ void HexagonBackend::destroy(DelegateHandle* handle) const {
   if (delegate == nullptr) {
     return;
   }
-  if (delegate->arena != nullptr) {
-    delegate->driver.Free(delegate->arena);
-    delegate->arena = nullptr;
+  if (delegate->probe.ptr != nullptr) {
+    delegate->driver.Free(delegate->probe.ptr);
+    delegate->probe.ptr = nullptr;
+  }
+  if (delegate->resident.ptr != nullptr) {
+    delegate->driver.Free(delegate->resident.ptr);
+    delegate->resident.ptr = nullptr;
   }
   // The delegate itself lives in the runtime allocator and is reclaimed with
-  // the program, so only DSP and shared-memory resources are released here.
+  // the program, and the scratch block belongs to the pool, so the resident
+  // block is the only thing released here.
+  //
+  // Closing is what releases the DSP side: the allocator only hands out raw
+  // bytes, so the delegate's driver is never constructed and ~HexagonDriver()
+  // never runs, which would otherwise leave the FastRPC session and the skel's
+  // global backend (init_backend's reference count, the VTCM context) held.
+  // Close() is idempotent, so the Free() calls above and the destructor that
+  // does not run are both still correct.
+  delegate->driver.Close();
 }
 
 namespace {

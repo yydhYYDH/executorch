@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -24,6 +25,16 @@ using runtime::Result;
 // Domain ids, see the Hexagon SDK's remote.h.
 constexpr int kAdspDomainId = 0;
 constexpr int kCdspDomainId = 3;
+
+// A DSP-visible buffer, plus the two numbers the DSP needs to address into it:
+// the fd it resolves through HAP_mmap_get and the offset of ptr inside that
+// mapping.
+struct Arena {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+  int fd = -1;
+  uint64_t bias = 0;
+};
 
 // One FastRPC session to the DSP plus the shared memory that command buffers,
 // weights and activations live in.
@@ -42,14 +53,8 @@ class HexagonDriver final {
   HexagonDriver& operator=(HexagonDriver&&) noexcept;
 
   // Shared memory, host-writable, mapped for the DSP, with a stable fd.
-  Result<void*> Alloc(size_t bytes, size_t alignment = 4096);
+  Result<Arena> Alloc(size_t bytes, size_t alignment = 4096);
   void Free(void* ptr);
-  Result<int> ToFd(void* ptr);
-
-  // Byte offset of ptr within its FastRPC mapping. The DSP resolves an fd to
-  // the base of that mapping, so every offset handed to it is measured from
-  // here rather than from ptr.
-  Result<uint64_t> MappingOffset(void* ptr);
 
   // Reconciles host and DSP views of a buffer. Both are no-ops when the arena
   // is uncached (see Alloc).
@@ -67,8 +72,29 @@ class HexagonDriver final {
       int sync_offset,
       int sync_size);
 
+  // ExecuteCommandGroup, plus the DSP-side per-command trace written into the
+  // buffer at (profile_fd, profile_offset). The trace is readable even when the
+  // call fails, which is the point of it: a DSP fault leaves nothing else behind.
+  Error ExecuteCommandGroupTraced(
+      int group_fd,
+      int group_offset,
+      uint32_t count,
+      int sync_fd,
+      int sync_offset,
+      int sync_size,
+      int profile_fd,
+      int profile_offset,
+      int profile_size);
+
   Error PowerAcquire();
   Error PowerRelease();
+
+  // Closes the FastRPC session and frees every buffer Alloc() handed out.
+  // HexagonBackend::destroy() is the caller that matters: the delegate's driver
+  // comes from the runtime allocator, which never constructs it, so the
+  // destructor that would otherwise close the session never runs. Idempotent,
+  // and safe after Free().
+  void Close();
 
   uint32_t skel_arch() const {
     return skel_arch_;
@@ -86,7 +112,6 @@ class HexagonDriver final {
   HexagonDriver() = default;
 
   Error Open();
-  void Close();
   // rpcmem_cache_flush/invalidate are on the device but absent from the SDK's
   // link-time stub, so they are resolved dynamically.
   void ResolveCacheOps();
@@ -106,6 +131,32 @@ class HexagonDriver final {
   CacheOpFn cache_flush_ = nullptr;
   CacheOpFn cache_invalidate_ = nullptr;
   std::unordered_map<void*, Allocation> allocations_;
+};
+
+// Buffers keyed by size and handed to every delegate that asks for that size.
+//
+// A delegate's scratch is dead between execute() calls: the method inputs are
+// copied in, the kernels fill the activations and the method outputs, and the
+// outputs are copied back out, all inside one execute. Nothing written there
+// has to survive, and a graph runs one delegate at a time, so delegates whose
+// scratch is the same size can overlap on one buffer. What a delegate keeps for
+// itself -- descriptors, sync group, command group, weights -- is tens of
+// kilobytes, which is what makes the DSP's shared-memory ceiling survivable for
+// a model with hundreds of delegates.
+class SharedArenaPool final {
+ public:
+  static SharedArenaPool& Get();
+
+  // The buffer for a size; everyone asking for that size shares it.
+  Result<Arena> Acquire(size_t bytes);
+
+ private:
+  SharedArenaPool() = default;
+
+  // The pool has its own session: a pooled buffer outlives the delegate that
+  // first asked for it, so it cannot belong to that delegate's driver.
+  std::unique_ptr<HexagonDriver> driver_;
+  std::unordered_map<size_t, Arena> arenas_;
 };
 
 } // namespace executorch::backends::hexagon
