@@ -74,6 +74,11 @@ _SOURCES = [
     "attention_hmx.cc",
     "attention_hmx_queue.cc",
     "hmx_queue.cc",
+    # The kernels above call htp_probe_stage, which the device build defines in
+    # execute_command.cc -- a translation unit with the whole op table behind it,
+    # so the probe is linked on its own here. It is a trace hook and every kernel
+    # below runs the same either way.
+    str(pathlib.Path(__file__).resolve().parent / "sim/htp_probe_stage_shim.cc"),
 ]
 
 #: The fused norm reduces in a different order than numpy does, so it is compared
@@ -121,6 +126,20 @@ class _Shapes(torch.nn.Module):
 class _Mm(torch.nn.Module):
     def forward(self, a, b):
         return torch.mm(a, b)
+
+
+class _Bmm(torch.nn.Module):
+    """A batch of tiles, so the descriptor's loop count is the batch."""
+
+    def forward(self, a, b):
+        return torch.bmm(a, b)
+
+
+class _Addmm(torch.nn.Module):
+    """A product and the bias the kernel has no operand for: two commands."""
+
+    def forward(self, x, weight, bias):
+        return torch.addmm(bias, x, weight)
 
 
 class _Scale(torch.nn.Module):
@@ -350,6 +369,26 @@ def _cases():
     left, right = _small((4, 8)), _small((8, 3))
     mm = _case("B", _Mm(), (left, right), _bits(left.float() @ right.float()))
 
+    ba, bb = _small((3, 4, 8)), _small((3, 8, 5))
+    bmm = _case("Q", _Bmm(), (ba, bb), _bits(torch.bmm(ba.float(), bb.float())))
+
+    # A 16-column bmm is deliberately absent here. It is the shape whose descriptor
+    # reaches an HMX route, and on that shape the simulator's answer disagrees with
+    # torch on 934 of 1024 elements with values no integer product can produce --
+    # while 32, 48 and 64 columns are exact. That is a finding of its own, recorded
+    # in hexagon_matmul_bench/_probe_sim_bmm_tail.py, and asserting either way here
+    # would bake in a diagnosis that is not yet attributed to kernel or simulator.
+
+    ax, aw, ab = _small((4, 8)), _small((8, 3)), _small((3,))
+    addmm = _case(
+        "R",
+        _Addmm(),
+        (ax, aw, ab),
+        # The delegate rounds the product into an fp16 activation before the bias
+        # is added, so the reference rounds there too.
+        _bits((ax.float() @ aw.float()).half().float() + ab.float()),
+    )
+
     x = _small((2, 3, 8))
     norm = _case(
         "C",
@@ -468,6 +507,8 @@ def _cases():
     return [
         shapes,
         mm,
+        bmm,
+        addmm,
         norm,
         *advances,
         scale,
@@ -543,6 +584,8 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     kinds = {case.tag: [command.type for command in case.commands] for case in cases}
     assert kinds["A"] == [3, 3, 3], "the concatenate, slice and transpose are not blits"
     assert kinds["B"] == [38], "the product is not a batch matmul"
+    assert kinds["Q"] == [38], "the batched product is not a batch matmul"
+    assert kinds["R"] == [38, 19], "addmm is not a product followed by an add"
     assert kinds["C"] == [8], "the fused norm is not a layer norm"
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
@@ -557,10 +600,10 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         command.patch_param != 0xFFFFFFFF
         for command in _tagged(cases, "N").commands
     ), "the dynamic slice has no patched parameter"
-    for index in (3, 4, 5):
+    for tag in ("D", "F", "G"):
         assert any(
-            command.patch_param != 0xFFFFFFFF for command in cases[index].commands
-        ), f"{cases[index].tag}: the cache advance has no patched parameter"
+            command.patch_param != 0xFFFFFFFF for command in _tagged(cases, tag).commands
+        ), f"{tag}: the cache advance has no patched parameter"
 
 
 def test_every_blob_agrees_three_ways(cases, simulated):

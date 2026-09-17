@@ -328,6 +328,144 @@ def test_a_broken_contraction_is_caught():
     )
 
 
+class _Bmm(torch.nn.Module):
+    """A batch of tiles contracted against a stack, so the loop count is the batch."""
+
+    def forward(self, a, b):
+        return torch.bmm(a, b)
+
+
+def _bmm_blob(batches, m, k, n):
+    a = torch.randn(batches, m, k, dtype=torch.float16)
+    b = torch.randn(batches, k, n, dtype=torch.float16)
+    program = to_edge(export(_Bmm(), (a, b))).exported_program()
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    return blob, a, b
+
+
+def _run_bmm(batches, m, k, n):
+    blob, a, b = _bmm_blob(batches, m, k, n)
+    got = np.frombuffer(execute(blob, [a.numpy(), b.numpy()])[0], dtype=np.float16)
+    expected = torch.bmm(a.float(), b.float()).half().numpy().reshape(-1)
+    return blob, a, b, got, expected
+
+
+def test_batched_matmul_matches_torch():
+    """One iteration per batch element, which is what the descriptor steps say.
+
+    The shapes cover the degenerate batch, a non-square tile and a contraction
+    that is neither a power of two nor a multiple of the DSP's tile width.
+    """
+    for batches, m, k, n in ((1, 16, 24, 32), (4, 16, 24, 32), (3, 8, 48, 20)):
+        _, _, _, got, expected = _run_bmm(batches, m, k, n)
+        assert got.shape == expected.shape, f"{got.shape} != {expected.shape}"
+        worst = float(
+            np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
+        )
+        assert worst < 1e-2, f"bmm differs by {worst} at {batches}x{m}x{k}x{n}"
+
+
+def test_a_batch_step_of_zero_is_caught():
+    """Zeroing the output step makes every iteration write the first tile.
+
+    That is a wrong result of the right shape: if the numbers did not move, the
+    steps in the descriptor are not what carries the batch.
+    """
+    batches, m, k, n = 4, 16, 24, 32
+    blob, a, b, got, expected = _run_bmm(batches, m, k, n)
+    worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
+    assert worst < 1e-2
+
+    data = bytearray(blob)
+    _, commands = read_blob(blob)
+    assert len(commands) == 1 and commands[0].type == _BATCH_MATMUL
+    assert commands[0].params[1] == batches, commands[0].params[:5]
+    # cmdSteps[0], the first int of the step triple.
+    struct.pack_into("<i", data, B.HEADER_SIZE + _PARAMS_AT + 4 * 14, 0)
+
+    bad = np.frombuffer(execute(bytes(data), [a.numpy(), b.numpy()])[0], dtype=np.float16)
+    assert not np.array_equal(bad, got), (
+        "zeroing the output step changed nothing, so the batch is not being walked"
+    )
+
+
+class _Addmm(torch.nn.Module):
+    """A weight and a bias the emitter has to reach as constants. bias is one input."""
+
+    def __init__(self, k, n):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(k, n, dtype=torch.float16) * 0.5)
+        self.bias = torch.nn.Parameter(torch.randn(n, dtype=torch.float16) * 0.5)
+
+    def forward(self, x):
+        return torch.addmm(self.bias, x, self.weight)
+
+
+def _run_addmm(m, k, n):
+    x = torch.randn(m, k, dtype=torch.float16)
+    model = _Addmm(k, n)
+    program = to_edge(export(model, (x,))).exported_program()
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    # to_edge lifts the parameters, so the blob takes them ahead of the input.
+    operands = [
+        model.weight.detach().numpy(),
+        model.bias.detach().numpy(),
+        x.numpy(),
+    ]
+    got = np.frombuffer(execute(blob, operands)[0], dtype=np.float16)
+    # The delegate rounds the product to fp16 in an activation before the bias is
+    # added, so the reference does the same rather than adding in fp32.
+    expected = (
+        (x.float() @ model.weight.detach().float()).half().float()
+        + model.bias.detach().float()
+    ).half().numpy().reshape(-1)
+    return blob, operands, got, expected
+
+
+def test_addmm_matches_torch():
+    """The product then the broadcast bias, as the two commands the emitter writes."""
+    for m, k, n in ((8, 64, 128), (4, 8, 3)):
+        blob, _, got, expected = _run_addmm(m, k, n)
+        _, commands = read_blob(blob)
+        assert [c.type for c in commands] == [_BATCH_MATMUL, _BINARY_ELEMENTWISE], (
+            f"addmm emitted {[c.type for c in commands]}"
+        )
+        # params[2] of the binary op is the bias length, which the broadcast walks.
+        assert commands[1].params[2] == n, commands[1].params[:8]
+        worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
+        assert worst < 1e-2, f"addmm differs by {worst} at {m}x{k}x{n}"
+
+
+def test_the_bias_broadcast_strides_are_the_ones_read():
+    """The bias is one row repeated down the tile, so its outer stride is zero.
+
+    Collapsing its inner stride makes every column read the same bias entry,
+    which is a wrong sum of the right shape. If the numbers did not move, the
+    strides in the broadcast tail are not what places the bias.
+    """
+    m, k, n = 8, 64, 128
+    blob, operands, got, expected = _run_addmm(m, k, n)
+    assert np.array_equal(got, expected)
+
+    data = bytearray(blob)
+    _, commands = read_blob(blob)
+    assert commands[1].type == _BINARY_ELEMENTWISE
+    # The broadcast tail starts at params[8]: rank, outDims[8], in0Strides[8],
+    # in1Strides[8]. in1Strides is the bias, one row over the tile: its outer
+    # stride is zero and its inner one is the contiguous unit.
+    assert commands[1].params[25] == 0, commands[1].params[25:33]
+    assert commands[1].params[26] == 1, commands[1].params[25:33]
+    # The add is the second command of the blob, so its params sit one op later.
+    struct.pack_into("<i", data, B.HEADER_SIZE + B.OP_SIZE + _PARAMS_AT + 4 * 26, 0)
+
+    bad = np.frombuffer(execute(bytes(data), operands)[0], dtype=np.float16).reshape(
+        got.shape
+    )
+    assert not np.array_equal(bad, got), (
+        "changing the bias stride changed nothing, so it is not being read"
+    )
+
+
 class _Eltwise(torch.nn.Module):
     """A product then a negation: one BINARY_ELEMENTWISE and one UNARY."""
 

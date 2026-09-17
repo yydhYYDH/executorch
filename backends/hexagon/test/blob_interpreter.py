@@ -325,17 +325,25 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
     store is fp16, so a sequential sum here reproduces it rather than merely
     approximating it.
 
-    The iterator operands are absent in every op this backend emits, which is
-    what makes the loop count one; anything else is left unmodelled.
+    The iterator operands are absent in every op this backend emits, so the DSP
+    numbers each iteration itself and reaches that iteration's operands through
+    the descriptor's steps, which are elements: with one iteration the steps are
+    unreachable and mm is what comes out, and with one step per tile bmm is.
     """
-    # params[0] is the element size, then the descriptor.
+    # params[0] is the element size, then the descriptor: the loop count, the
+    # three axes, three stride triples in bytes, three steps and three view
+    # offsets in elements, then the three operand sizes as int64.
     unit = params[0]
+    loops = params[1]
     rows, inner, cols = params[2], params[3], params[4]
     dst_stride = params[5:8]
     src0_stride = params[8:11]
     src1_stride = params[11:14]
-    if params[1] != 1:
-        raise UnsupportedOp(f"blob: a matmul loop of {params[1]} is not modelled")
+    steps = params[14:17]
+    views = params[17:20]
+    out_elems, in0_elems, in1_elems = params[20], params[22], params[24]
+    if params[21] or params[23] or params[25]:
+        raise UnsupportedOp("blob: a matmul operand of 2**31 elements or more")
 
     refs = list(command.inputs) + list(command.outputs)
     dst = refs[len(command.inputs)]
@@ -345,16 +353,26 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
 
     src0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)
     src1 = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16)
-    out = np.zeros(rows * cols, dtype=np.float16)
-    for row in range(rows):
-        for col in range(cols):
-            total = np.float32(0.0)
-            for k in range(inner):
-                a = (row * src0_stride[0] + k * src0_stride[1]) // unit
-                b = (k * src1_stride[1] + col * src1_stride[2]) // unit
-                total = np.float32(total) + np.float32(src0[a]) * np.float32(src1[b])
-            at = (row * dst_stride[0] + col * dst_stride[2]) // unit
-            out[at] = total
+    out = np.zeros(len(arena.view(dst)) // unit, dtype=np.float16)
+    for loop in range(loops):
+        # An iteration whose three bases do not all land inside their operand is
+        # skipped rather than clamped, which is what the DSP does with them.
+        out_at = loop * steps[0] + views[0]
+        in0_at = loop * steps[1] + views[1]
+        in1_at = loop * steps[2] + views[2]
+        if not 0 <= out_at < out_elems:
+            continue
+        if not 0 <= in0_at < in0_elems or not 0 <= in1_at < in1_elems:
+            continue
+        for row in range(rows):
+            for col in range(cols):
+                total = np.float32(0.0)
+                for k in range(inner):
+                    a = in0_at + (row * src0_stride[0] + k * src0_stride[1]) // unit
+                    b = in1_at + (k * src1_stride[1] + col * src1_stride[2]) // unit
+                    total = np.float32(total) + np.float32(src0[a]) * np.float32(src1[b])
+                at = out_at + (row * dst_stride[0] + col * dst_stride[2]) // unit
+                out[at] = total
     _store(arena, arena.address(dst), out.tobytes())
 
 

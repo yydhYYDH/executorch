@@ -120,7 +120,14 @@ def build(runner: pathlib.Path, sources: List[str], work: pathlib.Path,
     objects = []
     for index, source in enumerate(sources):
         obj = work / f"unit{index}.o"
-        compile_one(str(MNN_OPS / "src/dsp" / source), obj)
+        # A name without a directory is a vendored kernel; an absolute one is a
+        # translation unit this suite supplies, such as a device symbol the
+        # simulator has to stand in for.
+        relative = pathlib.Path(source)
+        compile_one(
+            str(relative if relative.is_absolute() else MNN_OPS / "src/dsp" / relative),
+            obj,
+        )
         objects.append(str(obj))
     main = work / "runner_main.o"
     compile_one(str(runner), main)
