@@ -113,7 +113,18 @@ static void htp_ops_global_backend_setup() {
   vtcm_manager_setup();
   hmx_manager_setup();
   hmx_queue_setup();
+// Default ON: the host-side re-acquire (HexagonDriver::PowerAcquire) has no caller, so without
+// this vote the HMX is powered down and the max-corner DCVS request is dropped while the op runs.
+// Override with -DMNN_ATTN_HOLD_POWER_VOTE=0 to reproduce the pre-fix hang.
+#ifndef MNN_ATTN_HOLD_POWER_VOTE
+#  define MNN_ATTN_HOLD_POWER_VOTE 1
+#endif
+#if !MNN_ATTN_HOLD_POWER_VOTE
+  // power_acquire/power_release around setup leaves the refcount at zero, so power_reset()
+  // powers HMX down and drops the max-corner DCVS request. The host-side re-acquire
+  // (HexagonDriver::PowerAcquire) has no caller anywhere, so nothing ever re-takes the vote.
   power_release();
+#endif
   worker_pool_global_init();
 }
 
