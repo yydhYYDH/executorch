@@ -1,0 +1,19 @@
+base:
+  model_class: "qwen3_0_6b"
+  params: "examples/models/qwen3/config/0_6b_config.json"
+  metadata: '{"get_bos_id": 151644, "get_eos_ids":[151645]}'
+
+model:
+  use_kv_cache: true
+  use_sdpa_with_kv_cache: true
+  dtype_override: fp16
+
+export:
+  output_name: qwen3_0_6b_hex_merged
+  max_seq_length: 128
+  max_context_length: 128
+
+backend:
+  xnnpack:
+    enabled: true
+    extended_ops: True

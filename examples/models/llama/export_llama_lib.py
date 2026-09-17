@@ -1167,6 +1167,15 @@ def _to_edge_and_lower_llama_xnnpack(
 ) -> LLMEdgeManager:  # noqa: C901
     partitioners = []
 
+    # LOCAL TEST HOOK: Hexagon first so it claims the ops its DSP emitters
+    # cover; XNNPACK then takes the rest.
+    if os.environ.get("EXECUTORCH_HEXAGON_PARTITION") == "1":
+        from executorch.backends.hexagon.partition.hexagon_partitioner import (
+            HexagonPartitioner,
+        )
+
+        partitioners.append(HexagonPartitioner())
+
     # Order matters here, dynamic quantization should be applied first when both xnnpack and xnnpack_extended_ops are enabled
     partitioners.append(
         get_xnnpack_partitioner(

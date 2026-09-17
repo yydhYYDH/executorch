@@ -1,0 +1,22 @@
+base:
+  model_class: "qwen3_1_7b"
+  params: "/home/yydh/qwen3vl_text_config.json"
+  checkpoint: "/home/yydh/qwen3vl_text_meta.pth"
+  tokenizer_path: "/home/yydh/Models/Qwen3-VL-2B-Instruct/tokenizer.json"
+  metadata: '{"get_bos_id": 151644, "get_eos_ids":[151645]}'
+
+model:
+  use_kv_cache: true
+  use_sdpa_with_kv_cache: true
+  dtype_override: fp16
+  enable_dynamic_shape: false
+
+export:
+  output_name: "qwen3vl_hex_nodyn"
+  max_seq_length: 128
+  max_context_length: 128
+
+backend:
+  xnnpack:
+    enabled: true
+    extended_ops: True
