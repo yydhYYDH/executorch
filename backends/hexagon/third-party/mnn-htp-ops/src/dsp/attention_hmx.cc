@@ -1,4 +1,17 @@
 #include "attention_private.hpp"
+
+// Hang-investigation breadcrumbs: the stage ring in execute_command.cc, read back on the host by
+// hexagon_backend.cpp's watchdog while an invoke is still blocked on the DSP. See
+// backends/hexagon/ATTENTION_HANG_INVESTIGATION.md. Compiled out of every shipping skel.
+extern "C" void htp_probe_stage(int stage, int a, int b, int c);
+#ifndef MNN_ATTN_STAGE_PROBE
+#  define MNN_ATTN_STAGE_PROBE 0
+#endif
+#if MNN_ATTN_STAGE_PROBE
+#  define ATTN_STAGE(stage, a, b, c) htp_probe_stage((stage), (int) (a), (int) (b), (int) (c))
+#else
+#  define ATTN_STAGE(stage, a, b, c) ((void) 0)
+#endif
 #include "HAP_perf.h"
 
 // STAGE 0 (prefill-attn decouple plan): race-free per-phase timers on the SINGLE
@@ -26,6 +39,60 @@ unsigned long long g_qattn_act_bytes    = 0;  // activation(Q/S)-DMA bytes
 #  define QATTN_BYTES(n)   ((void) 0)
 #  define QATTN_CALL(i)      ((void) 0)
 #  define QATTN_ACT_BYTES(n) ((void) 0)
+#endif
+
+// dmwait() stalls the hardware thread until the DMA engine is idle, so a transfer that errors
+// out or never completes is indistinguishable from a dead DSP. The probe build polls instead
+// and records the site, the status and the elapsed time, so the run returns a fault instead of
+// hanging. 0 = no fault, else (site << 16) | status.
+int g_attn_dma_fault = 0;
+
+// Bisect switch for the hang: 0 normal, 1 skip compute+store, 2 skip store, 3 skip compute.
+#ifndef MNN_ATTN_BISECT
+#  define MNN_ATTN_BISECT 0
+#endif
+#if MNN_ATTN_BISECT == 1 || MNN_ATTN_BISECT == 3
+#  define ATTN_BISECT_NO_COMPUTE 1
+#else
+#  define ATTN_BISECT_NO_COMPUTE 0
+#endif
+#if MNN_ATTN_BISECT == 1 || MNN_ATTN_BISECT == 2
+#  define ATTN_BISECT_NO_STORE 1
+#else
+#  define ATTN_BISECT_NO_STORE 0
+#endif
+
+#if MNN_ATTN_STAGE_PROBE
+// Liveness counters: a frozen trail cannot tell "blocked in a wait" from "the PD died right
+// here". Counts of entries/exits and of queue handoffs do, across successive host dumps.
+static int g_attn_matmul_enter = 0;
+static int g_attn_matmul_exit = 0;
+static int g_attn_weight_dma_starts = 0;
+static int g_attn_act_dma_starts = 0;
+#endif
+
+#if MNN_ATTN_STAGE_PROBE
+static inline void attn_dma_wait_site(int site, int tag) {
+  unsigned long long start = HAP_perf_get_time_us();
+  for (;;) {
+    uint32_t status = dmpoll() & DM0_STATUS_MASK;
+    unsigned long long elapsed = HAP_perf_get_time_us() - start;
+    if (status == DM0_STATUS_IDLE) {
+      ATTN_STAGE(59, site, tag, (int) elapsed);
+      return;
+    }
+    if (status == DM0_STATUS_ERROR || elapsed > 500000ULL) {
+      ATTN_STAGE(58, site, (int) status, (int) (elapsed / 1000));
+      if (g_attn_dma_fault == 0) {
+        g_attn_dma_fault = (site << 16) | (int) status;
+      }
+      return;
+    }
+  }
+}
+#  define ATTN_DMA_WAIT(site, tag) attn_dma_wait_site((site), (tag))
+#else
+#  define ATTN_DMA_WAIT(site, tag) (dma_wait_for_idle(), (void) 0)
 #endif
 
 static inline void attn_hmx_load_k_tiles(const __fp16* activation, const __fp16* weight, int kp) {
@@ -56,13 +123,33 @@ static inline void attn_hmx_load_activation_dma(dma_desc_2d_t* desc, const uint8
   }
   attn_prepare_dma_desc_2d(desc, src, raw, (uint32_t)roi_width, (uint32_t)rows,
                            (uint32_t)(src_stride * sizeof(int16_t)), (uint32_t)raw_width, 0);
+  ATTN_STAGE(74, (int) desc->src, (int) desc->dst, (int) desc->next);
+  ATTN_STAGE(75, (int) desc->roi_width, (int) desc->roi_height, (int) desc->dstate_order_bypass_type_length);
+  ATTN_STAGE(76, (int) desc->src_stride, (int) desc->dst_stride, (int) desc->cache_alloc);
+  ATTN_STAGE(77, rows, raw_row_stride, src_stride);
   QATTN_CALL(1);
   QATTN_ACT_BYTES((size_t) rows * (size_t) roi_width);
   unsigned long long _tq = QATTN_T0();
-  dma_wait_for_idle();
+  ATTN_DMA_WAIT(1, rows);
+  ATTN_STAGE(73, ++g_attn_act_dma_starts, rows, 0);
+#if MNN_ATTN_STAGE_PROBE
+  if (g_attn_dma_fault != 0) {
+    return;  // never submit into a latched RUN-forever engine: that is what keeps the PD wedged
+  }
+#endif
   dmstart((dma_desc_1d_t*)desc);
-  dma_wait_for_idle();
+  ATTN_DMA_WAIT(2, rows);
   QATTN_ADD(0, _tq);
+#if MNN_ATTN_STAGE_PROBE
+  // Stage 75 records this word before dmstart; the same word after the drain tells whether the
+  // engine actually fetched (and then cleared) the descriptor, which splits "never fetched" from
+  // "consumed and stalled downstream".
+  ATTN_STAGE(79, (int) desc->dstate_order_bypass_type_length, vtcm_manager_needs_release(),
+             vtcm_manager_is_acquired());
+#endif
+  if (g_attn_dma_fault != 0) {
+    return;
+  }
 }
 
 static inline void attn_hmx_compute_output_tiles(__fp16* vtcm_output, __fp16* vtcm_activation,
@@ -80,15 +167,28 @@ static inline void attn_hmx_compute_output_tiles(__fp16* vtcm_output, __fp16* vt
 static inline void attn_hmx_start_weight_dma(dma_desc_2d_t* descs, const uint8_t* b, __fp16* vtcm_weight,
                                              int oy_start, int oy_end, int kp, int layout, int kv_head,
                                              int n_kv_heads, int k_icP, int v_ocP, int wait_after) {
-  attn_prepare_weight_dma_descs(nullptr, descs, b, vtcm_weight, oy_start, oy_end, kp, layout, kv_head, n_kv_heads,
-                                k_icP, v_ocP);
+  dma_desc_1d_t* last_desc = attn_prepare_weight_dma_descs(nullptr, descs, b, vtcm_weight, oy_start, oy_end, kp, layout,
+                                                           kv_head, n_kv_heads, k_icP, v_ocP);
+#if MNN_ATTN_STAGE_PROBE
+  ATTN_STAGE(78, (int) last_desc, (int) descs[0].next, (int) ((dma_desc_2d_t*) last_desc)->next);
+#endif
   QATTN_BYTES((size_t) (oy_end - oy_start) * (size_t) kp * 1024 * sizeof(int16_t));  // ~K/V tile bytes
   QATTN_CALL(0);
+  ATTN_STAGE(60, (int) descs[0].src, (int) descs[0].dst, (int) descs[0].length);
+  ATTN_STAGE(61, (int) descs[0].roi_width, (int) descs[0].roi_height, descs[0].next != 0 ? 1 : 0);
+  ATTN_STAGE(62, (int) descs[0].src_stride, (int) descs[0].dst_stride, (int) descs[0].cache_alloc);
+  ATTN_STAGE(63, layout, v_ocP, kv_head);
+  ATTN_STAGE(72, ++g_attn_weight_dma_starts, (int) descs[0].cache_alloc, 0);
   unsigned long long _tq = QATTN_T0();
-  dma_wait_for_idle();
+  ATTN_DMA_WAIT(3, kp);
+#if MNN_ATTN_STAGE_PROBE
+  if (g_attn_dma_fault != 0) {
+    return;  // see attn_hmx_load_activation_dma
+  }
+#endif
   dmstart((dma_desc_1d_t*)&descs[0]);
   if (wait_after) {
-    dma_wait_for_idle();
+    ATTN_DMA_WAIT(4, kp);
   }
   QATTN_ADD(0, _tq);
 }
@@ -96,6 +196,8 @@ static inline void attn_hmx_start_weight_dma(dma_desc_2d_t* descs, const uint8_t
 void attn_hmx_matmul(uint8_t * c, const uint8_t * a, const uint8_t * b, int M, int K, int N, int max_K,
                             int a_stride, int outputLayoutType, float outputScale,
                             int weightLayoutType, int kv_head, int n_kv_heads, int output_stride, int output_row_offset) {
+  ATTN_STAGE(47, M, K, N);
+  ATTN_STAGE(64, ++g_attn_matmul_enter, M, N);
   int np_chunk = ATTN_HMX_KV_BLOCK_TILES;
   int pack = 64;
   int act_src_stride = a_stride > 0 ? a_stride : pack;
@@ -120,6 +222,7 @@ void attn_hmx_matmul(uint8_t * c, const uint8_t * a, const uint8_t * b, int M, i
   __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, kp * 32 * 32 * sizeof(int16_t));
   __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 32 * 32 * np_chunk * sizeof(int16_t));
   __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
+  ATTN_STAGE(48, kp, np, pair_packs);
 
   if (outputLayoutType == ATTN_HMX_OUT_LINEAR_FP32_SCALED) {
     hmx_init_column_scales(vtcm_scales, attn_hmx_scale_splat(outputScale));
@@ -153,13 +256,23 @@ void attn_hmx_matmul(uint8_t * c, const uint8_t * a, const uint8_t * b, int M, i
 
       attn_transform_activation_hmx(vtcm_activation, vtcm_activation_raw, valid_xi, pair_packs, kp);
 
-      attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation, vtcm_weight_bufs[0], 0, np, kp);
-      if (outputLayoutType == ATTN_HMX_OUT_PACKED_FP16) {
-        attn_store_output_packed_fp16(c, vtcm_output, 0, np, ox, M, valid_xi, output_stride, output_row_offset);
-      } else {
-        attn_store_output_linear_fp32(c, vtcm_output, 0, np, ox, N, valid_xi, output_stride, output_row_offset);
+      ATTN_STAGE(49, ox, 0, valid_xi);
+      if (!ATTN_BISECT_NO_COMPUTE) {
+        attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation, vtcm_weight_bufs[0], 0, np, kp);
       }
+      if (!ATTN_BISECT_NO_STORE) {
+        if (outputLayoutType == ATTN_HMX_OUT_PACKED_FP16) {
+          attn_store_output_packed_fp16(c, vtcm_output, 0, np, ox, M, valid_xi, output_stride, output_row_offset);
+        } else if (outputLayoutType == ATTN_HMX_OUT_LINEAR_FP16) {
+          attn_store_output_linear_fp16(c, vtcm_output, 0, np, ox, N, valid_xi, output_stride, output_row_offset);
+        } else {
+          attn_store_output_linear_fp32(c, vtcm_output, 0, np, ox, N, valid_xi, output_stride, output_row_offset);
+        }
+      }
+      ATTN_STAGE(50, ox, 0, 0);
     }
+    ATTN_STAGE(51, M, N, 0);
+    ATTN_STAGE(65, ++g_attn_matmul_exit, M, N);
     return;
   }
 
@@ -177,12 +290,19 @@ void attn_hmx_matmul(uint8_t * c, const uint8_t * a, const uint8_t * b, int M, i
 
     attn_transform_activation_hmx(vtcm_activation, vtcm_activation_raw, valid_xi, pair_packs, kp);
 
+    ATTN_STAGE(49, ox, 0, valid_xi);
+    if (g_attn_dma_fault != 0) {
+      return;
+    }
     int current_weight_buf_idx = 0;
     if (np > 0) {
       int first_oy_end = np_chunk;
       if (first_oy_end > np) first_oy_end = np;
       attn_hmx_start_weight_dma(weight_descs[current_weight_buf_idx], b, vtcm_weight_bufs[current_weight_buf_idx],
                                 0, first_oy_end, kp, weightLayoutType, kv_head, n_kv_heads, k_icP, v_ocP, 1);
+      if (g_attn_dma_fault != 0) {
+        return;
+      }
     }
 
     for (int oy_start = 0; oy_start < np; oy_start += np_chunk) {
@@ -200,18 +320,30 @@ void attn_hmx_matmul(uint8_t * c, const uint8_t * a, const uint8_t * b, int M, i
                                   k_icP, v_ocP, 0);
       }
 
-      attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation, vtcm_weight_current, oy_start, oy_end, kp);
+      if (!ATTN_BISECT_NO_COMPUTE) {
+        attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation, vtcm_weight_current, oy_start, oy_end, kp);
+      }
+      if (!ATTN_BISECT_NO_STORE) {
       if (outputLayoutType == ATTN_HMX_OUT_PACKED_FP16) {
         attn_store_output_packed_fp16(c, vtcm_output, oy_start, oy_end, ox, M, valid_xi, output_stride, output_row_offset);
+      } else if (outputLayoutType == ATTN_HMX_OUT_LINEAR_FP16) {
+        attn_store_output_linear_fp16(c, vtcm_output, oy_start, oy_end, ox, N, valid_xi, output_stride, output_row_offset);
       } else {
         attn_store_output_linear_fp32(c, vtcm_output, oy_start, oy_end, ox, N, valid_xi, output_stride, output_row_offset);
       }
+      }
+      ATTN_STAGE(50, ox, oy_start, oy_end);
       if (has_next_chunk) {
-        dma_wait_for_idle();
+        ATTN_DMA_WAIT(5, oy_start);
+        if (g_attn_dma_fault != 0) {
+          return;
+        }
         current_weight_buf_idx = next_weight_buf_idx;
       }
     }
   }
+  ATTN_STAGE(51, M, N, 0);
+  ATTN_STAGE(65, ++g_attn_matmul_exit, M, N);
 
 }
 
@@ -644,7 +776,7 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
 
   if (max_pair_packs > ATTN_HMX_MAX_PAIR_PACKS || max_kp > ATTN_HMX_MAX_KP) {
     FARF(ERROR, "attn_hmx_matmul_pages_sv overflow: pair_packs=%d kp=%d", max_pair_packs, max_kp);
-    sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, N);
+    sync_attention_zero_output(state, dst, rows, output_stride, row_offset);
     return;
   }
 
@@ -709,7 +841,7 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
         hmx_consume_accumulator_fp16(vtcm_dst);
       }
 
-      attn_store_output_packed_fp16((uint8_t*)dst, vtcm_output, 0, np, 0, M, M, output_stride, row_offset);
+      sync_attention_store_output(state, (uint8_t*)dst, vtcm_output, 0, np, 0, M, M, output_stride, row_offset);
       return;
     }
   }
@@ -769,18 +901,18 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
                                       valid_xi, pair_packs, kp);
 
         attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation, vtcm_weight_bufs[0], 0, np, kp);
-        attn_store_output_packed_fp16(out_ptr, vtcm_output, 0, np, ox, M, valid_xi, out_stride, out_row_offset);
+        sync_attention_store_output(state, out_ptr, vtcm_output, 0, np, ox, M, valid_xi, out_stride, out_row_offset);
       }
 
       if (accum_page) {
-        sync_attention_accumulate_packed_output(dst, temp_O, rows, output_stride, row_offset, N);
+        sync_attention_accumulate_output(state, dst, temp_O, rows, output_stride, row_offset);
       } else {
         wrote_output = 1;
       }
     }
 
     if (!wrote_output) {
-      sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, N);
+      sync_attention_zero_output(state, dst, rows, output_stride, row_offset);
     }
     return;
   }
@@ -831,11 +963,11 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
                                       kp);
         attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation + (size_t) ox * sv_act_tile_elems,
                                       vtcm_weight_bufs[cur_buf], 0, np, kp);
-        attn_store_output_packed_fp16(out_ptr, vtcm_output, 0, np, ox, M, valid_xi, out_stride, out_row_offset);
+        sync_attention_store_output(state, out_ptr, vtcm_output, 0, np, ox, M, valid_xi, out_stride, out_row_offset);
       }
 
       if (accum_page) {
-        sync_attention_accumulate_packed_output(dst, temp_O, rows, output_stride, row_offset, N);
+        sync_attention_accumulate_output(state, dst, temp_O, rows, output_stride, row_offset);
       } else {
         wrote_output = 1;
       }
@@ -846,7 +978,7 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
     }
 
     if (!wrote_output) {
-      sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, N);
+      sync_attention_zero_output(state, dst, rows, output_stride, row_offset);
     }
     return;
   }
@@ -922,8 +1054,8 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
         }
         attn_hmx_compute_output_tiles(vtcm_output, vtcm_activation + (size_t) ox * sv_act_tile_elems,
                                       vtcm_weight_current, oy_start, oy_end, kp);
-        attn_store_output_packed_fp16(out_ptr, vtcm_output, oy_start, oy_end, ox, M, valid_xi, out_stride,
-                                      out_row_offset);
+        sync_attention_store_output(state, out_ptr, vtcm_output, oy_start, oy_end, ox, M, valid_xi, out_stride,
+                                            out_row_offset);
       }
 
       if (has_next_chunk) {
@@ -933,14 +1065,14 @@ void attn_hmx_matmul_pages_sv(const SyncAttentionTaskState* state, __fp16* dst, 
     }
 
     if (accum_page) {
-      sync_attention_accumulate_packed_output(dst, temp_O, rows, output_stride, row_offset, N);
+      sync_attention_accumulate_output(state, dst, temp_O, rows, output_stride, row_offset);
     } else {
       wrote_output = 1;
     }
   }
 
   if (!wrote_output) {
-    sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, N);
+    sync_attention_zero_output(state, dst, rows, output_stride, row_offset);
   }
 }
 

@@ -1,5 +1,20 @@
 #include "attention_private.hpp"
 
+// Hang-investigation breadcrumbs: the stage ring in execute_command.cc, read back on the host by
+// hexagon_backend.cpp's watchdog while an invoke is still blocked on the DSP. See
+// backends/hexagon/ATTENTION_HANG_INVESTIGATION.md. Compiled out of every shipping skel.
+extern "C" void htp_probe_stage(int stage, int a, int b, int c);
+#ifndef MNN_ATTN_STAGE_PROBE
+#  define MNN_ATTN_STAGE_PROBE 0
+#endif
+#if MNN_ATTN_STAGE_PROBE
+#  define ATTN_STAGE(stage, a, b, c) htp_probe_stage((stage), (int) (a), (int) (b), (int) (c))
+static int g_attn_worker_iters = 0;
+static int g_attn_worker_exits = 0;
+#else
+#  define ATTN_STAGE(stage, a, b, c) ((void) 0)
+#endif
+
 // Worker-side phase profiling for the grouped-causal prefill path, mirroring the queue-thread timers in
 // attention_hmx.cc. Per-worker slots => no atomics needed. Surfaced into profile[251..255] by
 // execute_command.cc. [0]=Q gather, [1]=QK submit+wait, [2]=softmax, [3]=SV submit+wait, [4]=O scatter.
@@ -342,24 +357,29 @@ static inline void sync_attention_normalize_causal_block(const SyncAttentionTask
 
 static inline void sync_attention_run_causal_sv_block(const SyncAttentionTaskState* state, __fp16* head_O,
                                                       __fp16* temp_O, __fp16* linear_S, int h_kv, int q_begin,
-                                                      int q_rows, int block_valid_end) {
+                                                      int q_rows, int block_valid_end, int head_id) {
   const __fp16* block_s = linear_S + (size_t)q_begin * state->N_padded;
-  const int output_stride = state->qo_total_len;
+  const int linear = state->value_c4 == 0;
   const int output_row_offset = state->q_offset + q_begin;
   if (state->page_count > 0) {
-    sync_attention_run_page_sv(state, head_O, temp_O, block_s, q_rows, output_stride, output_row_offset, h_kv,
-                               block_valid_end);
+    sync_attention_run_page_sv(state, linear ? state->O + (size_t)head_id * state->head_dim : head_O, temp_O, block_s,
+                               q_rows, linear ? state->total_heads * state->head_dim : state->qo_total_len,
+                               output_row_offset, h_kv, block_valid_end);
   } else {
-    run_locked_attn_hmx_matmul_ex((uint8_t*)head_O, (uint8_t*)block_s, (uint8_t*)state->pastV,
+    __fp16* dst = linear ? state->O + (size_t)head_id * state->head_dim : head_O;
+    run_locked_attn_hmx_matmul_ex((uint8_t*)dst, (uint8_t*)block_s, (uint8_t*)state->pastV,
                                   q_rows, block_valid_end, state->K_dim_padded, state->N_padded,
-                                  state->N_padded, ATTN_HMX_OUT_PACKED_FP16, 1.0f,
+                                  state->N_padded,
+                                  linear ? ATTN_HMX_OUT_LINEAR_FP16 : ATTN_HMX_OUT_PACKED_FP16, 1.0f,
                                   ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256, h_kv, state->n_kv_heads,
-                                  output_stride, output_row_offset);
+                                  linear ? state->total_heads * state->head_dim : state->qo_total_len,
+                                  output_row_offset);
   }
 }
 
 static void sync_attention_process_head(const SyncAttentionTaskState* state, int head_id, int worker_index) {
   const int h_kv = head_id / state->gqa_factor;
+  ATTN_STAGE(39, head_id, worker_index, (int)state->qo_len);
   if (sync_attention_try_page_causal_len2(state, head_id, worker_index)) {
     return;
   }
@@ -392,12 +412,17 @@ static void sync_attention_process_head(const SyncAttentionTaskState* state, int
         sync_attention_clear_linear_block(linear_S, state, q_begin, q_rows, block_valid_end);
       }
 
+      ATTN_STAGE(40, head_id, q_begin, q_rows);
       sync_attention_run_causal_qk_block(state, scores, head_id, h_kv, q_begin, q_rows,
                                          block_valid_end, block_valid_end_padded);
+      ATTN_STAGE(41, head_id, q_begin, block_valid_end);
       sync_attention_normalize_causal_block(state, scores, linear_S, q_begin, q_rows,
                                             block_valid_end, prezero_linear_s);
+      ATTN_STAGE(42, head_id, q_begin, 0);
+      ATTN_STAGE(43, head_id, q_begin, 0);
       sync_attention_run_causal_sv_block(state, head_O, temp_O, linear_S, h_kv, q_begin,
-                                         q_rows, block_valid_end);
+                                         q_rows, block_valid_end, head_id);
+      ATTN_STAGE(44, head_id, q_begin, 0);
     }
     return;
   }
@@ -428,14 +453,22 @@ static void sync_attention_process_head(const SyncAttentionTaskState* state, int
     }
   }
 
+  const int linear = state->value_c4 == 0;
   if (state->page_count > 0) {
-    sync_attention_run_page_sv(state, head_O, temp_O, linear_S, state->qo_len, state->qo_total_len, state->q_offset,
-                               h_kv, state->N);
+    sync_attention_run_page_sv(state, linear ? state->O + (size_t)head_id * state->head_dim : head_O, temp_O, linear_S,
+                               state->qo_len, linear ? state->total_heads * state->head_dim : state->qo_total_len,
+                               state->q_offset, h_kv, state->N);
+  } else if (linear) {
+    run_locked_attn_hmx_matmul_ex((uint8_t*)(state->O + (size_t)head_id * state->head_dim), (uint8_t*)linear_S,
+                                  (uint8_t*)state->pastV, state->qo_len, state->N, state->K_dim_padded,
+                                  state->N_padded, state->N_padded, ATTN_HMX_OUT_LINEAR_FP16, 1.0f,
+                                  ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256, h_kv, state->n_kv_heads,
+                                  state->total_heads * state->head_dim, state->q_offset);
   } else {
     run_locked_attn_hmx_matmul_ex((uint8_t*)head_O, (uint8_t*)linear_S, (uint8_t*)state->pastV, state->qo_len,
                                   state->N, state->K_dim_padded, state->N_padded, state->N_padded,
-                                  ATTN_HMX_OUT_PACKED_FP16, 1.0f, ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256, h_kv,
-                                  state->n_kv_heads, state->qo_total_len, state->q_offset);
+                                  ATTN_HMX_OUT_LINEAR_FP16, 1.0f, ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256, h_kv,
+                                  state->n_kv_heads, 0, state->q_offset);
   }
 }
 
@@ -559,14 +592,22 @@ static void sync_attention_process_decode_group(const SyncAttentionTaskState *st
       }
       WATTN_ADD(worker_index, 3, _tw);
       _tw = WATTN_T0();
+      // value_c4 == 0 consumers (ExecuTorch) read a plain [token][head][head_dim] tensor, while MNN's
+      // NC4HW4 device order is the packed form; the two coincide only at qo_total_len == 1.
       for (int q = 0; q < q_count; ++q) {
         for (int h = 0; h < group_heads; ++h) {
           int row = q * group_heads + h;
-          __fp16* dst = state->O + (size_t)(head_base + h) * (state->head_dim / 64) * state->qo_total_len * 64;
+          const int token = state->q_offset + q_base + q;
           for (int pack_idx = 0; pack_idx < state->head_dim / 64; ++pack_idx) {
             const __fp16* src = packed_O + (size_t)(pack_idx * rows + row) * 64;
-            vmemu(dst + (size_t)pack_idx * state->qo_total_len * 64 +
-                  (state->q_offset + q_base + q) * 64) = vmemu(src);
+            if (state->value_c4) {
+              __fp16* dst = state->O + (size_t)(head_base + h) * (state->head_dim / 64) * state->qo_total_len * 64;
+              vmemu(dst + (size_t)pack_idx * state->qo_total_len * 64 + (size_t)token * 64) = vmemu(src);
+            } else {
+              __fp16* dst =
+                  state->O + ((size_t)token * state->total_heads + (head_base + h)) * state->head_dim;
+              vmemu(dst + (size_t)pack_idx * 64) = vmemu(src);
+            }
           }
         }
       }
@@ -689,21 +730,31 @@ static void sync_attention_worker(void* data, int worker_index) {
   SyncAttentionTaskState* state = (SyncAttentionTaskState*)data;
   while (1) {
     unsigned int task_id = worker_pool_atomic_inc_return(&(state->task_id)) - 1;
+    ATTN_STAGE(70, ++g_attn_worker_iters, worker_index, (int) task_id);
     if ((int)task_id >= state->total_heads) {
       break;
     }
     sync_attention_process_task(state, (int)task_id, worker_index);
   }
+  WP_TRACE("WP attn worker exit");
+  ATTN_STAGE(45, worker_index, 0, 0);
+  ATTN_STAGE(71, ++g_attn_worker_exits, worker_index, 0);
   worker_pool_synctoken_jobdone(&(state->sync_ctx));
 }
 
 void sync_attention_run_tasks(SyncAttentionTaskState* state, int n_tasks) {
+  WP_TRACE("WP attn run n_tasks=%d total_heads=%d grouped=%d qo_len=%d", n_tasks, (int)state->total_heads, (int)state->decode_grouped, (int)state->qo_len);
+  ATTN_STAGE(32, n_tasks, (int)state->total_heads, (int)state->decode_grouped);
+  ATTN_STAGE(33, 0, 0, 0);
   hmx_queue_begin();
+  ATTN_STAGE(34, 0, 0, 0);
   if (n_tasks <= 1) {
+    WP_TRACE("WP attn serial path tasks=%d", (int)state->total_heads);
     for (int task = 0; task < state->total_heads; ++task) {
       sync_attention_process_task(state, task, 0);
     }
     hmx_queue_end();
+    ATTN_STAGE(38, 0, 0, 0);
     return;
   }
 
@@ -711,10 +762,23 @@ void sync_attention_run_tasks(SyncAttentionTaskState* state, int n_tasks) {
   job.fptr = sync_attention_worker;
   job.dptr = state;
 
+#if MNN_WP_TRACE
+  int wp_submit_ok = 0;
+#endif
   worker_pool_synctoken_init(&(state->sync_ctx), n_tasks);
   for (int i = 0; i < n_tasks; ++i) {
+#if MNN_WP_TRACE
+    if (worker_pool_submit(NULL, job) == 0) { ++wp_submit_ok; }
+#else
     worker_pool_submit(NULL, job);
+#endif
   }
+  WP_TRACE("WP attn submits ok=%d of %d", wp_submit_ok, n_tasks);
+  ATTN_STAGE(35, n_tasks, (int)state->total_heads, 0);
+  ATTN_STAGE(36, 0, 0, 0);
   worker_pool_synctoken_wait(&(state->sync_ctx));
+  ATTN_STAGE(37, 0, 0, 0);
+  WP_TRACE("WP attn wait done");
   hmx_queue_end();
+  ATTN_STAGE(38, 0, 0, 0);
 }

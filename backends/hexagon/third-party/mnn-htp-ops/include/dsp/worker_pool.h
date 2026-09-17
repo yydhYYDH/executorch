@@ -26,6 +26,7 @@ WORKERPOOL_API extern unsigned int g_max_num_workers;
 
 #define WORKER_POOL_STACK_ALLOC(type, count) ((type *)__builtin_alloca(sizeof(type) * (count)))
 
+WORKERPOOL_API unsigned int worker_pool_debug_state(unsigned int *pool_present);
 WORKERPOOL_API void worker_pool_global_init(void);
 WORKERPOOL_API void worker_pool_global_deinit(void);
 WORKERPOOL_API AEEResult worker_pool_init_ex(worker_pool_context_t *context, int stack_size, int n_workers);

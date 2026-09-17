@@ -45,6 +45,12 @@ typedef union {
   } state;
 } MNNWorkerSyncToken;
 
+// Experiment switch: 1 forces every worker-pool caller down its serial path,
+// which is how the attention crash is localized to the pool or to its kernel.
+#ifndef MNN_FORCE_SERIAL_WORKERS
+#define MNN_FORCE_SERIAL_WORKERS 0
+#endif
+
 unsigned int g_max_num_workers = 1;
 
 static worker_pool_context_t g_default_pool = NULL;
@@ -126,12 +132,21 @@ void worker_pool_global_init(void) {
     }
   }
   g_max_num_workers = mnn_worker_clamp_count(count);
+#if MNN_FORCE_SERIAL_WORKERS
+  g_max_num_workers = 1;
+#endif
 
   if (worker_pool_init(&g_default_pool) != AEE_SUCCESS) {
     FARF(ERROR, "MNN worker pool init failed");
     g_default_pool = NULL;
     g_max_num_workers = 1;
   }
+}
+
+unsigned int worker_pool_debug_state(unsigned int *pool_present) {
+  MNNWorkerPool *pool = (MNNWorkerPool *) g_default_pool;
+  *pool_present = pool != NULL ? 1u : 0u;
+  return pool != NULL ? pool->worker_count : 0u;
 }
 
 void worker_pool_global_deinit(void) {

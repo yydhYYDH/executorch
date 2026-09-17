@@ -44,6 +44,25 @@ typedef struct {
   void* stack;
 } MNNHmxQueue;
 
+// Hang-investigation breadcrumbs; see backends/hexagon/ATTENTION_HANG_INVESTIGATION.md.
+extern "C" void htp_probe_stage(int stage, int a, int b, int c);
+#ifndef MNN_ATTN_STAGE_PROBE
+#  define MNN_ATTN_STAGE_PROBE 0
+#endif
+#if MNN_ATTN_STAGE_PROBE
+#  define HMXQ_STAGE(stage, a, b, c) htp_probe_stage((stage), (int) (a), (int) (b), (int) (c))
+#else
+#  define HMXQ_STAGE(stage, a, b, c) ((void) 0)
+#endif
+
+#if MNN_ATTN_STAGE_PROBE
+// Liveness counters for the handoffs: see the stage table in hexagon_backend.cpp.
+static int g_hmx_queue_wakes = 0;
+static int g_hmx_queue_jobs = 0;
+static int g_hmx_submit_done = 0;
+static int g_hmx_submit_sems = 0;
+#endif
+
 static MNNHmxQueue* g_hmx_queue = NULL;
 
 static void hmx_queue_resource_begin(MNNHmxQueue* queue) {
@@ -54,14 +73,17 @@ static void hmx_queue_resource_begin(MNNHmxQueue* queue) {
   if (context_id == 0) {
     return;
   }
+  HMXQ_STAGE(54, queue->active_depth, context_id, 0);
   HAP_compute_res_hmx_lock(context_id);
   hmx_unit_acquire();
+  HMXQ_STAGE(55, context_id, 0, 0);
 }
 
 static void hmx_queue_resource_end(MNNHmxQueue* queue) {
   if (queue->active_depth == 0 || --queue->active_depth != 0) {
     return;
   }
+  HMXQ_STAGE(56, queue->active_depth, 0, 0);
   int context_id = vtcm_manager_get_ctx_id();
   if (context_id == 0) {
     return;
@@ -88,12 +110,14 @@ static void hmx_queue_thread(void* opaque) {
         continue;
       }
       (void)qurt_futex_wait(&queue->sequence, observed_sequence);
+      HMXQ_STAGE(66, ++g_hmx_queue_wakes, (int) sequence, 0);
       poll_count = MNN_HMX_QUEUE_POLL_COUNT;
     }
 
     MNNHmxQueueJob* job = queue->jobs[queue->read_index];
     queue->read_index = (queue->read_index + 1) % MNN_HMX_QUEUE_CAPACITY;
     (void)qurt_sem_up(&queue->free_slots);
+    HMXQ_STAGE(52, job->type, queue->active_depth, queue->read_index);
 
     if (job->type == MNN_HMX_QUEUE_JOB_BEGIN) {
       hmx_queue_resource_begin(queue);
@@ -110,12 +134,14 @@ static void hmx_queue_thread(void* opaque) {
       }
     }
 
+    HMXQ_STAGE(53, job->type, queue->active_depth, 0);
     const int stop = job->type == MNN_HMX_QUEUE_JOB_STOP;
     if (stop) {
       while (queue->active_depth > 0) {
         hmx_queue_resource_end(queue);
       }
     }
+    HMXQ_STAGE(67, ++g_hmx_queue_jobs, job->type, queue->active_depth);
     __atomic_store_n(&job->done, 1u, __ATOMIC_RELEASE);
     (void)qurt_futex_wake(&job->done, 1);
     if (stop) {
@@ -146,6 +172,7 @@ static void hmx_queue_submit(MNNHmxQueueJobType type, hmx_queue_callback_t callb
   __atomic_store_n(&job.done, 0u, __ATOMIC_RELAXED);
 
   (void)qurt_sem_down(&queue->free_slots);
+  HMXQ_STAGE(69, ++g_hmx_submit_sems, 0, 0);
   qurt_mutex_lock(&queue->mutex);
   unsigned int write_index = __atomic_load_n(&queue->write_index, __ATOMIC_RELAXED);
   queue->jobs[write_index] = &job;
@@ -160,9 +187,11 @@ static void hmx_queue_submit(MNNHmxQueueJobType type, hmx_queue_callback_t callb
     }
     asm volatile("pause(#8)" ::: "memory");
   }
+  HMXQ_STAGE(57, spin_count, queue->read_index, type);
   while (__atomic_load_n(&job.done, __ATOMIC_ACQUIRE) == 0u) {
     (void)qurt_futex_wait(&job.done, 0u);
   }
+  HMXQ_STAGE(68, ++g_hmx_submit_done, spin_count, type);
 }
 
 void hmx_queue_setup() {

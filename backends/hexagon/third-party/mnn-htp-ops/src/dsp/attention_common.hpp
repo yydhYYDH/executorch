@@ -15,7 +15,10 @@ static inline void attn_prepare_dma_desc_2d(dma_desc_2d_t* desc, const void* src
   memset(desc, 0, sizeof(dma_desc_2d_t));
   desc->next = next;
   desc->type = DMA_DESC_TYPE_2D;
-  desc->src_bypass = 0;
+#ifndef MNN_ATTN_SRC_BYPASS
+#  define MNN_ATTN_SRC_BYPASS 0
+#endif
+  desc->src_bypass = MNN_ATTN_SRC_BYPASS;
   desc->dst_bypass = 1;
   desc->ordered = 1;
   desc->dstate = DMA_DESC_DSTATE_PENDING;
@@ -53,7 +56,10 @@ static inline dma_desc_1d_t* attn_prepare_weight_dma_descs(dma_desc_1d_t* curren
                                                      16 * kp * 64 * sizeof(int16_t), weight_dma_count,
                                                      k_icP * 1024 * sizeof(__fp16), 1024 * kp * sizeof(int16_t));
     // K pages may have just been written by DSP push_kv; let DMA allocate source lines for coherent QK reads.
-    weight_descs[weight_desc_count].cache_alloc = DMA_DESC_CACHEALLOC_READONLY;
+#ifndef MNN_ATTN_WEIGHT_CACHEALLOC
+#  define MNN_ATTN_WEIGHT_CACHEALLOC DMA_DESC_CACHEALLOC_READONLY
+#endif
+    weight_descs[weight_desc_count].cache_alloc = MNN_ATTN_WEIGHT_CACHEALLOC;
     ++weight_desc_count;
   } else {
     int weight_dma_count = oy_end - oy_start;
@@ -472,6 +478,54 @@ static inline void sync_attention_accumulate_packed_output(__fp16* dst, const __
         HVX_Vector vd = vmemu(d + i);
         HVX_Vector vs = vmemu(s + i);
         vmemu(d + i) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(vd, vs));
+      }
+    }
+  }
+}
+
+// value_c4 != 0 keeps MNN's device NC4HW4 order, where dst is the packed head base and output_stride
+// counts 64-element blocks. value_c4 == 0 serves a non-C4 consumer: the caller passes the head base of a
+// plain [token][head][head_dim] tensor and output_stride is the token stride in elements.
+static inline void sync_attention_store_output(const SyncAttentionTaskState* state, uint8_t* c, __fp16* vtcm_output,
+                                               int oy_start, int oy_end, int ox, int valid_rows, int valid_xi,
+                                               int output_stride, int output_row_offset) {
+  if (state->value_c4) {
+    attn_store_output_packed_fp16(c, vtcm_output, oy_start, oy_end, ox, valid_rows, valid_xi, output_stride,
+                                  output_row_offset);
+  } else {
+    attn_store_output_linear_fp16(c, vtcm_output, oy_start, oy_end, ox, state->head_dim, valid_xi, output_stride,
+                                  output_row_offset);
+  }
+}
+
+static inline void sync_attention_zero_output(const SyncAttentionTaskState* state, __fp16* dst, int rows,
+                                              int output_stride, int row_offset) {
+  if (state->value_c4) {
+    sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, state->head_dim);
+    return;
+  }
+  const int packs = state->head_dim / 64;
+  for (int r = 0; r < rows; ++r) {
+    __fp16* base = dst + (size_t)(row_offset + r) * output_stride;
+    for (int p = 0; p < packs; ++p) {
+      memset(base + (size_t)p * 64, 0, 64 * sizeof(__fp16));
+    }
+  }
+}
+
+static inline void sync_attention_accumulate_output(const SyncAttentionTaskState* state, __fp16* dst,
+                                                    const __fp16* src, int rows, int output_stride, int row_offset) {
+  if (state->value_c4) {
+    sync_attention_accumulate_packed_output(dst, src, rows, output_stride, row_offset, state->head_dim);
+    return;
+  }
+  const int packs = state->head_dim / 64;
+  for (int r = 0; r < rows; ++r) {
+    __fp16* base = dst + (size_t)(row_offset + r) * output_stride;
+    for (int p = 0; p < packs; ++p) {
+      const __fp16* s = src + ((size_t)p * rows + r) * 64;
+      for (int i = 0; i < 64; ++i) {
+        base[(size_t)p * 64 + i] += s[i];
       }
     }
   }

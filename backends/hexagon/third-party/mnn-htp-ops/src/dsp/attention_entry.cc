@@ -2,6 +2,19 @@
 
 #include "attention_private.hpp"
 
+// Hang-investigation breadcrumbs: the stage ring in execute_command.cc, read back on the host by
+// hexagon_backend.cpp's watchdog while an invoke is still blocked on the DSP. See
+// backends/hexagon/ATTENTION_HANG_INVESTIGATION.md. Compiled out of every shipping skel.
+extern "C" void htp_probe_stage(int stage, int a, int b, int c);
+#ifndef MNN_ATTN_STAGE_PROBE
+#  define MNN_ATTN_STAGE_PROBE 0
+#endif
+#if MNN_ATTN_STAGE_PROBE
+#  define ATTN_STAGE(stage, a, b, c) htp_probe_stage((stage), (int) (a), (int) (b), (int) (c))
+#else
+#  define ATTN_STAGE(stage, a, b, c) ((void) 0)
+#endif
+
 extern "C" AEEResult htp_ops_vision_attention_fp16(uint8_t *pOut, const uint8_t *pQ, const uint8_t *pK,
                                                    const uint8_t *pV, const uint8_t *pMask, uint8_t *pWorkspace,
                                                    int batch, int tokens, int heads, int headDim, float scale,
@@ -150,7 +163,7 @@ extern "C" AEEResult htp_ops_vision_flash_attention_fp16(uint8_t *pOut, const ui
       }
       ret = sync_attention(packedOutput, query + (size_t) qBase * heads * headDim, maskFp32, attentionWorkspace,
                            (__fp16 *) packedK, (__fp16 *) packedV, queryRows, tokens - queryRows, queryRows, heads,
-                           heads, headDim, scale, mask != NULL ? maskStride : 0);
+                           heads, headDim, scale, mask != NULL ? maskStride : 0, 1 /* packed output */);
       if (ret != AEE_SUCCESS) {
         free(ownedWorkspace);
         return ret;
@@ -181,9 +194,14 @@ AEEResult htp_ops_flash_attn(uint8_t* pOut,
                              int32_t qo_len, int32_t seq_current,
                              int32_t seq_add, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim, float scale, int32_t mask_stride,
                              int32_t max_kv_len, int32_t value_c4) {
+  WP_TRACE("WP entry add=%d qo=%d maskstride=%d", (int)seq_add, (int)qo_len, (int)mask_stride);
+  g_attn_dma_fault = 0;
+  ATTN_STAGE(1, seq_add, qo_len, mask_stride);
   if (pK && pV && seq_add > 0) {
+      ATTN_STAGE(2, seq_current, max_kv_len, seq_add);
       htp_ops_push_kv(pPastK, pPastV, pK, pV, seq_current, seq_add, n_kv_heads, head_dim, max_kv_len,
                       value_c4, 0, seq_add);
+      ATTN_STAGE(3, seq_current, seq_add, 0);
   }
   if (flash_attn_try_single_token_output(pOut, pV, qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim,
                                          value_c4)) {
@@ -214,8 +232,17 @@ AEEResult htp_ops_flash_attn(uint8_t* pOut,
     preprocess_mask_to_fp32(maskFp32Base, maskBase, qo_len, mask_stride);
   }
 
+  ATTN_STAGE(4, worker_slots, task_rows, (int)total_tasks);
   int ret = sync_attention(outBase, qBase, maskFp32Base, workspaceBase, pastKBase, pastVBase, qo_len, seq_current, seq_add,
-                           n_heads, n_kv_heads, head_dim, scale, mask_stride);
+                           n_heads, n_kv_heads, head_dim, scale, mask_stride, value_c4);
+  if (ret == 0 && g_attn_dma_fault != 0) {
+    // Report the probe's DMA fault (site in the high bits, engine status in the low ones)
+    // instead of returning success over a matmul that was skipped.
+#if !MNN_ATTN_FAULT_IS_SOFT
+    ret = (AEEResult) (0x10000 | g_attn_dma_fault);
+#endif
+  }
+  ATTN_STAGE(5, ret, g_attn_dma_fault, 0);
 
   return ret;
 }
@@ -232,11 +259,13 @@ AEEResult htp_ops_flash_attn_pages(uint8_t* pOut,
                                    int32_t seq_add, int32_t n_heads, int32_t n_kv_heads, int32_t head_dim, float scale,
                                    int32_t mask_stride, int32_t max_kv_len, int32_t page_count, int32_t page_size,
                                    int32_t value_c4) {
+  g_attn_dma_fault = 0;
   if (page_count <= 0 || page_size <= 0 || (page_size % 32) != 0) {
     return AEE_EBADPARM;
   }
   AsyncPushKVPagesState asyncPush = {};
   AsyncPushKVPagesState* asyncPushPtr = NULL;
+  WP_TRACE("WP entry add=%d qo=%d maskstride=%d", (int)seq_add, (int)qo_len, (int)mask_stride);
   if (pK && pV && seq_add > 0) {
     if (seq_current < page_size) {
       const int kv_stride_bytes = n_kv_heads * head_dim * (int)sizeof(__fp16);
@@ -250,6 +279,7 @@ AEEResult htp_ops_flash_attn_pages(uint8_t* pOut,
       if (ret != 0) {
         return ret;
       }
+      WP_TRACE("WP entry sync_push_len=%d of add=%d", sync_push_len, (int)seq_add);
       if (sync_push_len < seq_add) {
         asyncPush.done = 0;
         asyncPush.status = 0;
@@ -271,6 +301,7 @@ AEEResult htp_ops_flash_attn_pages(uint8_t* pOut,
         pushJob.fptr = push_kv_pages_async_worker;
         pushJob.dptr = &asyncPush;
         if (worker_pool_submit(NULL, pushJob) == 0) {
+          WP_TRACE("WP entry async submitted add=%d", (int)asyncPush.seq_add);
           asyncPushPtr = &asyncPush;
         } else {
           ret = htp_ops_push_kv_pages(pPastKPages, pPastVPages,
@@ -362,11 +393,13 @@ AEEResult htp_ops_flash_attn_pages(uint8_t* pOut,
   (void)max_kv_len;
   int ret = sync_attention_pages(outBase, qBase, maskForAttention, workspaceBase, pPastKPages, pPastVPages,
                                  qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim, scale, mask_stride,
-                                 page_count, page_size, asyncPushPtr, allow_online_pages);
+                                 page_count, page_size, asyncPushPtr, allow_online_pages, value_c4);
+  WP_TRACE("WP entry attn returned ret=%d pending=%d", ret, asyncPushPtr != NULL);
   if (asyncPushPtr != NULL) {
     while (!asyncPush.done) {
       asm volatile("pause(#8)" ::: "memory");
     }
+    WP_TRACE("WP entry async done status=%d", (int)asyncPush.status);
     if (asyncPush.status != 0) {
       return asyncPush.status;
     }

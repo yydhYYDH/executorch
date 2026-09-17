@@ -18,6 +18,18 @@ static inline const __fp16* push_v_src_ptr(const PushKVTaskState* state, int h_k
   return state->V + (size_t)(channel / pack) * state->value_seq_len * pack + (size_t)token * pack + (channel % pack);
 }
 
+// The KV tile layout reserves a whole 256-token block per cache, so a write
+// whose tile lands past the operand the emitter sized is an out-of-bounds write.
+#if MNN_CLAMP_CACHE_WRITES
+// Reported through the profile buffer the host hands to the command group, and
+// flushed on every write, so the figure survives the fault it describes. The
+// only caller is the clamp path below, so a default build never sees the symbol.
+extern "C" void htp_probe_stage(int stage, int a, int b, int c);
+static unsigned int g_max_k_off = 0;
+static unsigned int g_max_v_off = 0;
+#endif
+
+
 AEEResult htp_ops_push_kv(uint8_t* pPastK,
                            uint8_t* pPastV,
                            uint8_t* pK,
@@ -41,9 +53,16 @@ AEEResult htp_ops_push_kv(uint8_t* pPastK,
   int k_icP = (K_dim + 31) / 32;
   int v_ocP = (K_dim + 31) / 32;
   size_t kv_stride = n_kv_heads * head_dim;
+  WP_TRACE("WP push_kv enter seq=%d add=%d nkv=%d hd=%d maxkv=%d", (int)seq_current, (int)seq_add, (int)n_kv_heads, (int)head_dim, (int)max_kv_len);
   int seq_chunks = (insert_len + ATTN_HMX_KV_BLOCK - 1) / ATTN_HMX_KV_BLOCK;
   HVX_Vector* k_hvx_scratch = NULL;
-  (void)max_kv_len;
+  // Capacity the emitter sized the cache operand to, in fp16 elements. The tile
+  // layout below reserves a whole 256-token block per cache, so this is the
+  // bound the write offsets have to be checked against.
+  size_t cache_elems = (size_t)max_kv_len * n_kv_heads * head_dim;
+#if !MNN_CLAMP_CACHE_WRITES
+  (void)cache_elems;
+#endif
 
   int total_tasks = seq_chunks * n_kv_heads;
   int worker_tasks = push_kv_pick_task_count(total_tasks);
@@ -67,12 +86,14 @@ AEEResult htp_ops_push_kv(uint8_t* pPastK,
   state.value_token_offset = value_token_offset;
   state.value_seq_len = value_seq_len > 0 ? value_seq_len : insert_len;
   state.k_hvx_scratch_base = k_hvx_scratch;
+  state.cache_elems = cache_elems;
 
   if (seq_add == 1) {
     for (int h_kv = 0; h_kv < n_kv_heads; ++h_kv) {
       push_k_scalar_rows(&state, h_kv, past_kv_len, past_kv_len + 1);
       push_v_scalar_rows(&state, h_kv, past_kv_len, past_kv_len + 1);
     }
+    WP_TRACE("WP push_kv single-token done");
     return 0;
   }
 
@@ -80,28 +101,70 @@ AEEResult htp_ops_push_kv(uint8_t* pPastK,
   k_hvx_scratch = (HVX_Vector*)vtcm_manager_reserve_area("attn_push_k_hvx_scratch",
                                                          (size_t)worker_cap * ATTN_HMX_PUSH_K_HVX_SCRATCH_BYTES, 128);
   state.k_hvx_scratch_base = k_hvx_scratch;
+  WP_TRACE("WP push_kv scratch=%p worker_tasks=%d total=%d", (void*)k_hvx_scratch, worker_tasks, total_tasks);
 
   if (worker_tasks <= 1) {
+    WP_TRACE("WP push_kv serial begin total=%d", total_tasks);
     for (int chunk_id = 0; chunk_id < total_tasks; ++chunk_id) {
+      WP_TRACE("WP push_kv serial chunk=%d", chunk_id);
       push_kv_process_chunk(&state, chunk_id, 0);
     }
+    WP_TRACE("WP push_kv serial chunks done -> clear tail");
     push_v_clear_seq_tail(&state);
+    WP_TRACE("WP push_kv serial done");
     return 0;
   }
 
   worker_pool_job_t job;
   job.fptr = push_kv_worker;
   job.dptr = &state;
+#if MNN_WP_TRACE
+  int wp_push_ok = 0;
+#endif
   worker_pool_synctoken_init(&(state.sync_ctx), worker_tasks);
   for (int i = 0; i < worker_tasks; ++i) {
+#if MNN_WP_TRACE
+    if (worker_pool_submit(NULL, job) == 0) { ++wp_push_ok; }
+#else
     worker_pool_submit(NULL, job);
+#endif
   }
+  WP_TRACE("WP push_kv submits ok=%d of %d", wp_push_ok, worker_tasks);
+  WP_TRACE("WP push_kv submitted=%d -> wait", worker_tasks);
   worker_pool_synctoken_wait(&(state.sync_ctx));
+  WP_TRACE("WP push_kv wait done");
 
   push_v_clear_seq_tail(&state);
+  WP_TRACE("WP push_kv pool path done");
+#if MNN_CLAMP_CACHE_WRITES
+#endif
 
   return 0;
 }
+
+#ifndef MNN_CLAMP_ALL_WRITES
+#define MNN_CLAMP_ALL_WRITES 0
+#endif
+#if MNN_CLAMP_CACHE_WRITES
+static inline int push_off_inside(const PushKVTaskState* state, const __fp16* base, const __fp16* p, unsigned int span, int is_k) {
+#if MNN_CLAMP_ALL_WRITES
+  (void) state; (void) base; (void) p; (void) span; (void) is_k;
+  return 0;  // clamp EVERY write, in bounds or not
+#endif
+  size_t off = (size_t) (p - base);
+  if (off + span > state->cache_elems) {
+    unsigned int end = (unsigned int) (off + span);
+    if (is_k) {
+      if (end > g_max_k_off) g_max_k_off = end;
+    } else if (end > g_max_v_off) {
+      g_max_v_off = end;
+    }
+    htp_probe_stage(29, (int) g_max_k_off, (int) g_max_v_off, (int) state->cache_elems);
+    return 0;
+  }
+  return 1;
+}
+#endif
 
 static inline void push_k_scalar_rows(const PushKVTaskState* state, int h_kv, int seq_begin, int seq_end) {
   for (int global_seq = seq_begin; global_seq < seq_end; ++global_seq) {
@@ -117,9 +180,19 @@ static inline void push_k_scalar_rows(const PushKVTaskState* state, int h_kv, in
       int valid = remain > 32 ? 32 : remain;
       int dim = 0;
       for (; dim + 1 < valid; dim += 2) {
+#if MNN_CLAMP_CACHE_WRITES
+        if (!push_off_inside(state, state->pastK, k_dst + (dim / 2) * 64, 2, 1)) {
+          continue;
+        }
+#endif
         memcpy(k_dst + (dim / 2) * 64, k_src + dim_base + dim, sizeof(uint32_t));
       }
       if (dim < valid) {
+#if MNN_CLAMP_CACHE_WRITES
+        if (!push_off_inside(state, state->pastK, k_dst + (dim / 2) * 64, 1, 1)) {
+          continue;
+        }
+#endif
         k_dst[(dim / 2) * 64] = k_src[dim_base + dim];
       }
     }
@@ -140,6 +213,11 @@ static inline void push_v_scalar_rows(const PushKVTaskState* state, int h_kv, in
       int valid = remain > 32 ? 32 : remain;
       const __fp16* v_src = push_v_src_ptr(state, h_kv, local_seq, dim_base);
       for (int dim = 0; dim < valid; ++dim) {
+#if MNN_CLAMP_CACHE_WRITES
+        if (!push_off_inside(state, state->pastV, v_dst + dim * 2, 1, 0)) {
+          continue;
+        }
+#endif
         v_dst[dim * 2] = v_src[dim];
       }
     }
@@ -293,6 +371,11 @@ static inline void push_v_clear_seq_tail(const PushKVTaskState* state) {
         __fp16* v_dst = state->pastV + attn_hmx_v_tile_index(dim_tile, seq_tile, h_kv, state->n_kv_heads, state->v_ocP) * 1024 +
                         seq_pair * 64 + seq_lane;
         for (int dim = 0; dim < 32; ++dim) {
+#if MNN_CLAMP_CACHE_WRITES
+          if (!push_off_inside(state, state->pastV, v_dst + dim * 2, 1, 0)) {
+            continue;
+          }
+#endif
           v_dst[dim * 2] = (__fp16)0.0f;
         }
       }
@@ -302,14 +385,17 @@ static inline void push_v_clear_seq_tail(const PushKVTaskState* state) {
 
 static void push_kv_worker(void* data, int worker_index) {
   PushKVTaskState* state = (PushKVTaskState*)data;
+  unsigned int task_id = 0;
   while (1) {
-    unsigned int task_id = worker_pool_atomic_inc_return(&(state->task_id)) - 1;
+    task_id = worker_pool_atomic_inc_return(&(state->task_id)) - 1;
+    WP_TRACE("WP worker start w=%d task=%u", worker_index, task_id);
     int total_tasks = state->seq_chunks * state->n_kv_heads;
     if ((int)task_id >= total_tasks) {
       break;
     }
     push_kv_process_chunk(state, (int)task_id, worker_index);
   }
+  WP_TRACE("WP worker done w=%d", worker_index);
   worker_pool_synctoken_jobdone(&(state->sync_ctx));
 }
 
@@ -396,9 +482,11 @@ AEEResult htp_ops_push_kv_pages(uint8_t** pPastKPages,
 void push_kv_pages_async_worker(void* data, int worker_index) {
   (void)worker_index;
   AsyncPushKVPagesState* state = (AsyncPushKVPagesState*)data;
+  WP_TRACE("WP async worker start add=%d", (int)state->seq_add);
   state->status = htp_ops_push_kv_pages(state->pastKPages, state->pastVPages, state->K, state->V, state->seq_current,
                                         state->seq_add, state->n_kv_heads, state->head_dim, state->page_count,
                                         state->page_size, state->value_c4, state->value_token_offset,
                                         state->value_seq_len);
+  WP_TRACE("WP async worker done status=%d", (int)state->status);
   state->done = 1;
 }

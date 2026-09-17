@@ -48,6 +48,7 @@
 enum AttnHmxOutputLayoutType {
   ATTN_HMX_OUT_PACKED_FP16 = 0,
   ATTN_HMX_OUT_LINEAR_FP32_SCALED = 1,
+  ATTN_HMX_OUT_LINEAR_FP16 = 2,
 };
 
 #define ATTN_HMX_MAX_PAIR_PACKS 64
@@ -55,10 +56,34 @@ enum AttnHmxOutputLayoutType {
 #define ATTN_HMX_KV_BLOCK_TILES (ATTN_HMX_KV_BLOCK / 32)
 #define ATTN_HMX_MAX_KP 256
 #define ATTN_HMX_MAX_WEIGHT_DESCS 8
+
+// Set by the DMA probe in attention_hmx.cc when a transfer errors out or never completes, and
+// reported by the flash-attn entry as a nonzero AEEResult instead of stalling the DSP forever.
+extern int g_attn_dma_fault;
+
+// 1 = a latched DMA fault is recorded in the stage ring but the op still returns success, so
+// repeated executions (--num_executions) keep going and the host can measure the wedge budget.
+#ifndef MNN_ATTN_FAULT_IS_SOFT
+#  define MNN_ATTN_FAULT_IS_SOFT 0
+#endif
 #define ATTN_HMX_PUSH_K_HVX_SCRATCH_BYTES (128 * 128)
 #define ATTN_FIXED_WORKSPACE_KV 2048
 #define ATTN_PREFILL_SEGMENT_Q 64
 
+// Experiment switch: 1 drops KV cache writes that land past the operand the
+// emitter sized, and records the largest offset it would have written.
+#ifndef MNN_CLAMP_CACHE_WRITES
+#define MNN_CLAMP_CACHE_WRITES 0
+#endif
+
+#ifndef MNN_WP_TRACE
+#define MNN_WP_TRACE 0
+#endif
+#if MNN_WP_TRACE
+#define WP_TRACE(...) FARF(ALWAYS, __VA_ARGS__)
+#else
+#define WP_TRACE(...) ((void)0)
+#endif
 enum AttnHmxWeightLayoutType {
   ATTN_HMX_WEIGHT_LAYOUT_K_BLOCK256 = 0,
   ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256 = 1,
@@ -96,6 +121,7 @@ typedef struct {
   int value_token_offset;
   int value_seq_len;
   HVX_Vector* k_hvx_scratch_base;
+  size_t cache_elems;
 } PushKVTaskState;
 
 typedef struct {
@@ -126,6 +152,7 @@ typedef struct {
   int q_offset;
   int n_kv_heads;
   int head_dim;
+  int value_c4;
   int mask_stride;
   int seq_current;
   int N;
@@ -236,11 +263,12 @@ int flash_attn_try_single_token_output(uint8_t* pOut, const uint8_t* pV, int32_t
 
 int sync_attention(__fp16 *restrict O, const __fp16 *restrict Q, const float *restrict mask, uint8_t *workspace,
                    __fp16 *pastK, __fp16 *pastV, int qo_len, int seq_current, int seq_add, int n_heads,
-                   int n_kv_heads, int head_dim, float scale, int mask_stride);
+                   int n_kv_heads, int head_dim, float scale, int mask_stride, int value_c4);
 int sync_attention_pages(__fp16 *restrict O, const __fp16 *restrict Q, const float *restrict mask, uint8_t *workspace,
                          uint8_t **pastKPages, uint8_t **pastVPages, int qo_len, int seq_current, int seq_add,
                          int n_heads, int n_kv_heads, int head_dim, float scale, int mask_stride,
-                         int page_count, int page_size, AsyncPushKVPagesState* async_push, int allow_online_pages);
+                         int page_count, int page_size, AsyncPushKVPagesState* async_push, int allow_online_pages,
+                         int value_c4);
 void sync_attention_run_tasks(SyncAttentionTaskState* state, int n_tasks);
 
 extern "C" AEEResult htp_ops_flash_attn(uint8_t* pOut, uint8_t* pQ, uint8_t* pK, uint8_t* pV, uint8_t* pMask,

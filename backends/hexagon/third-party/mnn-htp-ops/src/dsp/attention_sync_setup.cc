@@ -60,7 +60,7 @@ static void sync_attention_configure_tasks(SyncAttentionTaskState* state, int n_
 static int sync_attention_init_common_state(SyncAttentionTaskState* state, __fp16* O, const __fp16* Q,
                                             const float* mask, uint8_t* workspace, int qo_len, int seq_current,
                                             int seq_add, int n_heads, int n_kv_heads, int head_dim, float scale,
-                                            int mask_stride, int* task_rows, int* n_tasks) {
+                                            int mask_stride, int value_c4, int* task_rows, int* n_tasks) {
   if (n_kv_heads <= 0 || n_heads % n_kv_heads != 0) {
     return -1;
   }
@@ -77,6 +77,7 @@ static int sync_attention_init_common_state(SyncAttentionTaskState* state, __fp1
   state->q_offset = 0;
   state->n_kv_heads = n_kv_heads;
   state->head_dim = head_dim;
+  state->value_c4 = value_c4;
   state->mask_stride = mask_stride;
   state->seq_current = seq_current;
   state->N = N;
@@ -116,13 +117,13 @@ static void sync_attention_run_segmented_prefill(SyncAttentionTaskState* state) 
 
 int sync_attention(__fp16 *restrict O, const __fp16 *restrict Q, const float *restrict mask, uint8_t *workspace, __fp16 *pastK,
                    __fp16 *pastV, int qo_len, int seq_current, int seq_add, int n_heads, int n_kv_heads, int head_dim,
-                   float scale, int mask_stride) {
+                   float scale, int mask_stride, int value_c4) {
   SyncAttentionTaskState state;
   int task_rows = 0;
   int n_tasks = 0;
   if (sync_attention_init_common_state(&state, O, Q, mask, workspace, qo_len, seq_current, seq_add,
-                                       n_heads, n_kv_heads, head_dim, scale, mask_stride, &task_rows,
-                                       &n_tasks) != 0) {
+                                       n_heads, n_kv_heads, head_dim, scale, mask_stride, value_c4,
+                                       &task_rows, &n_tasks) != 0) {
     return -1;
   }
   state.pastK = pastK;
@@ -143,13 +144,14 @@ int sync_attention(__fp16 *restrict O, const __fp16 *restrict Q, const float *re
 int sync_attention_pages(__fp16 *restrict O, const __fp16 *restrict Q, const float *restrict mask, uint8_t *workspace,
                          uint8_t **pastKPages, uint8_t **pastVPages, int qo_len, int seq_current, int seq_add,
                          int n_heads, int n_kv_heads, int head_dim, float scale, int mask_stride,
-                         int page_count, int page_size, AsyncPushKVPagesState* async_push, int allow_online_pages) {
+                         int page_count, int page_size, AsyncPushKVPagesState* async_push, int allow_online_pages,
+                         int value_c4) {
   SyncAttentionTaskState state;
   int task_rows = 0;
   int n_tasks = 0;
   if (sync_attention_init_common_state(&state, O, Q, mask, workspace, qo_len, seq_current, seq_add,
-                                       n_heads, n_kv_heads, head_dim, scale, mask_stride, &task_rows,
-                                       &n_tasks) != 0) {
+                                       n_heads, n_kv_heads, head_dim, scale, mask_stride, value_c4,
+                                       &task_rows, &n_tasks) != 0) {
     return -1;
   }
   int online_block_pages = 1;

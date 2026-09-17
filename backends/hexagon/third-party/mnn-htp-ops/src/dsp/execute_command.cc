@@ -770,6 +770,70 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
     return ret;
 }
 
+// Per-command trace into a host-mapped buffer. The DSP fault this exists to
+// catch (0x8000040d) takes the whole RPC session down, so FARF output is gone
+// with it; a record written to uncached shared memory survives, and the host
+// reads the slots back after the call fails.
+//
+// The probe lives at int offset kProbeBase inside the profile buffer, clear of
+// the timing slots that occupy 0..255.
+static constexpr int kProbeBase = 1024;
+static constexpr int kProbeMagic = 0x48455850;  // "HEXP"
+static constexpr int kProbeHeaderInts = 4;
+static constexpr int kProbeRecordInts = 8;
+static constexpr int kProbeMaxRecords = 508;
+// Record phases, plus the value the host prints for them.
+static constexpr int kProbeEnter = 0;
+static constexpr int kProbeDone = 1;
+static constexpr int kProbeFailed = 2;
+
+static void probe_flush(int* probe, int address, int words) {
+    qurt_mem_cache_clean(
+        (qurt_addr_t)probe, (address + words) * (int)sizeof(int), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+}
+
+static void probe_record(int* probe, int index, int count, int phase, int fd, int offset, int size, int opType, int ret) {
+    if (probe == nullptr || index < 0 || index >= kProbeMaxRecords) {
+        return;
+    }
+    probe[0] = kProbeMagic;
+    probe[1] = count;
+    probe[3] = index;
+    int* rec = probe + kProbeHeaderInts + index * kProbeRecordInts;
+    // index + 1: a zero slot is one the loop never reached.
+    rec[0] = index + 1;
+    rec[1] = phase;
+    rec[2] = fd;
+    rec[3] = offset;
+    rec[4] = size;
+    rec[5] = opType;
+    rec[6] = ret;
+    rec[7] = count;
+    probe_flush(probe, kProbeBase, kProbeHeaderInts + (index + 1) * kProbeRecordInts);
+}
+
+// Stage trace for the attention path. The record above says a command was
+// entered and never returned; this says how far *inside* it got, which is what
+// separates a fault in the dispatch from one in the kernel. The kernel calls it
+// and every write is flushed, because a fault takes the process down with the
+// cache still dirty.
+static constexpr int kProbeStageOffset = kProbeHeaderInts + kProbeMaxRecords * kProbeRecordInts;
+static constexpr int kProbeStages = 80;
+
+static int* g_stage_probe = nullptr;
+
+extern "C" void htp_probe_stage(int stage, int a, int b, int c) {
+    if (g_stage_probe == nullptr || stage < 1 || stage > kProbeStages) {
+        return;
+    }
+    int* rec = g_stage_probe + kProbeStageOffset + (stage - 1) * 4;
+    rec[0] = stage;
+    rec[1] = a;
+    rec[2] = b;
+    rec[3] = c;
+    probe_flush(g_stage_probe, kProbeStageOffset + (stage - 1) * 4, 4);
+}
+
 static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
     void* cmd_base = NULL;
     if ((cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd)) == NULL) {
@@ -964,19 +1028,56 @@ AEEResult htp_ops_execute_command_group_profile(remote_handle64 handle, int32 gr
     }
 
     int* profile = NULL;
+    int* probe = NULL;
     if (profileFd >= 0) {
         void* profile_base = mmap_manager_get_map_local(mmap_manager, profileFd);
         if (profile_base) {
             profile = (int*)((uint8_t*)profile_base + profileOffset);
             qurt_mem_cache_clean((qurt_addr_t)profile, profileSize, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+            probe = (profileSize >= (kProbeBase + kProbeHeaderInts) * (int)sizeof(int)) ? profile + kProbeBase : NULL;
+            if (probe) {
+                probe[1] = count;
+                probe[3] = -1;
+                probe[0] = kProbeMagic;
+                probe_flush(probe, kProbeBase, kProbeHeaderInts);
+                g_stage_probe = (profileSize >= (kProbeBase + kProbeStageOffset + kProbeStages * 4) * (int)sizeof(int))
+                    ? probe : NULL;
+                htp_probe_stage(22, (int) HAP_mem_available_stack(), 0, 0);
+                {
+                    unsigned int pool_present = 0;
+                    unsigned int workers = worker_pool_debug_state(&pool_present);
+                    htp_probe_stage(31, (int) pool_present, (int) workers, (int) g_max_num_workers);
+                }
+            }
         }
     }
 
     int ret = 0;
     for (int i = 0; i < count; i++) {
-        ret = execute_single_command(mmap_manager, commands[i * kCommandEntrySize],
-                                     commands[i * kCommandEntrySize + 1],
-                                     command_size(commands, i), command_is_dirty(commands, i), profile);
+        const int cmdFd = commands[i * kCommandEntrySize];
+        const int cmdOffset = commands[i * kCommandEntrySize + 1];
+        const int cmdSize = command_size(commands, i);
+        int opType = -1;
+        if (probe) {
+            // Parsed here rather than inside execute_single_command so a fault in
+            // the kernel is attributed to the command that was about to run.
+            void* cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd);
+            if (cmd_base) {
+                uint8_t* cmd_ptr = (uint8_t*)cmd_base + cmdOffset;
+                if (command_is_dirty(commands, i)) {
+                    qurt_mem_cache_clean((qurt_addr_t)cmd_ptr, cmdSize, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+                }
+                const DSPCOMMAND::Command* command = flatbuffers::GetRoot<DSPCOMMAND::Command>(cmd_ptr);
+                if (command != nullptr) {
+                    opType = command->type();
+                }
+            }
+            probe_record(probe, i, count, kProbeEnter, cmdFd, cmdOffset, cmdSize, opType, 0);
+        }
+        ret = execute_single_command(mmap_manager, cmdFd, cmdOffset, cmdSize, command_is_dirty(commands, i), profile);
+        if (probe) {
+            probe_record(probe, i, count, ret == 0 ? kProbeDone : kProbeFailed, cmdFd, cmdOffset, cmdSize, opType, ret);
+        }
         if (ret != 0) break;
     }
 
