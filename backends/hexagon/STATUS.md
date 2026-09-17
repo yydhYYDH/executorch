@@ -917,19 +917,71 @@ delegated -- the symptom the plan predicted, not an op that is missing. The
 one-layer replay shows the same shape: one `view_copy` against seventeen
 delegated, which is exactly the twenty-eighth of the full model.
 
+## Attention: the null cache, and how far the fix is verified
+
+The emitter's input list was
+
+    [q, k, v, mask, ABSENT, ABSENT]
+
+and the two slots at the end are not spare. htp_ops_flash_attn takes the past
+keys and values there -- mapped_ptrs[4] and [5], with the output and workspace
+after them at mapped_ptrs[inputs->size()] -- and it uses them twice before it
+looks at the query: htp_ops_push_kv writes the new rows into the cache through
+the first two, with no null check anywhere in it, and sync_attention passes both
+to the score and output matmuls as their key and value. So the command this
+backend emitted wrote through a null pointer and then read its keys and values
+from address zero. It could not have run, and no delegation count could show
+that.
+
+The cache belongs in those slots. It is an operand of this op rather than
+something the kernel keeps: the graph carries its own update_cache, which the
+KV-cache pass fuses into one node and which runs before attention, so the keys
+and values the op is handed are the whole cache -- 128 rows of 8 heads for a
+three-token prefill, which is what max_kv_len, read off kv_shape[1], already
+assumed. The kernel's push then copies cache rows onto themselves and changes
+nothing.
+
+The scratch was wrong too. attention_entry.cc sizes a different kernel's
+workspace; the one this op runs is one buffer of qo_len scores and one of qo_len
+probabilities, each over the sequence rounded up to 32 and 128-aligned, taken
+once per worker. The worker count is chosen on the DSP from g_max_num_workers,
+which the host cannot know, so the emitter now asks for the widest count any
+head could take: one slot per head.
+
+Neither fix is demonstrated. The host model for FLASH_ATTN is written --
+causal by clamping the row rather than by masking, kv head h / (n_heads /
+n_kv_heads), the scale from params[6] read as float bits -- and the simulator
+runner dispatches the op, but the case that would compare the three results does
+not run yet, and the reason is not the one this section first gave. The op does
+register: llama.custom_sdpa is a C++ custom op, and importing
+executorch.extension.llm.custom_ops.custom_ops puts it in the dialect, after
+which sdpa_targets() is non-empty and the case builds its blob.
+
+What stops it is the run. The attention kernel brings up a worker pool on the
+DSP -- worker_pool_global_init, which sizes itself from qurt_hvx_get_units -- and
+hexagon-sim cannot start it: qurt_cb_fwk_worker_init returns -4, QuRT reports
+0x7103, and the whole runner aborts. That takes the run down with it, so with the
+import in place every case in test_blob_on_sim.py stopped being checked, not just
+this one. The import is therefore out of the test and the case sits behind
+sdpa_targets(), which is empty without it. A skip is not a pass, and a run that
+skips everything is worse than one case that does not run: attention is still the
+least verified op in the model, now with a known bug fixed behind it.
+
 ## Not verified
 
 The bar every op taken over here had to meet was a real blob on hexagon-sim
 agreeing with torch. What follows is what did not meet it, so that a green suite
 is not read as more than it is.
 
-Flash attention has never run. `llama.custom_sdpa` has an emitter, the
-partitioner delegates it, and the blob it produces carries the command -- but
-blob_interpreter.py has no model for DSP_OP_FLASH_ATTN and no case issues one, so
-nothing has ever checked that the numbers it computes are right. It is the single
-most expensive op in the model and it is the one with the least evidence behind
-it. The patch path it depends on for start_pos is in the same position: the blit
-patch is exercised by case N, the attention patch by nothing.
+Flash attention has never run on the DSP. `llama.custom_sdpa` has an emitter,
+the partitioner delegates it, the blob it produces carries the command, and there
+is now a host model of the op in blob_interpreter.py -- but no case issues one,
+because hexagon-sim aborts in the kernel's worker pool before the kernel runs. It
+is the single most expensive op in the model and it is the one with the least
+evidence behind it. The host model itself is therefore unverified too: a model
+nothing has been compared against is a guess with arithmetic in it. The patch
+path attention depends on for start_pos is in the same position: the blit patch
+is exercised by case N, the attention patch by nothing.
 
 Nothing here has run on hardware. Every result comes from hexagon-sim, which is a
 functional model: it says what the kernels compute, not what the DSP costs or

@@ -427,19 +427,10 @@ def test_a_perturbed_region_changes_the_result():
     )
 
 
-#: The one op an emitter can produce that the interpreter refuses.
-#:
-#: FLASH_ATTN is excused here, not unreachable. `_register_llama_sdpa` only
-#: registers the attention emitter when `exir_ops.edge.llama.custom_sdpa`
-#: exists, which in a bare interpreter it does not -- but the op is a C++ custom
-#: op, and loading libcustom_ops_aot_lib.so with torch.ops.load_library makes
-#: `sdpa_targets()` non-empty and hangs `_emit_sdpa` on both overloads. A real
-#: LLM export loads it, since that is how the op reaches the graph at all, so a
-#: delegated subgraph can contain FLASH_ATTN and this interpreter would refuse
-#: it. Closing that gap means modelling an online softmax over the same
-#: approximated exponential the softmax test showed is not reconstructible on
-#: the host.
-_UNMODELLED = {18}
+#: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed
+#: the kernel's approximated exponential; it turned out to need only the causal
+#: rule and the head grouping, so the interpreter covers it and the set below is
+#: the whole command stream an emitter can produce.
 
 
 def _emitted_op_types():
@@ -464,7 +455,7 @@ def test_every_op_an_emitter_can_emit_is_modelled():
     """The interpreter has to cover the command stream, not a sample of it."""
     emitted = _emitted_op_types()
     assert len(emitted) >= 8, f"only found {sorted(emitted)} -- the parse failed"
-    missing = emitted - set(blob_interpreter._EXECUTORS) - _UNMODELLED
+    missing = emitted - set(blob_interpreter._EXECUTORS)
     assert not missing, f"an emitter produces unmodelled ops: {sorted(missing)}"
 
 

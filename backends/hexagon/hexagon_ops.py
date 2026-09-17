@@ -839,12 +839,31 @@ def _scalar_source(arg):
     return arg
 
 
+def _attention_workspace_bytes(qo_len, seq_len, n_slots):
+    """The scratch FLASH_ATTN needs, for the largest worker count it could pick.
+
+    sync_attention_head_workspace_bytes is a scores buffer and a probability
+    buffer, each qo_len rows of the sequence length rounded up to 32 and both
+    128-aligned, and the kernel takes one per worker. The worker count comes
+    from g_max_num_workers on the DSP, which the host cannot know, so this asks
+    for what the widest count could take: one slot per head.
+    """
+    padded = (seq_len + 31) // 32 * 32
+    scores = (qo_len * padded * 4 + 127) // 128 * 128
+    probabilities = (qo_len * padded * 2 + 127) // 128 * 128
+    return (scores + probabilities) * n_slots
+
+
 def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     """llama.sdpa_with_kv_cache as one non-paged FLASH_ATTN.
 
-    The kernel pushes the new keys and values into the cache at seq_current,
-    which is what the op promises, so the two agree. start_pos only exists once
-    the graph runs, and the cache is written in place.
+    The cache is an operand rather than something the kernel keeps: slots four
+    and five are the past keys and values, and this graph's own update_cache has
+    already written the new rows by the time attention runs, so the kernel's
+    push copies cache rows onto themselves and changes nothing. Passing those
+    two slots empty, as this did, hands the kernel null pointers it writes
+    through before it computes anything. start_pos only exists once the graph
+    runs, and the cache is written in place.
     """
     args = node.args
     query, key = args[0], args[1]
@@ -864,8 +883,8 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
         ctx.operand(args[1]),
         ctx.operand(args[2]),
         ABSENT if mask is None else ctx.operand(mask),
-        ABSENT,
-        ABSENT,
+        ctx.operand(args[1]),
+        ctx.operand(args[2]),
     ]
     # The position tensor is not an operand of this op, so it rides along as an
     # extra input the kernel never reads. See STATUS.md.
@@ -884,8 +903,13 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
         raise RuntimeError(f"hexagon: sdpa cannot resolve start_pos {args[3]!r}")
 
     out = ctx.result_for(node, _numel(node))
-    # attention_entry.cc sizes the scratch from the token count and pads by 127.
-    workspace = ctx.builder.add_activation(4 * kv_shape[1] + 127)
+    # The kernel sizes its scratch from seq_current + seq_add, and seq_current is
+    # the run-time position. The cache length bounds it: the position can never
+    # pass the rows that exist, so this asks for the longest sequence the cache
+    # could hold rather than the one this call happens to use.
+    workspace = ctx.builder.add_activation(
+        _attention_workspace_bytes(q_shape[1], q_shape[1] + kv_shape[1], q_shape[2])
+    )
 
     ctx.builder.add_op(
         Op(

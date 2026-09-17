@@ -35,6 +35,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 import hexagon_sim  # noqa: E402
 from blob_interpreter import Arena, execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
+from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
 from torch.export import export  # noqa: E402
@@ -65,6 +66,14 @@ _SOURCES = [
     "power.cc",
     "ops/matmul_q4fp16.c",
     "ops/matmul_q4fp16_mle32.c",
+    "attention_entry.cc",
+    "attention_sync_setup.cc",
+    "attention_sync_process.cc",
+    "attention_ops.cc",
+    "attention_push_kv.cc",
+    "attention_hmx.cc",
+    "attention_hmx_queue.cc",
+    "hmx_queue.cc",
 ]
 
 #: The fused norm reduces in a different order than numpy does, so it is compared
@@ -253,6 +262,57 @@ def _mul_silu_graph(shape):
     )
 
 
+def _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim):
+    """Attention whose key and value are the cache the graph already holds.
+
+    That is what an export produces: the graph carries its own update_cache, so
+    by the time attention runs the new rows are already in the cache and the
+    kernel's push copies cache rows onto themselves. A start_pos of zero is the
+    prefill case, where the query length is the whole sequence.
+    """
+    graph = torch.fx.Graph()
+    nodes = {}
+    for name, shape in (
+        ("query", (batch, qo_len, n_heads, head_dim)),
+        ("key", (batch, max_kv_len, n_kv_heads, head_dim)),
+        ("value", (batch, max_kv_len, n_kv_heads, head_dim)),
+    ):
+        node = graph.placeholder(name)
+        node.meta["val"] = torch.empty(shape, dtype=torch.float16)
+        nodes[name] = node
+    out = graph.call_function(
+        exir_ops.edge.llama.custom_sdpa.default,
+        args=(nodes["query"], nodes["key"], nodes["value"], 0, None, 0.0, True, None),
+    )
+    out.meta["val"] = torch.empty(
+        (batch, qo_len, n_heads, head_dim), dtype=torch.float16
+    )
+    graph.output(out)
+    return SimpleNamespace(
+        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
+    )
+
+
+def _attention_reference(query, key, value):
+    """The contract, written in torch ops so it shares no code with the model.
+
+    Row q of the query reads the cache up to and including position q, which is
+    what causal attention over a prefill means. Head h reads kv head
+    h // (n_heads / n_kv_heads).
+    """
+    group = query.shape[2] // key.shape[2]
+    scale = query.shape[-1] ** -0.5
+    out = torch.zeros(query.shape, dtype=torch.float32)
+    for row in range(query.shape[1]):
+        valid = row + 1
+        for head in range(query.shape[2]):
+            kv = head // group
+            scores = query[0, row, head].float() @ key[0, :valid, kv].float().T
+            weights = torch.softmax(scores * scale, dim=-1)
+            out[0, row, head] = weights @ value[0, :valid, kv].float()
+    return out
+
+
 def _case(tag, program, args, expected, kind="bits", tolerance=None):
     if isinstance(program, torch.nn.Module):
         program = to_edge(export(program, tuple(args))).exported_program()
@@ -273,6 +333,11 @@ def _case(tag, program, args, expected, kind="bits", tolerance=None):
         tolerance=tolerance,
         arena_bytes=len(arena.bytes),
     )
+
+
+def _tagged(cases, tag):
+    """One case by tag. Indexing the list would break when a case is added."""
+    return next(case for case in cases if case.tag == tag)
 
 
 def _cases():
@@ -372,6 +437,34 @@ def _cases():
         _bits(torch.neg(table[at : at + 3])),
     )
 
+    # Attention over a cache the graph already holds: three queries reading a
+    # 128-wide head out of an eight-row cache, with eight key heads shared by
+    # sixteen query heads.
+    #
+    # This only builds once something has registered llama.custom_sdpa, which is
+    # a C++ custom op: importing
+    # executorch.extension.llm.custom_ops.custom_ops does it. The case is kept
+    # behind that registration rather than importing it here because the
+    # attention kernel starts a worker pool at run time and hexagon-sim cannot
+    # start it -- qurt_cb_fwk_worker_init returns -4 and QuRT aborts -- so a blob
+    # that reaches the op takes the whole run down with it and the cases that do
+    # pass would stop being checked. STATUS.md has the detail.
+    batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim = 1, 3, 16, 8, 8, 128
+    query = _small((batch, qo_len, n_heads, head_dim))
+    cache_k = _small((batch, max_kv_len, n_kv_heads, head_dim))
+    cache_v = _small((batch, max_kv_len, n_kv_heads, head_dim))
+    if sdpa_targets():
+        attention = _case(
+            "P",
+            _attention_graph(
+                batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim
+            ),
+            (query, cache_k, cache_v),
+            _attention_reference(query, cache_k, cache_v).half(),
+        )
+    else:
+        attention = None
+
     return [
         shapes,
         mm,
@@ -384,6 +477,7 @@ def _cases():
         gated,
         absorbed,
         pinned,
+        *([attention] if attention is not None else []),
     ]
 
 
@@ -460,7 +554,8 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["L"] == [4], "the fp32 round trip left a command behind"
     assert kinds["N"] == [3, 4], "the dynamic slice is not a blit"
     assert any(
-        command.patch_param != 0xFFFFFFFF for command in cases[-1].commands
+        command.patch_param != 0xFFFFFFFF
+        for command in _tagged(cases, "N").commands
     ), "the dynamic slice has no patched parameter"
     for index in (3, 4, 5):
         assert any(

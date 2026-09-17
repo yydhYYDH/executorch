@@ -36,6 +36,7 @@ LAYER_NORM = 8
 UNARY = 4
 BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
+FLASH_ATTN = 18
 
 #: fp16, the only element size any op this backend emits carries.
 FP16_BYTES = 2
@@ -505,6 +506,51 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
     )
 
 
+def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
+    """Sync attention, over the cache the op was handed rather than one it keeps.
+
+    Query row q reads every cached position up to seq_current + q. The kernel
+    applies that causally by clamping the row length, not by filling a mask with
+    -inf, which is the same thing up to the softmax. Query head h reads key and
+    value head h // gqa_factor. The cache arrives twice, as the new keys and as
+    the past ones, because update_cache has already written the new rows by the
+    time attention runs, so the kernel's push copies each row onto itself and
+    this models the result rather than the copy.
+    """
+    qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim = params[:6]
+    scale = struct.unpack("<f", struct.pack("<i", params[6]))[0]
+    positions = seq_current + seq_add
+    if n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
+        raise UnsupportedOp(f"blob: {n_heads} heads over {n_kv_heads} kv heads")
+
+    def rows(ref, heads):
+        values = np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)
+        return values.reshape(-1, heads, head_dim).astype(np.float32)
+
+    query = rows(command.inputs[0], n_heads)
+    key = rows(command.inputs[4], n_kv_heads)
+    value = rows(command.inputs[5], n_kv_heads)
+    if query.shape[0] != qo_len or key.shape[0] < positions:
+        raise UnsupportedOp(
+            f"blob: {query.shape[0]} queries and a cache of {key.shape[0]} rows "
+            f"do not cover {qo_len} over {positions}"
+        )
+
+    group = n_heads // n_kv_heads
+    out = np.zeros((qo_len, n_heads, head_dim), dtype=np.float32)
+    for row in range(qo_len):
+        valid = min(seq_current + row + 1, positions)
+        for head in range(n_heads):
+            kv_head = head // group
+            scores = (query[row, head] @ key[:valid, kv_head].T) * scale
+            weights = np.exp(scores - scores.max())
+            weights /= weights.sum()
+            out[row, head] = weights @ value[:valid, kv_head]
+    _store(
+        arena, arena.address(command.outputs[0]), out.astype(np.float16).tobytes()
+    )
+
+
 _EXECUTORS = {
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
@@ -513,6 +559,7 @@ _EXECUTORS = {
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,
     BATCH_MATMUL: _run_batch_matmul,
+    FLASH_ATTN: _run_flash_attn,
 }
 
 

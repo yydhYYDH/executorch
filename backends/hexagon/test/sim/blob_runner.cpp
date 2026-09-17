@@ -50,11 +50,20 @@ extern "C" int htp_ops_raster_blit(uint8_t *dst, uint8_t **src, int src_number,
                                    int32_t bytes);
 extern "C" int htp_ops_unary(uint8_t *dst, uint8_t *src, int32_t size,
                              int32_t opType, int32_t bytes);
+extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v,
+                                  uint8_t *mask, uint8_t *workspace,
+                                  uint8_t *pastK, uint8_t *pastV, int32_t qo_len,
+                                  int32_t seq_current, int32_t seq_add,
+                                  int32_t n_heads, int32_t n_kv_heads,
+                                  int32_t head_dim, float scale,
+                                  int32_t mask_stride, int32_t max_kv_len,
+                                  int32_t value_c4);
 
 enum {
   kRasterBlit = 3,
   kUnary = 4,
   kLayerNorm = 8,
+  kFlashAttn = 18,
   kBinaryElementwise = 19,
   kSoftmax = 28,
   kReduction = 29,
@@ -149,6 +158,24 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header) {
   if (op.type == kSoftmax) {
     htp_ops_softmax(address(header, op.outputs[0]), address(header, op.inputs[0]),
                     params[0], params[1], params[2], params[3]);
+    return;
+  }
+  if (op.type == kFlashAttn) {
+    /* params[6] carries the scale as its float bits, the way the emitter packs
+     * it. The two slots after the mask are the past keys and values: the cache
+     * this op was handed, which the emitters pass rather than leaving empty,
+     * because the kernel writes through them before it computes anything. */
+    float scale;
+    memcpy(&scale, &params[6], 4);
+    htp_ops_flash_attn(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]), address(header, op.inputs[2]),
+        absent(op.inputs[3]) ? nullptr : address(header, op.inputs[3]),
+        address(header, op.outputs[1]),
+        absent(op.inputs[4]) ? nullptr : address(header, op.inputs[4]),
+        absent(op.inputs[5]) ? nullptr : address(header, op.inputs[5]),
+        params[0], params[1], params[2], params[3], params[4], params[5], scale,
+        params[7], params[8], params[11]);
     return;
   }
   if (op.type == kReduction) {
