@@ -12,6 +12,8 @@ third-party/mnn-htp-ops/src/dsp/execute_command.cc, and they are positional and
 unchecked: getting one wrong produces wrong numbers rather than an error.
 """
 
+import operator
+import os
 import struct
 from typing import Dict, List, NamedTuple, Optional
 
@@ -78,14 +80,49 @@ BINARY_OP_TYPES: Dict[str, int] = {
 FP16_BYTES = 2
 
 
+LAYER_NORM = exir_ops.edge.aten.layer_norm.default
+NATIVE_LAYER_NORM = exir_ops.edge.aten.native_layer_norm.default
+GETITEM = operator.getitem
+SOFTMAX_TARGETS = frozenset({exir_ops.edge.aten._softmax.default})
+
+
+def softmax_reduces_the_inner_axis(node: torch.fx.Node) -> bool:
+    """Whether this is the last-axis softmax the DSP kernel is right for.
+
+    The kernel's inside-greater-than-one path reduction over a strided span does
+    not agree with torch on hardware: [1,2,4,8] reduced over dim 1 came back with
+    eight of 64 elements past 1e-2, the worst by 1.1e-1, where the last-axis form
+    is exact to 4.9e-4. Until that path is checked against the kernel, a softmax
+    over anything but the last axis stays on the portable kernels.
+    """
+    return int(node.args[1]) in (-1, node.meta["val"].dim() - 1)
+
+
+def _value_of(node: torch.fx.Node) -> torch.Tensor:
+    """A node's value, or its first when the node hands out several.
+
+    native_layer_norm returns (out, mean, rstd), so the node's own value is the
+    tuple; the tensor the kernel reads is its first element.
+    """
+    value = node.meta["val"]
+    return value[0] if isinstance(value, tuple) else value
+
+
 def _numel(node: torch.fx.Node) -> int:
-    return node.meta["val"].numel()
+    return _value_of(node).numel()
 
 
-def _require_fp16(node: torch.fx.Node, what: str) -> None:
-    dtype = node.meta["val"].dtype
-    if dtype != torch.float16:
-        raise RuntimeError(f"hexagon: {what} must be fp16, got {dtype}")
+def _require_arena_dtype(node: torch.fx.Node, what: str) -> None:
+    """The two widths the arena holds, both of which reach the same fp16 command.
+
+    Every kernel reads and writes two bytes per element, and the runtime narrows
+    a fp32 operand and widens a fp32 result at the boundary, so a node the graph
+    declares fp32 is emitted exactly as its fp16 twin. Any other width would have
+    the kernels reading those bits as half floats.
+    """
+    dtype = _value_of(node).dtype
+    if dtype not in (torch.float16, torch.float32):
+        raise RuntimeError(f"hexagon: {what} must be fp16 or fp32, got {dtype}")
 
 
 def _float_bits(value: float) -> int:
@@ -421,7 +458,7 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
 def _unary(op_name: str):
     def emit(node: torch.fx.Node, ctx) -> TensorRef:
         src = node.args[0]
-        _require_fp16(node, f"unary {op_name} input")
+        _require_arena_dtype(node, f"unary {op_name} input")
         numel = _numel(node)
         out = ctx.result_for(node, numel)
         ctx.builder.add_op(
@@ -438,15 +475,27 @@ def _unary(op_name: str):
     return emit
 
 
-def _broadcast_strides(arg, out_shape):
-    """Row-major strides of arg over out_shape, zero on broadcast dimensions.
+def _shape_of(operand) -> tuple:
+    """An operand's shape: a node's value, a caller-given tuple, or a literal's ().
+
+    A literal is one element, which right-aligns and broadcasts the way a scalar
+    tensor does.
+    """
+    if isinstance(operand, torch.fx.Node):
+        return tuple(operand.meta["val"].shape)
+    if isinstance(operand, (tuple, list)):
+        return tuple(operand)
+    return ()
+
+
+def _broadcast_strides(shape, out_shape):
+    """Row-major strides of an operand of this shape, zero on broadcast dims.
 
     The DSP walks the output linearly and computes each operand's offset as
     sum(coord[d] * stride[d]), so a dimension of extent 1 contributes nothing.
     """
     rank = len(out_shape)
-    shape = tuple(arg.meta["val"].shape) if isinstance(arg, torch.fx.Node) else ()
-    padded = (1,) * (rank - len(shape)) + shape
+    padded = (1,) * (rank - len(shape)) + tuple(shape)
     strides = [0] * rank
     acc = 1
     for d in range(rank - 1, -1, -1):
@@ -456,16 +505,20 @@ def _broadcast_strides(arg, out_shape):
 
 
 def _broadcast_tail(lhs, rhs, out_shape):
-    """The 25 params the DSP's broadcast path reads from params[8]."""
+    """The 25 params the DSP's broadcast path reads from params[8].
+
+    Each operand is right-aligned against the output, which is torch's own rule,
+    so a broadcast operand's offsets come out the same either way.
+    """
     rank = len(out_shape)
     pad = 8 - rank
     return (
         [rank]
         + list(out_shape)
         + [0] * pad
-        + _broadcast_strides(lhs, out_shape)
+        + _broadcast_strides(_shape_of(lhs), out_shape)
         + [0] * pad
-        + _broadcast_strides(rhs, out_shape)
+        + _broadcast_strides(_shape_of(rhs), out_shape)
         + [0] * pad
     )
 
@@ -473,7 +526,7 @@ def _broadcast_tail(lhs, rhs, out_shape):
 def _binary(op_name: str):
     def emit(node: torch.fx.Node, ctx) -> TensorRef:
         lhs, rhs = node.args[0], node.args[1]
-        _require_fp16(node, f"binary {op_name} input")
+        _require_arena_dtype(node, f"binary {op_name} input")
 
         lhs_numel = _numel(lhs) if isinstance(lhs, torch.fx.Node) else 1
         rhs_numel = _numel(rhs) if isinstance(rhs, torch.fx.Node) else 1
@@ -520,11 +573,16 @@ def _loop_param(
     out_elems: int,
     in0_elems: int,
     in1_elems: int,
+    steps=(0, 0, 0),
 ):
     """The descriptor BATCH_MATMUL reads out of params[1:].
 
     Sizes are in elements and strides in bytes. The DSP settles that by
     dividing the stride terms by the element size before bounds-checking them.
+
+    With the three iter operands absent the DSP numbers every iteration itself,
+    so an iteration's base is steps[i] * iter, in elements: one stride per
+    operand, which is how a batch walks from one tile to the next.
     """
     packed = _LOOP_PARAM.pack(
         loop_number,
@@ -532,9 +590,7 @@ def _loop_param(
         *dst_stride,
         *src0_stride,
         *src1_stride,
-        0,
-        0,
-        0,  # cmdSteps: unused while the three iter operands are absent
+        *steps,
         0,
         0,
         0,  # cmdViewOffset: every operand starts at its own base
@@ -656,15 +712,42 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
-def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
-    """aten.mm as BATCH_MATMUL with a single loop iteration.
+def _matmul_command(ctx, lhs, rhs, out, batches: int, m: int, k: int, n: int) -> None:
+    """One BATCH_MATMUL over contiguous (m, k) @ (k, n) tiles.
 
     The DSP takes dst from mapped_ptrs[inputs->size()] and reads iter0..2 out of
     slots 2..4, so the three unused iterators still have to be present as absent
-    operands rather than dropped.
+    operands rather than dropped. A batch is the same tile geometry repeated,
+    which the steps in the descriptor walk: one whole tile of each operand per
+    iteration. A single iteration is mm, where those steps are unreachable and
+    stay zero.
     """
+    steps = (m * n, m * k, k * n) if batches > 1 else (0, 0, 0)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_BATCH_MATMUL,
+            inputs=[lhs, rhs, ABSENT, ABSENT, ABSENT],
+            outputs=[out],
+            params=[FP16_BYTES]
+            + _loop_param(
+                batches,
+                (m, k, n),
+                (n * FP16_BYTES, 0, FP16_BYTES),
+                (k * FP16_BYTES, FP16_BYTES, 0),
+                (0, n * FP16_BYTES, FP16_BYTES),
+                batches * m * n,
+                batches * m * k,
+                batches * k * n,
+                steps=steps,
+            ),
+        )
+    )
+
+
+def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.mm as BATCH_MATMUL with a single loop iteration."""
     lhs, rhs = node.args[0], node.args[1]
-    _require_fp16(node, "mm")
+    _require_arena_dtype(node, "mm")
     lhs_val, rhs_val = lhs.meta["val"], rhs.meta["val"]
     if not (lhs_val.is_contiguous() and rhs_val.is_contiguous()):
         raise RuntimeError("hexagon: mm operands must be contiguous; strides come from shape")
@@ -674,22 +757,74 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
         raise RuntimeError(f"hexagon: mm contracts {k} against {contracted}")
 
     out = ctx.result_for(node, m * n)
+    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), out, 1, m, k, n)
+    return ctx.record(node, out)
+
+
+def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.bmm as one BATCH_MATMUL, one iteration per batch element.
+
+    Both operands are contiguous stacks of tiles, so each step is one whole
+    tile of the operand it belongs to.
+    """
+    lhs, rhs = node.args[0], node.args[1]
+    _require_arena_dtype(node, "bmm")
+    lhs_val, rhs_val = lhs.meta["val"], rhs.meta["val"]
+    if not (lhs_val.is_contiguous() and rhs_val.is_contiguous()):
+        raise RuntimeError("hexagon: bmm operands must be contiguous; strides come from shape")
+    batches, m, k = lhs_val.shape
+    rhs_batches, contracted, n = rhs_val.shape
+    if batches != rhs_batches or k != contracted:
+        raise RuntimeError(
+            f"hexagon: bmm contracts {batches}x{k} against {rhs_batches}x{contracted}"
+        )
+
+    out = ctx.result_for(node, batches * m * n)
+    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), out, batches, m, k, n)
+    return ctx.record(node, out)
+
+
+def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.addmm as the matmul plus the bias the graph would add after it.
+
+    The kernel has no bias operand, so the sum is a second command. The bias is
+    one row or one column over the tile the matmul writes, and the broadcast
+    path the other binary ops already use repeats it with a zero stride on the
+    dimensions it is broadcast along.
+    """
+    bias, lhs, rhs = node.args[0], node.args[1], node.args[2]
+    beta = _scalar_arg(node, "beta", 3, 1.0)
+    _require_arena_dtype(node, "addmm")
+    m, k = lhs.meta["val"].shape
+    contracted, n = rhs.meta["val"].shape
+    if k != contracted:
+        raise RuntimeError(f"hexagon: addmm contracts {k} against {contracted}")
+    if beta is None or beta not in (0.0, 1.0):
+        raise RuntimeError(f"hexagon: addmm beta {beta} is neither 0 nor 1")
+
+    out = ctx.result_for(node, m * n)
+    # beta == 0 folds the bias away and leaves mm, so there is nothing to add.
+    target = out if beta == 0.0 else ctx.builder.add_activation(m * n * FP16_BYTES)
+    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), target, 1, m, k, n)
+    if beta == 0.0:
+        return ctx.record(node, out)
+
     ctx.builder.add_op(
         Op(
-            type=DSP_OP_BATCH_MATMUL,
-            inputs=[ctx.operand(lhs), ctx.operand(rhs), ABSENT, ABSENT, ABSENT],
+            type=DSP_OP_BINARY_ELEMENTWISE,
+            inputs=[target, ctx.operand(bias)],
             outputs=[out],
-            params=[FP16_BYTES]
-            + _loop_param(
-                1,
-                (m, k, n),
-                (n * FP16_BYTES, 0, FP16_BYTES),
-                (k * FP16_BYTES, FP16_BYTES, 0),
-                (0, n * FP16_BYTES, FP16_BYTES),
+            params=[
                 m * n,
-                m * k,
-                k * n,
-            ),
+                m * n,
+                _numel(bias) if isinstance(bias, torch.fx.Node) else 1,
+                BINARY_OP_TYPES["add"],
+                FP16_BYTES,
+                FP16_BYTES,
+                0,  # inputs are not 4-byte floats
+                0,  # output is not a 4-byte float
+                *_broadcast_tail((m, n), bias, (m, n)),
+            ],
         )
     )
     return ctx.record(node, out)
@@ -702,7 +837,7 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
     reduced dims have to be adjacent; the caller's support check enforces that.
     """
     src = node.args[0]
-    _require_fp16(node, "mean")
+    _require_arena_dtype(node, "mean")
     dims = node.args[1]
     dims = [dims] if isinstance(dims, int) else list(dims)
     shape = src.meta["val"].shape
@@ -735,7 +870,7 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
 
 def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
     src = node.args[0]
-    _require_fp16(node, "softmax input")
+    _require_arena_dtype(node, "softmax input")
     dim = int(node.args[1])
     shape = list(node.meta["val"].shape)
 
@@ -773,7 +908,7 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     a live address the kernel would read as data.
     """
     source, eps = node.args
-    _require_fp16(node, "rms_norm input")
+    _require_arena_dtype(node, "rms_norm input")
     inner = int(node.meta["val"].shape[-1])
     out = ctx.result_for(node, _numel(node))
     ctx.builder.add_op(
@@ -789,15 +924,58 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def layer_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The layer norm a getitem reads, when it reads the first output.
+
+    native_layer_norm returns (out, mean, rstd) and the DSP has a command for
+    out alone, so getitem 0 is the only reader a partition can carry.
+    """
+    if node.target is not GETITEM or len(node.args) != 2:
+        return None
+    source, index = node.args
+    if index != 0 or not isinstance(source, torch.fx.Node):
+        return None
+    return source if source.target is NATIVE_LAYER_NORM else None
+
+
+def layer_norm_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this layer norm takes the output the kernel writes.
+
+    mean and rstd come out of the same node and nothing here produces them, so a
+    graph that reads either one keeps the whole node on the portable kernels --
+    along with the readers of out, which would otherwise be left holding a tuple
+    no kernel can be handed.
+    """
+    return bool(node.users) and all(
+        layer_norm_getitem(reader) is node for reader in node.users
+    )
+
+
+def layer_norm_normalizes_the_trailing_dims(node: torch.fx.Node) -> bool:
+    """Whether the kernel's outer-times-inner view of the input is this norm's.
+
+    The command describes the norm as one inner span repeated outer times, which
+    only matches a normalized shape covering the trailing dims; any other shape
+    would read a span the kernel was never told about.
+    """
+    shape = list(_value_of(node).shape)
+    normalized = list(node.args[1])
+    if len(normalized) > len(shape):
+        return False
+    return [int(size) for size in normalized] == shape[len(shape) - len(normalized):]
+
+
 def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
     src = node.args[0]
     normalized_shape = node.args[1]
-    weight = node.args[2] if len(node.args) > 2 else None
-    bias = node.args[3] if len(node.args) > 3 else None
-    eps = float(node.args[4]) if len(node.args) > 4 else 1e-5
+    positional = dict(enumerate(node.args))
+    weight = node.kwargs.get("weight", positional.get(2))
+    bias = node.kwargs.get("bias", positional.get(3))
+    eps = _scalar_arg(node, "eps", 4, 1e-5)
 
-    _require_fp16(node, "layer_norm input")
-    shape = list(node.meta["val"].shape)
+    _require_arena_dtype(node, "layer_norm input")
+    value = _value_of(node)
+    shape = list(value.shape)
     inner = 1
     for size in normalized_shape:
         inner *= int(size)
@@ -805,22 +983,85 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
     for size in shape[: len(shape) - len(list(normalized_shape))]:
         outer *= int(size)
 
-    out = ctx.result_for(node, _numel(node))
+    # native_layer_norm hands its result on through a getitem, and that getitem
+    # is what downstream reads, so its output slot is the one to fill.
+    sink = next(
+        (reader for reader in node.users if layer_norm_getitem(reader) is node),
+        node,
+    )
+    numel = value.numel()
+    out = ctx.result_for(sink, numel)
+
+    # The kernel reads gamma and beta as fp32 and the affine step cannot be
+    # baked in: a subgraph carries no tensors, its weights arrive as delegate
+    # inputs at the width the arena holds. So the norm runs without them and the
+    # affine is the same pair of elementwise commands rms_norm uses for its
+    # scale. The cost is one rounding to fp16 before the multiply and one after
+    # the add; the kernels are fp16 in and out regardless.
+    affine = [(arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None]
+    normalized = (
+        ctx.builder.add_activation(numel * FP16_BYTES) if affine else out
+    )
     ctx.builder.add_op(
         Op(
             type=DSP_OP_LAYER_NORM,
-            # Order matters: dst is the DSP's mapped_ptrs[3], so this must be
-            # exactly src, gamma, beta.
-            inputs=[
-                ctx.operand(src),
-                ctx.constant(weight, dtype=torch.float32) if weight is not None else ABSENT,
-                ctx.constant(bias, dtype=torch.float32) if bias is not None else ABSENT,
-            ],
-            outputs=[out],
+            # Order matters: dst is the DSP's mapped_ptrs[3], so the three
+            # inputs must be exactly src, gamma, beta -- null here, which the
+            # kernel tests for and skips.
+            inputs=[ctx.operand(src), ABSENT, ABSENT],
+            outputs=[normalized],
             params=[outer, inner, _float_bits(eps), 0],
         )
     )
+
+    result = normalized
+    for index, (arg, kind) in enumerate(affine):
+        target = out if index == len(affine) - 1 else ctx.builder.add_activation(numel * FP16_BYTES)
+        ctx.builder.add_op(
+            Op(
+                type=DSP_OP_BINARY_ELEMENTWISE,
+                inputs=[result, ctx.operand(arg)],
+                outputs=[target],
+                params=[
+                    numel,
+                    numel,
+                    _numel(arg),
+                    BINARY_OP_TYPES[kind],
+                    FP16_BYTES,
+                    FP16_BYTES,
+                    0,  # inputs are not 4-byte floats
+                    0,  # output is not a 4-byte float
+                    *_broadcast_tail((outer, inner), tuple(arg.meta["val"].shape), (outer, inner)),
+                ],
+            )
+        )
+        result = target
+
     return ctx.record(node, out)
+
+
+def _emit_getitem(node: torch.fx.Node, ctx) -> TensorRef:
+    """Re-points the layer norm result, the only getitem this backend takes."""
+    return ctx.record(node, ctx.operand(node.args[0]))
+
+
+def _scalar_arg(node: torch.fx.Node, name: str, index: int, default: float):
+    """A scalar argument from wherever the graph put it, or None if it is not one.
+
+    The graph keeps a keyword argument in kwargs and a positional one in args,
+    and the two are the same number to the op; a value that is neither is a
+    run-time tensor, which no emitter here can fold. None says so rather than
+    reporting the default, so a caller cannot read it as agreement.
+    """
+    if name in node.kwargs:
+        value = node.kwargs[name]
+    elif len(node.args) > index:
+        value = node.args[index]
+    else:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
 def _scalar_source(arg):
@@ -866,7 +1107,7 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     runs, and the cache is written in place.
     """
     args = node.args
-    query, key = args[0], args[1]
+    query, key, value = args[0], args[1], args[2]
     # Unlike the other ops, attention accepts fp32: the runtime narrows those
     # operands to fp16 as they enter the arena, so the DSP still sees fp16.
     _dtype = node.meta["val"].dtype
@@ -878,13 +1119,38 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     q_shape = query.meta["val"].shape
     kv_shape = key.meta["val"].shape
 
+    # The kernel sizes and indexes this source as [batch, seq, heads, dim]:
+    # attention_entry.cc strides it by tokens * heads * headDim, which is the
+    # layout the upstream caller builds by transposing a head-major cache
+    # (examples/models/llama/source_transformation/sdpa.py), and the layout the
+    # vision path hands the same kernel. Slots four and five are the packed cache
+    # the kernel writes, not the cache itself -- attn_hmx_k_tile_index lays it
+    # out by tile: 256 tokens per block, eight 32-row sequence tiles per block,
+    # one 1024-element tile per (32 dim x 32 seq) sub-block. Any cache length
+    # pays for whole blocks, the same span attention_entry.cc sizes its own
+    # packed K/V to.
+    if len(kv_shape) != 4 or kv_shape[3] != q_shape[3]:
+        raise RuntimeError(f"hexagon: sdpa cache {tuple(kv_shape)} does not match head_dim {q_shape[3]}")
+    # Slots one and two reach the kernel as [batch, seq, heads, dim]: the
+    # partitioner hands them the stored cache, and a caller that keeps its cache
+    # head-major transposes it into that layout before the op.
+    n_kv_heads, max_kv_len = kv_shape[2], kv_shape[1]
+    if not 0 < n_kv_heads <= q_shape[2] or q_shape[2] % n_kv_heads:
+        raise RuntimeError(
+            "hexagon: sdpa cache operand is not [batch, seq, heads, dim]"
+            f" (heads {n_kv_heads} of {q_shape[2]} from {tuple(kv_shape)})"
+        )
+    seq_blocks = (max_kv_len + 255) // 256
+    dim_tiles = (q_shape[3] + 31) // 32
+    packed_bytes = seq_blocks * n_kv_heads * 8 * dim_tiles * 1024 * FP16_BYTES
+
     inputs = [
         ctx.operand(args[0]),
         ctx.operand(args[1]),
         ctx.operand(args[2]),
         ABSENT if mask is None else ctx.operand(mask),
-        ctx.operand(args[1]),
-        ctx.operand(args[2]),
+        ctx.builder.add_activation(packed_bytes),
+        ctx.builder.add_activation(packed_bytes),
     ]
     # The position tensor is not an operand of this op, so it rides along as an
     # extra input the kernel never reads. See STATUS.md.
@@ -908,8 +1174,15 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     # pass the rows that exist, so this asks for the longest sequence the cache
     # could hold rather than the one this call happens to use.
     workspace = ctx.builder.add_activation(
-        _attention_workspace_bytes(q_shape[1], q_shape[1] + kv_shape[1], q_shape[2])
+        _attention_workspace_bytes(q_shape[1], q_shape[1] + max_kv_len, q_shape[2])
     )
+
+    # HEXAGON_ATTN_PAGED=1 takes the paged entry (htp_ops_flash_attn_pages) that MNN's
+    # HexagonAttention.cpp always uses: one page spanning the whole packed cache, so the
+    # buffer layout is unchanged. page_size must be a multiple of 32 and must exceed
+    # seq_current, or push_kv_pages skips the insert.
+    paged = bool(os.environ.get("HEXAGON_ATTN_PAGED"))
+    page_size = seq_blocks * 256 if paged else 0
 
     ctx.builder.add_op(
         Op(
@@ -921,15 +1194,17 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
                 position,  # seq_current
                 q_shape[1],  # seq_add
                 q_shape[2],  # n_heads
-                kv_shape[2],  # n_kv_heads
+                n_kv_heads,  # n_kv_heads
                 q_shape[3],  # head_dim
                 _float_bits(
                     scale if isinstance(scale, (int, float)) else q_shape[3] ** -0.5
                 ),
                 -1,  # mask_stride
-                kv_shape[1],  # max_kv_len
-                0,  # page_count: the paged paths need fds, which only exist at load
-                0,  # page_size
+                # push_kv only reads this as the capacity its writes must stay
+                # inside, so it is the operand's length, not the cache's.
+                seq_blocks * 256,  # max_kv_len
+                1 if paged else 0,  # page_count
+                page_size,  # page_size
                 0,  # value_c4
             ],
             patch=patch,
@@ -958,8 +1233,15 @@ EMITTERS = {
     # to_edge rewrites softmax.int into _softmax, which is the name the
     # partitioner then sees.
     exir_ops.edge.aten._softmax.default: _emit_softmax,
+    # to_edge grows native_layer_norm out of layer_norm; the functional form is
+    # kept for a graph that reaches the backend without that rewrite.
     exir_ops.edge.aten.layer_norm.default: _emit_layer_norm,
+    NATIVE_LAYER_NORM: _emit_layer_norm,
+    # The getitem that reads a layer norm's first output.
+    GETITEM: _emit_getitem,
     exir_ops.edge.aten.mm.default: _emit_mm,
+    exir_ops.edge.aten.bmm.default: _emit_bmm,
+    exir_ops.edge.aten.addmm.default: _emit_addmm,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
@@ -993,6 +1275,13 @@ BINARY_TARGETS = frozenset(
 # Same reasoning as BINARY_TARGETS: mm derives its strides from the operand
 # shapes, which is only right for contiguous 2-D tiles.
 MM_TARGETS = frozenset({exir_ops.edge.aten.mm.default})
+
+# bmm is the same tile geometry with a batch axis in front of both operands.
+BMM_TARGETS = frozenset({exir_ops.edge.aten.bmm.default})
+
+# addmm needs the bias it can broadcast and an alpha it can fold away, so what
+# the emitter accepts is narrower than the op's own contract.
+ADDMM_TARGETS = frozenset({exir_ops.edge.aten.addmm.default})
 
 # REDUCTION collapses one contiguous span, so the reduced dims must be adjacent.
 MEAN_TARGETS = frozenset({exir_ops.edge.aten.mean.dim})
@@ -1032,6 +1321,22 @@ CAST_TARGETS = frozenset(
     }
 )
 
+# The DSP's attention entry point is written for `sdpa_with_kv_cache`: key and
+# value are the new tokens, which the kernel pushes into a cache it is handed as
+# two further operands. The graph carries `custom_sdpa`, whose key and value
+# *are* the caches and which has no cache operand at all, so the two contracts
+# do not meet. `_emit_sdpa` bridges them by leaving both cache operands ABSENT,
+# which the dispatcher maps to a null pointer, and the kernel writes the new rows
+# through it: the DSP dies with `execute_command_group failed: 0x8000040d` on
+# the first layer. Two of its params are wrong for the same reason -- the key
+# operand it ships is the permuted cache, so n_kv_heads and max_kv_len are read
+# off the wrong axes.
+#
+# Delegating attention is therefore off until the emitter is rewritten against
+# the kernel (and the kernel validated). Attention stays on the portable
+# kernels, which costs speed and not correctness. See STATUS.md.
+SDPA_DELEGATION = True
+
 # The fused attention belongs to the LLM extension, whose schema only appears
 # once that extension registers its ops -- which happens after this module is
 # imported. Resolving it here would bake in an empty set, so it is resolved on
@@ -1044,6 +1349,8 @@ SDPA_TARGETS: frozenset = frozenset()
 def _register_llama_sdpa() -> None:
     global SDPA_TARGETS
     if SDPA_TARGETS:
+        return
+    if not SDPA_DELEGATION:
         return
     op = getattr(getattr(exir_ops.edge, "llama", None), "custom_sdpa", None)
     if op is None:

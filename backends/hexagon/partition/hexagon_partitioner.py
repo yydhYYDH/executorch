@@ -9,11 +9,22 @@ from typing import Dict, final, Set
 import torch
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend, SUPPORTED_TARGETS
 from executorch.backends.hexagon.hexagon_ops import (
+    _scalar_arg,
     _scalar_source,
+    ADDMM_TARGETS,
     ALIAS_TARGETS,
+    BMM_TARGETS,
     CAST_TARGETS,
     BINARY_TARGETS,
+    GETITEM,
+    LAYER_NORM,
+    layer_norm_getitem,
+    layer_norm_is_emittable,
+    layer_norm_normalizes_the_trailing_dims,
     MEAN_TARGETS,
+    NATIVE_LAYER_NORM,
+    softmax_reduces_the_inner_axis,
+    SOFTMAX_TARGETS,
     cat_region,
     CAT_TARGETS,
     MM_TARGETS,
@@ -39,8 +50,18 @@ from torch.export import ExportedProgram
 from torch.fx.passes.operator_support import OperatorSupportBase
 
 
+# Emitters that store a constant at the width their kernel reads rather than the
+# graph's own, so the weight does not have to be fp16 for them.
+FP32_CONSTANT_TARGETS = frozenset({LAYER_NORM, NATIVE_LAYER_NORM})
+
+
 def _dtype_of(node: torch.fx.Node):
-    return getattr(node.meta.get("val"), "dtype", None)
+    val = node.meta.get("val")
+    # A multi-output op carries the whole tuple as its value; the first tensor is
+    # the one the kernels read, so that is the width the gate is about.
+    if isinstance(val, tuple):
+        val = val[0] if val else None
+    return getattr(val, "dtype", None)
 
 
 def _sdpa_fits_dsp_limits(node: torch.fx.Node) -> bool:
@@ -102,6 +123,93 @@ def _mm_operands_fit_flat_path(node: torch.fx.Node) -> bool:
         and rhs_val.is_contiguous()
         and lhs_val.shape[1] == rhs_val.shape[0]
     )
+
+
+def _batched_operands_fit(node: torch.fx.Node) -> bool:
+    """Whether bmm's operands are the contiguous 3-D stacks the emitter assumes.
+
+    The batch axis has to be there on both operands and the contraction has to
+    line up, because the emitter derives one tile geometry and one step from the
+    shapes and cannot describe a broadcast batch.
+    """
+    lhs, rhs = node.args[0], node.args[1]
+    if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
+        return False
+    lhs_val, rhs_val = lhs.meta.get("val"), rhs.meta.get("val")
+    if lhs_val is None or rhs_val is None:
+        return False
+    return (
+        lhs_val.dim() == 3
+        and rhs_val.dim() == 3
+        and lhs_val.is_contiguous()
+        and rhs_val.is_contiguous()
+        and lhs_val.shape[0] == rhs_val.shape[0]
+        and lhs_val.shape[2] == rhs_val.shape[1]
+        and _fits_int32_offsets(node, lhs_val, rhs_val)
+    )
+
+
+def _fits_int32_offsets(node: torch.fx.Node, *operands) -> bool:
+    """Whether the sizes and steps the descriptor carries fit an int32.
+
+    The DSP computes an iteration's base as step * iter in int32, so a tile
+    large enough to overflow it would land somewhere else in the arena rather
+    than fail.
+    """
+    result = node.meta.get("val")
+    if result is None:
+        return False
+    values = [operand.numel() for operand in operands]
+    values.append(result.numel())
+    return all(0 < value < 2**31 for value in values)
+
+
+def _addmm_fits_flat_path(node: torch.fx.Node) -> bool:
+    """Whether addmm is one matmul plus a bias the DSP's broadcast can repeat.
+
+    alpha has no kernel here, so only 1 is emittable and the rest has to stay on
+    a portable kernel. beta is the bias's own scale: 0 drops it, 1 keeps it, and
+    anything else would need a multiply this does not emit. The bias is read
+    right-aligned against the 2-D result, so it cannot have more axes than that
+    and it must be a tensor the delegate can reach.
+    """
+    if len(node.args) < 3:
+        return False
+    mat1, mat2 = node.args[1], node.args[2]
+    if not (isinstance(mat1, torch.fx.Node) and isinstance(mat2, torch.fx.Node)):
+        return False
+    alpha = _scalar_arg(node, "alpha", 4, 1.0)
+    if alpha != 1.0:
+        return False
+    beta = _scalar_arg(node, "beta", 3, 1.0)
+    if beta not in (0.0, 1.0):
+        return False
+    mat1_val, mat2_val = mat1.meta.get("val"), mat2.meta.get("val")
+    if mat1_val is None or mat2_val is None:
+        return False
+    if not (
+        mat1_val.dim() == 2
+        and mat2_val.dim() == 2
+        and mat1_val.is_contiguous()
+        and mat2_val.is_contiguous()
+        and mat1_val.shape[1] == mat2_val.shape[0]
+    ):
+        return False
+    if beta == 0.0:
+        return _fits_int32_offsets(node, mat1_val, mat2_val)
+    bias = node.args[0]
+    if not isinstance(bias, torch.fx.Node):
+        return False
+    bias_val = bias.meta.get("val")
+    if bias_val is None or bias_val.dim() > 2:
+        return False
+    # Whatever torch broadcasts the bias to is what the DSP repeats, so the only
+    # question left is whether the strides it walks can reach it.
+    try:
+        torch.broadcast_shapes(tuple(bias_val.shape), tuple(mat1_val.shape[:1] + mat2_val.shape[1:]))
+    except RuntimeError:
+        return False
+    return _fits_int32_offsets(node, mat1_val, mat2_val, bias_val)
 
 
 def _mean_reduces_one_span(node: torch.fx.Node) -> bool:
@@ -193,24 +301,44 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target not in SUPPORTED_TARGETS:
             return False
         dtype = _dtype_of(node)
-        if dtype is not torch.float16:
-            # Attention is the one op whose fp32 operands are narrowed to fp16
-            # on the way into the arena, so it is the one op that may be fp32.
-            # A cast between the two widths is the other: the runtime performs it
-            # on whichever side of the boundary the cast ends up.
-            absorbed = node.target in sdpa or (
-                node.target in CAST_TARGETS and _cast_stays_in_fp16(node)
-            )
-            if dtype is not torch.float32 or not absorbed:
-                return False
+        if dtype not in (torch.float16, torch.float32):
+            # Both widths the arena holds are emittable: every kernel reads and
+            # writes two bytes per element, the runtime narrows a fp32 operand on
+            # the way in and widens a fp32 result on the way out, so one declared
+            # fp32 emits the same commands as its fp16 twin. Any other width
+            # would leave the kernels reading int64 bits as half floats.
+            return False
         if node.target in sdpa and not _sdpa_fits_dsp_limits(node):
             return False
         if node.target in BINARY_TARGETS and not _broadcast_fits_dsp_limits(node):
             return False
         if node.target in MM_TARGETS and not _mm_operands_fit_flat_path(node):
             return False
+        if node.target in BMM_TARGETS and not _batched_operands_fit(node):
+            return False
+        if node.target in ADDMM_TARGETS and not _addmm_fits_flat_path(node):
+            return False
         if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
             return False
+        if node.target in (LAYER_NORM, NATIVE_LAYER_NORM):
+            # A run-time epsilon is not a number the command can carry, and a
+            # normalized shape that is not the trailing dims is a span the kernel
+            # would read wrong rather than refuse.
+            if _scalar_arg(node, "eps", 4, 1e-5) is None:
+                return False
+            if not layer_norm_normalizes_the_trailing_dims(node):
+                return False
+            if node.target is NATIVE_LAYER_NORM and not layer_norm_is_emittable(node):
+                return False
+        if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
+            return False
+        if node.target is GETITEM:
+            # The getitem that reads a layer norm's first output is the one this
+            # backend can place; every other getitem (a split's, for one) has no
+            # producer here.
+            source = layer_norm_getitem(node)
+            if source is None or not layer_norm_is_emittable(source):
+                return False
         if _emits_no_command(node) and not _alias_keeps_the_same_bytes(node):
             # A narrowing select reaches the same emitter through its own region
             # rather than by re-pointing, so the alias test is not the last word.
@@ -224,14 +352,23 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target is UPDATE_CACHE and update_cache_layout(node) is None:
             return False
-        return all(
-            isinstance(arg, torch.fx.Node)
-            and (arg.op != "get_attr" or _dtype_of(arg) is torch.float16)
-            for arg in node.args
-            # None is a legitimate argument (custom_sdpa passes no mask), so it
-            # must be excluded here rather than rejected by the Node test.
-            if not isinstance(arg, (int, float, bool, list, tuple, type(None)))
-        )
+        for arg in node.args:
+            # None is a legitimate argument (custom_sdpa passes no mask), so a
+            # literal is excluded here rather than rejected by the Node test.
+            if isinstance(arg, (int, float, bool, list, tuple, type(None))):
+                continue
+            if not isinstance(arg, torch.fx.Node):
+                return False
+            # A weight has to be the width the arena holds, except where the
+            # emitter converts it itself because the kernel reads that width:
+            # layer norm's gamma and beta are fp32 on the DSP.
+            if (
+                arg.op == "get_attr"
+                and node.target not in FP32_CONSTANT_TARGETS
+                and _dtype_of(arg) is not torch.float16
+            ):
+                return False
+        return True
 
 
 @final
