@@ -8,6 +8,7 @@
 - `/cortex-m` - Build, test, or develop the Cortex-M backend
 - `/binary-size` - Analyze and reduce binary size
 - `/qualcomm` - Build, test, or develop the QNN (Qualcomm AI Engine Direct) backend
+- `/hexagon` - Build, test, or develop the Hexagon DSP backend (no QNN)
 - `/executorch-kb` - Search tribal knowledge base (known issues, quant recipes, debugging guides)
 
 Reference docs in `.claude/`: backends, runtime-api, quantization, llm-export, faq, tokenizers

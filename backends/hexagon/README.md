@@ -42,32 +42,47 @@ reorder is delegated to `htp_ops_weight_reorder` at init instead.
 **Init.** `HexagonBackend::init` opens the FastRPC session, picks the skel for
 the device's arch, and turns the blob into the wire format the DSP wants:
 
-1. allocate one shared arena, copy the weights in,
+1. allocate the delegate's resident block and copy the weights in,
 2. build one `DSPCOMMAND::Command` FlatBuffer per op and one `SyncGroup`,
-3. fill the command group array with `(arena_fd, command_offset, size)`.
+3. fill the command group array with `(resident_fd, command_offset, size)`.
 
 Everything after this point is addressed by fd and offset only.
 
-**Execute.** Copy the method's inputs into their arena slots, flush the host
+**Execute.** Copy the method's inputs into their scratch slots, flush the host
 cache, issue the single `execute_command_group` RPC, invalidate, copy the
 outputs back out.
 
 ## Memory and cache protocol
 
+A delegate's memory is two blocks, because a model can hold hundreds of
+delegates and the DSP's rpcmem heap holds a few gigabytes:
+
+- the **resident** block is written once at init and read on every execute:
+  command descriptors, sync group, command group and weights. It stays private
+  to the delegate.
+- the **scratch** block holds the method inputs, the activations and the method
+  outputs. Nothing in it outlives an execute -- inputs are copied in and outputs
+  are copied out, both inside `execute()` -- and a graph runs one delegate at a
+  time, so `SharedArenaPool` keeps one block per size and hands the same block
+  to every delegate that needs that size. Subgraphs repeat shapes, so a model
+  with hundreds of delegates over a handful of shapes holds a handful of blocks.
+
 The DSP reaches buffers through `HAP_mmap_get(fd)`, which resolves the fd to the
 base of its FastRPC mapping. Consequences the host code has to respect:
 
-- Every arena buffer is `rpcmem_alloc` + `fastrpc_mmap(..., FASTRPC_MAP_FD)`.
-  Without the mmap the DSP has no address for the fd.
+- Every block is `rpcmem_alloc` + `fastrpc_mmap(..., FASTRPC_MAP_FD)`. Without
+  the mmap the DSP has no address for the fd.
 - `FASTRPC_MAP_FD` puts cache maintenance on the caller, so a host write is
   flushed before the DSP reads it and a DSP write is invalidated before the host
   reads it.
 - `Alloc()` may return a pointer inside its mapping to satisfy an alignment, so
-  every offset handed to the DSP is biased by `HexagonDriver::MappingOffset()`.
+  every offset handed to the DSP is biased by the offset the `Arena` it returns
+  carries. Tensors and command entries each name the fd of the block their
+  offset is measured in.
 
 `rpcmem_cache_flush`/`rpcmem_cache_invalidate` exist on the device but are
 absent from the SDK's link-time `libcdsprpc.so`, so the driver resolves them
-with `dlsym`. When they are missing, the arena is allocated uncached
+with `dlsym`. When they are missing, the blocks are allocated uncached
 (`RPCMEM_FLAG_UNCACHED`) and the flush/invalidate calls become no-ops: slower
 host access, but no chance of a stale cache line reaching the DSP.
 
@@ -211,9 +226,11 @@ Not done yet:
   take fp16 in and out. `STATUS.md` has the measurements and the limits of what
   the cast absorption covers;
 - the quantized matmul path, which needs the pack64 repack described above;
-- layer norm is not reachable yet: `to_edge` turns it into
-  `native_layer_norm`, which returns three tensors, so it needs the aliasing
-  machinery for multi-output ops before it can be delegated.
+- softmax is delegated on its last axis only. The kernel's strided path, for a
+  reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
+  reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
+  1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
+  keeps that form off the delegate until the kernel is checked.
 
 ## Open design points
 

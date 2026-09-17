@@ -70,9 +70,11 @@ whole export.
 
 Of the 24 registered emitters, 5 have produced a DSP command on a real graph --
 `mm`, `mul`, `add`, `neg`, `custom_sdpa` -- and 4 more have run without
-emitting one (the views below). The rest are unexercised, and
-`aten.layer_norm.default` is unreachable as written because `to_edge` rewrites
-it to `native_layer_norm`, which returns three tensors.
+emitting one (the views below). The rest are unexercised.
+`layer_norm` is registered through the `native_layer_norm` that `to_edge`
+rewrites it to, plus the `getitem 0` that carries its first output; its kernel
+reads gamma and beta as fp32, which no delegate input can hold, so the norm runs
+without them and the affine is a mul and an add (see `_emit_layer_norm`).
 
 ## Views
 
