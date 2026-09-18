@@ -500,9 +500,8 @@ static inline void htp_ops_loop_hmx_pack_activation_tile(__fp16* dst, const uint
     }
 }
 
-static inline void htp_ops_loop_hmx_pack_weight_tile(__fp16* dst, const uint8_t* src1Base,
+static inline void htp_ops_loop_hmx_pack_weight_tile(__fp16* tile, const uint8_t* src1Base,
                                                     const HtpOpsLoopParam* lp, int K, int N, int nt, int kt) {
-    __fp16* tile = dst + ((size_t)nt * htp_ops_loop_up_div(K, 32) + kt) * 1024;
     memset(tile, 0, 1024 * sizeof(__fp16));
     int kBegin = kt * 32;
     int kRemain = K - kBegin;
@@ -616,9 +615,34 @@ static inline bool htp_ops_loop_matmul_prefer_hmx_general(int K, int N) {
 #endif
 }
 
+// hmxFlags of a host that planned the tile budget: bit 0 marks weights already
+// stored in the order the unit reads them.
+static constexpr int32_t kHmxPlanMagic = 0x484D58;
+static constexpr int32_t kHmxPlanPrepackedWeights = 1;
+
+static inline bool htp_ops_loop_hmx_planned(const HtpOpsLoopParam* lp, bool* prepacked,
+                                            int* tileBudget) {
+    *prepacked = false;
+    *tileBudget = 0;
+    if (lp->hmxFlags != (kHmxPlanMagic | (lp->hmxFlags & kHmxPlanPrepackedWeights))) {
+        return false;
+    }
+    *prepacked = (lp->hmxFlags & kHmxPlanPrepackedWeights) != 0;
+    *tileBudget = lp->hmxTileBudget;
+    return true;
+}
+
 static inline bool htp_ops_loop_matmul_batch_hmx_prepare(const HtpOpsLoopParam* lp) {
     const int K = lp->sizeXYZ[1];
     const int N = lp->sizeXYZ[2];
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    if (htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles) && prepackedWeights) {
+        // Committed to the unit: the weights are already in its tile order, so
+        // there is no other kernel to fall back to and the unit is acquired here
+        // rather than per command.
+        return true;
+    }
     const bool preferHmxGeneral = htp_ops_loop_matmul_prefer_hmx_general(K, N);
     return htp_ops_loop_matmul_hmx_small_eligible(lp) ||
            (preferHmxGeneral && htp_ops_loop_matmul_hmx_general_eligible(lp));
@@ -645,10 +669,32 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 
     const int kp = htp_ops_loop_up_div(K, 32);
     const int np = htp_ops_loop_up_div(N, 32);
+    const size_t blockBytes = (size_t)kp * 1024 * sizeof(__fp16);
+    const size_t outputBytes = 1024 * sizeof(__fp16);
+    // Keep as many 32-column weight blocks in VTCM as it takes and no more: the
+    // whole matrix is K*N*2 bytes, past the unit's capacity for every transformer
+    // shape, and the allocator cannot tell when it has run off the end.
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles);
     uint8_t* vtcmPtr = (uint8_t*)vtcm_manager_get_vtcm_base();
-    __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)kp * 1024 * sizeof(__fp16));
-    __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)np * kp * 1024 * sizeof(__fp16));
-    __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 1024 * sizeof(__fp16));
+    uint8_t* vtcmEnd = (uint8_t*)vtcm_manager_get_vtcm_alloc_end();
+    int ntPerPass = 1;
+    if (vtcmPtr != NULL && vtcmEnd != NULL) {
+        const uint8_t* fixedEnd = vtcmPtr + blockBytes + outputBytes + 256;
+        if (vtcmEnd > fixedEnd) {
+            ntPerPass = (int)((size_t)(vtcmEnd - fixedEnd) / blockBytes);
+        }
+    }
+    if (plannedTiles > 0 && plannedTiles < ntPerPass) {
+        ntPerPass = plannedTiles;
+    }
+    if (ntPerPass < 1 || ntPerPass > np) {
+        ntPerPass = (np > 0) ? np : 1;
+    }
+    __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, blockBytes);
+    __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)ntPerPass * blockBytes);
+    __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, outputBytes);
     __fp16* vtcmScales = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 256);
     if (vtcmActivation == nullptr || vtcmWeight == nullptr || vtcmOutput == nullptr || vtcmScales == nullptr) {
         return false;
@@ -661,24 +707,42 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     hmx_init_column_scales(vtcmScales, Q6_V_vsplat_R(0x3c00));
     hmx_set_output_scales(vtcmScales);
 
-    for (int nt = 0; nt < np; ++nt) {
-        for (int kt = 0; kt < kp; ++kt) {
-            htp_ops_loop_hmx_pack_weight_tile(vtcmWeight, src1Base, lp, K, N, nt, kt);
+    for (int nt0 = 0; nt0 < np; nt0 += ntPerPass) {
+        const int ntEnd = (np - nt0 < ntPerPass) ? np : nt0 + ntPerPass;
+        if (prepackedWeights) {
+            // Already in the unit's tile order, and one 32-column group of tiles
+            // is contiguous in the weights section, so the group is one copy out
+            // of DDR instead of kp tiles rearranged element by element.
+            memcpy(vtcmWeight, src1Base + (size_t)nt0 * kp * 1024 * sizeof(__fp16),
+                   (size_t)(ntEnd - nt0) * blockBytes);
+        } else {
+            for (int nt = nt0; nt < ntEnd; ++nt) {
+                for (int kt = 0; kt < kp; ++kt) {
+                    htp_ops_loop_hmx_pack_weight_tile(vtcmWeight + ((size_t)(nt - nt0) * kp + kt) * 1024,
+                                                      src1Base, lp, K, N, nt, kt);
+                }
+            }
         }
-    }
-
-    for (int eBase = 0; eBase < E; eBase += 32) {
-        int validRows = E - eBase;
-        if (validRows > 32) {
-            validRows = 32;
-        }
-        for (int kt = 0; kt < kp; ++kt) {
-            htp_ops_loop_hmx_pack_activation_tile(vtcmActivation, src0Base, lp, K, kt, eBase, validRows);
-        }
-        for (int nt = 0; nt < np; ++nt) {
-            hmx_load_tiles_fp16(vtcmActivation, vtcmWeight + (size_t)nt * kp * 1024, kp);
-            hmx_consume_accumulator_fp16(vtcmOutput);
-            htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+        for (int eBase = 0; eBase < E; eBase += 32) {
+            int validRows = E - eBase;
+            if (validRows > 32) {
+                validRows = 32;
+            }
+            for (int kt = 0; kt < kp; ++kt) {
+                htp_ops_loop_hmx_pack_activation_tile(vtcmActivation, src0Base, lp, K, kt, eBase, validRows);
+            }
+            for (int nt = nt0; nt < ntEnd; ++nt) {
+                const __fp16* weightBlock = vtcmWeight + (size_t)(nt - nt0) * kp * 1024;
+                for (int k = 0; k < kp; k += HMX_FP16_MAX_TILES_PER_LOAD) {
+                    int tiles = kp - k;
+                    if (tiles > HMX_FP16_MAX_TILES_PER_LOAD) {
+                        tiles = HMX_FP16_MAX_TILES_PER_LOAD;
+                    }
+                    hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
+                }
+                hmx_consume_accumulator_fp16(vtcmOutput);
+                htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+            }
         }
     }
 
@@ -728,7 +792,7 @@ static inline bool htp_ops_loop_matmul_hmx_small(uint8_t* dstBase, const uint8_t
 
     for (int nt = 0; nt < np; ++nt) {
         for (int kt = 0; kt < kp; ++kt) {
-            htp_ops_loop_hmx_pack_weight_tile(vtcmWeight, src1Base, lp, K, N, nt, kt);
+            htp_ops_loop_hmx_pack_weight_tile(vtcmWeight + ((size_t)nt * kp + kt) * 1024, src1Base, lp, K, N, nt, kt);
         }
     }
 
@@ -1019,6 +1083,14 @@ static inline void htp_ops_loop_matmul_region(uint8_t* dstBase, const uint8_t* s
                                               const uint8_t* src1Base, const HtpOpsLoopParam* lp,
                                               int64_t outOff, int64_t in0Off, int64_t in1Off,
                                               bool hmxPrepared) {
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    if (htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles) && prepackedWeights) {
+        // No other kernel here can read this operand: the weights are in the
+        // unit's tile order rather than the (K, N) one the HVX paths walk.
+        htp_ops_loop_matmul_hmx_general(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared);
+        return;
+    }
     if (htp_ops_loop_matmul_hmx_small(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
         return;
     }
@@ -1209,6 +1281,15 @@ AEEResult htp_ops_loop_blit(uint8_t* dst, uint8_t* src0, uint8_t* src1,
     return 0;
 }
 
+// What the routing decision below saw, published for the host. The profile
+// buffer lives in execute_command.cc, which copies these into slots 235..237;
+// a build that predates this code leaves the marker at its initial value.
+extern "C" {
+int g_htp_plan_marker = -1;
+int g_htp_plan_hmx_flags = -1;
+int g_htp_plan_status = -1;
+}
+
 AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
                                uint8_t* iter0, uint8_t* iter1, uint8_t* iter2,
                                int32_t bytes, uint8_t* param) {
@@ -1222,6 +1303,12 @@ AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
     const uint8_t* srcIter0 = iter0;
     const uint8_t* srcIter1 = iter1;
     const uint8_t* srcIter2 = iter2;
+    bool probePrepacked = false;
+    int probeTiles = 0;
+    const bool probePlanned = htp_ops_loop_hmx_planned(lp, &probePrepacked, &probeTiles);
+    g_htp_plan_marker = 0x0853;
+    g_htp_plan_hmx_flags = lp->hmxFlags;
+    g_htp_plan_status = probePlanned ? (probePrepacked ? 2 : 1) : 0;
     const bool hmxPrepared = htp_ops_loop_matmul_batch_hmx_prepare(lp);
     if (hmxPrepared) {
         hmx_manager_enable_execution();

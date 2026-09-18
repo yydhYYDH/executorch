@@ -834,6 +834,13 @@ extern "C" void htp_probe_stage(int stage, int a, int b, int c) {
     probe_flush(g_stage_probe, kProbeStageOffset + (stage - 1) * 4, 4);
 }
 
+// Published by loop_ops.cc so the host can see how a matmul was routed: the
+// marker proves that build's code ran, and the other two report the plan fields
+// it read and the conclusion it drew from them.
+extern "C" int g_htp_plan_marker;
+extern "C" int g_htp_plan_hmx_flags;
+extern "C" int g_htp_plan_status;
+
 static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
     void* cmd_base = NULL;
     if ((cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd)) == NULL) {
@@ -863,6 +870,9 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
         unsigned long long end_time = HAP_perf_get_time_us();
         int opType = command->type();
         profile[opType] += (int)(end_time - start_time);
+        profile[235] = g_htp_plan_marker;
+        profile[236] = g_htp_plan_hmx_flags;
+        profile[237] = g_htp_plan_status;
 #if HTP_MM_PHASE_PROFILE
         // HMX prefill phase breakdown (us) into spare slots 200..207.
         extern unsigned long long g_mm_phase_us[13];

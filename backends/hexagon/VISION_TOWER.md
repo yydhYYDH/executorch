@@ -232,6 +232,31 @@ So the accuracy fix has to go where the loss actually is: the multiplier that
 rounds the accumulator to fp16 in the HVX fast paths (loop_ops.cc:745). Switching
 routes only moves the problem.
 
+Both breaks are now fixed, and they were two independent mistakes. The general
+route kept the *whole* packed weight matrix in VTCM (`np*kp*1024*2` bytes = `K*N*2`,
+past the unit for every transformer shape) and `vtcm_seq_alloc` never checked its
+own bound, so a 4096-wide output corrupted whatever followed VTCM and a 4096-wide
+reduction left it entirely. It also issued one deep load of `kp` tiles where the
+hardware takes 32 - `attn_hmx_load_k_tiles` (attention_hmx.cc:98) splits long
+reductions, the matmul path did not. The route now holds as many 32-column weight
+blocks as VTCM takes, splits reductions at 32 tiles, and the allocator returns NULL
+instead of overrunning.
+
+| route | 16x1024x4096 + 16x4096x1024 (one MLP block) | 24-layer vision tower |
+|---|---|---|
+| HVX (default) | max abs 0.0132, bit-identical to the pre-fix build | 145 domains, 12 s |
+| HMX general (preference) | max abs 0.0132, within 2.0e-3 of HVX | 145 domains, 11 s |
+
+Preferring HMX still does not pay end to end: the merger's relative L2 error goes
+0.1540 to 0.2074 and the 24-layer export 12 s to 11 s. HMX *is* the faster GEMM -
+one MLP block (1024x4096, pre-transposed weights, one domain) at 16/64/256 tokens
+runs 80/207/676 ms on HVX against 66/131/393 ms on HMX, a 1.2x to 1.7x lead that
+is still only 5-16 GFLOP/s - but a GEMM is not where the vision tower spends its
+time. A single 64-token transformer block (vpblk.pte, 53 MB, 7 domains) takes
+765 ms on HVX, against 275 ms for its 2.15 GFLOP at that measured rate, so roughly
+60% of a block is the ops around the GEMM. The route is correct now; the switch
+stays off.
+
 ## The text tower runs end to end, with the position scheme on the host
 
 Qwen3-VL's text tower cannot be driven by token ids: image features are spliced
@@ -326,6 +351,56 @@ the same module run eagerly on the host in fp16:
 | attn | 3.72 | 2.8e-01 | 0.99916 |
 | proj | 9.13 | 2.2e-01 | 0.99989 |
 | res1 | 28.06 | 2.2e-01 | 0.99995 |
+## Exporting the tower again
+
+The scripts live under `tmp/` and artifacts are written next to them, never to
+`/tmp`. They were recovered from the DSH session store
+(`~/.dsh/sessions/--home-yydh-executorch--/*/session.jsonl.zstd`, zstd-compressed,
+so a plain grep finds nothing); `tmp/recover_scripts.py` pulls a file back out of
+a transcript by its `file_path`, which is how `vit_real_export.py` and
+`vl_e2e.py` were brought back.
+
+```bash
+cd /home/yydh/executorch/tmp
+/home/yydh/miniconda3/envs/et/bin/python vit_real_export.py \\
+  --layers 24 --grid 1,8,8 --tag v1vit24 --export
+```
+
+The checkpoint path is baked into the script
+(`/home/yydh/Models/Qwen3-VL-2B-Instruct`). Lowering uses `DecomposePatchEmbed`
+and `HexagonPartitioner`; the run prints HOST PARITY against HF and writes
+`v1vit24.pte`, `v1vit24_in.bin` and `v1vit24_ref.bin` under `tmp/`.
+
+`HEXAGON_HMX_PREPACK=1` (with `HEXAGON_HMX_TILE_BUDGET=N`) packs matmul weights
+into the HMX tile order at export, but only for shapes the DSP routes to its
+general HMX kernel (`hmx_prefers_general`: a non-multiple-of-32 dimension, or a
+32-wide one); everywhere else it is gated off because forcing that kernel there
+is slower.
+
+Running it on the device, with the tower's own skel directory and the runner
+built by `build.sh runner`:
+
+```bash
+cd $B/hxwin
+export LD_LIBRARY_PATH=$B/libs:/system/lib64:/vendor/lib64
+export ADSP_LIBRARY_PATH=$B/hxskel_fix1
+HEXAGON_ACCT=1 ./executor_runner_p2 --model_path $B/hxvlt/v1vit24.pte \\
+  --inputs $B/hxvlt/pixels.bin --output_file out --print_output none
+```
+
+Measure with `HEXAGON_ACCT=1` and **not** `HEXAGON_TRACE=1`: the trace prints
+every command of every delegate and starts a watchdog thread per delegate, which
+costs about 12 s on this tower and once made a 4.9 s inference look like 16 s.
+`HEXAGON_ACCT` prints one line per delegate (input bytes, input/flush/call/total
+ms) with no other change in behaviour.
+
+Baseline with the fixes in, 128x128 input, 1x8x8 grid, untraced: 145 delegates,
+input bytes 690 MB per execution, `call_ms` sum 3.89 s against 3.83 s of DSP
+kernel time reported by `optime`, host copies 0.18 s, about 0.8 s of framework
+work, and a per-inference wall of 4.9 s (5.9 s including the ~1.0 s load of the
+768 MB pte). Output md5 `23ffd2e2` on `hxskel_fix1`, which is the skel this
+number belongs to.
+
 
 Every matmul is at the noise floor, the fused qkv at 3.9e-03 and the batched
 QK^T at 1.6e-02 on logits that reach 26.5, both corr 1.00000, and so are the

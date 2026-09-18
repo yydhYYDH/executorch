@@ -148,6 +148,10 @@ unsigned int vtcm_manager_get_vtcm_size() {
   return vtcm_manager::vtcm_total_size;
 }
 
+void *vtcm_manager_get_vtcm_alloc_end() {
+  return vtcm_manager::vtcm_reserved_start;
+}
+
 int vtcm_manager_get_ctx_id() {
   return vtcm_manager::vtcm_mgr_ctx_id;
 }

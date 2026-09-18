@@ -264,6 +264,21 @@ void PrintProbe(const HexagonDelegate& delegate) {
   }
 }
 
+// Kernel microseconds per DSP op type, accumulated on the DSP side by
+// execute_command.cc into the low slots of the profile buffer. This is the time
+// inside the op switch, so it excludes the RPC and the per-command loop.
+void PrintOpTimes(const HexagonDelegate& delegate) {
+  if (delegate.probe.ptr == nullptr) {
+    return;
+  }
+  const int32_t* slots = static_cast<const int32_t*>(delegate.probe.ptr);
+  for (int slot = 0; slot < 256; slot++) {
+    if (slots[slot] != 0) {
+      std::fprintf(stderr, "[hexagon] optime d%d slot=%d: %d us\n", delegate.index, slot, slots[slot]);
+    }
+  }
+}
+
 // How far inside the kernel the crash happened. A stage is written by the kernel
 // itself and flushed, so the last one present is where it was when it died.
 const char* StageName(int stage) {
@@ -903,6 +918,14 @@ Result<DelegateHandle*> HexagonBackend::init(
   return delegate;
 }
 
+// Host-side accounting: the DSP reports kernel time, so whatever else the
+// round trip costs is what happens inside this function.
+double AcctNowMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 Error HexagonBackend::execute(
     BackendExecutionContext& context,
     DelegateHandle* handle,
@@ -924,6 +947,10 @@ Error HexagonBackend::execute(
 
   auto* const resident = static_cast<uint8_t*>(delegate->resident.ptr);
   auto* const scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
+
+  const bool acct = EnvInt("HEXAGON_ACCT", 0) != 0;
+  const double t_begin = acct ? AcctNowMs() : 0.0;
+  size_t input_bytes = 0;
 
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
     // Not every method input is a tensor: a graph can hand a subgraph an int it
@@ -978,7 +1005,10 @@ Error HexagonBackend::execute(
       return Error::InvalidArgument;
     }
     std::memcpy(dst, tensor.const_data_ptr(), nbytes);
+    input_bytes += nbytes;
   }
+
+  const double t_input = acct ? AcctNowMs() : 0.0;
 
   // The inputs are in the arena by now, so a patched param can read back what
   // the caller just handed us. This has to precede the flush below.
@@ -999,6 +1029,7 @@ Error HexagonBackend::execute(
     ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
         resident + delegate->commands.offset, delegate->commands.size));
   }
+  const double t_flush = acct ? AcctNowMs() : 0.0;
 
   const TraceConfig& config = Trace();
   static int next_execute = 0;
@@ -1028,6 +1059,7 @@ Error HexagonBackend::execute(
     PrintCommands(*delegate);
   }
 
+  const double t_call0 = acct ? AcctNowMs() : 0.0;
   Error group_error = Error::Ok;
   {
     ProbeWatchdog watchdog(delegate, traced);
@@ -1058,8 +1090,23 @@ Error HexagonBackend::execute(
       "[hexagon] exit d%d: %s\n",
       exec_index,
       group_error == Error::Ok ? "ok" : "failed");
+  if (acct) {
+    const double t_call1 = AcctNowMs();
+    std::fprintf(
+        stderr,
+        "[hexagon] acct d%d ops=%u in=%zuB in_ms=%.3f flush_ms=%.3f "
+        "call_ms=%.3f total_ms=%.3f\n",
+        exec_index,
+        delegate->n_ops,
+        input_bytes,
+        t_input - t_begin,
+        t_flush - t_input,
+        t_call1 - t_call0,
+        t_call1 - t_begin);
+  }
   if (traced) {
     PrintProbe(*delegate);
+    PrintOpTimes(*delegate);
     PrintStages(*delegate);
   }
   if (config.stop_after == exec_index) {

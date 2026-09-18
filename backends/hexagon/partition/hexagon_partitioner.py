@@ -372,6 +372,8 @@ class HexagonOperatorSupport(OperatorSupportBase):
 
 
 @final
+
+
 class HexagonPartitioner(Partitioner):
     """Delegates every supported op, merging connected ones into one subgraph.
 

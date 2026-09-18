@@ -10,6 +10,8 @@
 #define HMX_FP16_TILE_N_COLS 32
 #define HMX_FP16_TILE_N_ELMS 1024
 #define HMX_FP16_TILE_SIZE   2048
+// One deep load takes this many tiles at most; longer reductions are split.
+#define HMX_FP16_MAX_TILES_PER_LOAD 32
 #define HMX_FP16_SCALE_TABLE_HALF_ENTRIES 128
 #define HMX_FP16_SCALE_COLUMN_STRIDE 2
 

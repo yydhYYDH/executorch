@@ -441,8 +441,29 @@ def permute_region(node: torch.fx.Node):
     return [0, 0, 0, outer, rows, cols, rows * cols, cols, 1, rows * cols, 1, rows]
 
 
+def _fold_constant_transpose(node: torch.fx.Node, ctx):
+    """Transposes a constant weight at export instead of on the DSP.
+
+    Every permute_copy in these graphs turns a weight round for the matmul that
+    consumes it, so its result is a constant as well. Computing it here costs one
+    pass and saves the DSP the rearrange on every inference, along with the
+    weight-sized tensor it would otherwise hand across a delegate boundary.
+    """
+    if len(node.args) < 2 or not isinstance(node.args[0], torch.fx.Node):
+        return None
+    if tuple(node.args[1]) != (1, 0):
+        return None
+    tensor = ctx.constant_value(node.args[0])
+    if tensor is None or tensor.dim() != 2 or tensor.dtype != torch.float16:
+        return None
+    return ctx.folded_weight(node, tensor.transpose(0, 1).contiguous())
+
+
 def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     """A transpose is a strided read and a strided write, which is one region."""
+    folded = _fold_constant_transpose(node, ctx)
+    if folded is not None:
+        return folded
     out = ctx.result_for(node, _numel(node))
     ctx.builder.add_op(
         Op(
@@ -558,10 +579,16 @@ def _binary(op_name: str):
 
 
 # HtpOpsLoopParam, from the DSP's region_ops.h. The struct is packed, so its
-# three int64 tails sit at byte offsets 76/84/92 with no padding: "<19i3q"
-# reproduces that layout and "<25i" re-reads it as the int32 words the param
-# vector carries.
-_LOOP_PARAM = struct.Struct("<19i3q")
+# three int64 tails sit at byte offsets 76/84/92 with no padding: "<19i3q2i"
+# reproduces that layout, including the two int32 fields the host plan lives in,
+# and "<27i" re-reads it as the int32 words the param vector carries.
+_LOOP_PARAM = struct.Struct("<19i3q2i")
+
+# hmxFlags: the magic marks the two plan fields as present, so a command that
+# predates them reads as unplanned rather than as garbage. Bit 0 says the weights
+# are already in the unit's tile order.
+_HMX_PLAN_MAGIC = 0x484D58
+_HMX_PLAN_PREPACKED_WEIGHTS = 1
 
 
 def _loop_param(
@@ -574,6 +601,8 @@ def _loop_param(
     in0_elems: int,
     in1_elems: int,
     steps=(0, 0, 0),
+    hmx_prepacked: bool = False,
+    hmx_tile_budget: int = 0,
 ):
     """The descriptor BATCH_MATMUL reads out of params[1:].
 
@@ -597,8 +626,10 @@ def _loop_param(
         out_elems,
         in0_elems,
         in1_elems,
+        _HMX_PLAN_MAGIC | (_HMX_PLAN_PREPACKED_WEIGHTS if hmx_prepacked else 0),
+        hmx_tile_budget,
     )
-    return list(struct.unpack("<25i", packed))
+    return list(struct.unpack("<27i", packed))
 
 
 def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
@@ -712,7 +743,72 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
-def _matmul_command(ctx, lhs, rhs, out, batches: int, m: int, k: int, n: int) -> None:
+def hmx_prefers_general(k: int, n: int) -> bool:
+    """Whether the DSP routes this matmul to the general HMX kernel.
+
+    Mirrors the DSP's own rule: a non-multiple-of-32 dimension, or a 32-wide one.
+    Only there can pre-packed weights pay for themselves, because that kernel is
+    the only one that rearranges the weight, and forcing it elsewhere is slower.
+    """
+    return bool(((k | n) & 31) != 0 or k == 32 or n == 32)
+
+
+def _hmx_prepack_enabled() -> bool:
+    """HEXAGON_HMX_PREPACK=1 stores matmul weights in the unit's tile order.
+
+    Off by default: packing a weight here forces that matmul onto the HMX route,
+    because no other kernel reads that layout.
+    """
+    import os
+
+    return os.environ.get("HEXAGON_HMX_PREPACK", "") not in ("", "0", "false")
+
+
+def _hmx_tile_budget() -> int:
+    """HEXAGON_HMX_TILE_BUDGET caps the 32-column weight tiles held in VTCM.
+
+    A cap, not a size: the DSP fits itself to the VTCM it actually finds, so
+    planning for more than the part has cannot overflow it.
+    """
+    import os
+
+    return int(os.environ.get("HEXAGON_HMX_TILE_BUDGET", "0"))
+
+
+def _hmx_weight_operand(ctx, rhs, k: int, n: int):
+    """The weight operand: packed at export when the graph stores it as one."""
+    if getattr(rhs, "target", None) in ctx.packed_targets:
+        return ctx.operand(rhs), True
+    return ctx.operand(rhs), False
+
+
+def pack_hmx_weight(weight, k: int, n: int) -> bytes:
+    """A (k, n) fp16 weight in the tile order the DSP would pack it into VTCM.
+
+    Tile (nt, kt) holds rows kt*32..+32 against columns nt*32..+32, and inside a
+    tile the unit reads k interleaved in pairs: element (k, c) sits at
+    (k // 2) * 64 + c * 2 + (k & 1), which is exactly what
+    htp_ops_loop_hmx_pack_weight_tile writes. Tiles run nt-major, so the kp tiles
+    of one 32-column group are contiguous and the DSP streams a group in one copy.
+    """
+    import numpy as np
+
+    w = weight.astype(np.float16, copy=False)
+    if w.shape != (k, n):
+        raise RuntimeError(f"hexagon: weight is {w.shape}, expected ({k}, {n})")
+    kp = -(-k // 32)
+    nt_total = -(-n // 32)
+    padded = np.zeros((kp * 32, nt_total * 32), dtype=np.float16)
+    padded[:k, :n] = w
+    tiles = padded.reshape(kp, 32, nt_total, 32).transpose(2, 0, 1, 3)
+    tiles = tiles.reshape(nt_total, kp, 16, 2, 32).transpose(0, 1, 2, 4, 3)
+    return np.ascontiguousarray(tiles).tobytes()
+
+
+def _matmul_command(
+    ctx, lhs, rhs, out, batches: int, m: int, k: int, n: int,
+    hmx_prepacked: bool = False, hmx_tile_budget: int = 0,
+) -> None:
     """One BATCH_MATMUL over contiguous (m, k) @ (k, n) tiles.
 
     The DSP takes dst from mapped_ptrs[inputs->size()] and reads iter0..2 out of
@@ -739,6 +835,8 @@ def _matmul_command(ctx, lhs, rhs, out, batches: int, m: int, k: int, n: int) ->
                 batches * m * k,
                 batches * k * n,
                 steps=steps,
+                hmx_prepacked=hmx_prepacked,
+                hmx_tile_budget=hmx_tile_budget,
             ),
         )
     )
@@ -756,8 +854,13 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
     if k != contracted:
         raise RuntimeError(f"hexagon: mm contracts {k} against {contracted}")
 
+    # Same switch that packed the weights before lowering, so what the DSP is
+    # told matches what its operand actually holds.
+    prepacked = _hmx_prepack_enabled() and hmx_prefers_general(k, n)
+    weight = ctx.operand(rhs)
     out = ctx.result_for(node, m * n)
-    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), out, 1, m, k, n)
+    _matmul_command(ctx, ctx.operand(lhs), weight, out, 1, m, k, n, hmx_prepacked=prepacked,
+                    hmx_tile_budget=_hmx_tile_budget())
     return ctx.record(node, out)
 
 

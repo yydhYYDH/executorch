@@ -35,6 +35,11 @@ typedef struct {
   int64_t outputElementSize;
   int64_t input0Size;
   int64_t input1Size;
+  // The host's HMX plan, written only by a host that also writes hmxFlags. A
+  // command that predates these fields leaves the four bytes outside its params
+  // vector, so anything but the magic is ignored and the DSP sizes VTCM itself.
+  int32_t hmxFlags;
+  int32_t hmxTileBudget;
   // followed by iter arrays:
   // int32_t iter0[loopNumber];
   // int32_t iter1[loopNumber];

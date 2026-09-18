@@ -965,6 +965,62 @@ static inline int htp_ops_binary_broadcast_offset(int index, int dims, const int
   return offset;
 }
 
+// Only fp16 multiply has a native operation; adds, subtracts and the relu of an
+// add go through qf16 (fp32) and are rounded back, as the chunk kernels above
+// also do. Q6_Vh_vadd_VhVh and its siblings are integer halfword operations and
+// would add the bit patterns. The tail is left to the scalar apply, and a false
+// return means the caller should not take this route.
+static inline bool htp_ops_binary_compute_fp16_rows(__fp16* dst, const __fp16* src0,
+                                                    const __fp16* src1, int size, int opType) {
+  const int vec_len = 128 / (int)sizeof(__fp16);
+  int i = 0;
+  if (opType == HTP_OPS_BINARY_ADD) {
+    for (; i + vec_len <= size; i += vec_len) {
+      vmem(dst + i) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(vmem(src0 + i), vmem(src1 + i)));
+    }
+  } else if (opType == HTP_OPS_BINARY_MUL) {
+    for (; i + vec_len <= size; i += vec_len) {
+      vmem(dst + i) = Q6_Vhf_vmpy_VhfVhf(vmem(src0 + i), vmem(src1 + i));
+    }
+  } else if (opType == HTP_OPS_BINARY_SUB) {
+    for (; i + vec_len <= size; i += vec_len) {
+      vmem(dst + i) = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(vmem(src0 + i), vmem(src1 + i)));
+    }
+  } else if (opType == HTP_OPS_BINARY_ADD_RELU) {
+    const HVX_Vector zero_v = Q6_V_vzero();
+    for (; i + vec_len <= size; i += vec_len) {
+      HVX_Vector vr = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(vmem(src0 + i), vmem(src1 + i)));
+      vmem(dst + i) = Q6_Vhf_vmax_VhfVhf(vr, zero_v);
+    }
+  } else {
+    return false;
+  }
+  for (; i < size; ++i) {
+    dst[i] = htp_ops_binary_apply_fp16(src0[i], src1[i], opType);
+  }
+  return true;
+}
+
+// True when the innermost dimension is contiguous on both sides and every outer
+// stride either repeats one row (zero) or walks the output's own rows. That is
+// what a per-channel operand looks like, and it reduces the whole broadcast to a
+// sequence of contiguous rows the vector kernel can take.
+static inline bool htp_ops_binary_broadcast_rowwise(int dims, const int32_t* outDims,
+                                                    const int32_t* in0Strides,
+                                                    const int32_t* in1Strides) {
+  if (dims < 1 || in0Strides[dims - 1] != 1 || in1Strides[dims - 1] != 1) {
+    return false;
+  }
+  int64_t row = outDims[dims - 1];
+  for (int d = dims - 2; d >= 0; --d) {
+    if ((in0Strides[d] != 0 && in0Strides[d] != row) || (in1Strides[d] != 0 && in1Strides[d] != row)) {
+      return false;
+    }
+    row *= outDims[d];
+  }
+  return true;
+}
+
 static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src0, const uint8_t* src1,
                                                 int32_t outSize, int32_t opType, int32_t bytes,
                                                 int32_t inputBytes, int32_t inputIsFloat,
@@ -1030,6 +1086,39 @@ static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src
       return false;
     }
     __fp16* out = (__fp16*)dst;
+    // The vector kernel loads with vmem, so every row it is handed has to land
+    // on a 128-byte boundary. The bases come from the caller's buffers, which are
+    // aligned; a row width that is not a whole number of vectors would not be.
+    const bool rowwise =
+        ((outDims[dims - 1] & (128 / (int)sizeof(__fp16) - 1)) == 0) &&
+        ((uintptr_t)dst % 128) == 0 && ((uintptr_t)src0 % 128) == 0 && ((uintptr_t)src1 % 128) == 0 &&
+        htp_ops_binary_broadcast_rowwise(dims, outDims, in0Strides, in1Strides) &&
+        htp_ops_binary_compute_fp16_rows(out, src0_fp16, src1_fp16, 0, opType);
+    if (rowwise) {
+      // Row by row. The loop below recomputes two multi-dimensional offsets per
+      // element for this shape, at roughly a hundred cycles per element; here the
+      // offsets are an odometer that only moves when a row does.
+      int coord[8] = {0};
+      const int inner = outDims[dims - 1];
+      const int rows = outSize / inner;
+      int off0 = 0;
+      int off1 = 0;
+      for (int row = 0; row < rows; ++row) {
+        htp_ops_binary_compute_fp16_rows(out + (size_t)row * inner, src0_fp16 + off0,
+                                         src1_fp16 + off1, inner, opType);
+        for (int d = dims - 2; d >= 0; --d) {
+          if (++coord[d] < outDims[d]) {
+            off0 += in0Strides[d];
+            off1 += in1Strides[d];
+            break;
+          }
+          coord[d] = 0;
+          off0 -= in0Strides[d] * (outDims[d] - 1);
+          off1 -= in1Strides[d] * (outDims[d] - 1);
+        }
+      }
+      return true;
+    }
     for (int i = 0; i < outSize; ++i) {
       const int off0 = htp_ops_binary_broadcast_offset(i, dims, outDims, in0Strides);
       const int off1 = htp_ops_binary_broadcast_offset(i, dims, outDims, in1Strides);

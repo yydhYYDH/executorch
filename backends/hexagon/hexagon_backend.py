@@ -8,7 +8,13 @@ import copy
 from typing import Callable, Dict, List, Tuple
 
 import torch
-from executorch.backends.hexagon.hexagon_ops import EMITTERS
+
+import torch
+from executorch.backends.hexagon.hexagon_ops import (
+    _hmx_prepack_enabled,
+    EMITTERS,
+    pack_hmx_weight,
+)
 from executorch.backends.hexagon.serialization.blob import BlobBuilder, TensorRef
 from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec
@@ -39,6 +45,8 @@ def _val_of(node: torch.fx.Node) -> torch.Tensor:
     return val
 
 
+
+
 class BlobContext:
     """State shared by the emitters while one subgraph is being lowered."""
 
@@ -53,6 +61,11 @@ class BlobContext:
         self.builder = BlobBuilder(n_inputs, n_outputs)
         self.producer: Dict[torch.fx.Node, TensorRef] = {}
         self._constants: Dict[torch.fx.Node, TensorRef] = {}
+        # Placeholder targets whose stored bytes were rewritten into the HMX tile
+        # order; their matmul has to say so, because no other kernel reads that.
+        self.packed_targets: set = set()
+        # Nodes whose value was computed at export time and stored as a weight.
+        self.folded: Dict[torch.fx.Node, TensorRef] = {}
         self._output_index = output_index
 
     def constant(
@@ -74,6 +87,23 @@ class BlobContext:
         self._constants[key] = ref
         return ref
 
+    def constant_hmx(self, node: torch.fx.Node, k: int, n: int) -> TensorRef:
+        """Materializes a weight in the order the HMX unit reads its tiles.
+
+        The DSP would otherwise rearrange the whole matrix on every inference;
+        done here it costs one pass at export. torch.export lifts parameters to
+        placeholders, so the target is looked up among them rather than among
+        attributes.
+        """
+        key = (node, "hmx")
+        cached = self._constants.get(key)
+        if cached is not None:
+            return cached
+        tensor = self.graph_module.get_parameter(node.target).detach().to(torch.float16)
+        ref = self.builder.add_weights(pack_hmx_weight(tensor.cpu().numpy(), k, n))
+        self._constants[key] = ref
+        return ref
+
     def scalar(self, value, dtype: torch.dtype = torch.float16) -> TensorRef:
         """Materializes a python scalar as a one-element tensor.
 
@@ -89,11 +119,38 @@ class BlobContext:
         self._constants[key] = ref
         return ref
 
+    def constant_value(self, node: torch.fx.Node):
+        """The tensor behind a constant, whether attribute or lifted input.
+
+        None means this layer cannot see it, which is what a placeholder whose
+        value only the runtime holds looks like: nothing is folded then.
+        """
+        if node.op == "get_attr":
+            return self.graph_module.get_parameter(node.target).detach()
+        value = node.meta.get("val")
+        if isinstance(value, torch.Tensor) and type(value).__name__ != "FakeTensor":
+            return value.detach()
+        return None
+
+    def folded_weight(self, node: torch.fx.Node, tensor) -> TensorRef:
+        """Materializes a tensor computed at export time as a weight."""
+        key = ("folded", node)
+        cached = self._constants.get(key)
+        if cached is not None:
+            return cached
+        ref = self.builder.add_weights(tensor.contiguous().cpu().numpy().tobytes())
+        self._constants[key] = ref
+        self.folded[node] = ref
+        return ref
+
     def operand(self, arg) -> TensorRef:
         """Resolves an operand, whether computed, stored, or a literal."""
         if isinstance(arg, torch.fx.Node):
             if arg.op == "get_attr":
                 return self.constant(arg)
+            folded = self.folded.get(arg)
+            if folded is not None:
+                return folded
             ref = self.producer.get(arg)
             if ref is None:
                 raise RuntimeError(f"hexagon: nothing produced {arg.name} yet")
