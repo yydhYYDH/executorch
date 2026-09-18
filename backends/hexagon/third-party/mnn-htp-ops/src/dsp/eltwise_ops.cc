@@ -2222,7 +2222,11 @@ static inline float htp_ops_reduction_reduce_sum2_f32(HVX_Vector acc0, HVX_Vecto
   return tmp[0];
 }
 
-static inline uint16_t htp_ops_reduce_sum_fp16_inside1_hvx(const __fp16* src, int reduce) {
+// Returns the exact fp32 sum. Narrowing it to fp16 here would cap every result
+// at the fp16 maximum: a layer norm's sum of squares goes past 65,504 as soon as
+// the mean square passes 32, which turns its whole row into inf downstream. The
+// mean is in range once divided, so the division has to happen in fp32.
+static inline float htp_ops_reduce_sum_inside1_fp32(const __fp16* src, int reduce) {
   const int vec_len = 128 / (int)sizeof(__fp16);
   const int vec_end = reduce & -vec_len;
   HVX_Vector acc0 = Q6_V_vzero();
@@ -2246,8 +2250,7 @@ static inline uint16_t htp_ops_reduce_sum_fp16_inside1_hvx(const __fp16* src, in
   for (; r < reduce; ++r) {
     sum += (float)src[r];
   }
-  __fp16 result = (__fp16)sum;
-  return *(uint16_t*)&result;
+  return sum;
 }
 
 static inline uint16_t htp_ops_reduce_max_fp16_inside1_hvx(const __fp16* src, int reduce) {
@@ -2287,8 +2290,7 @@ static inline void htp_ops_reduce_fp16_inside1_range(HtpOpsReductionTaskState* s
       const uint16_t bits = htp_ops_reduce_max_fp16_inside1_hvx(src_outer, reduce);
       dst[o] = *(__fp16*)&bits;
     } else {
-      const uint16_t bits = htp_ops_reduce_sum_fp16_inside1_hvx(src_outer, reduce);
-      float value = (float)(*(__fp16*)&bits);
+      float value = htp_ops_reduce_sum_inside1_fp32(src_outer, reduce);
       if (state->opType == HTP_OPS_REDUCTION_MEAN) {
         value /= (float)reduce;
       }
@@ -2296,6 +2298,15 @@ static inline void htp_ops_reduce_fp16_inside1_range(HtpOpsReductionTaskState* s
     }
   }
 }
+
+// The fp16 accumulator used by these reducers saturates at the fp16 maximum,
+// which a sum of squares reaches easily: any row with a mean square above 32
+// overflows, so a layer norm over activations of a few hundred turns its whole
+// row into inf. The scalar tails below already accumulate in fp32. Build with
+// -DMNN_REDUCTION_FP32_ACC=0 to get the fp16 accumulator back for an A/B.
+#ifndef MNN_REDUCTION_FP32_ACC
+#  define MNN_REDUCTION_FP32_ACC 1
+#endif
 
 static inline void htp_ops_reduce_fp16_inside_vector_range(HtpOpsReductionTaskState* state,
                                                            int outsideStart, int outsideEnd) {
@@ -2310,6 +2321,27 @@ static inline void htp_ops_reduce_fp16_inside_vector_range(HtpOpsReductionTaskSt
     __fp16* dst_outer = dst + o * inside;
     int i = 0;
     for (; i < vec_end; i += vec_len) {
+#if MNN_REDUCTION_FP32_ACC
+      if (state->opType != HTP_OPS_REDUCTION_MAXIMUM) {
+        HVX_VectorPair first = Q6_Wsf_vcvt_Vhf(vmemu((const HVX_Vector*)(src_outer + i)));
+        HVX_Vector acc0 = Q6_V_lo_W(first);
+        HVX_Vector acc1 = Q6_V_hi_W(first);
+        for (int r = 1; r < reduce; ++r) {
+          HVX_VectorPair v = Q6_Wsf_vcvt_Vhf(vmemu((const HVX_Vector*)(src_outer + r * inside + i)));
+          acc0 = Q6_Vsf_vadd_VsfVsf(acc0, Q6_V_lo_W(v));
+          acc1 = Q6_Vsf_vadd_VsfVsf(acc1, Q6_V_hi_W(v));
+        }
+        HVX_Vector acc = Q6_Vhf_vcvt_VsfVsf(acc0, acc1);
+        if (state->opType == HTP_OPS_REDUCTION_MEAN) {
+          const __fp16 scaleValue = (__fp16)(1.0f / (float)reduce);
+          uint16_t scaleBits = *(uint16_t*)&scaleValue;
+          HVX_Vector scale = Q6_Vh_vsplat_R(scaleBits);
+          acc = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(acc, scale));
+        }
+        vmemu((HVX_Vector*)(dst_outer + i)) = acc;
+        continue;
+      }
+#endif
       HVX_Vector acc = vmemu((const HVX_Vector*)(src_outer + i));
       for (int r = 1; r < reduce; ++r) {
         HVX_Vector v = vmemu((const HVX_Vector*)(src_outer + r * inside + i));

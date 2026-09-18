@@ -20,6 +20,38 @@
 #include "dsp/worker_pool.h"
 #include "region_ops.h"
 
+// The matmul HVX fast paths round the accumulator to fp16 after every
+// multiply-add, so a 1024-wide reduction loses about 17x more accuracy than the
+// HMX route, whose accumulator stays in fp32. HMX is only preferred for shapes a
+// transformer does not have (a reduction or output width that is not a multiple
+// of 32), which leaves the shapes a transformer does use on the fp16 path.
+// Preferring HMX always measured 3.42e-02 -> 1.95e-03 max error on a 64x1024x1024
+// matmul, but it also aborts a vision tower delegate with 0x8000040d, so the
+// blanket rule stays off until the failing shape is known. Build with
+// -DMNN_MATMUL_PREFER_HMX=1 to turn it on.
+#ifndef MNN_MATMUL_PREFER_HMX
+#  define MNN_MATMUL_PREFER_HMX 0
+#endif
+
+// The h-contiguous fast path below accumulates in fp16, which rounds both the
+// product and the running sum on every step: a 2048-wide reduction drifts
+// visibly and, a few layers deep, overflows to inf. Its neighbouring paths
+// (fast_h_inner and fast_l_contiguous) widen to fp32 before accumulating, so
+// this keeps the fast path consistent with them. Build with
+// -DMNN_MATMUL_FP32_ACC=0 to get the old fp16 accumulator back for an A/B.
+#ifndef MNN_MATMUL_FP32_ACC
+#  define MNN_MATMUL_FP32_ACC 1
+#endif
+
+// With the accumulator in fp32 the remaining rounding sits in the product: the
+// half-precision multiply narrows to fp16 before the widening, which costs
+// ~1e-3 of a term. An fp16 pair always multiplies exactly into fp32, so taking
+// the products wide leaves the final narrowing to fp16 as the only rounding
+// step, which is what the HMX route does.
+#ifndef MNN_MATMUL_EXACT_PRODUCT
+#  define MNN_MATMUL_EXACT_PRODUCT 1
+#endif
+
 extern "C" {
 
 AEEResult htp_ops_binary_blit(uint8_t* dst, const uint8_t* src0, const uint8_t* src1,
@@ -574,10 +606,20 @@ static inline bool htp_ops_loop_matmul_hmx_small_eligible(const HtpOpsLoopParam*
     return lp->dstStrideXYZ[0] >= 0 && lp->src0StrideXYZ[0] >= 0 && lp->src1StrideXYZ[1] >= 0;
 }
 
+static inline bool htp_ops_loop_matmul_prefer_hmx_general(int K, int N) {
+#if MNN_MATMUL_PREFER_HMX
+    (void)K;
+    (void)N;
+    return true;
+#else
+    return ((K | N) & 31) != 0 || K == 32 || N == 32;
+#endif
+}
+
 static inline bool htp_ops_loop_matmul_batch_hmx_prepare(const HtpOpsLoopParam* lp) {
     const int K = lp->sizeXYZ[1];
     const int N = lp->sizeXYZ[2];
-    const bool preferHmxGeneral = ((K | N) & 31) != 0 || K == 32 || N == 32;
+    const bool preferHmxGeneral = htp_ops_loop_matmul_prefer_hmx_general(K, N);
     return htp_ops_loop_matmul_hmx_small_eligible(lp) ||
            (preferHmxGeneral && htp_ops_loop_matmul_hmx_general_eligible(lp));
 }
@@ -734,17 +776,50 @@ static inline void htp_ops_loop_matmul_fast_h_contiguous_range(uint8_t* dstBase,
         const uint8_t* src0Row = src0Base + (int64_t)e * lp->src0StrideXYZ[0];
         int h = 0;
         for (; h + vecElems <= H; h += vecElems) {
-            HVX_Vector acc = Q6_V_vzero();
+#if MNN_MATMUL_FP32_ACC && MNN_MATMUL_EXACT_PRODUCT
+            HVX_VectorPair accW = Q6_W_vzero();
             for (int l = 0; l < L; ++l) {
                 const __fp16* aPtr = (const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]);
                 uint16_t aBits = *(const uint16_t*)aPtr;
                 HVX_Vector aVec = Q6_Vh_vsplat_R(aBits);
                 const uint8_t* bPtr = src1Base + (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
                 HVX_Vector bVec = vmemu((const HVX_Vector*)bPtr);
+                accW = Q6_Wsf_vmpyacc_WsfVhfVhf(accW, aVec, bVec);
+            }
+            vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) =
+                Q6_Vhf_vcvt_VsfVsf(Q6_V_lo_W(accW), Q6_V_hi_W(accW));
+#else
+#if MNN_MATMUL_FP32_ACC
+            HVX_Vector acc0 = Q6_V_vzero();
+            HVX_Vector acc1 = Q6_V_vzero();
+#else
+            HVX_Vector acc = Q6_V_vzero();
+#endif
+            for (int l = 0; l < L; ++l) {
+                const __fp16* aPtr = (const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]);
+                uint16_t aBits = *(const uint16_t*)aPtr;
+                HVX_Vector aVec = Q6_Vh_vsplat_R(aBits);
+                const uint8_t* bPtr = src1Base + (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
+                HVX_Vector bVec = vmemu((const HVX_Vector*)bPtr);
+#if MNN_MATMUL_FP32_ACC && MNN_MATMUL_EXACT_PRODUCT
+                HVX_VectorPair prodF = Q6_Vqf32_vmpy_VhfVhf(aVec, bVec);
+                acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+                acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+#elif MNN_MATMUL_FP32_ACC
+                HVX_VectorPair prodF = hvx_my_vqf16_to_wsf(Q6_Vqf16_vmpy_VhfVhf(aVec, bVec));
+                acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+                acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+#else
                 HVX_Vector prod = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(aVec, bVec));
                 acc = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(acc, prod));
+#endif
             }
+#if MNN_MATMUL_FP32_ACC
+            vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) = Q6_Vhf_vcvt_VsfVsf(acc0, acc1);
+#else
             vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) = acc;
+#endif
+#endif
         }
         for (; h < H; ++h) {
             float sum = 0.0f;
@@ -947,8 +1022,8 @@ static inline void htp_ops_loop_matmul_region(uint8_t* dstBase, const uint8_t* s
     if (htp_ops_loop_matmul_hmx_small(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
         return;
     }
-    const bool preferHmxGeneral = ((lp->sizeXYZ[1] | lp->sizeXYZ[2]) & 31) != 0 ||
-                                  lp->sizeXYZ[1] == 32 || lp->sizeXYZ[2] == 32;
+    const bool preferHmxGeneral =
+        htp_ops_loop_matmul_prefer_hmx_general(lp->sizeXYZ[1], lp->sizeXYZ[2]);
     if (preferHmxGeneral &&
         htp_ops_loop_matmul_hmx_general(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
         return;
