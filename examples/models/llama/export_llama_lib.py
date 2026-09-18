@@ -113,6 +113,7 @@ EXECUTORCH_DEFINED_MODELS = [
     "qwen3_5_0_8b",
     "qwen3_5_2b",
     "qwen3_5_4b",
+    "qwen3_vl_embeds",
     "phi_4_mini",
     "smollm2",
     "smollm2_360m",
@@ -1485,6 +1486,16 @@ def _to_edge_and_lower_llama(  # noqa: C901
 
     # to_backend
     partitioners = []
+
+    # LOCAL TEST HOOK: Hexagon first so it claims the ops its DSP emitters
+    # cover; XNNPACK then takes the rest.
+    if os.environ.get("EXECUTORCH_HEXAGON_PARTITION") == "1":
+        from executorch.backends.hexagon.partition.hexagon_partitioner import (
+            HexagonPartitioner,
+        )
+
+        partitioners.append(HexagonPartitioner())
+
     if vulkan:
         partitioners.append(
             get_vulkan_partitioner(
@@ -1969,7 +1980,10 @@ def _load_llama_model(llm_config: LlmConfig) -> "LLMEdgeManager":
     """
 
     modelname = llm_config.base.model_class.value
-    if modelname in EXECUTORCH_DEFINED_MODELS:
+    if modelname == "qwen3_vl_embeds":
+        module_name = "qwen3"
+        model_class_name = "Qwen3VLEmbedsModel"
+    elif modelname in EXECUTORCH_DEFINED_MODELS:
         module_name = "llama"
         model_class_name = "Llama2Model"  # TODO: Change to "LlamaModel" in examples/models/llama/model.py.
     elif modelname in TORCHTUNE_DEFINED_MODELS:

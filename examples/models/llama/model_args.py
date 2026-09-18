@@ -107,6 +107,11 @@ class ModelArgs:
     apply_embedding: bool = True  # Use embedding inside the transformer
     embedding_scale_factor: float = 1.0  # Multiple by which to scale embeddings.
     apply_output: bool = True  # Use output layer (unembedding) inside the transformer
+    rope_from_input: bool = (
+        False  # Take cos/sin from attn_options instead of an input_pos lookup
+    )
+    example_seq_len: int = 1  # positions traced when the embedding is an input
+    deepstack_inputs: int = 0  # visual residuals added after the first N layers
     use_qk_norm: bool = False  # apply normalization to q and k in the attention
     qk_norm_before_rope: bool = False  # when to apply qk norm
     qk_norm_affine: bool = (

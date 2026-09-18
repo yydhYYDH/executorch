@@ -8,7 +8,7 @@
 # Please refer to README.md in the same folder for more information.
 
 import math
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -327,6 +327,8 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
         self.apply_embedding = params.apply_embedding
         self.apply_output = params.apply_output
+        self.rope_from_input = params.rope_from_input
+        self.deepstack_inputs = params.deepstack_inputs
 
         self.tok_embeddings = (
             nn.Embedding(params.vocab_size, params.dim)
@@ -361,6 +363,7 @@ class Transformer(nn.Module):
         freqs_sin: torch.Tensor,
         attn_options_: Dict,
         seqlen: int,
+        residuals: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[Any]]:
         """Run transformer layers with YOCO KV sharing support."""
         attn_options_update = None
@@ -380,6 +383,11 @@ class Transformer(nn.Module):
                     attn_options_["shared_kv"] = shared_kv[donor_idx]
 
             h, attn_options_update = layer(h, freqs_cos, freqs_sin, attn_options_)
+
+            # Qwen3-VL feeds the vision tower's deepstack features into the
+            # first layers of the text tower, one per layer.
+            if residuals is not None and layer_idx < len(residuals):
+                h = h + residuals[layer_idx]
 
             if _is_kv_donor_layer(layer_idx, self.n_layers, self.num_kv_shared_layers):
                 assert (
@@ -407,6 +415,11 @@ class Transformer(nn.Module):
         attn_options: Optional[ForwardOptions] = None,
         h: Optional[torch.FloatTensor] = None,  # embeddings
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[Any]]]:
+        # Without an embedding table inside, the first input is the embedding
+        # itself. Multimodal towers splice features into the input embeddings, so
+        # the caller computes them and the first argument carries them.
+        if not self.apply_embedding and h is None and tokens is not None:
+            h, tokens = tokens, None
         if (tokens is None) ^ (h is not None):
             raise ValueError(
                 "You cannot specify both tokens and h at the same time, and must specify either one"
@@ -417,14 +430,31 @@ class Transformer(nn.Module):
         if attn_options is None:
             attn_options = {}
         seqlen = h.shape[1]
-        freqs_cos, freqs_sin = self.rope.get_freqs(
-            attn_options.get("input_pos"), seqlen
-        )
+        if self.rope_from_input:
+            # A scheme like M-RoPE rotates each frequency pair by a different
+            # position, which one input_pos cannot express, so the caller passes
+            # the frequencies for this step. input_pos still drives the cache and
+            # the attention mask.
+            freqs_cos = attn_options["rope_cos"]
+            freqs_sin = attn_options["rope_sin"]
+        else:
+            freqs_cos, freqs_sin = self.rope.get_freqs(
+                attn_options.get("input_pos"), seqlen
+            )
 
         attn_options_ = attn_options.copy() if attn_options is not None else {}
 
+        residuals = (
+            [
+                attn_options["deepstack_%d" % i]
+                for i in range(self.deepstack_inputs)
+            ]
+            if self.deepstack_inputs
+            else None
+        )
+
         h, attn_options_update = self._forward_layers(
-            h, freqs_cos, freqs_sin, attn_options_, seqlen
+            h, freqs_cos, freqs_sin, attn_options_, seqlen, residuals
         )
 
         if not self.generate_full_logits:
