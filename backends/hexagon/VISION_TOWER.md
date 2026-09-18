@@ -311,6 +311,43 @@ and every text chunk reports the same for its own delegates. The embedding
 lookup and the M-RoPE tables are computed on the host, as they are for any
 llama-style pipeline; nothing else of the model runs outside the DSP.
 
+## Where the remaining vision error comes from
+
+Per-stage measurement of vision block 0 on the current skel, the device against
+the same module run eagerly on the host in fp16:
+
+| stage | peak | max abs diff | corr |
+|---|---|---|---|
+| norm1 | 7.83 | 3.9e-03 | 1.00000 |
+| qkv, fused | 7.76 | 3.9e-03 | 1.00000 |
+| q_roped | 7.80 | 3.9e-03 | 1.00000 |
+| qk, batched | 26.53 | 1.6e-02 | 1.00000 |
+| softmax | 1.000 | 1.1e-01 | 0.99843 |
+| attn | 3.72 | 2.8e-01 | 0.99916 |
+| proj | 9.13 | 2.2e-01 | 0.99989 |
+| res1 | 28.06 | 2.2e-01 | 0.99995 |
+
+Every matmul is at the noise floor, the fused qkv at 3.9e-03 and the batched
+QK^T at 1.6e-02 on logits that reach 26.5, both corr 1.00000, and so are the
+norms and the rope. The deviation enters at the softmax: its probabilities come
+back with max abs diff 0.11 at corr 0.99843, and the device picks a different
+winning key in 129 of the 1024 attention rows. The attention state then carries
+0.284 of error, which is seventy percent of what the block ends up with (0.414)
+and what the image features inherit.
+
+The logits explain the sensitivity. Inside a row the spread is 27.8, so the
+distribution is close to one-hot and a row whose top two logits are close is
+decided by arithmetic detail rather than by content. The median top1-top2 gap is
+0.585 and the tenth percentile is 0.098, so the rows that flip are the near
+ties, but an fp16 softmax flips an order of magnitude more of them than the
+reference's fp32 one does.
+
+`softmax_ops.cc` computes the whole row in fp16: the max, the exp2 (a
+fifth-order qhmath polynomial, whose own error is small), the running sum, the
+reciprocal and the final scale. The sum and the reciprocal are the same defect
+the two reductions had, and the fix is the same one: keep them in fp32 and
+narrow once at the end.
+
 What is left open is the vision tower's own feature error, and it is what the
 end-to-end numbers above carry: image_embeds at corr 0.9882 with max abs diff
 0.94 on a peak of 8.5. The fp32 accumulator cut that from 5.52 and the deepstack
