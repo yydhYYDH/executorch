@@ -140,7 +140,10 @@ class BlobBuilder:
     """Collects ops and the four tensor sections into one blob.
 
     Sections are accumulated independently and packed back to back at build
-    time, so a caller never reasons about arena offsets.
+    time, so a caller never reasons about arena offsets. Only the weights are
+    written out: the activation section is a size the runtime reserves for
+    itself, and the input and output sections are sizes it copies to and from
+    the caller, so neither is a region on disk.
     """
 
     def __init__(self, n_inputs: int, n_outputs: int) -> None:
@@ -148,7 +151,7 @@ class BlobBuilder:
         self._n_outputs = n_outputs
         self._ops: List[Op] = []
         self._weights = bytearray()
-        self._activations = bytearray()
+        self._activations_bytes = 0
         self._input_slots: Dict[int, TensorRef] = {}
         self._output_slots: Dict[int, TensorRef] = {}
 
@@ -181,9 +184,16 @@ class BlobBuilder:
         return TensorRef(TensorSpace.WEIGHTS, offset, len(data))
 
     def add_activation(self, nbytes: int, alignment: int = ALIGNMENT) -> TensorRef:
-        """Bump-allocates scratch space for an intermediate tensor."""
-        offset = _align_up(len(self._activations), alignment)
-        self._activations.extend(b"\x00" * (offset - len(self._activations) + nbytes))
+        """Bump-allocates scratch space for an intermediate tensor.
+
+        The bytes are not kept. They are all zero by construction, the runtime
+        sizes the section from the header without reading it, and a padding
+        region materialised here is duplicated into the file by every delegate
+        that shares the tensor layout -- 810 MB of zeros for the vision tower,
+        none of which anything reads.
+        """
+        offset = _align_up(self._activations_bytes, alignment)
+        self._activations_bytes = offset + nbytes
         return TensorRef(TensorSpace.ACTIVATION, offset, nbytes)
 
     def method_input(self, index: int, nbytes: int) -> TensorRef:
@@ -241,7 +251,7 @@ class BlobBuilder:
             self._n_outputs,
             len(self._weights),
             inputs_bytes,
-            len(self._activations),
+            self._activations_bytes,
             outputs_bytes,
         )
-        return header + ops + bytes(self._weights) + bytes(self._activations)
+        return header + ops + bytes(self._weights)

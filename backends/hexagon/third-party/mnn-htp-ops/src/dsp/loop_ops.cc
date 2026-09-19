@@ -30,7 +30,7 @@
 // blanket rule stays off until the failing shape is known. Build with
 // -DMNN_MATMUL_PREFER_HMX=1 to turn it on.
 #ifndef MNN_MATMUL_PREFER_HMX
-#  define MNN_MATMUL_PREFER_HMX 0
+#  define MNN_MATMUL_PREFER_HMX 1
 #endif
 
 // The h-contiguous fast path below accumulates in fp16, which rounds both the
@@ -1281,15 +1281,6 @@ AEEResult htp_ops_loop_blit(uint8_t* dst, uint8_t* src0, uint8_t* src1,
     return 0;
 }
 
-// What the routing decision below saw, published for the host. The profile
-// buffer lives in execute_command.cc, which copies these into slots 235..237;
-// a build that predates this code leaves the marker at its initial value.
-extern "C" {
-int g_htp_plan_marker = -1;
-int g_htp_plan_hmx_flags = -1;
-int g_htp_plan_status = -1;
-}
-
 AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
                                uint8_t* iter0, uint8_t* iter1, uint8_t* iter2,
                                int32_t bytes, uint8_t* param) {
@@ -1303,12 +1294,6 @@ AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
     const uint8_t* srcIter0 = iter0;
     const uint8_t* srcIter1 = iter1;
     const uint8_t* srcIter2 = iter2;
-    bool probePrepacked = false;
-    int probeTiles = 0;
-    const bool probePlanned = htp_ops_loop_hmx_planned(lp, &probePrepacked, &probeTiles);
-    g_htp_plan_marker = 0x0853;
-    g_htp_plan_hmx_flags = lp->hmxFlags;
-    g_htp_plan_status = probePlanned ? (probePrepacked ? 2 : 1) : 0;
     const bool hmxPrepared = htp_ops_loop_matmul_batch_hmx_prepare(lp);
     if (hmxPrepared) {
         hmx_manager_enable_execution();

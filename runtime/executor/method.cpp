@@ -12,8 +12,10 @@
 #include <c10/util/safe_numerics.h>
 #include <array>
 #include <cinttypes> // @donotremove
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/event_tracer_hooks.h>
@@ -37,6 +39,29 @@ namespace executorch {
 namespace ET_RUNTIME_NAMESPACE {
 
 using internal::PlatformMemoryAllocator;
+
+namespace {
+
+// HEXAGON_PHASE=1 timeline of the instruction loop: which instruction the host
+// is running and when, so the gap between two delegate calls can be attributed
+// to the runtime's own work or to a host-side operator.
+bool PhaseEnabled() {
+  static const bool enabled = std::getenv("HEXAGON_PHASE") != nullptr;
+  return enabled;
+}
+
+void PhaseStamp(const char* what, size_t idx, const char* name = nullptr) {
+  const double t = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+  if (name != nullptr) {
+    std::fprintf(stderr, "[phase] t=%.1f rt %s i=%zu %s\n", t, what, idx, name);
+  } else {
+    std::fprintf(stderr, "[phase] t=%.1f rt %s i=%zu\n", t, what, idx);
+  }
+}
+
+} // namespace
 
 // Maximum number of instructions that Method::execute() will run before
 // returning an error. Prevents infinite loops caused by malformed programs
@@ -1466,6 +1491,11 @@ Error Method::execute_instruction() {
 
   switch (instruction->instr_args_type()) {
     case executorch_flatbuffer::InstructionArguments::KernelCall: {
+      if (PhaseEnabled()) {
+        auto op_index = instruction->instr_args_as_KernelCall()->op_index();
+        const auto* op = serialization_plan_->operators()->Get(op_index);
+        PhaseStamp("op_enter", step_state_.instr_idx, op->name()->c_str());
+      }
       EXECUTORCH_SCOPE_PROF("OPERATOR_CALL");
       internal::EventTracerProfileOpScope event_tracer_op_scope =
           internal::EventTracerProfileOpScope(event_tracer_, "OPERATOR_CALL");
@@ -1500,6 +1530,9 @@ Error Method::execute_instruction() {
         // debugging. This is a failure path, and it doesn't matter if it's a
         // little slow. Do the same for DelegateCall errors.
       }
+      if (PhaseEnabled()) {
+        PhaseStamp("op_exit", step_state_.instr_idx);
+      }
     } break;
     case executorch_flatbuffer::InstructionArguments::DelegateCall: {
       EXECUTORCH_SCOPE_PROF("DELEGATE_CALL");
@@ -1521,9 +1554,15 @@ Error Method::execute_instruction() {
           /*event_tracer=*/event_tracer_,
           /*temp_allocator=*/temp_allocator_,
           /*method_name=*/serialization_plan_->name()->c_str());
+      if (PhaseEnabled()) {
+        PhaseStamp("dei_pre", delegate_idx);
+      }
       err = delegates_[delegate_idx].Execute(
           backend_execution_context,
           chain.argument_lists_[step_state_.instr_idx]);
+      if (PhaseEnabled()) {
+        PhaseStamp("dei_post", delegate_idx);
+      }
       if (err != Error::Ok) {
         ET_LOG(
             Error,

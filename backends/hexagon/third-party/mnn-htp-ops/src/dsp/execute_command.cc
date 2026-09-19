@@ -62,6 +62,12 @@ extern AEEResult htp_ops_raster_blit(uint8_t* dst, uint8_t** src, int src_number
 
 extern AEEResult htp_ops_unary(uint8_t* dst, uint8_t* src, int32 size, int32 type, int32 bytes);
 
+// HtpOpsUnaryOpType, from unary_ops.cc. clamp is the one type whose params[3]
+// and params[4] hold the fp16 bit patterns of its bounds rather than being
+// unused, and it has an entry point of its own to read them.
+#define HTP_OPS_UNARY_CLAMP 15
+extern AEEResult htp_ops_unary_clamp(uint8_t* dst, uint8_t* src, int32 size, int32 min_bits, int32 max_bits);
+
 extern AEEResult htp_ops_cast(uint8_t* dst, const uint8_t* src, int32_t size, int32_t castType);
 
 extern AEEResult htp_ops_binary_blit(uint8_t* dst, const uint8_t* src0, const uint8_t* src1, uint8_t* region, int32 regionCount, int32 bytes, int32 type);
@@ -141,7 +147,7 @@ static int htp_profile_unary_bucket(const int32_t* intParams) {
         return -1;
     }
     const int32_t opType = intParams[1];
-    if (opType >= 1 && opType <= 14) {
+    if (opType >= 1 && opType <= HTP_OPS_UNARY_CLAMP) {
         return 119 + opType;
     }
     return -1;
@@ -368,9 +374,15 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
             break;
         }
         case DSP_OP_UNARY: {
-            ret = htp_ops_unary(mapped_ptrs[inputs->size()],
-                                mapped_ptrs[0],
-                                intParams[0], intParams[1], intParams[2]);
+            if (intParams[1] == HTP_OPS_UNARY_CLAMP) {
+                ret = htp_ops_unary_clamp(mapped_ptrs[inputs->size()],
+                                          mapped_ptrs[0],
+                                          intParams[0], intParams[3], intParams[4]);
+            } else {
+                ret = htp_ops_unary(mapped_ptrs[inputs->size()],
+                                    mapped_ptrs[0],
+                                    intParams[0], intParams[1], intParams[2]);
+            }
             break;
         }
         case DSP_OP_CAST: {
@@ -834,13 +846,6 @@ extern "C" void htp_probe_stage(int stage, int a, int b, int c) {
     probe_flush(g_stage_probe, kProbeStageOffset + (stage - 1) * 4, 4);
 }
 
-// Published by loop_ops.cc so the host can see how a matmul was routed: the
-// marker proves that build's code ran, and the other two report the plan fields
-// it read and the conclusion it drew from them.
-extern "C" int g_htp_plan_marker;
-extern "C" int g_htp_plan_hmx_flags;
-extern "C" int g_htp_plan_status;
-
 static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
     void* cmd_base = NULL;
     if ((cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd)) == NULL) {
@@ -870,9 +875,6 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
         unsigned long long end_time = HAP_perf_get_time_us();
         int opType = command->type();
         profile[opType] += (int)(end_time - start_time);
-        profile[235] = g_htp_plan_marker;
-        profile[236] = g_htp_plan_hmx_flags;
-        profile[237] = g_htp_plan_status;
 #if HTP_MM_PHASE_PROFILE
         // HMX prefill phase breakdown (us) into spare slots 200..207.
         extern unsigned long long g_mm_phase_us[13];
@@ -920,7 +922,7 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
             auto params = command->params();
             const int32_t* intParams = params ? params->data() : nullptr;
             const int bucket = htp_profile_unary_bucket(intParams);
-            if (bucket >= 120 && bucket <= 133) {
+            if (bucket >= 120 && bucket <= 119 + HTP_OPS_UNARY_CLAMP) {
                 profile[bucket] += (int)(end_time - start_time);
             }
         }

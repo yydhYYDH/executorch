@@ -446,3 +446,111 @@ reaches the constants, so the delegated weights are serialized fp32 (about
 per element. The vision export does not hit this because it traces the module in
 fp16 to begin with. The fix is to build the text graph the same way, in its own
 export script, instead of casting after partitioning.
+
+## What a 24-layer run spends its time on, and the two fixes that came out of it
+
+Same device, same session, old and new runner alternating so the phone's state is
+the same for both legs. The model is `v1vit24z.pte` (73 delegates, 1165
+commands), `-num_executions 3`, account and phase instrumentation on.
+
+| | before | after |
+|---|---|---|
+| input copy per execution | 104.4, 104.5 ms | 61.7, 59.8 ms |
+| delegate init, `-num_executions 1` | 530 ms | 489 ms |
+| output md5 | 18b6997d | 18b6997d, four legs of four |
+
+Neither change re-exports anything.
+
+**The fp32-to-fp16 narrowing runs four lanes at a time.** Every delegated input
+that arrives fp32 is narrowed into its fp16 slot, and a layer's residual stream
+is 64x1024 values, so that loop was the whole cost of an input copy: 90 ms of the
+104 ms per execution. The scalar form rounds by adding 0x1000 to the mantissa and
+carrying into the exponent when that overflows, and both steps are the same
+integer arithmetic on all four lanes, so the vector form copies it exactly rather
+than using `vcvt_f16_f32`, which rounds to nearest even and would change the bits
+a re-run produces. Lanes fp16 cannot reach -- subnormal, infinity, overflow --
+fall back to the scalar form. The lane arithmetic was checked against the scalar
+form over 4 million random patterns plus every mantissa that forces a carry, with
+no mismatches.
+
+**The resident block is no longer zero-filled.** Its weights section is memcpy'd
+over it a few lines later, its command and sync sections are written by the
+descriptor builder, and its group array has its own memset, so the pass over 659
+MB bought nothing. The scratch block is still zeroed by the pool: it holds
+activation slots, which the blob does not carry.
+
+One execution is 594 ms with both fixes in, and it divides three ways:
+
+| part | ms |
+|---|---|
+| DSP calls, 73 delegates | 435 |
+| narrowing and input copies | 43 |
+| portable kernels between delegates | ~116 |
+| init, once per load | 489 |
+
+The 116 ms is the guard chain `_safe_softmax` decomposes into: per layer
+`eq`, `any`, two `logical_not`, `full_like`, `where` and two `mul.Scalar` --
+about eleven small ops, 24 times over, at ~0.4 ms each of dispatch and fp32
+elementwise work. It is a no-op on this graph (no mask, so no all-minus-infinity
+row) and all three exports that drop it land within fp16 noise of the host
+reference: cos 0.9996160 against 0.9996200.
+
+### Merging the delegates costs the DSP twice the time
+
+Four layers, one input file, all four exports run back to back on the same
+phone:
+
+| export | delegates | call per execution | input copy |
+|---|---|---|---|
+| sdpa (the guard chain) | 13 | 94.3 ms | 10.1 ms |
+| explicit softmax, every op in one delegate | 1 | 174.0 ms | 0.0 ms |
+| one `clamp` fence before the softmax | 5 | 176.9 ms | 0.8 ms |
+| `clamp` fences on both sides of the softmax | 9 | 177.4, 179.8 ms | 0.9 ms |
+
+The 24-layer pair says the same thing at scale: 940 ms of DSP time for the
+single-delegate export against 463 ms for the split one.
+
+Windowed execution pins down where the extra time lands. Running a suffix of the
+single-delegate blob with `HEXAGON_CMD_START` and `HEXAGON_CMD_LIMIT`, and
+reading the binary slot out of the per-command profile:
+
+| window | what it holds | binary slot |
+|---|---|---|
+| [15,+7) | 3 binaries, no matmul | 0.23 ms |
+| [25,+7) | 2 binaries, no matmul | 0.17 ms |
+| [60,+8) | 3 binaries, no matmul | 0.22 ms |
+| [31,+4) | matmul, binary, softmax, matmul | 22.85 ms |
+| [31,+48) | one whole layer | 21.8 ms |
+
+A binary that runs right after a score matmul inside the same command group is
+charged about 21 ms, once per layer, while the matmul's own slot reports 0.42 ms
+for submitting both of its instances. The number is the same in every window that
+contains one, and the same at 4 layers and at 24, so it is a stall rather than
+work: nothing in the command, the shapes or the loop parameters differs from the
+split export, where the same adjacency costs 0.05 ms. The one structural
+difference is that in the split export the score matmul and the softmax each sit
+alone in a one-command delegate.
+
+That is what the guard chain is doing for the DSP, and it is why removing it --
+by exporting `torch.softmax` directly, by fencing with `clone` (which
+`to_edge` rewrites to `_clone_dim_order` and the partitioner then absorbs), or
+by fencing with one or two exact no-op `clamp`s -- gives back more than the
+116 ms it saves. The fp16 case for the fence is otherwise clean: `clamp` to the
+fp16 range is exact on fp16 data, and both fence exports reproduce the merged
+export's output bit for bit (md5 73e5df61) while the sdpa export differs only in
+the last place (md5 cd4fa67d, cos 0.9996160 against 0.9996200).
+
+### A load costs 0.76 ms per MB of pte
+
+| export | blob | delegate init |
+|---|---|---|
+| four layers, split | 154.6 MB | 254, 258 ms |
+| 24 layers, split | 659.6 MB | 636, 661, 640, 606 ms |
+
+Repeating the same load back to back, with 16 GB of the phone's 23 GB in the page
+cache, does not move it, so the size law is not file I/O: it is the weights
+crossing into rpcmem at about 1.3 GB/s, plus ~140 ms of per-delegate setup that
+does not depend on the blob. Only a smaller pte shrinks the first term, which
+makes the weight width -- not the delegate structure -- the one lever left on the
+load path.
+

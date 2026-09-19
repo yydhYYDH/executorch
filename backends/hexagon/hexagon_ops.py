@@ -57,6 +57,10 @@ UNARY_OP_TYPES: Dict[str, int] = {
     "expm1": 12,
     "cos": 13,
     "sin": 14,
+    # clamp carries its bounds rather than a single op type: params[3] and
+    # params[4] are the fp16 bit patterns of them, and the DSP dispatches it to
+    # an entry point of its own instead of htp_ops_unary.
+    "clamp": 15,
 }
 
 # HtpOpsBinaryOpType, declared in the DSP's eltwise_ops.cc. Same reasoning as
@@ -397,18 +401,30 @@ def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _row_major_strides(shape) -> List[int]:
+    """The strides a contiguous tensor of this shape is read at, in elements."""
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * int(shape[axis + 1])
+    return strides
+
+
 def permute_region(node: torch.fx.Node):
-    """The blit region for a transpose of the last two axes, or None.
+    """The blit region for a permutation of the axes, or None.
 
-    Every `permute_copy` in the graph is `permute(w, [1, 0])` between a weight
-    and its `mm`, so it is one matrix transpose per outer index. A region
-    describes that exactly -- the inner run reads a contiguous source row and
-    writes a strided destination column -- and it is the shape
-    `htp_ops_prepare_transpose` recognises and routes to the HVX transpose.
+    A region is three nested loops with a stride per side, so a permutation is
+    describable exactly when the axes split into at most three groups, each a run
+    of consecutive axes that keeps its order in both layouts: such a run is one
+    loop whose size is the product of the run and whose strides are its last
+    axis's. `permute(w, [1, 0])` between a weight and its `mm` is the two-group
+    case, and it is the shape `htp_ops_prepare_transpose` recognises and routes
+    to the HVX transpose -- the inner run reads a contiguous source row and
+    writes a strided destination column. `permute(1, 0, 2, 3)` over a fused qkv
+    is the same split with the head run carried whole.
 
-    A permutation that moves any other axis is refused rather than approximated:
-    the row index stops being linear in the destination, which a single region
-    cannot describe.
+    A permutation that reverses the axes inside a group, or that needs a fourth
+    one, is refused rather than approximated: no single region describes it, and
+    what it would emit reads the wrong elements rather than failing.
     """
     if len(node.args) < 2 or not isinstance(node.args[0], torch.fx.Node):
         return None
@@ -421,24 +437,59 @@ def permute_region(node: torch.fx.Node):
         return None
     if not isinstance(dims, (list, tuple)):
         return None
-    if source_value.dtype is not torch.float16:
+    # Both widths the arena holds reach the same two-byte command.
+    if source_value.dtype not in (torch.float16, torch.float32):
         return None
     if not source_value.is_contiguous() or not result_value.is_contiguous():
         return None
 
     rank = len(source_value.shape)
-    if rank < 2 or sorted(dims) != list(range(rank)):
+    if rank < 2 or len(dims) != rank or sorted(dims) != list(range(rank)):
         return None
-    if list(dims) != list(range(rank - 2)) + [rank - 1, rank - 2]:
+    if source_value.numel() != result_value.numel():
         return None
 
-    rows = int(source_value.shape[rank - 2])
-    cols = int(source_value.shape[rank - 1])
-    outer = 1
-    for size in source_value.shape[: rank - 2]:
-        outer *= size
+    source_strides = _row_major_strides(source_value.shape)
+    result_strides = _row_major_strides(result_value.shape)
+    # Where each source axis lands, and so the stride the destination keeps it at.
+    positions = [0] * rank
+    for position, axis in enumerate(dims):
+        positions[axis] = position
+    destinations = [result_strides[position] for position in positions]
+
+    # A group ends where the destination stops advancing one axis at a time.
+    groups = []
+    first = 0
+    for axis in range(1, rank):
+        if positions[axis] != positions[first] + (axis - first):
+            groups.append((first, axis - 1))
+            first = axis
+    groups.append((first, rank - 1))
+    if len(groups) > 3:
+        return None
+
+    levels = []
+    for start, last in groups:
+        run = 1
+        for axis in range(start, last + 1):
+            run *= int(source_value.shape[axis])
+        levels.append((run, source_strides[last], destinations[last]))
+    while len(levels) < 3:
+        levels.append((1, 0, 0))
+    # A run both sides read contiguously is one copy where it is innermost and
+    # one two-byte copy per element where it is not, and the loop order does not
+    # change which elements the region covers.
+    for index, level in enumerate(levels):
+        if level[1] == 1 and level[2] == 1 and index != 2:
+            levels[index] = levels[2]
+            levels[2] = level
+            break
+
+    size = [level[0] for level in levels]
+    src = [level[1] for level in levels]
+    dst = [level[2] for level in levels]
     # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
-    return [0, 0, 0, outer, rows, cols, rows * cols, cols, 1, rows * cols, 1, rows]
+    return [0, 0, 0] + size + src + dst
 
 
 def _fold_constant_transpose(node: torch.fx.Node, ctx):
@@ -476,6 +527,45 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def dim_order_keeps_the_bytes(node: torch.fx.Node) -> bool:
+    """Whether a dim-order copy only re-reads its operand's bytes.
+
+    `to_edge` carries a memory format through the graph as a dim-order op, which
+    names the layout by listing the axes rather than by giving strides. The arena
+    holds row-major two-byte elements, so one whose order is the identity is a
+    plain copy of the same elements in the same order: a widening or a narrowing
+    when the widths differ, which the runtime does at the boundary, and nothing
+    at all when they do not, which is why the alias emitter is the right one.
+
+    Any other order describes a layout the arena does not hold, and re-pointing
+    the operand would hand the consumer the wrong numbers rather than fail, so
+    the support check refuses it and the node stays on a portable kernel.
+    """
+    if node.target not in DIM_ORDER_TARGETS:
+        return False
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return False
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return False
+    if source_value.dtype not in (torch.float16, torch.float32):
+        return False
+    if result_value.dtype not in (torch.float16, torch.float32):
+        return False
+    if source_value.dim() != result_value.dim():
+        return False
+    if source_value.numel() != result_value.numel():
+        return False
+    if not source_value.is_contiguous() or not result_value.is_contiguous():
+        return False
+    order = node.kwargs.get("dim_order")
+    return order is None or list(order) == list(range(result_value.dim()))
+
+
 def _unary(op_name: str):
     def emit(node: torch.fx.Node, ctx) -> TensorRef:
         src = node.args[0]
@@ -494,6 +584,40 @@ def _unary(op_name: str):
         return ctx.record(node, out)
 
     return emit
+
+
+def _clamp_bound_bits(bound, unbounded: float) -> int:
+    """A clamp bound as the fp16 bit pattern the DSP compares against.
+
+    torch narrows a Python float bound to the tensor's dtype before comparing,
+    so narrowing here is the same comparison the portable kernel makes; an
+    omitted bound is an infinity, which fp16 holds exactly.
+    """
+    value = unbounded if bound is None else float(bound)
+    return int(torch.tensor(value, dtype=torch.float16).view(torch.uint16).item())
+
+
+def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
+    src = node.args[0]
+    _require_arena_dtype(node, "clamp input")
+    numel = _numel(node)
+    out = ctx.result_for(node, numel)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[ctx.operand(src)],
+            outputs=[out],
+            # size is in elements, not bytes, as in _unary.
+            params=[
+                numel,
+                UNARY_OP_TYPES["clamp"],
+                FP16_BYTES,
+                _clamp_bound_bits(node.args[1], float("-inf")),
+                _clamp_bound_bits(node.args[2], float("inf")),
+            ],
+        )
+    )
+    return ctx.record(node, out)
 
 
 def _shape_of(operand) -> tuple:
@@ -1316,6 +1440,13 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+# torch's dim-order copies, which `to_edge` leaves behind where a memory format
+# had to be named. Both reach `_emit_alias` through `dim_order_keeps_the_bytes`,
+# which is also what keeps a non-identity order on a portable kernel.
+TO_DIM_ORDER_COPY = exir_ops.edge.dim_order_ops._to_dim_order_copy.default
+CLONE_DIM_ORDER = exir_ops.edge.dim_order_ops._clone_dim_order.default
+DIM_ORDER_TARGETS = frozenset({TO_DIM_ORDER_COPY, CLONE_DIM_ORDER})
+
 EMITTERS = {
     exir_ops.edge.aten.abs.default: _unary("abs"),
     exir_ops.edge.aten.neg.default: _unary("neg"),
@@ -1324,6 +1455,8 @@ EMITTERS = {
     exir_ops.edge.aten.exp.default: _unary("exp"),
     exir_ops.edge.aten.log.default: _unary("log"),
     exir_ops.edge.aten.silu.default: _unary("silu"),
+    exir_ops.edge.aten.clamp.default: _emit_clamp,
+    exir_ops.edge.aten.clamp.out: _emit_clamp,
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),
     exir_ops.edge.aten.rsqrt.default: _unary("rsqrt"),
@@ -1348,7 +1481,11 @@ EMITTERS = {
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
+    exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
     exir_ops.edge.aten.view_copy.default: _emit_alias,
+    exir_ops.edge.aten.expand_copy.default: _emit_alias,
+    TO_DIM_ORDER_COPY: _emit_alias,
+    CLONE_DIM_ORDER: _emit_alias,
     exir_ops.edge.aten.select_copy.int: _emit_select_copy,
     exir_ops.edge.aten._to_copy.default: _emit_alias,
     exir_ops.edge.aten.to.dtype: _emit_alias,
@@ -1407,7 +1544,9 @@ ALIAS_TARGETS = frozenset(
     {
         exir_ops.edge.aten.alias_copy.default,
         exir_ops.edge.aten.unsqueeze_copy.default,
+        exir_ops.edge.aten.squeeze_copy.dims,
         exir_ops.edge.aten.view_copy.default,
+        exir_ops.edge.aten.expand_copy.default,
         exir_ops.edge.aten.select_copy.int,
     }
 )

@@ -27,6 +27,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     SOFTMAX_TARGETS,
     cat_region,
     CAT_TARGETS,
+    DIM_ORDER_TARGETS,
+    dim_order_keeps_the_bytes,
     MM_TARGETS,
     permute_region,
     PERMUTE_TARGETS,
@@ -246,6 +248,8 @@ def _emits_no_command(node: torch.fx.Node) -> bool:
     """Whether this node's emitter only re-points its operand's TensorRef."""
     if node.target in ALIAS_TARGETS:
         return True
+    if dim_order_keeps_the_bytes(node):
+        return True
     return node.target in CAST_TARGETS and _cast_stays_in_fp16(node)
 
 
@@ -350,6 +354,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in PERMUTE_TARGETS and permute_region(node) is None:
             return False
+        if node.target in DIM_ORDER_TARGETS and not dim_order_keeps_the_bytes(node):
+            # A dim-order copy the alias emitter cannot stand in for is one the
+            # portable kernels run, not one the DSP should read wrong.
+            return False
         if node.target is UPDATE_CACHE and update_cache_layout(node) is None:
             return False
         for arg in node.args:
@@ -369,6 +377,20 @@ class HexagonOperatorSupport(OperatorSupportBase):
             ):
                 return False
         return True
+
+
+def _data_placeholders(exported_program: ExportedProgram) -> Set[str]:
+    """Placeholders the program owns rather than the caller hands in.
+
+    Parameters, buffers and lifted constants reach the partitioner as ordinary
+    graph inputs. Their names are what says which is which.
+    """
+    signature = exported_program.graph_signature
+    return (
+        set(signature.inputs_to_parameters)
+        | set(signature.inputs_to_buffers)
+        | set(signature.inputs_to_lifted_tensor_constants)
+    )
 
 
 @final
@@ -427,14 +449,21 @@ class HexagonPartitioner(Partitioner):
             graph_module, [supported], support
         )
 
+        data_names = _data_placeholders(exported_program)
         for partition in partitions:
             delegation_tag = f"hexagon_{partition.id}"
             for node in partition.nodes:
                 node.meta["delegation_tag"] = delegation_tag
                 # Constants consumed by a delegated node have to come along, or
                 # they stay in the graph as inputs the delegate never sees.
-                for arg in node.args:
-                    if isinstance(arg, torch.fx.Node) and arg.op == "get_attr":
+                # Tagging a parameter, buffer or lifted constant is also what
+                # makes it the delegate's own weight rather than an argument:
+                # EXIR then hands its bytes to the backend and deletes it from
+                # the call, so the runtime stores it once instead of copying it
+                # into the arena on every execute. A constant another partition
+                # also reads is duplicated for us.
+                for arg in node.all_input_nodes:
+                    if arg.op == "get_attr" or arg.name in data_names:
                         arg.meta["delegation_tag"] = delegation_tag
             partition_tags[delegation_tag] = self.delegation_spec
 

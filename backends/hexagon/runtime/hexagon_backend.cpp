@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include <flatbuffers/flatbuffers.h>
 // Regenerated from the vendored Command.fbs with the flatbuffers version this
 // tree vendors; the checked-in copy was produced by an older codegen whose
@@ -65,6 +69,9 @@ struct TraceConfig {
   int limit = 0;
   int stop_after = -1;
   bool fake_cache = false;
+  // HEXAGON_PHASE=1: emit a steady-clock timeline of the init and execute
+  // phases, so the host-side setup and per-inference overhead can be split.
+  bool phase = false;
 };
 
 int EnvInt(const char* name, int fallback) {
@@ -81,6 +88,7 @@ const TraceConfig& Trace() {
     c.limit = EnvInt("HEXAGON_CMD_LIMIT", 0);
     c.stop_after = EnvInt("HEXAGON_STOP_AFTER", -1);
     c.fake_cache = EnvInt("HEXAGON_FAKE_CACHE", 0) != 0;
+    c.phase = EnvInt("HEXAGON_PHASE", 0) != 0;
     return c;
   }();
   return config;
@@ -141,6 +149,63 @@ uint16_t float_to_half_bits(float value) {
   }
   return static_cast<uint16_t>(
       sign | (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13));
+}
+
+// The same conversion, four lanes at a time, because the scalar form is the
+// whole cost of handing an fp32 tensor to an fp16 kernel: a layer's residual
+// stream is 64x1024 values and the loop below ran one branchy scalar per value.
+// The scalar form rounds by adding 0x1000 to the mantissa and carrying into the
+// exponent when that overflows, and both steps are the same integer arithmetic
+// on all four lanes, so the vector form copies it exactly instead of using
+// vcvt_f16_f32 (which rounds to nearest even and would change the bits a
+// re-run produces). Lanes fp16 cannot reach -- subnormal, infinity, overflow --
+// go back to the scalar form; on the ViT's residuals they are rare.
+void narrow_fp32_to_fp16(const float* from, uint16_t* to, size_t elements) {
+#if defined(__aarch64__)
+  const uint32x4_t mantissa_mask = vdupq_n_u32(0x7FFFFFu);
+  const uint32x4_t round_addend = vdupq_n_u32(0x1000u);
+  const uint32x4_t exponent_mask = vdupq_n_u32(0xFFu);
+  const uint32x4_t sign_mask = vdupq_n_u32(0x8000u);
+  const uint32x4_t low_exponent = vdupq_n_u32(112u);
+  const uint32x4_t high_exponent = vdupq_n_u32(143u);
+  const uint32x4_t half_exponent_bias = vdupq_n_u32(112u);
+  const uint32x4_t half_mantissa_mask = vdupq_n_u32(0x3FFu);
+  const uint32x4_t max_exponent = vdupq_n_u32(31u);
+  const uint32x4_t infinity = vdupq_n_u32(0x7C00u);
+
+  size_t i = 0;
+  for (; i + 4 <= elements; i += 4) {
+    const uint32x4_t bits = vld1q_u32(reinterpret_cast<const uint32_t*>(from + i));
+    const uint32x4_t exponent = vandq_u32(vshrq_n_u32(bits, 23), exponent_mask);
+    const uint32x4_t sign = vandq_u32(vshrq_n_u32(bits, 16), sign_mask);
+    const uint32x4_t rounded = vaddq_u32(vandq_u32(bits, mantissa_mask), round_addend);
+    const uint32x4_t half_exp = vaddq_u32(
+        vsubq_u32(exponent, half_exponent_bias), vshrq_n_u32(rounded, 23));
+    uint32x4_t half = vorrq_u32(
+        sign,
+        vorrq_u32(
+            vshlq_n_u32(half_exp, 10),
+            vandq_u32(vshrq_n_u32(rounded, 13), half_mantissa_mask)));
+    half = vbslq_u32(vcgeq_u32(half_exp, max_exponent), vorrq_u32(sign, infinity), half);
+
+    const uint32x4_t unusual =
+        vorrq_u32(vcleq_u32(exponent, low_exponent), vcgeq_u32(exponent, high_exponent));
+    if (vmaxvq_u32(unusual) != 0) {
+      for (int lane = 0; lane < 4; lane++) {
+        to[i + lane] = float_to_half_bits(from[i + lane]);
+      }
+      continue;
+    }
+    vst1_u16(to + i, vmovn_u32(half));
+  }
+  for (; i < elements; i++) {
+    to[i] = float_to_half_bits(from[i]);
+  }
+#else
+  for (size_t i = 0; i < elements; i++) {
+    to[i] = float_to_half_bits(from[i]);
+  }
+#endif
 }
 
 // The inverse of the narrowing above. The algorithm was checked against numpy
@@ -455,6 +520,14 @@ void PrintCommands(const HexagonDelegate& delegate) {
   }
 }
 
+// Absolute steady-clock milliseconds. The runner prints its own phase stamps
+// off the same clock, so both timelines line up in one process run.
+double PhaseNowMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 size_t AlignUp(size_t value, size_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
@@ -555,12 +628,28 @@ Result<DelegateHandle*> HexagonBackend::init(
     return Error::MemoryAllocationFailed;
   }
 
+  // Assigned here rather than at the end of init: the phase timeline needs an
+  // ordinal from the first stage on.
+  {
+    static int next_delegate = 0;
+    delegate->index = next_delegate++;
+  }
+  const bool phase = Trace().phase;
+  auto stamp = [&](const char* what) {
+    if (phase) {
+      std::fprintf(
+          stderr, "[phase] t=%.1f init d%d %s\n", PhaseNowMs(), delegate->index, what);
+    }
+  };
+  stamp("alloc_delegate");
+
   auto driver = HexagonDriver::Create();
   if (!driver.ok()) {
     ET_LOG(Error, "hexagon: no DSP session");
     return driver.error();
   }
   delegate->driver = std::move(driver.get());
+  stamp("driver_open");
   ET_LOG(Info, "hexagon: skel arch V%02X, arena %s", delegate->driver.skel_arch(),
       delegate->driver.cached() ? "cached" : "uncached");
 
@@ -598,7 +687,15 @@ Result<DelegateHandle*> HexagonBackend::init(
     return arena.error();
   }
   delegate->resident = arena.get();
-  std::memset(delegate->resident.ptr, 0, resident_bytes);
+  stamp("resident_alloc");
+  // No zero-fill. Every byte of this block is written before it is read: the
+  // weights section by the memcpy below, the command and sync sections by the
+  // descriptor builder, and the group array by its own memset. Zeroing it first
+  // cost a full pass over the weights -- 659 MB, a third of a second, on every
+  // load -- to clear memory that the next few lines overwrite.
+  // (The scratch block is still zeroed by the pool: it holds activation slots,
+  // which the blob does not carry, so the first execution of a model would
+  // otherwise read whatever the previous delegate left behind.)
 
   auto pooled = SharedArenaPool::Get().Acquire(scratch_bytes);
   if (!pooled.ok()) {
@@ -606,6 +703,7 @@ Result<DelegateHandle*> HexagonBackend::init(
     return pooled.error();
   }
   delegate->scratch = pooled.get();
+  stamp("scratch_alloc");
 
   const TraceConfig& config = Trace();
   if (config.trace || config.delegate >= 0) {
@@ -621,11 +719,13 @@ Result<DelegateHandle*> HexagonBackend::init(
       sizeof(HexagonBlobHeader));
   const uint8_t* blob = reinterpret_cast<const uint8_t*>(processed->data());
   const size_t weights_blob_offset = sizeof(HexagonBlobHeader) + ops_bytes;
-  // Only the weights and activations live in the blob; the input and output
-  // sizes are arena budgets the runtime allocates against, so counting them
-  // here overstates the blob and rejects every delegate that has an input.
-  const size_t sections_total = static_cast<size_t>(header->weights_bytes) +
-      header->activations_bytes;
+  // Only the weights are on disk. Every other section is a size the runtime
+  // works from -- the input and output sizes are arena budgets it copies to and
+  // from the caller, and the activation section is scratch it reserves for
+  // itself and never reads out of the blob -- so only the weights have to be
+  // present. A blob written before the padding was dropped still carries the
+  // zeros, which this accepts too: it is a lower bound, not an equality.
+  const size_t sections_total = static_cast<size_t>(header->weights_bytes);
   if (weights_blob_offset + sections_total > processed->size()) {
     ET_LOG(Error, "hexagon: tensor sections out of bounds");
     return Error::DelegateInvalidCompatibility;
@@ -670,6 +770,7 @@ Result<DelegateHandle*> HexagonBackend::init(
       static_cast<uint8_t*>(delegate->resident.ptr) + delegate->weights.offset,
       blob + weights_blob_offset,
       header->weights_bytes);
+  stamp("weights_copy");
 
   cursor = 0;
   place(delegate->input_section, header->inputs_bytes);
@@ -838,6 +939,8 @@ Result<DelegateHandle*> HexagonBackend::init(
     command_cursor = AlignUp(command_cursor + size, kHexagonAlignment);
   }
 
+  stamp("commands_built");
+
   // The sync group names everything the DSP invalidates on the way in and
   // flushes on the way out.
   {
@@ -882,12 +985,9 @@ Result<DelegateHandle*> HexagonBackend::init(
         delegate->sync.size);
   }
 
+  stamp("sync_built");
   delegate->n_ops = header->n_ops;
   delegate->activations_bytes = header->activations_bytes;
-  {
-    static int next_delegate = 0;
-    delegate->index = next_delegate++;
-  }
 
   if (config.trace) {
     std::fprintf(
@@ -906,6 +1006,7 @@ Result<DelegateHandle*> HexagonBackend::init(
   // and never touched again, so one flush at init covers them.
   ET_CHECK_OK_OR_RETURN_ERROR(
       delegate->driver.Flush(delegate->resident.ptr, delegate->resident.bytes));
+  stamp("resident_flush");
 
   ET_LOG(
       Info,
@@ -914,6 +1015,7 @@ Result<DelegateHandle*> HexagonBackend::init(
       header->n_inputs,
       header->n_outputs,
       delegate->resident.bytes);
+  stamp("init_done");
 
   return delegate;
 }
@@ -949,7 +1051,12 @@ Error HexagonBackend::execute(
   auto* const scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
 
   const bool acct = EnvInt("HEXAGON_ACCT", 0) != 0;
+  const bool phase = Trace().phase;
   const double t_begin = acct ? AcctNowMs() : 0.0;
+  if (phase) {
+    std::fprintf(
+        stderr, "[phase] t=%.1f exec d%d enter\n", PhaseNowMs(), delegate->index);
+  }
   size_t input_bytes = 0;
 
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
@@ -988,10 +1095,7 @@ Error HexagonBackend::execute(
         delegate->inputs[i].size == elements * 2) {
       const float* const from =
           static_cast<const float*>(tensor.const_data_ptr());
-      uint16_t* const to = reinterpret_cast<uint16_t*>(dst);
-      for (size_t element = 0; element < elements; element++) {
-        to[element] = float_to_half_bits(from[element]);
-      }
+      narrow_fp32_to_fp16(from, reinterpret_cast<uint16_t*>(dst), elements);
       continue;
     }
 
@@ -1060,6 +1164,10 @@ Error HexagonBackend::execute(
   }
 
   const double t_call0 = acct ? AcctNowMs() : 0.0;
+  if (phase) {
+    std::fprintf(
+        stderr, "[phase] t=%.1f exec d%d pre_call\n", PhaseNowMs(), delegate->index);
+  }
   Error group_error = Error::Ok;
   {
     ProbeWatchdog watchdog(delegate, traced);
@@ -1090,8 +1198,11 @@ Error HexagonBackend::execute(
       "[hexagon] exit d%d: %s\n",
       exec_index,
       group_error == Error::Ok ? "ok" : "failed");
+  double t_call1 = 0.0;
   if (acct) {
-    const double t_call1 = AcctNowMs();
+    t_call1 = AcctNowMs();
+    std::fprintf(
+        stderr, "[phase] t=%.1f exec d%d post_call\n", PhaseNowMs(), delegate->index);
     std::fprintf(
         stderr,
         "[hexagon] acct d%d ops=%u in=%zuB in_ms=%.3f flush_ms=%.3f "
@@ -1172,6 +1283,20 @@ Error HexagonBackend::execute(
     }
     std::memcpy(
         tensor.mutable_data_ptr(), scratch + out.offset, tensor.nbytes());
+  }
+
+  if (acct) {
+    const double t_end = AcctNowMs();
+    std::fprintf(
+        stderr,
+        "[hexagon] acct2 d%d outcopy_ms=%.3f span_ms=%.3f\n",
+        exec_index,
+        t_end - t_call1,
+        t_end - t_begin);
+  }
+  if (phase) {
+    std::fprintf(
+        stderr, "[phase] t=%.1f exec d%d end\n", PhaseNowMs(), delegate->index);
   }
 
   return Error::Ok;

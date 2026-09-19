@@ -432,7 +432,8 @@ weaknesses. The loop is retyped per check, so it can drift from `blit_ops.cc`
 unnoticed, and it never sees what the emitters actually emitted.
 
 `test/blob_interpreter.py` closes both. It decodes a blob the real
-`HexagonBackend.preprocess` produced -- header, ops, the four sections -- builds
+`HexagonBackend.preprocess` produced -- header, ops, and the weights, with the
+other three sections present as header sizes -- builds
 the arena the runtime builds, applies the patch slot, executes the command
 stream, and compares against torch. Sizes, offsets and strides come out of the
 blob, so the check cannot agree with an emitter it is not reading.
@@ -969,6 +970,42 @@ sdpa_targets(), which is empty without it. A skip is not a pass, and a run that
 skips everything is worse than one case that does not run: attention is still the
 least verified op in the model, now with a known bug fixed behind it.
 
+## clamp, and the compare that orders a NaN above its bound
+
+`aten.clamp.default` and `clamp.out` are delegated now, with the two bounds the
+graph carries rather than a tensor. The op rides the unary machinery -- the same
+worker pool, the same fp16 chunking -- but its params[3] and params[4] hold the
+fp16 bit patterns of the bounds instead of sitting unused, so it has an entry
+point of its own in the skel, `htp_ops_unary_clamp`, rather than widening
+`htp_ops_unary` for every other type as well. Narrowing a Python float bound to
+fp16 happens at export, which is the narrowing torch's portable kernel applies to
+the same bound before comparing.
+
+The kernel is `min(max(x, lo), hi)` in that order, torch's order, which is why a
+range whose lower bound sits above its upper one returns the upper bound. The
+vector path is two fp16 compares and two selects. Its first device run returned
+exactly one wrong element out of 4096: the NaN. The Hexagon fp16 compare is not
+ordered -- a NaN input compares greater than its upper bound -- so that element
+came back as the bound where torch returns the input. The fix asks the compare
+unit nothing about NaN: a NaN is an all-ones exponent with a non-zero mantissa,
+so `|x| > 0x7c00` as an integer compare, and the input is muxed back over the
+clamped value, payload included. The scalar tail uses the C comparison, which
+propagates NaN on its own.
+
+Four probe exports carry the check, each one clamp and one delegate: 4096
+elements so every one is in a vector, 4161 so the scalar tail runs,
+`clamp(x, None, 1.0)` for an omitted bound, and the full fp16 range as bounds.
+All four come back bit for bit identical to torch's own fp16 result on the
+device, with an infinity and a NaN in each input. The four-layer tower with its
+clamps delegated reproduces, bit for bit, the export whose clamps ran on the host
+(md5 73e5df61 on the same input), and the 24-layer split export is still
+18b6997d.
+
+One consequence belongs with the fence measurements in `VISION_TOWER.md`: with
+clamp supported, the two no-op clamps that were holding the score matmul and the
+softmax apart are delegated like every other node, so that graph comes back as a
+single delegate and its DSP time per execution for four layers goes from 94.3 ms
+to 177.7 ms. A supported op cannot be a fence.
 ## Not verified
 
 The bar every op taken over here had to meet was a real blob on hexagon-sim

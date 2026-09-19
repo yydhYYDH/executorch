@@ -533,7 +533,10 @@ static inline HVX_Vector htp_ops_binary_compute_fp16_vector(HVX_Vector v0, HVX_V
     case HTP_OPS_BINARY_SUB:
       return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(v0, v1));
     case HTP_OPS_BINARY_MUL:
-      return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v0, v1));
+      // The native multiply rounds exactly as the scalar a * b does; widening
+      // to qf16 and narrowing back differs in the last bit, which is enough to
+      // change the answer of a whole network.
+      return Q6_Vhf_vmpy_VhfVhf(v0, v1);
     case HTP_OPS_BINARY_SQUARED_DIFFERENCE: {
       return htp_ops_binary_squared_difference_fp16_vec(v0, v1);
     }
@@ -1021,6 +1024,70 @@ static inline bool htp_ops_binary_broadcast_rowwise(int dims, const int32_t* out
   return true;
 }
 
+static inline bool htp_ops_binary_compute_fp16_flat(__fp16* dst, const __fp16* src0,
+                                                    const __fp16* src1, int size, int opType);
+
+// A broadcast whose innermost dimension is dense on both sides is a run of
+// vector-sized rows. Walking them row by row costs one offset update per row
+// instead of two index computations per element, which is what made a
+// broadcast add over 64x1024 elements take 80 ms.
+static inline bool htp_ops_binary_try_broadcast_rows_fp16(uint8_t* dst, const uint8_t* src0,
+                                                          const uint8_t* src1, int32_t opType,
+                                                          int dims, const int32_t* outDims,
+                                                          const int32_t* in0Strides,
+                                                          const int32_t* in1Strides) {
+  if (dims < 1) {
+    return false;
+  }
+  const int row_len = outDims[dims - 1];
+  if (row_len <= 0 || row_len % 8 != 0) {
+    return false;
+  }
+  if (in0Strides[dims - 1] != 1 || in1Strides[dims - 1] != 1) {
+    return false;
+  }
+  // Every row this walks has to be a whole row of each input: a stride that is
+  // neither broadcast nor a multiple of the row length would mean an input row
+  // shorter than the output's, and reading across it would mix rows up.
+  for (int i = 0; i < dims - 1; ++i) {
+    if ((in0Strides[i] != 0 && in0Strides[i] % row_len != 0) ||
+        (in1Strides[i] != 0 && in1Strides[i] % row_len != 0)) {
+      return false;
+    }
+  }
+  int rows = 1;
+  for (int i = 0; i < dims - 1; ++i) {
+    if (outDims[i] <= 0) {
+      return false;
+    }
+    rows *= outDims[i];
+  }
+  __fp16* d = (__fp16*)dst;
+  const __fp16* s0 = (const __fp16*)src0;
+  const __fp16* s1 = (const __fp16*)src1;
+  int32_t idx[8] = {0};
+  int32_t off0 = 0;
+  int32_t off1 = 0;
+  for (int r = 0; r < rows; ++r) {
+    if (!htp_ops_binary_compute_fp16_flat(d + (size_t)r * row_len, s0 + off0, s1 + off1, row_len,
+                                          opType)) {
+      return false;
+    }
+    for (int i = dims - 2; i >= 0; --i) {
+      idx[i] += 1;
+      off0 += in0Strides[i];
+      off1 += in1Strides[i];
+      if (idx[i] < outDims[i]) {
+        break;
+      }
+      idx[i] = 0;
+      off0 -= in0Strides[i] * outDims[i];
+      off1 -= in1Strides[i] * outDims[i];
+    }
+  }
+  return true;
+}
+
 static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src0, const uint8_t* src1,
                                                 int32_t outSize, int32_t opType, int32_t bytes,
                                                 int32_t inputBytes, int32_t inputIsFloat,
@@ -1047,6 +1114,30 @@ static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src
   }
   if (size != outSize) {
     return false;
+  }
+
+  // Nothing to broadcast is the common case for these ops, and the per-element
+  // offset loop below costs more than the arithmetic does: a residual add over
+  // 64x1024 contiguous elements took 80 ms through it.
+  if (bytes == 2 && inputBytes == 2 && !htp_ops_binary_is_compare(opType)) {
+    bool contiguous = true;
+    int32_t stride = 1;
+    for (int i = dims - 1; i >= 0; --i) {
+      if (in0Strides[i] != stride || in1Strides[i] != stride) {
+        contiguous = false;
+        break;
+      }
+      stride *= outDims[i];
+    }
+    if (contiguous &&
+        htp_ops_binary_compute_fp16_flat((__fp16*)dst, (const __fp16*)src0, (const __fp16*)src1,
+                                         outSize, opType)) {
+      return true;
+    }
+    if (htp_ops_binary_try_broadcast_rows_fp16(dst, src0, src1, opType, dims, outDims, in0Strides,
+                                               in1Strides)) {
+      return true;
+    }
   }
 
   if (inputBytes == 2) {
@@ -1209,17 +1300,27 @@ static inline void htp_ops_binary_blit_run_row(uint8_t* dstY, const uint8_t* src
         dst_fp16[i] = value;
       }
     } else if (src0StrideX == bytes && src1StrideX == bytes &&
-               (!htp_ops_binary_is_aligned_128(dst_fp16) ||
-                !htp_ops_binary_is_aligned_128(src0_fp16) ||
-                !htp_ops_binary_is_aligned_128(src1_fp16)) &&
                htp_ops_binary_supports_fp16_vector_tail(opType)) {
+      // Alignment is what decides the load, not whether the loop is entered:
+      // every tensor the emitter puts in the arena starts on a 128-byte
+      // boundary, so requiring misalignment here left the common case on the
+      // scalar path below.
+      const bool aligned = htp_ops_binary_is_aligned_128(dst_fp16) &&
+                           htp_ops_binary_is_aligned_128(src0_fp16) &&
+                           htp_ops_binary_is_aligned_128(src1_fp16);
       int i = 0;
       const int vec_len = 128 / (int)sizeof(__fp16);
       for (; i <= size - vec_len; i += vec_len) {
-        HVX_Vector v0 = vmemu((const HVX_Vector*)(src0_fp16 + i));
-        HVX_Vector v1 = vmemu((const HVX_Vector*)(src1_fp16 + i));
+        HVX_Vector v0 = aligned ? *(const HVX_Vector*)(src0_fp16 + i)
+                                : vmemu((const HVX_Vector*)(src0_fp16 + i));
+        HVX_Vector v1 = aligned ? *(const HVX_Vector*)(src1_fp16 + i)
+                                : vmemu((const HVX_Vector*)(src1_fp16 + i));
         HVX_Vector vr = htp_ops_binary_compute_fp16_vector(v0, v1, opType);
-        vmemu((HVX_Vector*)(dst_fp16 + i)) = vr;
+        if (aligned) {
+          *(HVX_Vector*)(dst_fp16 + i) = vr;
+        } else {
+          vmemu((HVX_Vector*)(dst_fp16 + i)) = vr;
+        }
       }
       for (; i < size; ++i) {
         dst_fp16[i] = htp_ops_binary_apply_fp16(src0_fp16[i], src1_fp16[i], opType);
@@ -1614,6 +1715,34 @@ AEEResult htp_ops_binary_blit(uint8_t* dst, const uint8_t* src0, const uint8_t* 
   return 0;
 }
 
+// The same-shape case is one flat run of vectors. It used to go through the
+// task and worker path, whose bookkeeping costs far more than the arithmetic:
+// a residual add over 64x1024 elements took 80 ms that way.
+static inline bool htp_ops_binary_compute_fp16_flat(__fp16* dst, const __fp16* src0,
+                                                   const __fp16* src1, int size, int opType) {
+  if (!htp_ops_binary_supports_fp16_vector_tail(opType)) {
+    return false;
+  }
+  const bool aligned = htp_ops_binary_is_aligned_128(dst) && htp_ops_binary_is_aligned_128(src0) &&
+                       htp_ops_binary_is_aligned_128(src1);
+  const int vec_len = 128 / (int)sizeof(__fp16);
+  int i = 0;
+  for (; i <= size - vec_len; i += vec_len) {
+    HVX_Vector v0 = aligned ? *(const HVX_Vector*)(src0 + i) : vmemu((const HVX_Vector*)(src0 + i));
+    HVX_Vector v1 = aligned ? *(const HVX_Vector*)(src1 + i) : vmemu((const HVX_Vector*)(src1 + i));
+    HVX_Vector vr = htp_ops_binary_compute_fp16_vector(v0, v1, opType);
+    if (aligned) {
+      *(HVX_Vector*)(dst + i) = vr;
+    } else {
+      vmemu((HVX_Vector*)(dst + i)) = vr;
+    }
+  }
+  for (; i < size; ++i) {
+    dst[i] = htp_ops_binary_apply_fp16(src0[i], src1[i], opType);
+  }
+  return true;
+}
+
 AEEResult htp_ops_binary_elementwise(uint8_t* dst, uint8_t* src0_ptr, uint8_t* src1_ptr,
                                      int32_t outSize, int32_t in0Size, int32_t in1Size,
                                      int32_t opType, int32_t bytes, int32_t inputBytes,
@@ -1813,6 +1942,9 @@ AEEResult htp_ops_binary_elementwise(uint8_t* dst, uint8_t* src0_ptr, uint8_t* s
     const __fp16* src1 = (const __fp16*)src1Base;
 
     if (outSize == in0Size && outSize == in1Size) {
+      if (htp_ops_binary_compute_fp16_flat(dst_fp16, src0, src1, outSize, opType)) {
+        return 0;
+      }
       HtpOpsBinaryTaskState task_state = {};
       task_state.kind = HTP_OPS_BINARY_TASK_FP16;
       task_state.opType = opType;

@@ -93,8 +93,8 @@ struct HexagonBlobHeader {
   uint32_t n_ops;
   uint32_t n_inputs; // method inputs, in signature order
   uint32_t n_outputs; // method outputs, in signature order
-  uint32_t weights_bytes;
-  uint32_t inputs_bytes;
+  uint32_t weights_bytes; // on disk, right after the ops
+  uint32_t inputs_bytes; // arena sizes, not regions of the blob
   uint32_t activations_bytes;
   uint32_t outputs_bytes;
 };
@@ -114,7 +114,9 @@ static_assert(offsetof(HexagonOp, patch_scale) == 184);
 static_assert(offsetof(HexagonOp, in_place) == 188);
 static_assert(offsetof(HexagonOp, inputs) == 192);
 
-// Layout: header, then n_ops of HexagonOp, then the four sections back to back,
-// each starting 128-byte aligned.
+// Layout: header, then n_ops of HexagonOp, then the weights, 128-byte aligned.
+// The other three sections are sizes the header carries and the runtime uses to
+// lay out its own arenas; only the weights are on disk, because they are the
+// only section it copies out of the blob.
 
 } // namespace executorch::backends::hexagon

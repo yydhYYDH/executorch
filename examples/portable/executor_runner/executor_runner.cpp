@@ -22,6 +22,8 @@
 #ifdef ET_BUNDLE_IO_ENABLED
 #include <filesystem>
 #endif // ET_BUNDLE_IO_ENABLED
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -301,6 +303,20 @@ bool is_expected_vgf_dump_stop(Error status) {
 }
 
 int main(int argc, char** argv) {
+  // HEXAGON_PHASE=1: steady-clock stamps for every runner phase. The hexagon
+  // backend stamps its own phases off the same clock, so one run yields one
+  // timeline of setup, per-inference overhead and teardown.
+  const bool phase = std::getenv("HEXAGON_PHASE") != nullptr;
+  auto stamp = [&](const char* what) {
+    if (phase) {
+      const double t = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+      std::fprintf(stderr, "[phase] t=%.1f runner %s\n", t, what);
+    }
+  };
+  stamp("main_entry");
+
   executorch::runtime::runtime_init();
 
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -438,6 +454,8 @@ int main(int argc, char** argv) {
         static_cast<uint64_t>(ptd_data_map->get_num_keys().get()));
   }
 
+  stamp("inputs_loaded");
+
   // Create a loader to get the data of the program file. There are other
   // DataLoaders that use mmap() or point to data that's already in memory, and
   // users can create their own DataLoaders to load from arbitrary sources.
@@ -465,6 +483,8 @@ int main(int argc, char** argv) {
     loader = std::make_unique<FileDataLoader>(std::move(file_loader.get()));
   }
 
+  stamp("post_file_loader");
+
   // Parse the program file. This is immutable, and can also be reused between
   // multiple execution invocations across multiple threads.
   const et_timestamp_t before_load = executorch::runtime::pal_current_ticks();
@@ -473,6 +493,7 @@ int main(int argc, char** argv) {
     ET_LOG(Error, "Failed to parse model file %s", FLAGS_model_path.c_str());
     return 1;
   }
+  stamp("post_program_load");
   ET_LOG(Info, "Model file %s is loaded.", FLAGS_model_path.c_str());
 
   const char* method_name = nullptr;
@@ -587,6 +608,8 @@ int main(int argc, char** argv) {
   // For CPU-only programs keep the legacy single-arg allocator so behavior is
   // unchanged. When the program plans device buffers, pass the per-buffer
   // device metadata so the runtime can place tensors on the right device.
+  stamp("post_planned_buffers");
+
   std::optional<HierarchicalAllocator> planned_memory;
   if (has_device_buffers) {
     planned_memory.emplace(
@@ -607,6 +630,8 @@ int main(int argc, char** argv) {
   // the method can mutate the memory-planned buffers, so the method should only
   // be used by a single thread at at time, but it can be reused.
   //
+  stamp("pre_load_method");
+
   EventTraceManager tracer;
   Result<Method> method = program->load_method(
       method_name,
@@ -628,6 +653,7 @@ int main(int argc, char** argv) {
             load_tick_ratio.numerator / load_tick_ratio.denominator /
             1000000.0);
   }
+  stamp("post_load_method");
 
   if (FLAGS_server_mode) {
     ET_CHECK_MSG(
@@ -756,9 +782,11 @@ int main(int argc, char** argv) {
       ET_LOG(Debug, "Inputs prepared.");
     }
 
+    stamp("pre_execute");
     const et_timestamp_t before_execute =
         executorch::runtime::pal_current_ticks();
     Error status = method->execute();
+    stamp("post_execute");
 
     if (is_expected_vgf_dump_stop(status)) {
       ET_LOG(
@@ -798,6 +826,7 @@ int main(int argc, char** argv) {
   ET_LOG(Info, "%zu outputs: ", outputs.size());
   Error status = method->get_outputs(outputs.data(), outputs.size());
   ET_CHECK(status == Error::Ok);
+  stamp("post_get_outputs");
 
   if (FLAGS_output_file.size() > 0) {
     for (int i = 0; i < outputs.size(); ++i) {
@@ -817,6 +846,8 @@ int main(int argc, char** argv) {
       }
     }
   }
+
+  stamp("post_write_outputs");
 
   if (print_output_mode == PrintOutputMode::All) {
     for (int i = 0; i < outputs.size(); ++i) {
@@ -924,5 +955,6 @@ int main(int argc, char** argv) {
   }
 #endif
 
+  stamp("main_exit");
   return 0;
 }

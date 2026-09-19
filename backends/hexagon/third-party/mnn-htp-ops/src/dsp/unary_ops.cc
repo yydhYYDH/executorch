@@ -25,6 +25,7 @@ typedef enum {
   HTP_OPS_UNARY_EXPM1 = 12,
   HTP_OPS_UNARY_COS = 13,
   HTP_OPS_UNARY_SIN = 14,
+  HTP_OPS_UNARY_CLAMP = 15,
 } HtpOpsUnaryOpType;
 
 #define HTP_OPS_UNARY_MT_MIN_FP16_ELEMS 2048
@@ -41,6 +42,8 @@ typedef struct {
   int grain;
   int opType;
   int bytes;
+  _Float16 clamp_min;
+  _Float16 clamp_max;
   __fp16* fp16_dst;
   const __fp16* fp16_src;
   int32_t* int32_dst;
@@ -486,6 +489,64 @@ static inline void htp_ops_unary_compute_fp16_chunk(__fp16* dst, const __fp16* s
   }
 }
 
+// clamp is min(max(x, lo), hi) in that order, the same order torch's portable
+// kernel applies, so a range whose lower bound sits above its upper one comes
+// back as the upper bound. Both steps are fp16 vector compares, and a NaN
+// input fails both and stays NaN.
+static inline void htp_ops_clamp_fp16_chunk(__fp16* dst, const __fp16* src, int size, _Float16 lo, _Float16 hi) {
+  union {
+    _Float16 h;
+    uint16_t u;
+  } lo_bits, hi_bits;
+  lo_bits.h = lo;
+  hi_bits.h = hi;
+  const HVX_Vector vlo = Q6_Vh_vsplat_R(lo_bits.u);
+  const HVX_Vector vhi = Q6_Vh_vsplat_R(hi_bits.u);
+  // The fp16 compares are not ordered: a NaN input compares greater than its
+  // upper bound and comes back as that bound where torch returns the input. The
+  // magnitude test is exact in bits -- a NaN is an all-ones exponent with a
+  // non-zero mantissa, so |x| > 0x7c00 -- and restores the input, payload and
+  // all, without asking the compare unit about NaN a second time.
+  const HVX_Vector vmag = Q6_Vh_vsplat_R(0x7fff);
+  const HVX_Vector vinf = Q6_Vh_vsplat_R(0x7c00);
+  const float lo_f = (float)lo;
+  const float hi_f = (float)hi;
+
+  int i = 0;
+  const int vec_len = 128 / (int)sizeof(__fp16);
+  const int vec_end = size & -vec_len;
+  const __fp16* src_ptr = src;
+  __fp16* dst_ptr = dst;
+  for (; i < vec_end; i += vec_len) {
+    const int pf = i + vec_len * HTP_OPS_UNARY_L2FETCH_VECS;
+    if (pf < vec_end) {
+      const int remain = (vec_end - pf) / vec_len;
+      l2fetch(src + pf, 128, 128, remain < HTP_OPS_UNARY_L2FETCH_VECS ? remain : HTP_OPS_UNARY_L2FETCH_VECS, 0);
+    }
+    const HVX_Vector v = vmem(src_ptr);
+    HVX_Vector c = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(vlo, v), vlo, v);
+    c = Q6_V_vmux_QVV(Q6_Q_vcmp_gt_VhfVhf(c, vhi), vhi, c);
+    const HVX_VectorPred is_nan = Q6_Q_vcmp_gt_VuhVuh(Q6_V_vand_VV(v, vmag), vinf);
+    vmem(dst_ptr) = Q6_V_vmux_QVV(is_nan, v, c);
+    src_ptr += vec_len;
+    dst_ptr += vec_len;
+  }
+  for (; i < size; ++i) {
+    const float x = (float)src[i];
+    dst[i] = (__fp16)(x < lo_f ? lo_f : (x > hi_f ? hi_f : x));
+  }
+}
+
+// One fp16 chunk, whichever fp16 op was asked for: the rest of the unary table
+// carries its op type, clamp carries its bounds.
+static inline void htp_ops_unary_fp16_chunk(HtpOpsUnaryTaskState* state, __fp16* dst, const __fp16* src, int count) {
+  if (state->opType == HTP_OPS_UNARY_CLAMP) {
+    htp_ops_clamp_fp16_chunk(dst, src, count, state->clamp_min, state->clamp_max);
+  } else {
+    htp_ops_unary_compute_fp16_chunk(dst, src, count, state->opType);
+  }
+}
+
 static inline void htp_ops_unary_compute_int32_chunk(int32_t* dst, const int32_t* src, int size, int opType) {
   for (int i = 0; i < size; ++i) {
     dst[i] = htp_ops_unary_apply_int32(src[i], opType);
@@ -503,8 +564,8 @@ static void htp_ops_unary_fixed_worker(void* data, int worker_index) {
   HtpOpsUnaryFixedTask* task = (HtpOpsUnaryFixedTask*)data;
   HtpOpsUnaryTaskState* state = task->state;
   if (state->bytes == 2) {
-    htp_ops_unary_compute_fp16_chunk(state->fp16_dst + task->start, state->fp16_src + task->start,
-                                     task->count, state->opType);
+    htp_ops_unary_fp16_chunk(state, state->fp16_dst + task->start, state->fp16_src + task->start,
+                             task->count);
   } else {
     htp_ops_unary_compute_int32_chunk(state->int32_dst + task->start, state->int32_src + task->start,
                                       task->count, state->opType);
@@ -537,7 +598,7 @@ static inline void htp_ops_unary_run_task(HtpOpsUnaryTaskState* state, int size)
   const int n_tasks = htp_ops_unary_pick_task_count(size, state->bytes);
   if (n_tasks <= 1) {
     if (state->bytes == 2) {
-      htp_ops_unary_compute_fp16_chunk(state->fp16_dst, state->fp16_src, size, state->opType);
+      htp_ops_unary_fp16_chunk(state, state->fp16_dst, state->fp16_src, size);
     } else {
       htp_ops_unary_compute_int32_chunk(state->int32_dst, state->int32_src, size, state->opType);
     }
@@ -593,6 +654,31 @@ AEEResult htp_ops_unary(uint8_t* dst, uint8_t* src, int32_t size, int32_t opType
     task_state.int32_dst = (int32_t*)dst;
     task_state.int32_src = (const int32_t*)src;
   }
+  htp_ops_unary_run_task(&task_state, size);
+  return 0;
+}
+
+// clamp rides the unary machinery -- the same worker pool and the same fp16
+// chunking -- but takes its two bounds where the other types take an op type,
+// so it has an entry point of its own rather than a wider htp_ops_unary.
+AEEResult htp_ops_unary_clamp(uint8_t* dst, uint8_t* src, int32_t size, int32_t min_bits, int32_t max_bits) {
+  if (size <= 0) {
+    return 0;
+  }
+  union {
+    uint16_t u;
+    _Float16 h;
+  } lo_bits, hi_bits;
+  lo_bits.u = (uint16_t)min_bits;
+  hi_bits.u = (uint16_t)max_bits;
+
+  HtpOpsUnaryTaskState task_state = {};
+  task_state.opType = HTP_OPS_UNARY_CLAMP;
+  task_state.bytes = 2;
+  task_state.clamp_min = lo_bits.h;
+  task_state.clamp_max = hi_bits.h;
+  task_state.fp16_dst = (__fp16*)dst;
+  task_state.fp16_src = (const __fp16*)src;
   htp_ops_unary_run_task(&task_state, size);
   return 0;
 }

@@ -5,9 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
-from typing import Callable, Dict, List, Tuple
-
-import torch
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from executorch.backends.hexagon.hexagon_ops import (
@@ -18,6 +16,11 @@ from executorch.backends.hexagon.hexagon_ops import (
 from executorch.backends.hexagon.serialization.blob import BlobBuilder, TensorRef
 from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec
+from torch._export.utils import (
+    get_buffer,
+    get_lifted_tensor_constant,
+    get_param,
+)
 from torch.export import ExportedProgram
 
 # node.target -> emitter. The partitioner delegates exactly these, so what the
@@ -45,6 +48,34 @@ def _val_of(node: torch.fx.Node) -> torch.Tensor:
     return val
 
 
+def owned_weight(
+    program: ExportedProgram, node: torch.fx.Node
+) -> Optional[torch.Tensor]:
+    """The tensor behind a placeholder the caller does not pass in.
+
+    A parameter, buffer or lifted constant consumed by a subgraph still arrives
+    as a placeholder, but its bytes belong to the program rather than to the
+    caller. The partitioner tags those, so EXIR moves their values into this
+    program's own state and out of the delegate's arguments; what is left here
+    is to find them.
+    """
+    for fetch in (get_param, get_buffer, get_lifted_tensor_constant):
+        tensor = fetch(program, node)
+        if tensor is not None:
+            return tensor
+    return None
+
+
+def weight_bytes(tensor: torch.Tensor) -> bytes:
+    """The bytes the DSP reads out of the weight section.
+
+    The kernels read two bytes per element, and the runtime narrows a fp32
+    method input to fp16 on the way into the arena, so a weight stored where
+    that input used to be has to hold the same fp16 bytes it would have carried.
+    """
+    if tensor.dtype == torch.float32:
+        tensor = tensor.to(torch.float16)
+    return tensor.detach().contiguous().cpu().numpy().tobytes()
 
 
 class BlobContext:
@@ -198,11 +229,24 @@ class HexagonBackend(BackendDetails):
         output_node = next(node for node in graph.nodes if node.op == "output")
         outputs = _flatten_outputs(output_node)
 
-        context = BlobContext(
-            graph_module, len(placeholders), len(outputs), dict(outputs)
-        )
+        # A weight this subgraph owns is stored in the blob, not handed over as
+        # an argument. The runtime uploads the blob's weight section once, at
+        # delegate init; a method input is copied into the arena on every
+        # execute, which for a tower of stacked matmuls is the whole model's
+        # weights per inference.
+        weights = {
+            placeholder: owned_weight(program, placeholder)
+            for placeholder in placeholders
+        }
+        weights = {node: tensor for node, tensor in weights.items() if tensor is not None}
+        inputs = [node for node in placeholders if node not in weights]
 
-        for index, placeholder in enumerate(placeholders):
+        context = BlobContext(graph_module, len(inputs), len(outputs), dict(outputs))
+
+        for node, tensor in weights.items():
+            context.producer[node] = context.builder.add_weights(weight_bytes(tensor))
+
+        for index, placeholder in enumerate(inputs):
             value = _val_of(placeholder)
             # A scalar input such as llama.custom_sdpa's start_pos arrives as a
             # SymInt, not a tensor. It still needs a slot: the runtime patches
