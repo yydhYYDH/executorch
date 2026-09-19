@@ -992,11 +992,13 @@ so `|x| > 0x7c00` as an integer compare, and the input is muxed back over the
 clamped value, payload included. The scalar tail uses the C comparison, which
 propagates NaN on its own.
 
-Four probe exports carry the check, each one clamp and one delegate: 4096
-elements so every one is in a vector, 4161 so the scalar tail runs,
-`clamp(x, None, 1.0)` for an omitted bound, and the full fp16 range as bounds.
-All four come back bit for bit identical to torch's own fp16 result on the
-device, with an infinity and a NaN in each input. The four-layer tower with its
+Six probe exports carry the check, each one clamp and one delegate: 4096 elements
+so every one is in a vector, 4161 so the scalar tail runs, both bounds, one bound
+either way -- a one-bound clamp arrives as `args = (x, bound)` and means `min`,
+which is the form `clamp(x, min=0.5)` and `clamp(x, 0.5)` both lower to, and
+which the emitter used to index past the end of -- an omitted bound, and the full
+fp16 range as bounds. All six come back bit for bit identical to torch's own fp16
+result on the device, with an infinity and a NaN in each input. The four-layer tower with its
 clamps delegated reproduces, bit for bit, the export whose clamps ran on the host
 (md5 73e5df61 on the same input), and the 24-layer split export is still
 18b6997d.

@@ -602,6 +602,11 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "clamp input")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
+    # The bounds arrive positionally and are not always both there: a one-bound
+    # clamp is min= that bound, and a clamp with no bounds at all is the
+    # identity, which the infinities below express on their own.
+    lower = node.args[1] if len(node.args) > 1 else None
+    upper = node.args[2] if len(node.args) > 2 else None
     ctx.builder.add_op(
         Op(
             type=DSP_OP_UNARY,
@@ -612,8 +617,8 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
                 numel,
                 UNARY_OP_TYPES["clamp"],
                 FP16_BYTES,
-                _clamp_bound_bits(node.args[1], float("-inf")),
-                _clamp_bound_bits(node.args[2], float("inf")),
+                _clamp_bound_bits(lower, float("-inf")),
+                _clamp_bound_bits(upper, float("inf")),
             ],
         )
     )
