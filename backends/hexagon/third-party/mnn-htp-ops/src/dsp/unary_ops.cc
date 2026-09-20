@@ -26,6 +26,8 @@ typedef enum {
   HTP_OPS_UNARY_COS = 13,
   HTP_OPS_UNARY_SIN = 14,
   HTP_OPS_UNARY_CLAMP = 15,
+  HTP_OPS_UNARY_ROW_GUARD = 16,
+  HTP_OPS_UNARY_SCALE = 17,
 } HtpOpsUnaryOpType;
 
 #define HTP_OPS_UNARY_MT_MIN_FP16_ELEMS 2048
@@ -655,6 +657,92 @@ AEEResult htp_ops_unary(uint8_t* dst, uint8_t* src, int32_t size, int32_t opType
     task_state.int32_src = (const int32_t*)src;
   }
   htp_ops_unary_run_task(&task_state, size);
+  return 0;
+}
+
+// The masked-row guard the attention export carries: rows of the second operand
+// whose counterpart row in the first is entirely the pad value -- all -inf,
+// which is what a fully masked row looks like -- become zeros, and every other
+// row is copied through unchanged. Rows are the unit of work here rather than
+// elements, so this runs in one pass instead of riding the chunked worker pool:
+// the whole tensor is one attention block, not the model's bulk.
+static inline void htp_ops_row_guard_fp16(
+    __fp16* dst, const __fp16* mask, const __fp16* src, int rows, int row_len, _Float16 pad) {
+  for (int r = 0; r < rows; ++r) {
+    const __fp16* mask_row = mask + (size_t)r * row_len;
+    bool all_pad = true;
+    for (int c = 0; c < row_len; ++c) {
+      if (mask_row[c] != pad) {
+        all_pad = false;
+        break;
+      }
+    }
+    __fp16* out = dst + (size_t)r * row_len;
+    if (all_pad) {
+      memset(out, 0, (size_t)row_len * sizeof(__fp16));
+    } else {
+      memcpy(out, src + (size_t)r * row_len, (size_t)row_len * sizeof(__fp16));
+    }
+  }
+}
+
+// A fp16 tensor times a python float is not a fp16 multiply. torch and the
+// portable kernel both promote the scalar to fp32, multiply in fp32 and round
+// the product back, which differs from a fp16 product on about one element in
+// six -- so a fp16 product here would change the model's output. Widening is
+// the whole job of this op: it exists so the scale stays in the graph instead
+// of being handed out to the host, which splits a delegate at every scale.
+static inline int32_t htp_ops_scale_bits(float scale) {
+  int32_t bits = 0;
+  memcpy(&bits, &scale, sizeof(bits));
+  return bits;
+}
+
+static inline void htp_ops_scale_fp32(
+    __fp16* dst, const __fp16* src, int32_t size, float scale) {
+  const int32_t vec_len = 128 / (int)sizeof(__fp16);
+  const int32_t vec_end = size & -vec_len;
+  const __fp16* s = src;
+  __fp16* d = dst;
+  int32_t i = 0;
+  // The shuffle and its inverse deal are what keep the halves in the order the
+  // pair of fp32 vectors was read in; without them the widened lanes are
+  // interleaved and the result comes back with each element in the wrong place.
+  const HVX_Vector vscale = Q6_V_vsplat_R(htp_ops_scale_bits(scale));
+  for (; i < vec_end; i += vec_len) {
+    const HVX_VectorPair wide = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(vmemu((const HVX_Vector*)s)));
+    const HVX_Vector lo = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_V_lo_W(wide), vscale));
+    const HVX_Vector hi = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(Q6_V_hi_W(wide), vscale));
+    vmemu((HVX_Vector*)d) = Q6_Vh_vdeal_Vh(Q6_Vhf_vcvt_VsfVsf(lo, hi));
+    s += vec_len;
+    d += vec_len;
+  }
+  for (; i < size; ++i) {
+    d[i - vec_end] = (__fp16)((float)s[i - vec_end] * scale);
+  }
+}
+
+AEEResult htp_ops_unary_scale(uint8_t* dst, uint8_t* src, int32_t size, int32_t scale_bits) {
+  float scale = 0.0f;
+  memcpy(&scale, &scale_bits, sizeof(scale));
+  if (size > 0) {
+    htp_ops_scale_fp32((__fp16*)dst, (const __fp16*)src, size, scale);
+  }
+  return 0;
+}
+
+AEEResult htp_ops_unary_row_guard(
+    uint8_t* dst, uint8_t* mask, uint8_t* src, int32_t size, int32_t row_len, int32_t pad_bits) {
+  if (size <= 0 || row_len <= 0) {
+    return 0;
+  }
+  union {
+    uint16_t u;
+    _Float16 h;
+  } pad;
+  pad.u = (uint16_t)pad_bits;
+  htp_ops_row_guard_fp16(
+      (__fp16*)dst, (const __fp16*)mask, (const __fp16*)src, (int)(size / row_len), row_len, pad.h);
   return 0;
 }
 

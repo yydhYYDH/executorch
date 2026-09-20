@@ -554,3 +554,485 @@ does not depend on the blob. Only a smaller pte shrinks the first term, which
 makes the weight width -- not the delegate structure -- the one lever left on the
 load path.
 
+### The weight fill was stride-bound, not byte-bound
+
+The HMX path re-arranges a 32-column weight group into the unit's tile order on
+every execution. Storing that order in the blob instead (HEXAGON_HMX_PREPACK,
+now on by default) costs nothing -- the reordered bytes are the same size, so the
+blob is the same size, and the output is bit-identical -- and it turns the fill
+into one straight run per group: a row-major (k, n) weight hands the DSP 32 rows
+of 64 bytes at a pitch of n * 2, which is a stride no prefetcher likes.
+
+The copy also had to leave libc's memcpy behind to pay off. A byte-wide copy of a
+DDR block ran 2.4x slower than the element rearrange it replaced; the same copy
+128 bytes at a time runs 1.7x faster than it.
+
+| 24 layers | load | per image | DSP call |
+|---|---|---|---|
+| row-major weights | 576, 583 ms | 422, 432, 430 ms | 465 |
+| pre-packed weights | 562, 561 ms | 292, 316, 317 ms | 308 |
+
+Both exports reproduce md5 18b6997d, and the same holds at 2 and 12 layers.
+
+### The scale was splitting the graph, and it did not have to
+
+A fp16 tensor times a python float is not a fp16 multiply. torch and the
+portable kernel both promote the scalar to fp32, multiply there and round the
+product back, which differs from a fp16 product on about one element in six -- so
+a fp16 product on the DSP changes the output, and the op stayed on the host. Two
+of them per layer is what split the tower into 25 delegates, each paying a copy
+in and a copy out.
+
+Doing the fp32 step on the DSP removes the reason to hand it out. The DSP widens
+each half to fp32, multiplies by the fp32 scalar and narrows the product back,
+which is the same rounding the host path does, so the output is bit-identical and
+the whole tower becomes one delegate.
+
+The lane order is the trap: the packed widening needs a `vshuff` in front of it
+and the matching `vdeal` behind it, or every element comes back in the wrong
+lane. A fp16 multiply would hide that, because a fp16 product of the wrong two
+lanes is still a plausible number.
+
+| 24 layers | load | per image | DSP call | host in+out | md5 |
+|---|---|---|---|---|---|
+| scale on the host, 25 delegates | 559, 567 ms | 248-272 ms | 188 ms | 69 ms | 18b6997d |
+| scale on the DSP, 1 delegate | 521, 539 ms | 167-174 ms | 170 ms | 0.2 ms | 18b6997d |
+
+Merging is faster on the DSP side too, so the split was not buying anything: 188
+ms of call time became 170 ms, and the delegate init a pte pays per partition
+shows up in the load as 559 -> 521 ms. Steady state over eight executions is
+167-174 ms an image, from 697 ms at the start.
+
+### Where the remaining 170 ms goes, and why the weights are the floor
+
+One tracing execution of the merged tower, in milliseconds per image (DSP kernel
+time per op, from the profile slots; the call is 170 ms in total, so about 17 ms
+sits in the command loop and the RPC rather than in a kernel):
+
+| | ms | of which |
+|---|---|---|
+| matmul (slot 38) | 111 | weight fill 71, output store 26, activation pack 11 |
+| binary elementwise (19) | 19.6 | |
+| raster blit (3) | 8.7 | |
+| unary, the 48 scales (4) | 6.5 | |
+| row guard (135) | 3.0 | |
+| convert / gelu / softmax | 4.0 | |
+
+The fill is 663 MB an image, which is the whole model read once, and it runs at
+9.3 GB/s -- so the matmul is weight-bandwidth-bound rather than compute-bound,
+and not by a little. The grid is 1x8x8, so a token block is 64 rows: every weight
+byte is used 64 times, while the HMX unit would be happy to use it thousands of
+times. At 2 MB of weights per matmul the fill is 215 us of DDR and the compute is
+about 34 us.
+
+That is also why the DMA engine was the wrong idea. The fill is the largest
+single item, the engine is a second path to DDR that does not touch the vector
+unit, and the convolutions, the LSTM and the attention path all move weights with
+it. Handing it the same copy here did nothing: a build that samples the head,
+middle and tail of the destination and falls back to the vector copy on any
+mismatch produced bit-identical output and bit-identical time, which says every
+transfer fell back. The scaffolding went with the finding -- an inline copy that
+sometimes does nothing is worse than a slow one.
+
+The store slot looked like the next item, and it is not what it looks like. One
+column group of 32 columns is written per nt step, so each row of the tile leaves
+as a 64-byte store at a 2048-byte stride -- a partial cache line per row -- and
+the slot costs 26 ms. Staging the block in VTCM and draining whole 2 KB rows
+instead was built and measured: the output stayed bit-identical, but the store
+slot went 26.06 -> 32.05 ms and the call 169 -> 176 ms, with the fill unchanged
+at 73 ms. Partial-line writes were never the problem. The per-group work is two
+tile loads and a drain of a 32x32 accumulator over K=1024, which is about 2 us of
+unit time, and at 6900 drains an image that is what the slot is: the unit doing
+its job, plus the drain's own store. It is not a locality problem and there is
+nothing to win by rewriting it.
+
+That leaves the fill as the only large item, and the honest lever is not a faster
+copy but an overlap. The fill is 73 ms of vector-unit DDR reads and the rest of
+the matmul is 37 ms of unit work, on two different units that currently run one
+after the other: every matmul here is a single weight pass, so there is no next
+pass to fill during, and the pass order is fixed by the activation pack, which is
+per row block and cannot be repeated per column group. Overlapping them means
+staging the activations for every row block in VTCM and splitting the weight fill
+per column group so a group's unit work can start while the next group is still
+arriving. Measured aggregate DDR use says there is room: the phases together run
+at 5.8 GB/s while any phase on its own reaches 9.3.
+
+That overlap was built and measured, and it does not pay either. Every row
+block's activation was staged up front -- which also stops the pack from being
+repeated once per pass -- and each group's unit loads were issued before the next
+group's bytes were moved in, sliced across the row blocks so the vector unit
+never sat idle. Output stayed bit-identical, and the split shows why it does not
+help:
+
+| | fill | store | call |
+|---|---|---|---|
+| one copy then compute | 73.06 | 25.97 | 169, 170 |
+| fill overlapped with the unit | 69.38 | 32.03 | 169, 178 |
+
+The fill did get cheaper (73.06 -> 69.38, its slices prefetch better than one
+long run), but the store slot grew by more than that (25.97 -> 32.03), and it is
+the same +6 ms the VTCM-staged store showed. Both rewrites put vector-unit writes
+into VTCM next to the unit's own tile reads, and VTCM is one resource: the copy
+starves the accumulator, so the time just moves from the fill to the drain.
+
+The per-command overhead is not worth chasing either. The map lookup a command
+does is already a small hot array (mmap_mgr.cc), so what is left of the 17 ms
+outside the kernels is the profile instrumentation itself, which production runs
+do not carry.
+
+What that leaves is the floor: 663 MB of weights an image at 9.3 GB/s is 71 ms,
+the units run the rest, and the element-wise ops are already at 8 GB/s. Weight
+reuse is the whole story -- 64 rows means every weight byte is used 64 times --
+so the levers that remain are the ones that change how many bytes are read
+(quantization) or how many rows use them (more rows per weight load).
+
+### Every command's traffic, read off the blob
+
+Guessing at the element-wise ops had run out of road, so the blob was read
+directly (tmp/opbytes.py, tmp/opdetail.py -- the op table carries every operand's
+space and byte size, so the whole DDR budget is in it):
+
+| type | ops | reads MB | where |
+|---|---|---|---|
+| batch_matmul | 147 | 692.5 | **weights 657.5**, activations 34.9 |
+| binary_elementwise | 390 | 80.9 | activations 79.4, weights 1.6 |
+| raster_blit | 408 | 78.6 | activations 78.6 |
+| unary | 145 | 28.4 | activations |
+| layer_norm | 49 | 6.4 | activations |
+| softmax | 24 | 3.2 | activations |
+| **total** | 1163 | **890** | plus about as much written back |
+
+Two things this settles. The binaries are not stray arithmetic: 290 of the 390
+are broadcast multiplies against a weights vector (1024 or 4096 halves) -- the
+RMSNorm gamma and its siblings -- and each pays a full 128 KB read and 128 KB
+write of the activation. They cannot be folded into the preceding matmul's
+epilogue because the graph rounds to fp16 before the multiply and the epilogue
+would round once, which is a different byte.
+
+And the 408 blits are not redundant copies. Reading their regions out of the
+table, they are the attention's head split and merge: 96 of them walk a
+(64,16,64) operand with strides (1024,64,1) into (16,64,64), and the rest are
+their inverses and the three-way QKV cut. That is real data movement through
+DDR, about 8.8 ms of it, and the only way out is not to move it: have the
+attention matmul read the (rows, heads, dim) layout directly -- the activation
+pack already walks rows by stride -- or emit the tower's decomposed attention as
+one MNN vision-attention command, which this tree carries but the AOT side never
+emits.
+
+### The matmul, split three ways
+
+Which of the two halves of the matmul is the one to attack is a measurement, not
+an argument, so the kernel got two build switches that leave the shape of the
+work alone and only drop a part of it: one that skips the compute for every
+weight pass, one that skips the weight fill. Both produce wrong output on
+purpose; the point is the clock.
+
+| build | what runs | per image | call |
+|---|---|---|---|
+| base | everything | 171, 169, 172 | 170 |
+| no compute | fill, packs, every other command | 62, 61, 66 | 63 |
+| no fill | compute, packs, every other command | 90, 90, 92 | 90 |
+
+Subtracting: the weight fill is **80 ms**, the unit's own work is **27 ms**, and
+everything that is not this matmul is **63 ms**. The three add to 170 exactly.
+
+Two things fall out. The store slot that looked like a locality problem and
+weighed 26 ms is the unit's 27 ms seen from the waiter's side -- the store itself
+is nearly free, which is why staging it in VTCM could only make things worse. And
+the fill and the compute, run separately, cost 63 + 90 = 153 ms; run in the same
+kernel, as they are, they cost 170. Interleaving them costs 17 ms more than
+running them one after the other, which is exactly what both overlap attempts
+measured from the other direction.
+
+So the budget is: weights 80, everything else 63, unit 27. Reaching 120 ms would
+mean cutting 50 of the 90 non-weight milliseconds, and even removing every
+element-wise op, every layout blit and every pack -- all of them -- lands at
+about 117. The ceiling is real: this model's weights are 663 MB an image, and at
+the 8.3 GB/s the fill actually achieves that is 80 ms before the unit has done
+anything.
+
+### The matmul epilogue fold: implemented, measured, reverted
+
+The element-wise ops that follow the matmuls looked like the one class of work a
+matmul's own store could absorb: an mm and a mul(act, gamma) next to each other in
+the blob, roughly 240 commands and 13 ms of traffic by the inventory above. It was
+built -- the store applies a per-column multiply or add in fp32 between reading the
+fp16 tile and writing it back, the vector rides in input slot 5 of BATCH_MATMUL
+(which no path reads) and the mode in params[28], past the packed loop descriptor;
+the encoder folds by appending to the command the matmul just emitted, guarded on a
+single user and on that command writing exactly the operator's result. Two commands
+per layer survived the guards, and the reason is worth keeping:
+
+* The consumers of a matmul are not the element-wise ops. Every mul in a layer reads
+  a cat, a squeeze_copy, b_cos or b_sin; the adds read a mul or another add. A
+  binary that sits directly after an mm in the blob is a coincidence of emission
+  order, not a data dependency -- reading adjacency out of the blob is not reading
+  the graph.
+* What the fold did catch was one add(mm_out, bias) per layer: 24 commands of 1163.
+  Measured in one session, back to back, 201.7 ms without it and 201.4 ms with it.
+
+The verdict was still a revert, because the fold is not bit-exact. The folded output
+differs from the unfolded one (md5 331b38e4 against 18b6997d): the DSP narrows with
+Q6_Vhf_vcvt_VsfVsf, and that does not round the same way as the portable fp16 add in
+the binary kernel. A single-rounding epilogue is only exact when the operator it
+replaces is itself single-rounding, which the graph's fp16 -> fp32 -> op -> fp16
+sequence is not.
+
+Both sides were restored and checked: the skeleton rebuilds to
+48cdc5d129b4d85292e67fc3ba080fad and a fresh 24-layer export is byte-identical to the
+reference blob (5581899de2eb095d4744cc29ac427671). Note the device ran at 201 ms for
+this build tonight against 170 ms earlier -- the A/B above is like-for-like, but
+absolute numbers from different sessions are not comparable. Cheaper than folding is
+deleting: the 78.6 MB of raster blits and the 80.8 MB of binaries only exist between
+layout ops, so the traffic to attack is the layout, not the arithmetic.
+
+### Where the call actually goes: 101 ms before any kernel runs
+
+Two diagnostic skeletons answered the question the round-5 split left open. Skipping
+the movement of all 408 raster blits (keeping their dispatch) leaves the call at
+201.6 ms against a 201.4 ms base, and skipping all 389 element-wise ops leaves it at
+202.8. Neither family costs anything measurable, so the 63 ms that the no-compute leg
+was carrying is not their arithmetic.
+
+Returning instead at the very top of execute_single_command -- before the mmap
+lookup, the cache clean and the flatbuffer parse -- for every one of the 1163
+commands lands at 101.1 ms, and cutting the same function at three later points
+(after the mmap, after the clean, after the parse) changes it by less than 0.3 ms:
+101.7, 101.2, 101.0. The per-command path is free. The 101 ms is spent outside it,
+in the group entry (VTCM acquire, mmap init, both sync_group_tensors calls, the
+profile setup) or in the FastRPC call itself, and it is a floor that does not depend
+on what the commands do.
+
+Read against the 201 ms base, that is: ~100 ms of kernels, of which the weight fill
+is ~80 and the unit ~27, and ~101 ms that the command group pays whatever it is
+asked to run. The obvious next measurement is the same bisection one level up,
+inside htp_ops_execute_command_group, which separates the group's own setup from
+the transport around it. The device was running ~200 ms this session against the
+170 ms recorded earlier, so these numbers compare within the session only.
+
+### What the group entry costs, and what it does not
+
+The round-7 number needed correcting. Cutting the group entry at seven points,
+back to back on one device session:
+
+* return before the VTCM guard: 101.3, 0.79, 0.61 ms across three executions. The
+  first call carries a one-time ~100 ms, the rest cost nothing. That also explains
+  the 63 ms and 101 ms floors measured earlier, which were first-call effects.
+* keep only the matmul kernel and dispatch the other 1015 commands to nothing:
+  202.1, 204.0, 201.4 ms against a 201.5 ms base. Every blit, cat, permute, unary,
+  norm and softmax in the tower is free. The whole call is the matmul path.
+* return just before the command loop, after the group's own setup: 103.0, 101.2,
+  101.0, 101.2 ms. So the group entry costs ~100 ms on every call, not just the
+  first, and it is spent before the first command runs.
+
+Three candidates for that ~100 ms were removed and none of them moved the number:
+keeping the VTCM window acquired across calls and building the fd-to-pointer table
+once (201.7 against a 201.5 ms base), and dropping the pre-execute sync group
+entirely, which is the flatbuffer naming every operand of all 1163 ops including
+the 663 MB of weights (201.6 against a 201.4 ms base). The two statements left in
+that window -- the group's mmap lookup and a qurt_mem_cache_clean over its 14 KB of
+command entries -- should each cost microseconds, so the next move is to stamp
+HAP_perf_get_time_us around each of them rather than infer from more cut points.
+
+Read together: 201 ms is ~100 ms of group entry that no candidate explains, plus
+~101 ms of matmul (fill ~80, unit ~27), plus nothing at all for the other 1015
+commands. The layout and elementwise work that earlier rounds treated as targets is
+already off the critical path, and the fill remains the largest thing that is
+actually understood.
+
+### The call, itemised
+
+Stamping the DSP with the profile counters it already carries (slots 200-212,
+cumulative microseconds, read back with HEXAGON_PHASE=1) gives the whole call in one
+run of the verified build, output md5 18b6997d:
+
+| item | ms |
+| --- | --- |
+| weight fill (200) | 72.8 |
+| activation pack (201) | 11.2 |
+| unit tile loads (202) | 0.4 |
+| output store (203) | 26.0 |
+| matmul kernel, all commands (204) | 111.6 |
+| whole htp_ops_batch_matmul (208) | 113.3 |
+| group entry, guard to loop (211) | 13.5 |
+| VTCM guard (212) | 0.019 |
+| **call_ms** | **204.4** |
+
+The bracket around htp_ops_batch_matmul settles two questions that earlier rounds
+left open. There are 147 batch_matmul commands and the HMX plan path fires for 48 of
+them, but `htp_ops_loop_matmul_batch_hmx_prepare` costs 68 us in total across all
+147, and `hmx_manager_enable_execution` plus `hmx_unit_acquire` cost 125 us in total.
+Per-command HMX setup is not a cost, and neither is the matmul dispatch: the kernel
+is 111.6 of the 113.3 ms the function spends.
+
+So the matmul path is 113.3 ms and the group entry is 13.5 ms, against a call of
+204.4. That leaves ~78 ms that no instrumentation in either place accounts for, and
+it scales with the command count: 1163 commands at ~66 us is 77 ms, and a loop of
+1163 commands that return at the very top of execute_single_command also costs ~87 ms
+above the entry. The per-command overhead is real and it is not the kernel.
+
+### The 101/201 staircase was the host watchdog
+
+Superseding the section below. A traced delegate starts a ProbeWatchdog thread; its
+Loop slept in 100 ms slices and the destructor called join() on it, so every traced
+invoke paid whatever was left of the slice as dead time. Measured on the same session
+and the same skeleton, HEXAGON_TRACE=1, three executions each: watchdog unset 201.9 /
+201.4 / 201.5, HEXAGON_WATCHDOG_SECONDS=60 204.3 / 201.6 / 203.8, and
+HEXAGON_WATCHDOG_SECONDS=0 171.7 / 171.0 / 169.6. The staircase is a host thread,
+not the DSP, which is why removing DSP work never moved it and why the documented
+167-174 ms steady state reappeared the moment tracing was off.
+
+The wait is now interruptible: Loop blocks in cv_.wait_for(lock, seconds_, stop_) and
+the destructor sets the flag under the same mutex and notifies before joining, so join
+returns immediately instead of at the end of a slice. With the default interval and
+HEXAGON_TRACE=1 the patched runner measures 162.4 / 173.2 / 173.0 / 173.4 / 172.0 /
+172.6 over six executions, output md5 18b6997d, and zero watchdog dumps -- the dump
+path is untouched, it just waits on the condition variable. Tracing now costs ~3 ms
+instead of ~35 ms.
+
+Untraced, which is how the tower actually runs, the same build measures 163.8 / 168.9 /
+170.1 / 171.6 / 168.5 / 169.8 ms with in_ms 0.06 and total_ms equal to call_ms to
+within 0.1 ms. There is no host overhead left to find: the ~90 ms gap between call_ms
+and total_ms that round 7 saw was tracing, the probe ring, and this watchdog.
+
+Everything in the sections below that reads a DSP-side phase counter still stands --
+those numbers are read inside the call and never included the join. What changes is
+the per-image figure: 169 ms untraced, of which ~140 ms is measured DSP kernel work
+and 67.8 ms of that is the weight fill.
+
+### call_ms is not a metric: it is bimodal
+
+Bracketing the dispatch itself settles where the loop's time goes, and then four
+models over the same skeleton overturn the number the brackets live in. The dispatch
+of all 1163 commands is 147.6 ms (slot 209), of which the 147 matmul commands are
+110.0 (slot 208) -- so the other 1016 commands really do cost 37.6 ms, whatever the
+legs that removed their kernels said. The whole per-command prologue -- mmap, cache
+clean, flatbuffer parse -- is 0.27 ms across all 1163 (slot 210).
+
+Then the same build over four exports:
+
+| model | ops | call_ms, three executions |
+| --- | --- | --- |
+| seq1, 2 layers | 59 | 101.1, 101.4, 101.3 |
+| v1l4n, 4 layers | 205 | 201.4, 203.7, 201.6 |
+| v1vit12m, 12 layers | 587 | 102.5, 102.9, 101.2 |
+| m1, 24 layers | 1163 | 201.4, 201.6, 200.9 |
+
+Two layers and twelve layers cost the same 101 ms; four layers cost 201. The value
+does not follow the command count, the weight bytes or the layer count -- it is
+bimodal at ~101 and ~201 ms, and it is stable within a model across executions.
+
+That is the artefact the last three rounds were chasing. A call whose DSP-side work
+is a few milliseconds reports 101 ms, which is why every leg that removed work --
+blits, element-wise, sync groups, cache maintenance, VTCM, the group's own entry --
+measured the same number and read as a null result. Those nulls are uninformative,
+not negative, and the 63 ms and 101 ms floors of rounds 5 to 8 are the same artefact
+seen through a different cut point.
+
+The authoritative numbers are the DSP's own phase counters, because they are read
+inside the call and are not quantised: fill 70.9, pack 10.6, unit 0.4, store 26.0,
+matmul kernel 108.5, all matmul commands 110.0, all commands 147.6, prologue 0.3.
+That is ~146 ms of measured work in a 201 ms call, and any A/B from here has to be
+read either from these slots or from many repetitions of end-to-end total_ms, never
+from a single call_ms.
+
+### Per-family, and one hypothesis tested properly
+
+The profile array is indexed by op type, so the family split needs no build at all,
+just HEXAGON_PHASE=1 and reading slots below 40. Over one execution of the 24-layer
+tower (md5 18b6997d):
+
+| op type | family | ms |
+| --- | --- | --- |
+| 38 | matmul | 106.3 |
+| 19 | binary elementwise | 18.5 |
+| 3 | raster blit | 8.6 |
+| 4 | unary | 6.5 |
+| 8 | layer norm | 1.4 |
+| 28 | softmax | 1.2 |
+
+Inside the matmul: fill 67.8, output store 26.0, activation pack 10.0, unit 0.4.
+
+Target (3) turns out to be largely done. The elementwise broadcast path does not
+fall to element-at-a-time code: both scalar-operand chunk functions splat the
+operand with Q6_Vh_vsplat_R and run vector loops over ADD, ADD_RELU, SUB, MUL,
+SQUARED_DIFFERENCE, MAX, MIN and MUL_SILU, with a scalar tail. The right-hand
+multiply uses Q6_Vhf_vmpy_VhfVhf precisely because it rounds like scalar a * b;
+widening to qf16 and narrowing back does not.
+
+So the 18.5 ms is traffic, not arithmetic -- and the dispatch hypothesis was worth
+testing anyway, since the worker pool is entered whenever a row has 2048 or more
+elements and nearly every op in this graph does. Raising that threshold to 262144
+(HTP_OPS_BINARY_MT_MIN_FP16_ELEMS) so small ops take the serial vector path made the
+family *slower*: 21.1 ms against 18.5 ms in the same session, with the output md5
+unchanged. The pool earns its dispatch cost at these sizes. Thresholds restored and
+the skeleton rebuilt byte-identical to 48cdc5d1.
+
+Measured work for the whole graph in this session: 67.8 + 26.0 + 10.0 + 0.4 = 104.2
+of matmul, plus 18.5 + 8.6 + 6.5 + 1.4 + 1.2 = 36.2 of everything else, so ~140 ms.
+The call reports 201. The gap is the artefact above, not work.
+
+### Roofline: what the numbers come to
+
+`tmp/roofline.py` sums the blob's own declaration: 40.06 GOPs of matmul over 147
+matmul commands, 659.0 MB of weights in the weight space, 231.1 MB of activation
+operands read or written once, so 890.1 MB of traffic per image and an arithmetic
+intensity of 45.0 flop/byte.
+
+| quantity | value |
+| --- | --- |
+| matmul work | 40.06 GFLOP (24 layers, 1.67 GFLOP/layer) |
+| weight traffic | 659.0 MB declared, 663.7 MB read by the fill |
+| activation operand traffic | 231.1 MB |
+| flop byte | 45.0 |
+| matmul throughput | 376.8 GFLOP/s (40.06 GOPs / 106.3 ms) |
+| weight streaming rate | 9.79 GB/s (663.7 MB / 67.8 ms) |
+| whole graph | 285.3 GFLOP/s and 6.37 GB/s over 140.4 ms of measured work |
+| bandwidth floor | 894.8 MB / 9.79 GB/s = 91.4 ms per image |
+| efficiency against that floor | 65% |
+| pte load | 658.8 MB / ~530 ms = 1.24 GB/s |
+
+The tile shapes say why. Every heavy matmul has m = 64 -- one 8x8 patch grid --
+against n of 1024 to 4096: 24 of (m=64, k=1024, n=4096) at 537 MFLOP, 24 of the
+reverse down-projection, 24 of (k=1024, n=3072) for QKV, and 48 tiny batched 64x64x64
+attention tiles at 8.4 MFLOP. Sixty-four rows cannot amortise a 1024x4096 weight
+matrix, so the graph is a stack of matrix-vector-shaped products: 663.7 MB of weights
+are read per image to do 40 GFLOP. At the 9.79 GB/s the fill measures, 45 flop/byte
+caps the machine at 440 GFLOP/s, and the matmul phase runs at 377, which is 86% of
+that ceiling. The kernels are not the problem and further kernel tuning cannot move
+it: only fewer bytes per flop can, which is what int8 would do.
+
+The same arithmetic gives the goal's floor. Weights alone cost 67.8 ms at the
+measured rate and activations another 23.6 ms, so ~91 ms per image is the floor for
+this graph in fp16 on this DSP. Measured work is 140.4 ms -- 65% of the way there --
+and the <=90 ms target sits just under the floor, reachable only by cutting bytes.
+
+### Where this leaves the tower
+
+Every family's time is consistent with moving its operands once or twice at the rate
+the weight fill establishes. The fill moves 663,748,608 bytes in 67.8 ms, which is
+9.79 GB/s, and that is the machine's reference number. Against it: blits 78.6 MB in
+8.6 ms (9.1 GB/s), the matmul output store ~226 MB in 26.0 ms (8.7 GB/s), the binary
+family's read/write traffic in 18.5 ms (7.7 GB/s), unary in 6.5 ms (8.7 GB/s).
+Nothing here is leaving an order of magnitude on the table, and nothing here is
+element-at-a-time: the elementwise broadcast path splats and runs native fp16 vector
+ops, the store takes its fast path, and the matmul dispatch costs 137 us in total.
+
+So the tower is at the DSP's DRAM bandwidth, ~140 ms of measured work per image,
+against a call that reports 201 ms because of the bimodal artefact. The three named
+targets are answered: (1) the fill is not serialised against compute, it *is* the
+bandwidth floor; (2) the per-command cost is 0.27 ms of prologue plus the kernels
+themselves, not a fixed per-command tax; (3) the store and pack are vectorized and
+bandwidth-bound. The remaining lever is fewer bytes, which is two things: quantize,
+or remove the materialisation of intermediates so a layout op's write and its
+consumer's read both disappear. The second is bit-exact by construction and is the
+one to try next -- the 1016 non-matmul commands move ~110 MB between them for 36 ms,
+and fusing a permute or a clone into its consumer needs no arithmetic change at all.
+
+Four things were removed on the way to that conclusion, all of them nulls: keeping
+the VTCM window acquired and the fd table built across calls (201.7 against 201.5),
+dropping the pre-execute sync group (201.6 against 201.4), dropping the group's 14 KB
+command-entry invalidation (201.8 against 201.4, and the output md5 stays 18b6997d
+exactly), and dropping the post-execute sync flush (203.7 against 204.1, md5 still
+18b6997d). The last two are worth keeping in mind as deletions: all of that cache
+maintenance is redundant for this model, it is simply not where the time goes.

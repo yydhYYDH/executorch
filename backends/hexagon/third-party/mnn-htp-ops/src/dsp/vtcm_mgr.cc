@@ -126,9 +126,15 @@ void vtcm_manager_release() {
   using namespace vtcm_manager;
 
   if (vtcm_mgr_ctx_id != 0 && vtcm_valid) {
+#ifdef HTP_OPS_KEEP_VTCM
+    // Experiment only (off by default): hold the reservation across delegates so
+    // the next one skips HAP_compute_res_acquire_cached. reset() still drops it.
+    return;
+#else
     HAP_compute_res_release_cached(vtcm_mgr_ctx_id);
     vtcm_valid = false;
     vtcm_needs_release = false;
+#endif
   }
 }
 

@@ -236,12 +236,11 @@ static int run_blob(const unsigned char *blob, uint8_t *arena, uint64_t arena_by
   const uint8_t *sections =
       blob + sizeof(HexagonBlobHeader) + header->n_ops * sizeof(HexagonOp);
 
-  /* The two sections the blob carries. */
+  /* The one section the blob carries. The activations are scratch the runtime
+   * reserves from the header size and never reads out of the blob, so the arena
+   * is left as the memset above made it. */
   const HexagonTensorRef weights{(uint32_t)HexagonTensorSpace::kWeights, 0, 0, 0};
-  const HexagonTensorRef activations{(uint32_t)HexagonTensorSpace::kActivation, 0, 0, 0};
   memcpy(address(header, weights), sections, header->weights_bytes);
-  memcpy(address(header, activations), sections + header->weights_bytes,
-         header->activations_bytes);
 
   /* The method inputs, from the fixture, in method-input order. */
   uint64_t at = 0;

@@ -52,3 +52,32 @@ def test_a_cast_is_absorbed_only_between_the_two_widths_the_arena_holds():
     assert not _cast_stays_in_fp16(_cast(torch.float16, torch.int64))
     assert _emits_no_command(_cast(torch.float16, torch.float32))
     assert not _emits_no_command(_cast(torch.int64, torch.float16))
+
+
+def _dim_order(order, dtype=torch.float16, shape=(4, 3)):
+    """A dim-order copy node, with the order it is judged on."""
+    graph = torch.fx.Graph()
+    source = graph.placeholder("x")
+    source.meta["val"] = torch.empty(shape, dtype=dtype)
+    copy = graph.call_function(
+        exir_ops.edge.dim_order_ops._to_dim_order_copy.default,
+        args=(source,),
+        kwargs={"dim_order": order},
+    )
+    copy.meta["val"] = torch.empty(shape, dtype=dtype)
+    return copy
+
+
+def test_a_dim_order_copy_is_absorbed_only_in_the_order_the_arena_holds():
+    """The order is the whole content of the op, so a named one is not a view.
+
+    The arena holds row-major two-byte elements: an identity order re-reads the
+    operand's bytes, with the runtime converting the width at the boundary in
+    both directions, while any other order describes a layout those bytes are not
+    in. Absorbing that one would hand the consumer the wrong numbers rather than
+    fail, which is why the check is on the order and not on the shape.
+    """
+    assert _emits_no_command(_dim_order([0, 1]))
+    assert _emits_no_command(_dim_order(None))
+    assert not _emits_no_command(_dim_order([1, 0]))
+    assert not _emits_no_command(_dim_order([0, 1], dtype=torch.int64))

@@ -237,4 +237,7 @@ def test_blob_roundtrip(tmp_path):
         132,
         (bytes(range(10)) + bytes(118) + b"\xde\xad\xbe\xef").hex(),
     )
-    assert sections["activations"] == (188, "00" * 188)
+    # The activation section is a header size alone: the runtime reserves it and
+    # never reads it from the blob, so the file stops at the weights.
+    assert sections.keys() == {"weights"}
+    assert len(blob_bytes) == B.HEADER_SIZE + len(written_ops) * B.OP_SIZE + 132

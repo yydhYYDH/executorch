@@ -141,19 +141,15 @@ class Arena:
             cursor = _align(cursor + size)
         self.bytes = bytearray(cursor)
 
-        # The blob carries the two sections the host owns; the other two are
-        # filled from the caller's tensors.
+        # The blob carries the weights and nothing else: the inputs and outputs
+        # come from the caller's tensors, and the activations are scratch the
+        # runtime reserves from the header size and never reads back, so they
+        # are zero here exactly as they would be if the file carried them.
         host_at = B.HEADER_SIZE + header.n_ops * B.OP_SIZE
         self.bytes[
             self.base[int(B.TensorSpace.WEIGHTS)] : self.base[int(B.TensorSpace.WEIGHTS)]
             + header.weights_bytes
         ] = data[host_at : host_at + header.weights_bytes]
-        act = self.base[int(B.TensorSpace.ACTIVATION)]
-        self.bytes[act : act + header.activations_bytes] = data[
-            host_at + header.weights_bytes : host_at
-            + header.weights_bytes
-            + header.activations_bytes
-        ]
 
     def address(self, ref: B.TensorRef) -> int:
         if ref.space == ABSENT:

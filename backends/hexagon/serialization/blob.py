@@ -150,7 +150,7 @@ class BlobBuilder:
         self._n_inputs = n_inputs
         self._n_outputs = n_outputs
         self._ops: List[Op] = []
-        self._weights = bytearray()
+        self._weight_data: List[bytes] = []
         self._activations_bytes = 0
         self._input_slots: Dict[int, TensorRef] = {}
         self._output_slots: Dict[int, TensorRef] = {}
@@ -177,11 +177,15 @@ class BlobBuilder:
         self._ops.append(op)
 
     def add_weights(self, data: bytes, alignment: int = ALIGNMENT) -> TensorRef:
-        """Appends constant data and returns where the DSP will find it."""
-        offset = _align_up(len(self._weights), alignment)
-        self._weights.extend(b"\x00" * (offset - len(self._weights)))
-        self._weights.extend(data)
-        return TensorRef(TensorSpace.WEIGHTS, offset, len(data))
+        """Keeps constant data and returns the reference the DSP will follow.
+
+        The offset is assigned at build time, not here: a weight an emitter
+        computed and then did not use -- the plain copy of a weight that a
+        second pass stored in another order, say -- costs the file nothing.
+        """
+        index = len(self._weight_data)
+        self._weight_data.append(data)
+        return TensorRef(TensorSpace.WEIGHTS, 0, len(data), index)
 
     def add_activation(self, nbytes: int, alignment: int = ALIGNMENT) -> TensorRef:
         """Bump-allocates scratch space for an intermediate tensor.
@@ -221,16 +225,41 @@ class BlobBuilder:
             offset = _align_up(offset + ref.size)
         return offset
 
+    def _pack_weights(self) -> Tuple[bytes, Dict[int, int]]:
+        """Lays out the weights a command actually reads and returns the section.
+
+        Order follows first use, which is what keeps a delegate's weights in the
+        order its ops were emitted in.
+        """
+        used: List[int] = []
+        seen: set = set()
+        for op in self._ops:
+            for ref in op.inputs + op.outputs:
+                if ref.space == TensorSpace.WEIGHTS and ref.index not in seen:
+                    seen.add(ref.index)
+                    used.append(ref.index)
+        offsets: Dict[int, int] = {}
+        data = bytearray()
+        for index in used:
+            offset = _align_up(len(data))
+            data.extend(b"\x00" * (offset - len(data)))
+            data.extend(self._weight_data[index])
+            offsets[index] = offset
+        return bytes(data), offsets
+
     def _remap(self, ref: TensorRef) -> TensorRef:
         if ref.space == TensorSpace.INPUT:
             return self._input_slots[ref.index]
         if ref.space == TensorSpace.OUTPUT:
             return self._output_slots[ref.index]
+        if ref.space == TensorSpace.WEIGHTS:
+            return TensorRef(TensorSpace.WEIGHTS, self._weight_offsets[ref.index], ref.size, ref.index)
         return ref
 
     def build(self) -> bytes:
         inputs_bytes = self._pack_section(self._input_slots, self._n_inputs, "input")
         outputs_bytes = self._pack_section(self._output_slots, self._n_outputs, "output")
+        weights, self._weight_offsets = self._pack_weights()
 
         # rebuild via replace() so every other field survives automatically:
         # listing them by hand silently dropped patch and in_place.
@@ -249,9 +278,9 @@ class BlobBuilder:
             len(self._ops),
             self._n_inputs,
             self._n_outputs,
-            len(self._weights),
+            len(weights),
             inputs_bytes,
             self._activations_bytes,
             outputs_bytes,
         )
-        return header + ops + bytes(self._weights)
+        return header + ops + weights

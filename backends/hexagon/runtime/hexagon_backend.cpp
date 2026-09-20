@@ -11,9 +11,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -456,7 +458,11 @@ class ProbeWatchdog {
     thread_ = std::thread([this] { Loop(); });
   }
   ~ProbeWatchdog() {
-    stop_.store(true);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_.store(true);
+    }
+    cv_.notify_all();
     if (thread_.joinable()) {
       thread_.join();
     }
@@ -464,11 +470,11 @@ class ProbeWatchdog {
 
  private:
   void Loop() {
+    std::unique_lock<std::mutex> lock(mutex_);
     for (int elapsed = seconds_; !stop_.load(); elapsed += seconds_) {
-      for (int tick = 0; tick < seconds_ * 10 && !stop_.load(); ++tick) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-      if (stop_.load()) {
+      // Waiting has to be interruptible: a fixed 100 ms sleep charged the destructor
+      // whatever was left of the slice on every invoke, traced or not.
+      if (cv_.wait_for(lock, std::chrono::seconds(seconds_), [this] { return stop_.load(); })) {
         return;
       }
       std::fprintf(
@@ -483,6 +489,8 @@ class ProbeWatchdog {
   }
 
   const HexagonDelegate* delegate_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
   std::atomic<bool> stop_{false};
   int seconds_ = 15;
   std::thread thread_;

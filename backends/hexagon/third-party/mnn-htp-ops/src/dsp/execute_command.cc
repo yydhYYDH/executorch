@@ -67,6 +67,10 @@ extern AEEResult htp_ops_unary(uint8_t* dst, uint8_t* src, int32 size, int32 typ
 // unused, and it has an entry point of its own to read them.
 #define HTP_OPS_UNARY_CLAMP 15
 extern AEEResult htp_ops_unary_clamp(uint8_t* dst, uint8_t* src, int32 size, int32 min_bits, int32 max_bits);
+#define HTP_OPS_UNARY_ROW_GUARD 16
+#define HTP_OPS_UNARY_SCALE 17
+extern AEEResult htp_ops_unary_row_guard(uint8_t* dst, uint8_t* mask, uint8_t* src, int32 size, int32 row_len, int32 pad_bits);
+extern AEEResult htp_ops_unary_scale(uint8_t* dst, uint8_t* src, int32 size, int32 scale_bits);
 
 extern AEEResult htp_ops_cast(uint8_t* dst, const uint8_t* src, int32_t size, int32_t castType);
 
@@ -147,7 +151,7 @@ static int htp_profile_unary_bucket(const int32_t* intParams) {
         return -1;
     }
     const int32_t opType = intParams[1];
-    if (opType >= 1 && opType <= HTP_OPS_UNARY_CLAMP) {
+    if (opType >= 1 && opType <= HTP_OPS_UNARY_ROW_GUARD) {
         return 119 + opType;
     }
     return -1;
@@ -378,6 +382,15 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                 ret = htp_ops_unary_clamp(mapped_ptrs[inputs->size()],
                                           mapped_ptrs[0],
                                           intParams[0], intParams[3], intParams[4]);
+            } else if (intParams[1] == HTP_OPS_UNARY_ROW_GUARD) {
+                ret = htp_ops_unary_row_guard(mapped_ptrs[inputs->size()],
+                                              mapped_ptrs[0],
+                                              mapped_ptrs[1],
+                                              intParams[0], intParams[3], intParams[4]);
+            } else if (intParams[1] == HTP_OPS_UNARY_SCALE) {
+                ret = htp_ops_unary_scale(mapped_ptrs[inputs->size()],
+                                          mapped_ptrs[0],
+                                          intParams[0], intParams[3]);
             } else {
                 ret = htp_ops_unary(mapped_ptrs[inputs->size()],
                                     mapped_ptrs[0],
@@ -922,7 +935,7 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
             auto params = command->params();
             const int32_t* intParams = params ? params->data() : nullptr;
             const int bucket = htp_profile_unary_bucket(intParams);
-            if (bucket >= 120 && bucket <= 119 + HTP_OPS_UNARY_CLAMP) {
+            if (bucket >= 120 && bucket <= 119 + HTP_OPS_UNARY_SCALE) {
                 profile[bucket] += (int)(end_time - start_time);
             }
         }
@@ -930,6 +943,7 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
 
     return ret;
 }
+
 
 static constexpr int kMaxCommandSize = 4096;
 static constexpr int kCommandEntrySize = 3;
@@ -966,6 +980,7 @@ private:
 };
 
 AEEResult htp_ops_execute_command_group(remote_handle64 handle, int32 groupFd, int32 groupOffset, int32 count, int32 syncGroupFd, int32 syncGroupOffset, int32 syncGroupSize) {
+
     if (handle == 0 || handle == (remote_handle64)-1) {
         return AEE_EBADSTATE;
     }
@@ -1011,6 +1026,7 @@ AEEResult htp_ops_execute_command_group(remote_handle64 handle, int32 groupFd, i
 }
 
 AEEResult htp_ops_execute_command_group_profile(remote_handle64 handle, int32 groupFd, int32 groupOffset, int32 count, int32 syncGroupFd, int32 syncGroupOffset, int32 syncGroupSize, int32 profileFd, int32 profileOffset, int32 profileSize) {
+
     if (handle == 0 || handle == (remote_handle64)-1) {
         return AEE_EBADSTATE;
     }

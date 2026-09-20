@@ -23,6 +23,7 @@ from executorch.backends.hexagon.rms_norm import RMS_NORM
 
 # After rms_norm, which opens the et_hexagon namespace this fragment joins.
 from executorch.backends.hexagon.mul_silu import MUL_SILU
+from executorch.backends.hexagon.row_guard import ROW_GUARD
 from executorch.backends.hexagon.serialization.blob import ABSENT, Op, TensorRef
 from executorch.exir.dialects._ops import ops as exir_ops
 
@@ -61,6 +62,13 @@ UNARY_OP_TYPES: Dict[str, int] = {
     # params[4] are the fp16 bit patterns of them, and the DSP dispatches it to
     # an entry point of its own instead of htp_ops_unary.
     "clamp": 15,
+    # row_guard is the same arrangement: params[3] is the row length and
+    # params[4] the masked value, and its entry point walks whole rows.
+    "row_guard": 16,
+    # mul_scalar carries the scale the same way: params[3] is the fp32 bit
+    # pattern of a python float, because widening to fp32 is the whole point of
+    # the op (see the emitter).
+    "mul_scalar": 17,
 }
 
 # HtpOpsBinaryOpType, declared in the DSP's eltwise_ops.cc. Same reasoning as
@@ -505,9 +513,13 @@ def _fold_constant_transpose(node: torch.fx.Node, ctx):
     if tuple(node.args[1]) != (1, 0):
         return None
     tensor = ctx.constant_value(node.args[0])
-    if tensor is None or tensor.dim() != 2 or tensor.dtype != torch.float16:
+    if tensor is None or tensor.dim() != 2:
         return None
-    return ctx.folded_weight(node, tensor.transpose(0, 1).contiguous())
+    # The arena holds two-byte elements, so a fp32 weight is narrowed here the
+    # same way the runtime narrows one that arrives as a method input.
+    return ctx.folded_weight(
+        node, tensor.to(torch.float16).transpose(0, 1).contiguous()
+    )
 
 
 def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
@@ -619,6 +631,66 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
                 FP16_BYTES,
                 _clamp_bound_bits(lower, float("-inf")),
                 _clamp_bound_bits(upper, float("inf")),
+            ],
+        )
+    )
+    return ctx.record(node, out)
+
+
+def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
+    """A fp16 tensor times a python float, widened to fp32 to multiply.
+
+    torch and the portable kernel both promote the scalar to fp32, multiply in
+    fp32 and round the product back to fp16; a product of two fp16 values
+    differs from that on about one element in six. Reproducing the fp32 step is
+    what lets the op stay inside a partition instead of being handed out, which
+    is what the graph is split on everywhere the attention scales its queries
+    and keys.
+    """
+    values, scale = node.args
+    _require_arena_dtype(node, "mul scalar")
+    numel = _numel(node)
+    out = ctx.result_for(node, numel)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[ctx.operand(values)],
+            outputs=[out],
+            params=[
+                numel,
+                UNARY_OP_TYPES["mul_scalar"],
+                FP16_BYTES,
+                struct.unpack("<i", struct.pack("<f", float(scale)))[0],
+                0,
+            ],
+        )
+    )
+    return ctx.record(node, out)
+
+
+def _emit_row_guard(node: torch.fx.Node, ctx) -> TensorRef:
+    """The masked-row guard as one op over the logits and the values it guards.
+
+    It walks rows of the last dimension -- the mask says which of them are
+    entirely the masked value, the second operand holds what they select -- so
+    beyond the size the DSP needs a row's length and that value.
+    """
+    mask, values, pad = node.args
+    _require_arena_dtype(node, "row guard")
+    numel = _numel(node)
+    row = int(values.meta["val"].shape[-1])
+    out = ctx.result_for(node, numel)
+    ctx.builder.add_op(
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[ctx.operand(mask), ctx.operand(values)],
+            outputs=[out],
+            params=[
+                numel,
+                UNARY_OP_TYPES["row_guard"],
+                FP16_BYTES,
+                row,
+                _clamp_bound_bits(pad, float("-inf")),
             ],
         )
     )
@@ -875,22 +947,52 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
 def hmx_prefers_general(k: int, n: int) -> bool:
     """Whether the DSP routes this matmul to the general HMX kernel.
 
-    Mirrors the DSP's own rule: a non-multiple-of-32 dimension, or a 32-wide one.
-    Only there can pre-packed weights pay for themselves, because that kernel is
-    the only one that rearranges the weight, and forcing it elsewhere is slower.
+    The DSP answers this with MNN_MATMUL_PREFER_HMX in loop_ops.cc, which this
+    tree sets to 1, so every shape takes that kernel. It is the only kernel that
+    can read a weight in the unit's own tile order, and that order is what lets
+    the unit stream the weight out of DDR instead of the DSP copying it into
+    VTCM first, so there is nothing to gain from leaving a shape out. Two places
+    answer the same question; they have to agree.
     """
-    return bool(((k | n) & 31) != 0 or k == 32 or n == 32)
+    del k, n
+    return True
+
+
+# The general kernel is the only one that reads the unit's tile order, and it
+# takes a region only once the region's work, E*K*N, reaches this many elements:
+# loop_ops.cc htp_ops_loop_matmul_hmx_general_eligible. Two places answer the
+# same question, so they have to agree.
+HMX_GENERAL_MIN_ELEMS = 32768
+
+
+def hmx_general_eligible(m: int, k: int, n: int) -> bool:
+    """Whether the DSP's general HMX kernel will take an (m, k) @ (k, n) region.
+
+    A command whose weight is already tiled and whose shape this kernel refuses
+    has no kernel left that can read its operand: the fallbacks walk the weight
+    row-major, so the packed bytes are rubbish to them and the output keeps
+    whatever its buffer held. The host has to ask before it packs, not after.
+    """
+    return m * k * n >= HMX_GENERAL_MIN_ELEMS
 
 
 def _hmx_prepack_enabled() -> bool:
-    """HEXAGON_HMX_PREPACK=1 stores matmul weights in the unit's tile order.
+    """HEXAGON_HMX_PREPACK=0 leaves matmul weights in their row-major order.
 
-    Off by default: packing a weight here forces that matmul onto the HMX route,
-    because no other kernel reads that layout.
+    On by default. Packing a weight here forces that matmul onto the HMX route,
+    because no other kernel reads that layout, and it costs the model nothing:
+    the reordered bytes are the same size, so the blob is unchanged in size and
+    the output is bit-identical.
+
+    What it buys is the DSP's weight fill. A row-major (k, n) weight gives the
+    unit 32 rows of 64 bytes at a pitch of n * 2, which is a stride no prefetcher
+    likes; the tile order turns the same read into one straight run per 32-column
+    group. On the 24-layer vision tower that is the difference between 430 and
+    315 ms an image, and the DSP call drops from 465 to 310 ms.
     """
     import os
 
-    return os.environ.get("HEXAGON_HMX_PREPACK", "") not in ("", "0", "false")
+    return os.environ.get("HEXAGON_HMX_PREPACK", "") not in ("0", "false")
 
 
 def _hmx_tile_budget() -> int:
@@ -932,6 +1034,32 @@ def pack_hmx_weight(weight, k: int, n: int) -> bytes:
     tiles = padded.reshape(kp, 32, nt_total, 32).transpose(2, 0, 1, 3)
     tiles = tiles.reshape(nt_total, kp, 16, 2, 32).transpose(0, 1, 2, 4, 3)
     return np.ascontiguousarray(tiles).tobytes()
+
+
+def _weight_operand(ctx, rhs, m: int, k: int, n: int):
+    """The matmul's weight operand, in the unit's tile order where that pays.
+
+    Returns (ref, prepacked) so the command can say which one its operand holds.
+    A weight whose value this layer can see is stored rearranged and read
+    straight out of the weights section by the unit itself; one it cannot see is
+    left alone and the DSP rearranges a tile at a time per inference.
+
+    The region the DSP judges is one (m, k, n) tile. A batched matmul is one
+    command per batch element -- loopNumber is the batch and E the tile's rows --
+    so a batch of small tiles is a batch of small regions, and the bar is m*K*N
+    rather than the batch's total work.
+    """
+    value = ctx.constant_value(rhs)
+    if (
+        _hmx_prepack_enabled()
+        and hmx_prefers_general(k, n)
+        and hmx_general_eligible(m, k, n)
+        and value is not None
+        and value.dim() == 2
+        and tuple(value.shape) == (k, n)
+    ):
+        return ctx.packed_weight(rhs, value, k, n), True
+    return ctx.operand(rhs), False
 
 
 def _matmul_command(
@@ -983,10 +1111,7 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
     if k != contracted:
         raise RuntimeError(f"hexagon: mm contracts {k} against {contracted}")
 
-    # Same switch that packed the weights before lowering, so what the DSP is
-    # told matches what its operand actually holds.
-    prepacked = _hmx_prepack_enabled() and hmx_prefers_general(k, n)
-    weight = ctx.operand(rhs)
+    weight, prepacked = _weight_operand(ctx, rhs, m, k, n)
     out = ctx.result_for(node, m * n)
     _matmul_command(ctx, ctx.operand(lhs), weight, out, 1, m, k, n, hmx_prepacked=prepacked,
                     hmx_tile_budget=_hmx_tile_budget())
@@ -1011,8 +1136,10 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
             f"hexagon: bmm contracts {batches}x{k} against {rhs_batches}x{contracted}"
         )
 
+    weight, prepacked = _weight_operand(ctx, rhs, m, k, n)
     out = ctx.result_for(node, batches * m * n)
-    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), out, batches, m, k, n)
+    _matmul_command(ctx, ctx.operand(lhs), weight, out, batches, m, k, n, hmx_prepacked=prepacked,
+                    hmx_tile_budget=_hmx_tile_budget())
     return ctx.record(node, out)
 
 
@@ -1037,7 +1164,9 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     out = ctx.result_for(node, m * n)
     # beta == 0 folds the bias away and leaves mm, so there is nothing to add.
     target = out if beta == 0.0 else ctx.builder.add_activation(m * n * FP16_BYTES)
-    _matmul_command(ctx, ctx.operand(lhs), ctx.operand(rhs), target, 1, m, k, n)
+    weight, prepacked = _weight_operand(ctx, rhs, m, k, n)
+    _matmul_command(ctx, ctx.operand(lhs), weight, target, 1, m, k, n, hmx_prepacked=prepacked,
+                    hmx_tile_budget=_hmx_tile_budget())
     if beta == 0.0:
         return ctx.record(node, out)
 
@@ -1462,6 +1591,7 @@ EMITTERS = {
     exir_ops.edge.aten.silu.default: _unary("silu"),
     exir_ops.edge.aten.clamp.default: _emit_clamp,
     exir_ops.edge.aten.clamp.out: _emit_clamp,
+    ROW_GUARD: _emit_row_guard,
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),
     exir_ops.edge.aten.rsqrt.default: _unary("rsqrt"),
@@ -1497,6 +1627,7 @@ EMITTERS = {
     exir_ops.edge.aten.slice_copy.Tensor: _emit_slice_copy,
     exir_ops.edge.aten.cat.default: _emit_cat,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
+    exir_ops.edge.aten.mul.Scalar: _emit_mul_scalar,
     UPDATE_CACHE: _emit_update_cache,
     RMS_NORM: _emit_rms_norm,
     MUL_SILU: _binary("mul_silu"),

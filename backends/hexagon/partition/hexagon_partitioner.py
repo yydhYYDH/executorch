@@ -288,15 +288,7 @@ class HexagonOperatorSupport(OperatorSupportBase):
     whereas one rejected while emitting fails the whole export.
     """
 
-    def __init__(self) -> None:
-        # Views that a partition would have to hand out, recorded by the
-        # partitioner once the consumers are known. Empty means the per-node
-        # answer, which is all this check can reach on its own.
-        self.boundary_views: Set[torch.fx.Node] = set()
-
     def is_node_supported(self, _submodules, node: torch.fx.Node) -> bool:
-        if node in self.boundary_views:
-            return False
         if node.op != "call_function":
             return False
         # Resolving the attention overloads also registers their emitter, and the
@@ -415,27 +407,6 @@ class HexagonPartitioner(Partitioner):
             for node in graph_module.graph.nodes
             if support.is_node_supported(None, node)
         ]
-
-        # A view re-points its operand's TensorRef and emits no command, so a
-        # partition that has to hand one out would have nothing to fill the
-        # output slot with. One whose consumers are all delegated stays inside
-        # its partition; one that is a boundary keeps its own result instead.
-        # Who the consumers are is only known here, so the question is asked
-        # here rather than in the support check.
-        # Reversed, because dropping a view makes the view feeding it a
-        # boundary as well, and graph.nodes is topological, so walking backwards
-        # settles every consumer before its producer. The answer is recorded on
-        # the support object as well as removed from this list, because
-        # generate_partitions_from_list_of_nodes asks the support object again
-        # instead of trusting the list.
-        supported_set = set(supported)
-        for node in reversed(list(supported)):
-            if _emits_no_command(node) and any(
-                user not in supported_set for user in node.users
-            ):
-                supported.remove(node)
-                supported_set.discard(node)
-                support.boundary_views.add(node)
 
         partition_tags: Dict[str, DelegationSpec] = {}
         if not supported:

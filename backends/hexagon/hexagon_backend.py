@@ -87,8 +87,13 @@ class BlobContext:
         n_inputs: int,
         n_outputs: int,
         output_index: Dict[torch.fx.Node, int],
+        weights: Optional[Dict[torch.fx.Node, torch.Tensor]] = None,
     ) -> None:
         self.graph_module = graph_module
+        # The tensors behind the placeholders this subgraph owns. torch.export
+        # leaves a fake in a lifted weight's metadata, so this is the only way an
+        # emitter can look at the value it is being asked to store.
+        self.weights: Dict[torch.fx.Node, torch.Tensor] = dict(weights or {})
         self.builder = BlobBuilder(n_inputs, n_outputs)
         self.producer: Dict[torch.fx.Node, TensorRef] = {}
         self._constants: Dict[torch.fx.Node, TensorRef] = {}
@@ -97,6 +102,10 @@ class BlobContext:
         self.packed_targets: set = set()
         # Nodes whose value was computed at export time and stored as a weight.
         self.folded: Dict[torch.fx.Node, TensorRef] = {}
+        # Those same values, so a consumer that wants to store the tensor itself
+        # -- a matmul pre-packing its weight, say -- does not have to read the
+        # bytes back out of the blob to get them.
+        self.folded_values: Dict[torch.fx.Node, torch.Tensor] = {}
         self._output_index = output_index
 
     def constant(
@@ -111,35 +120,68 @@ class BlobContext:
         cached = self._constants.get(key)
         if cached is not None:
             return cached
-        tensor = self.graph_module.get_parameter(node.target).detach()
+        tensor = self.lifted_value(node)
+        if tensor is None:
+            raise RuntimeError(f"hexagon: no value for constant {node.name}")
         if dtype is not None:
             tensor = tensor.to(dtype)
         ref = self.builder.add_weights(tensor.contiguous().cpu().numpy().tobytes())
         self._constants[key] = ref
         return ref
 
-    def constant_hmx(self, node: torch.fx.Node, k: int, n: int) -> TensorRef:
+    def packed_weight(self, node: torch.fx.Node, tensor, k: int, n: int) -> TensorRef:
         """Materializes a weight in the order the HMX unit reads its tiles.
 
-        The DSP would otherwise rearrange the whole matrix on every inference;
-        done here it costs one pass at export. torch.export lifts parameters to
-        placeholders, so the target is looked up among them rather than among
-        attributes.
+        The unit can then stream the matrix straight out of the weights section,
+        where otherwise the DSP rearranges it into VTCM before every inference,
+        and that rearrange is most of what a matmul costs.
         """
         key = (node, "hmx")
         cached = self._constants.get(key)
         if cached is not None:
             return cached
-        tensor = self.graph_module.get_parameter(node.target).detach().to(torch.float16)
+        tensor = tensor.detach().to(torch.float16)
         ref = self.builder.add_weights(pack_hmx_weight(tensor.cpu().numpy(), k, n))
         self._constants[key] = ref
+        self.packed_targets.add(getattr(node, "target", node))
         return ref
+
+    def lifted_value(self, node: torch.fx.Node):
+        """The tensor behind a lifted parameter, buffer or constant.
+
+        torch.export lifts every weight to a placeholder, so the node carries a
+        fake in its metadata and nothing can be folded or pre-packed from it
+        until the graph module -- which still holds the real tensor -- is asked.
+        """
+        tensor = self.weights.get(node)
+        if tensor is not None:
+            return tensor.detach()
+        if node.op == "get_attr":
+            return self.graph_module.get_parameter(node.target).detach()
+        if not isinstance(node.target, str):
+            return None
+        for name in ("get_parameter", "get_buffer"):
+            try:
+                tensor = getattr(self.graph_module, name)(node.target)
+            except Exception:
+                continue
+            if isinstance(tensor, torch.Tensor):
+                return tensor.detach()
+        value = getattr(self.graph_module, node.target, None)
+        return value.detach() if isinstance(value, torch.Tensor) else None
 
     def scalar(self, value, dtype: torch.dtype = torch.float16) -> TensorRef:
         """Materializes a python scalar as a one-element tensor.
 
         The DSP reads every operand out of a buffer, so a literal operand has to
         exist in the arena like any other.
+
+        Nothing that carries a torch scalar reaches this today, and a scalar
+        multiply is the reason: torch multiplies a half tensor by a float scalar
+        in fp32 and rounds the product back, which differs from a fp16 product
+        on about one element in six (measured over 65536 random halves), so
+        giving the DSP that op changes the output's md5. The op stays on the
+        portable kernel and splits the graph where it sits.
         """
         key = ("scalar", float(value), dtype)
         cached = self._constants.get(key)
@@ -156,8 +198,12 @@ class BlobContext:
         None means this layer cannot see it, which is what a placeholder whose
         value only the runtime holds looks like: nothing is folded then.
         """
-        if node.op == "get_attr":
-            return self.graph_module.get_parameter(node.target).detach()
+        folded = self.folded_values.get(node)
+        if folded is not None:
+            return folded
+        lifted = self.lifted_value(node)
+        if lifted is not None:
+            return lifted
         value = node.meta.get("val")
         if isinstance(value, torch.Tensor) and type(value).__name__ != "FakeTensor":
             return value.detach()
@@ -172,6 +218,7 @@ class BlobContext:
         ref = self.builder.add_weights(tensor.contiguous().cpu().numpy().tobytes())
         self._constants[key] = ref
         self.folded[node] = ref
+        self.folded_values[node] = tensor.detach()
         return ref
 
     def operand(self, arg) -> TensorRef:
@@ -241,7 +288,9 @@ class HexagonBackend(BackendDetails):
         weights = {node: tensor for node, tensor in weights.items() if tensor is not None}
         inputs = [node for node in placeholders if node not in weights]
 
-        context = BlobContext(graph_module, len(inputs), len(outputs), dict(outputs))
+        context = BlobContext(
+            graph_module, len(inputs), len(outputs), dict(outputs), weights
+        )
 
         for node, tensor in weights.items():
             context.producer[node] = context.builder.add_weights(weight_bytes(tensor))

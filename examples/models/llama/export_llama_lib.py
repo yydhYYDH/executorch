@@ -1170,12 +1170,20 @@ def _to_edge_and_lower_llama_xnnpack(
 
     # LOCAL TEST HOOK: Hexagon first so it claims the ops its DSP emitters
     # cover; XNNPACK then takes the rest.
+    hexagon_transform_passes = []
     if os.environ.get("EXECUTORCH_HEXAGON_PARTITION") == "1":
         from executorch.backends.hexagon.partition.hexagon_partitioner import (
             HexagonPartitioner,
         )
+        from executorch.backends.hexagon.rms_norm import FuseRmsNormPass
 
         partitioners.append(HexagonPartitioner())
+        # The DSP's elementwise square runs in fp16, so a decomposed RMSNorm clamps
+        # every x^2 above 65504 and normalises by a mean that is far too small.
+        # Fusing puts the norm back into one command, which squares and accumulates
+        # in fp32. The pass belongs to the caller: the splitter requires a
+        # partitioner to return the graph it was given.
+        hexagon_transform_passes.append(FuseRmsNormPass())
 
     # Order matters here, dynamic quantization should be applied first when both xnnpack and xnnpack_extended_ops are enabled
     partitioners.append(
@@ -1215,7 +1223,9 @@ def _to_edge_and_lower_llama_xnnpack(
             gen_tag_fn=gen_tag_fn,
         )
 
-    builder = builder.to_edge_transform_and_lower(partitioners)
+    builder = builder.to_edge_transform_and_lower(
+        partitioners, transform_passes=hexagon_transform_passes or None
+    )
     if verbose:
         print_delegation_info(builder.edge_manager.exported_program().graph_module)
 

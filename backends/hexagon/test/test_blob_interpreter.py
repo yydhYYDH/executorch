@@ -38,6 +38,7 @@ from executorch.backends.hexagon.kv_cache import UPDATE_CACHE, _update_cache  # 
 from executorch.backends.hexagon.rms_norm import RMS_NORM  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
 #: DSP_OP_RASTER_BLIT, the only op every shape here lowers to.
@@ -563,6 +564,80 @@ def test_a_perturbed_region_changes_the_result():
         "swapping the size axes changed nothing, so these tests cannot detect a "
         "wrong region"
     )
+
+
+class _LeadingAxes(torch.nn.Module):
+    """Permutations that move the leading axes, with a contiguous run kept whole.
+
+    A region is three nested loops, so a permutation is describable exactly when
+    the axes group into runs that keep their order in both layouts. These are the
+    shapes the vision tower's attention needs, where the axes that move are the
+    outer ones and the head run travels as one.
+    """
+
+    def __init__(self, dims) -> None:
+        super().__init__()
+        self.dims = dims
+
+    def forward(self, x):
+        return x.permute(*self.dims)
+
+
+def _run_permute(shape, dims):
+    x = torch.randn(*shape, dtype=torch.float16)
+    model = _LeadingAxes(dims)
+    program = to_edge(export(model, (x,))).exported_program()
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    expected = model(x)
+    got = np.frombuffer(execute(blob, [x.numpy()])[0], dtype=np.float16).reshape(
+        expected.shape
+    )
+    return blob, got, expected.numpy()
+
+
+def test_leading_axes_permutes_match_torch():
+    """The permutations the region has to describe beyond the last two axes.
+
+    The fused qkv of the vision tower swaps the two outer axes of a 4-D tile and
+    carries the head run whole; the attention output swaps three of the four axes
+    of an unsqueezed tile. Both are one region each, and a wrong grouping shows
+    up as wrong numbers rather than as a shape error.
+    """
+    for shape, dims in (
+        ((64, 3, 16, 64), (1, 0, 2, 3)),
+        ((64, 16, 64), (1, 0, 2)),
+        ((1, 16, 64, 64), (2, 0, 1, 3)),
+        ((16, 1, 64, 64), (1, 2, 0, 3)),
+        ((1, 16, 64, 64), (0, 1, 3, 2)),
+        ((2, 3, 5, 7), (1, 0, 2, 3)),
+    ):
+        _, got, expected = _run_permute(shape, dims)
+        assert np.array_equal(got, expected), f"differs from torch at {shape}/{dims}"
+
+
+def _permute_copy(shape, dims):
+    """A permute_copy node, holding the shapes the region is computed from."""
+    graph = torch.fx.Graph()
+    source = graph.placeholder("x")
+    source.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    node = graph.call_function(
+        exir_ops.edge.aten.permute_copy.default, args=(source, list(dims))
+    )
+    node.meta["val"] = torch.empty([shape[d] for d in dims], dtype=torch.float16)
+    return node
+
+
+def test_a_permutation_needing_a_fourth_run_is_refused():
+    """Four groups is one more loop than a region has, so it has to be refused.
+
+    Swapping the two outer axes *and* the two inner ones pairs every axis with a
+    different one, so every group is a single axis and no single region describes
+    it. The emitter would write the wrong elements rather than fail, which is why
+    the refusal lives in the predicate the support check reads.
+    """
+    assert hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 3, 2))) is None
+    assert hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 2, 3))) is not None
+    assert hexagon_ops.permute_region(_permute_copy((2, 3, 4, 5, 6), (4, 3, 2, 1, 0))) is None
 
 
 #: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed

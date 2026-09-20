@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dsp/dma_utils.h"
 #include "dsp/hmx_mgr.h"
 #include "dsp/hmx_utils.h"
 #include "dsp/hvx_convert.h"
@@ -500,6 +501,90 @@ static inline void htp_ops_loop_hmx_pack_activation_tile(__fp16* dst, const uint
     }
 }
 
+// A straight copy of a pre-packed weight block into VTCM. libc's memcpy walks
+// this byte wide, and the source is DDR, which made the copy 2.4x slower than
+// the element rearrange it replaces even though it reads less and in a better
+// order. 128 bytes at a time is what the vector unit moves.
+// The DMA engine moves a whole prepacked group in one descriptor at a rate the
+// HVX loop below cannot reach: that loop has ~2 KB in flight and measured
+// 8.4 GB/s, which is the entire decode cost (122 of 130 ms of matmul time on
+// Qwen3-0.6B, HMX compute being 0.35 ms of it). Whole groups are 128-byte
+// aligned on both ends, which is all the 1D descriptor needs.
+static inline bool htp_ops_loop_hmx_dma_copy(void* dst, const void* src, size_t bytes) {
+    const uint32_t kMaxChunk = 4u << 20;  // the descriptor's length field is 24 bits
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    for (size_t x = 0; x < bytes; x += kMaxChunk) {
+        size_t chunk = bytes - x < kMaxChunk ? bytes - x : kMaxChunk;
+        if ((chunk & 127) != 0) {
+            return false;
+        }
+        _Alignas(64) dma_desc_1d_t desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.length = (uint32_t)chunk;
+        desc.type = DMA_DESC_TYPE_1D;
+        desc.ordered = 1;
+        desc.dstate = DMA_DESC_DSTATE_PENDING;
+        desc.src = (uint32_t)(uintptr_t)(s + x);
+        desc.dst = (uint32_t)(uintptr_t)(d + x);
+        dma_wait_for_idle();
+        dmstart(&desc);
+        dma_wait_for_idle();
+        if (desc.dstate != DMA_DESC_DSTATE_DONE) {
+            FARF(ERROR, "hmx: weight DMA incomplete dstate=%u bytes=%u src=%x dst=%x",
+                 desc.dstate, (unsigned)chunk, desc.src, desc.dst);
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline void htp_ops_loop_hmx_copy_block(__fp16* dst, const __fp16* src, size_t bytes) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    size_t x = 0;
+#ifndef HTP_OPS_DISABLE_WEIGHT_DMA
+    if ((((uintptr_t)d | (uintptr_t)s) & 127) == 0 && bytes >= 2048 && htp_ops_loop_hmx_dma_copy(d, s, bytes)) {
+        return;
+    }
+#endif
+    // Both ends are 128-byte aligned in practice: VTCM allocations are, and the
+    // group offset inside a weight is a multiple of 2048. The unaligned load
+    // costs extra byte rotates, so use the plain one where the alignment allows
+    // and keep the unaligned one for the odd case. Four loads are issued before
+    // the first store so the uncached reads can overlap instead of being
+    // serialized by the store that follows each one.
+    if ((((uintptr_t)d | (uintptr_t)s) & 127) == 0) {
+        for (; x + 512 <= bytes; x += 512) {
+            // The source is DDR and this loop is latency bound without it: one
+            // 128-byte load in flight per iteration. Ask for the next kilobyte
+            // while the current one is still being stored.
+            if (x + 1024 + 2048 <= bytes) {
+                l2fetch(s + x + 1024, 128, 128, 8, 0);
+                l2fetch(s + x + 2048, 128, 128, 8, 0);
+            }
+            HVX_Vector v0 = vmem((const HVX_Vector*)(s + x));
+            HVX_Vector v1 = vmem((const HVX_Vector*)(s + x + 128));
+            HVX_Vector v2 = vmem((const HVX_Vector*)(s + x + 256));
+            HVX_Vector v3 = vmem((const HVX_Vector*)(s + x + 384));
+            vmem((HVX_Vector*)(d + x)) = v0;
+            vmem((HVX_Vector*)(d + x + 128)) = v1;
+            vmem((HVX_Vector*)(d + x + 256)) = v2;
+            vmem((HVX_Vector*)(d + x + 384)) = v3;
+        }
+        for (; x + 128 <= bytes; x += 128) {
+            vmem((HVX_Vector*)(d + x)) = vmem((const HVX_Vector*)(s + x));
+        }
+    } else {
+        for (; x + 128 <= bytes; x += 128) {
+            vmemu((HVX_Vector*)(d + x)) = vmemu((const HVX_Vector*)(s + x));
+        }
+    }
+    for (; x < bytes; ++x) {
+        d[x] = s[x];
+    }
+}
+
 static inline void htp_ops_loop_hmx_pack_weight_tile(__fp16* tile, const uint8_t* src1Base,
                                                     const HtpOpsLoopParam* lp, int K, int N, int nt, int kt) {
     memset(tile, 0, 1024 * sizeof(__fp16));
@@ -548,7 +633,10 @@ static inline void htp_ops_loop_hmx_store_output_tile(uint8_t* dstBase, const __
     if (nRemain > 32) {
         nRemain = 32;
     }
-    if (lp->dstStrideXYZ[0] == N * 2 && lp->dstStrideXYZ[2] == 2) {
+    // Columns are contiguous even when the destination has padding or a larger
+    // token stride.  The pair-store below only assumes contiguous columns; the
+    // row stride is already applied independently for each destination row.
+    if (lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0) {
         const uint32_t rowBytes = (uint32_t)(nRemain * (int)sizeof(__fp16));
         const HVX_Vector* src = (const HVX_Vector*)vtcmOutput;
         int r = 0;
@@ -639,14 +727,34 @@ static inline bool htp_ops_loop_matmul_batch_hmx_prepare(const HtpOpsLoopParam* 
     int plannedTiles = 0;
     if (htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles) && prepackedWeights) {
         // Committed to the unit: the weights are already in its tile order, so
-        // there is no other kernel to fall back to and the unit is acquired here
-        // rather than per command.
-        return true;
+        // there is no other kernel to fall back to. The unit itself is still
+        // acquired by the kernel, once its buffers are allocated, because the
+        // lock is taken against a VTCM context that does not exist yet here --
+        // and a unit left unlocked never retires an instruction, which hangs the
+        // command rather than slowing it down.
+        return false;
     }
     const bool preferHmxGeneral = htp_ops_loop_matmul_prefer_hmx_general(K, N);
     return htp_ops_loop_matmul_hmx_small_eligible(lp) ||
            (preferHmxGeneral && htp_ops_loop_matmul_hmx_general_eligible(lp));
 }
+
+// Phase timing for the HMX matmul path, off by default. The FARF lines below
+// are the measurement: how a command's time splits between the weight copy, the
+// activation pack, the unit's tile loads and the output store.
+#ifndef HTP_MM_PHASE_PROFILE
+#  define HTP_MM_PHASE_PROFILE 0
+#endif
+#if HTP_MM_PHASE_PROFILE
+#  include <HAP_perf.h>
+#  define MM_T0() ((unsigned long long) HAP_perf_get_time_us())
+// [0] weight fill, [1] activation pack, [2] unit tile loads, [3] output store,
+// [4] whole kernel, [5] calls, [6] weight bytes, [7] path (0 general, 1 small).
+// Surfaced by execute_command.cc into profile[200..212].
+unsigned long long g_mm_phase_us[13] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+#else
+#  define MM_T0() (0ULL)
+#endif
 
 static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8_t* src0Base,
                                                    const uint8_t* src1Base, const HtpOpsLoopParam* lp,
@@ -693,6 +801,9 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
         ntPerPass = (np > 0) ? np : 1;
     }
     __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, blockBytes);
+    // Every operand the unit loads has to be in VTCM: its loads address VTCM and
+    // a weights-section pointer hangs the command instead of reading it, so the
+    // pre-packed weight is still copied in, just without the rearrange.
     __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)ntPerPass * blockBytes);
     __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, outputBytes);
     __fp16* vtcmScales = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 256);
@@ -707,14 +818,22 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     hmx_init_column_scales(vtcmScales, Q6_V_vsplat_R(0x3c00));
     hmx_set_output_scales(vtcmScales);
 
+#if HTP_MM_PHASE_PROFILE
+    unsigned long long mm_t0 = MM_T0(), mm_t = 0, mm_wfill = 0, mm_act = 0, mm_hmx = 0, mm_store = 0;
+#endif
+
     for (int nt0 = 0; nt0 < np; nt0 += ntPerPass) {
         const int ntEnd = (np - nt0 < ntPerPass) ? np : nt0 + ntPerPass;
+#if HTP_MM_PHASE_PROFILE
+        mm_t = MM_T0();
+#endif
         if (prepackedWeights) {
-            // Already in the unit's tile order, and one 32-column group of tiles
-            // is contiguous in the weights section, so the group is one copy out
-            // of DDR instead of kp tiles rearranged element by element.
-            memcpy(vtcmWeight, src1Base + (size_t)nt0 * kp * 1024 * sizeof(__fp16),
-                   (size_t)(ntEnd - nt0) * blockBytes);
+            // Already in the unit's tile order and contiguous per 32-column group,
+            // so the whole group is one straight copy out of the weights section
+            // instead of kp tiles rearranged an element at a time.
+            htp_ops_loop_hmx_copy_block(vtcmWeight,
+                                        (const __fp16*)(src1Base + (size_t)nt0 * kp * 1024 * sizeof(__fp16)),
+                                        (size_t)(ntEnd - nt0) * blockBytes);
         } else {
             for (int nt = nt0; nt < ntEnd; ++nt) {
                 for (int kt = 0; kt < kp; ++kt) {
@@ -723,16 +842,28 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
                 }
             }
         }
+#if HTP_MM_PHASE_PROFILE
+        mm_wfill += MM_T0() - mm_t;
+#endif
         for (int eBase = 0; eBase < E; eBase += 32) {
             int validRows = E - eBase;
             if (validRows > 32) {
                 validRows = 32;
             }
+#if HTP_MM_PHASE_PROFILE
+            mm_t = MM_T0();
+#endif
             for (int kt = 0; kt < kp; ++kt) {
                 htp_ops_loop_hmx_pack_activation_tile(vtcmActivation, src0Base, lp, K, kt, eBase, validRows);
             }
             for (int nt = nt0; nt < ntEnd; ++nt) {
+                // One 32-column group of a pre-packed weight is contiguous, so
+                // the unit's own loads run straight down the weights section.
                 const __fp16* weightBlock = vtcmWeight + (size_t)(nt - nt0) * kp * 1024;
+#if HTP_MM_PHASE_PROFILE
+                mm_act += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
                 for (int k = 0; k < kp; k += HMX_FP16_MAX_TILES_PER_LOAD) {
                     int tiles = kp - k;
                     if (tiles > HMX_FP16_MAX_TILES_PER_LOAD) {
@@ -741,10 +872,33 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
                     hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
                 }
                 hmx_consume_accumulator_fp16(vtcmOutput);
+#if HTP_MM_PHASE_PROFILE
+                mm_hmx += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
                 htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+                mm_store += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
             }
         }
     }
+
+#if HTP_MM_PHASE_PROFILE
+    {
+        const unsigned long long mm_tot = MM_T0() - mm_t0;
+        const unsigned long long mm_wb = (unsigned long long) ((size_t) kp * np * 1024 * sizeof(__fp16));
+        g_mm_phase_us[0] += mm_wfill;
+        g_mm_phase_us[1] += mm_act;
+        g_mm_phase_us[2] += mm_hmx;
+        g_mm_phase_us[3] += mm_store;
+        g_mm_phase_us[4] += mm_tot;
+        g_mm_phase_us[5] += 1;
+        g_mm_phase_us[6] += mm_wb;
+        g_mm_phase_us[7] = 0;
+    }
+#endif
 
     if (!hmxPrepared) {
         hmx_unit_release();
@@ -790,27 +944,60 @@ static inline bool htp_ops_loop_matmul_hmx_small(uint8_t* dstBase, const uint8_t
     hmx_init_column_scales(vtcmScales, Q6_V_vsplat_R(0x3c00));
     hmx_set_output_scales(vtcmScales);
 
+#if HTP_MM_PHASE_PROFILE
+    unsigned long long mm_t0 = MM_T0(), mm_t = MM_T0(), mm_wfill = 0, mm_act = 0, mm_hmx = 0, mm_store = 0;
+#endif
     for (int nt = 0; nt < np; ++nt) {
         for (int kt = 0; kt < kp; ++kt) {
             htp_ops_loop_hmx_pack_weight_tile(vtcmWeight + ((size_t)nt * kp + kt) * 1024, src1Base, lp, K, N, nt, kt);
         }
     }
+#if HTP_MM_PHASE_PROFILE
+    mm_wfill += MM_T0() - mm_t;
+#endif
 
     for (int eBase = 0; eBase < E; eBase += 32) {
         int validRows = E - eBase;
         if (validRows > 32) {
             validRows = 32;
         }
+#if HTP_MM_PHASE_PROFILE
+        mm_t = MM_T0();
+#endif
         htp_ops_loop_hmx_pack_activation_k64(vtcmActivation, src0Base, lp, eBase, validRows);
         for (int nt = 0; nt < np; ++nt) {
+#if HTP_MM_PHASE_PROFILE
+            mm_act += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
             for (int kt = 0; kt < kp; ++kt) {
                 hmx_load_tiles_fp16(vtcmActivation + (size_t)kt * 1024,
                                     vtcmWeight + ((size_t)nt * kp + kt) * 1024, 1);
             }
             hmx_consume_accumulator_fp16(vtcmOutput);
+#if HTP_MM_PHASE_PROFILE
+            mm_hmx += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
             htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+            mm_store += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
         }
     }
+#if HTP_MM_PHASE_PROFILE
+    {
+        g_mm_phase_us[0] += mm_wfill;
+        g_mm_phase_us[1] += mm_act;
+        g_mm_phase_us[2] += mm_hmx;
+        g_mm_phase_us[3] += mm_store;
+        g_mm_phase_us[4] += MM_T0() - mm_t0;
+        g_mm_phase_us[5] += 1;
+        g_mm_phase_us[6] += (unsigned long long) ((size_t) np * kp * 1024 * sizeof(__fp16));
+        g_mm_phase_us[7] = 1;
+    }
+#endif
 
     if (!hmxPrepared) {
         hmx_unit_release();
@@ -1321,6 +1508,7 @@ AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
         const uint8_t* src1Base = src1 + (int64_t)in1Off * bytes;
         htp_ops_loop_matmul_region(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared);
     }
+
     if (hmxPrepared) {
         hmx_unit_release();
         hmx_manager_disable_execution();

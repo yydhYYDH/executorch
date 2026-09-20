@@ -554,10 +554,13 @@ static void sync_attention_process_decode_group(const SyncAttentionTaskState *st
         sync_attention_run_page_qk(state, scores, packed_Q, rows, state->head_dim, 0, kv_head, block_valid_end);
       } else {
         int block_valid_end_padded = (block_valid_end + 31) & ~31;
-        run_locked_attn_hmx_matmul((uint8_t*)scores, (uint8_t*)packed_Q, (uint8_t*)state->pastK,
-                                   rows, state->head_dim, block_valid_end_padded, state->K_dim_padded, state->head_dim,
-                                   ATTN_HMX_OUT_LINEAR_FP32_SCALED, state->scale, ATTN_HMX_WEIGHT_LAYOUT_K_BLOCK256,
-                                   kv_head, state->n_kv_heads);
+        // scores rows are read back by the softmax below at stride state->N_padded, so the QK store
+        // must use the same row stride; the 13-arg overload leaves output_stride=0, which the store
+        // resolves to N (= block_valid_end_padded) and only matches when this block reaches the end.
+        run_locked_attn_hmx_matmul_ex((uint8_t*)scores, (uint8_t*)packed_Q, (uint8_t*)state->pastK,
+                                      rows, state->head_dim, block_valid_end_padded, state->K_dim_padded, state->head_dim,
+                                      ATTN_HMX_OUT_LINEAR_FP32_SCALED, state->scale, ATTN_HMX_WEIGHT_LAYOUT_K_BLOCK256,
+                                      kv_head, state->n_kv_heads, state->N_padded, 0);
       }
 
       WATTN_ADD(worker_index, 1, _tw);
@@ -605,7 +608,8 @@ static void sync_attention_process_decode_group(const SyncAttentionTaskState *st
               vmemu(dst + (size_t)pack_idx * state->qo_total_len * 64 + (size_t)token * 64) = vmemu(src);
             } else {
               __fp16* dst =
-                  state->O + ((size_t)token * state->total_heads + (head_base + h)) * state->head_dim;
+                  state->O + ((size_t)token * state->n_kv_heads * state->gqa_factor + (head_base + h)) *
+                      state->head_dim;
               vmemu(dst + (size_t)pack_idx * 64) = vmemu(src);
             }
           }

@@ -29,16 +29,14 @@ using namespace executorch::backends::hexagon;
 
 namespace {
 
+// The weights are the only section in the file; the other three are sizes in
+// the header, so there is nothing else to print or to bound the blob against.
 void print_sections(const uint8_t* sections, const HexagonBlobHeader* header) {
-  for (const auto& named : {std::pair<const char*, uint32_t>{"weights", header->weights_bytes},
-                            {"activations", header->activations_bytes}}) {
-    std::printf("section %s %u ", named.first, named.second);
-    for (uint32_t i = 0; i < named.second; i++) {
-      std::printf("%02x", sections[i]);
-    }
-    std::printf("\n");
-    sections += named.second;
+  std::printf("section weights %u ", header->weights_bytes);
+  for (uint32_t i = 0; i < header->weights_bytes; i++) {
+    std::printf("%02x", sections[i]);
   }
+  std::printf("\n");
 }
 
 } // namespace
@@ -143,7 +141,7 @@ int main(int argc, char** argv) {
   }
 
   const size_t sections_at = sizeof(HexagonBlobHeader) + ops_bytes;
-  if (sections_at + header->weights_bytes + header->activations_bytes > blob.size()) {
+  if (sections_at + header->weights_bytes > blob.size()) {
     std::fprintf(stderr, "blob_reader: truncated sections\n");
     return 1;
   }
