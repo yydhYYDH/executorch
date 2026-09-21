@@ -18,11 +18,13 @@ import struct
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
+from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.backends.hexagon.rms_norm import RMS_NORM
 
 # After rms_norm, which opens the et_hexagon namespace this fragment joins.
 from executorch.backends.hexagon.mul_silu import MUL_SILU
+from executorch.backends.hexagon.rope import ROPE
 from executorch.backends.hexagon.row_guard import ROW_GUARD
 from executorch.backends.hexagon.serialization.blob import ABSENT, Op, TensorRef
 from executorch.exir.dialects._ops import ops as exir_ops
@@ -32,6 +34,8 @@ from executorch.exir.sym_util import eval_upper_bound
 DSP_OP_RASTER_BLIT = 3
 DSP_OP_UNARY = 4
 DSP_OP_LAYER_NORM = 8
+DSP_OP_ROPE = 14
+DSP_OP_ADD_FUSE_LAYERNORM = 16
 DSP_OP_BINARY_ELEMENTWISE = 19
 DSP_OP_SOFTMAX = 28
 DSP_OP_REDUCTION = 29
@@ -1398,6 +1402,134 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _emit_rope(node: torch.fx.Node, ctx) -> TensorRef:
+    """The rotate-half embedding as one command, per tensor.
+
+    The command takes q and k together, but the graph rotates them in separate
+    partitions, so the k operand is the same tensor with `kv_num_head = 0`: the
+    kernel's k loop runs zero times and never reads or writes it. The table is
+    the graph's own `[seq, head_dim]` cos/sin, whose first half is the even
+    angles and whose second half is the odd ones, which is the layout the
+    dispatcher reconstructs `cos_odd` from.
+
+    The kernel walks tokens as the leading axis and heads inside a token, so the
+    geometry is `[seq, num_head, head_dim]`; the graph's one-wide batch axis
+    folds into the sequence.
+    """
+    source, cos, sin = node.args
+    _require_arena_dtype(node, "rope input")
+    shape = tuple(node.meta["val"].shape)
+    head_dim = ctx.upper_bound(shape[-1])
+    num_head = ctx.upper_bound(shape[-2])
+    batch_seq = _upper_product(shape[:-2], ctx)
+    out = ctx.result_for(node, _numel(node))
+    # q, k, cos, sin; k is q with kv_num_head = 0, so it is inert.
+    inputs = [
+        ctx.operand(source),
+        ctx.operand(source),
+        ctx.operand(cos),
+        ctx.operand(sin),
+    ]
+    op_index = ctx.builder.add_op(
+        Op(
+            type=DSP_OP_ROPE,
+            inputs=inputs,
+            outputs=[out, out],
+            params=[batch_seq, num_head, 0, head_dim, head_dim, 0],
+        )
+    )
+    _patch_dynamic_product(ctx, op_index, shape[:-2], 0)
+    return ctx.record(node, out)
+
+
+def _add_rms_norm_getitem_user(node: torch.fx.Node, index: int):
+    """The getitem reading one of this fused node's two outputs, if present."""
+    return next(
+        (
+            user
+            for user in node.users
+            if user.target is GETITEM and len(user.args) == 2 and user.args[1] == index
+        ),
+        None,
+    )
+
+
+def add_rms_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The fused add+norm a getitem reads, for either of its two outputs.
+
+    Like the layer norm, this op hands out several tensors, so a getitem is the
+    only reader the DSP can carry. Which output it names decides which of the
+    command's two pointers the emitter fills.
+    """
+    if node.target is not GETITEM or len(node.args) != 2:
+        return None
+    source, index = node.args
+    if not isinstance(source, torch.fx.Node) or index not in (0, 1):
+        return None
+    return source if source.target is ADD_RMS_NORM else None
+
+
+def add_rms_norm_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this fused op takes one of the two outputs it writes.
+
+    The command produces the normalized tensor and the residual sum together; a
+    reader that is not a getitem would be left holding a tuple no kernel can be
+    handed, so the whole node stays off the DSP.
+    """
+    return bool(node.users) and all(
+        add_rms_norm_getitem(reader) is node for reader in node.users
+    )
+
+
+def _emit_add_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
+    """One command for the residual add and the norm that reads it.
+
+    The kernel adds the two fp16 operands, writes the sum to `add_out`, and
+    normalizes it in fp32 with gamma (fp32) -- the RMSNorm flavor, selected by
+    the last param and a null beta. Output order is the command's: the
+    normalized tensor is mapped_ptrs[inputs], the residual sum the one after,
+    so the two getitems name them in that order.
+    """
+    residual, branch, weight, eps = node.args
+    _require_arena_dtype(node, "add_rms_norm input")
+    norm_value, add_value = node.meta["val"]
+    shape = tuple(norm_value.shape)
+    inner = ctx.upper_bound(shape[-1])
+    outer = _upper_product(shape[:-1], ctx)
+    numel = _upper_product(shape, ctx)
+
+    norm_sink = _add_rms_norm_getitem_user(node, 0)
+    add_sink = _add_rms_norm_getitem_user(node, 1)
+    normalized = (
+        ctx.result_for(norm_sink, numel)
+        if norm_sink is not None
+        else ctx.activation_for_shape(shape)
+    )
+    residual_out = (
+        ctx.result_for(add_sink, numel)
+        if add_sink is not None
+        else ctx.activation_for_shape(shape)
+    )
+
+    # The kernel applies gamma itself and reads it as fp32.
+    gamma = ctx.constant(weight, torch.float32)
+    op_index = ctx.builder.add_op(
+        Op(
+            type=DSP_OP_ADD_FUSE_LAYERNORM,
+            # beta is ABSENT: RMSNorm has no bias and the kernel's RMSNorm path
+            # only fires when it is null.
+            inputs=[ctx.operand(residual), ctx.operand(branch), gamma, ABSENT],
+            outputs=[normalized, residual_out],
+            params=[outer, inner, _float_bits(float(eps)), 1],
+        )
+    )
+    _patch_dynamic_product(ctx, op_index, shape[:-1], 0)
+    for sink, ref in ((norm_sink, normalized), (add_sink, residual_out)):
+        if sink is not None:
+            ctx.record(sink, ref)
+    return ctx.record(node, normalized)
+
+
 def layer_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
     """The layer norm a getitem reads, when it reads the first output.
 
@@ -1515,7 +1647,12 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
 
 def _emit_getitem(node: torch.fx.Node, ctx) -> TensorRef:
     """Re-points the layer norm result, the only getitem this backend takes."""
-    return ctx.record(node, ctx.operand(node.args[0]))
+    source = node.args[0]
+    if isinstance(source, torch.fx.Node) and source.target is ADD_RMS_NORM:
+        # The fused add+norm records both getitems itself, at the output each
+        # index names; re-pointing to the op would collapse them to one.
+        return ctx.producer[node]
+    return ctx.record(node, ctx.operand(source))
 
 
 def _scalar_arg(node: torch.fx.Node, name: str, index: int, default: float):
@@ -1759,7 +1896,9 @@ EMITTERS = {
     exir_ops.edge.aten.mul.Scalar: _emit_mul_scalar,
     UPDATE_CACHE: _emit_update_cache,
     RMS_NORM: _emit_rms_norm,
+    ADD_RMS_NORM: _emit_add_rms_norm,
     MUL_SILU: _binary("mul_silu"),
+    ROPE: _emit_rope,
 }
 
 # Ops whose operands must match the output's shape or be scalar. The support

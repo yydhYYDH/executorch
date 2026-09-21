@@ -33,6 +33,7 @@ from executorch.backends.hexagon.serialization import blob as B
 #: DSPOpType values this can execute.
 RASTER_BLIT = 3
 LAYER_NORM = 8
+ADD_FUSE_LAYERNORM = 16
 UNARY = 4
 BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
@@ -312,6 +313,38 @@ def _as_float(bits: int) -> float:
     return struct.unpack("<f", struct.pack("<i", bits))[0]
 
 
+def _run_add_fuse_layernorm(command: Command, params: List[int], arena: Arena) -> None:
+    """The RMSNorm path of htp_ops_add_fuse_layernorm.
+
+    The kernel adds the two fp16 operands, writes the sum to its second output,
+    and normalizes that sum in fp32 with the fp32 gamma -- beta is null, which
+    is what selects the RMSNorm flavor. Like `_run_layer_norm` this is the
+    scalar path; the vendored kernel reduces in another order and uses an
+    approximate rsqrt, so agreement is to about fp16 precision.
+    """
+    rows, inner, eps_bits, rms = params[0], params[1], params[2], params[3]
+    eps = _as_float(eps_bits)
+    if not rms:
+        raise UnsupportedOp("blob: the layer-norm mode of add_fuse_layernorm is not modelled")
+    refs = list(command.inputs) + list(command.outputs)
+    if refs[3].space != ABSENT:
+        raise UnsupportedOp("blob: the bias of add_fuse_layernorm is not modelled")
+
+    src0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16).reshape(rows, inner)
+    src1 = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16).reshape(rows, inner)
+    added = (src0 + src1).astype(np.float16)
+    _store(arena, arena.address(refs[len(command.inputs) + 1]), added.tobytes())
+
+    x = added.astype(np.float32)
+    sqsum = np.sum(x * x, axis=1, dtype=np.float32)
+    inv_std = (1.0 / np.sqrt(sqsum / inner + eps)).astype(np.float32)
+    out = x * inv_std[:, None]
+    if refs[2].space != ABSENT:
+        gamma = np.frombuffer(bytes(arena.view(refs[2])), dtype=np.float32).reshape(inner)
+        out = out * gamma[None, :]
+    _store(arena, arena.address(refs[len(command.inputs)]), out.astype(np.float16).tobytes())
+
+
 def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None:
     """The general path of htp_ops_loop_matmul_region.
 
@@ -572,6 +605,7 @@ _EXECUTORS = {
     UNARY: _run_unary,
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,
+    ADD_FUSE_LAYERNORM: _run_add_fuse_layernorm,
     BATCH_MATMUL: _run_batch_matmul,
     FLASH_ATTN: _run_flash_attn,
 }

@@ -11,6 +11,9 @@ from executorch.backends.hexagon.hexagon_backend import HexagonBackend, SUPPORTE
 from executorch.backends.hexagon.hexagon_ops import (
     _scalar_arg,
     _scalar_source,
+    ADD_RMS_NORM,
+    add_rms_norm_getitem,
+    add_rms_norm_is_emittable,
     ADDMM_TARGETS,
     ALIAS_TARGETS,
     BMM_TARGETS,
@@ -333,15 +336,22 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 return False
             if node.target is NATIVE_LAYER_NORM and not layer_norm_is_emittable(node):
                 return False
+        if node.target is ADD_RMS_NORM and not add_rms_norm_is_emittable(node):
+            return False
         if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
             return False
         if node.target is GETITEM:
-            # The getitem that reads a layer norm's first output is the one this
-            # backend can place; every other getitem (a split's, for one) has no
-            # producer here.
+            # The getitem that reads a layer norm's first output, or one of the
+            # fused add+norm's two, is the one this backend can place; every
+            # other getitem (a split's, for one) has no producer here.
             source = layer_norm_getitem(node)
-            if source is None or not layer_norm_is_emittable(source):
-                return False
+            if source is not None:
+                if not layer_norm_is_emittable(source):
+                    return False
+            else:
+                source = add_rms_norm_getitem(node)
+                if source is None or not add_rms_norm_is_emittable(source):
+                    return False
         if _emits_no_command(node) and not _alias_keeps_the_same_bytes(node):
             # A narrowing select reaches the same emitter through its own region
             # rather than by re-pointing, so the alias test is not the last word.

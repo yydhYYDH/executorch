@@ -1172,11 +1172,14 @@ def _to_edge_and_lower_llama_xnnpack(
     # cover; XNNPACK then takes the rest.
     hexagon_transform_passes = []
     if os.environ.get("EXECUTORCH_HEXAGON_PARTITION") == "1":
+        from executorch.backends.hexagon.add_rms_norm import FuseAddRmsNormPass
         from executorch.backends.hexagon.kv_cache import FuseKvCachePass
+        from executorch.backends.hexagon.mul_silu import FuseMulSiluPass
         from executorch.backends.hexagon.partition.hexagon_partitioner import (
             HexagonPartitioner,
         )
         from executorch.backends.hexagon.rms_norm import FuseRmsNormPass
+        from executorch.backends.hexagon.rope import FuseRopePass
 
         partitioners.append(HexagonPartitioner())
         # The cache advance arrives wrapped in an undelegable
@@ -1199,6 +1202,20 @@ def _to_edge_and_lower_llama_xnnpack(
         # in fp32.
         if os.environ.get("EXECUTORCH_HEXAGON_NO_RMS_FUSE") != "1":
             hexagon_transform_passes.append(FuseRmsNormPass())
+        # The residual add and the norm that reads it are one DSP command. Runs
+        # after the norm pass, which hands it the fused et_hexagon.rms_norm to
+        # anchor on.
+        if os.environ.get("EXECUTORCH_HEXAGON_NO_ADD_RMS_FUSE") != "1":
+            hexagon_transform_passes.append(FuseAddRmsNormPass())
+        # The HF rotary embedding is a rotate-half chain of four multiplies and
+        # two adds per tensor; DSP_OP_ROPE applies the same convention in one
+        # command.
+        if os.environ.get("EXECUTORCH_HEXAGON_NO_ROPE_FUSE") != "1":
+            hexagon_transform_passes.append(FuseRopePass())
+        # The gated MLP's `a * sigmoid(b)` has one command on the DSP
+        # (HTP_OPS_BINARY_MUL_SILU); opt-in until its arithmetic is rechecked.
+        if os.environ.get("EXECUTORCH_HEXAGON_MUL_SILU_FUSE") == "1":
+            hexagon_transform_passes.append(FuseMulSiluPass())
 
     # Order matters here, dynamic quantization should be applied first when both xnnpack and xnnpack_extended_ops are enabled
     partitioners.append(
