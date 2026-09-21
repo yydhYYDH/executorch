@@ -1205,7 +1205,11 @@ def _to_edge_and_lower_llama_xnnpack(
         # The residual add and the norm that reads it are one DSP command. Runs
         # after the norm pass, which hands it the fused et_hexagon.rms_norm to
         # anchor on.
-        if os.environ.get("EXECUTORCH_HEXAGON_NO_ADD_RMS_FUSE") != "1":
+        #
+        # Off by default: the fused kernel's fast rsqrt agrees with the separate
+        # norm to a few parts in 1e4 on one layer, but 28 of them compound and
+        # the model stops generating coherent text.
+        if os.environ.get("EXECUTORCH_HEXAGON_ADD_RMS_FUSE") == "1":
             hexagon_transform_passes.append(FuseAddRmsNormPass())
         # The HF rotary embedding is a rotate-half chain of four multiplies and
         # two adds per tensor; DSP_OP_ROPE applies the same convention in one
