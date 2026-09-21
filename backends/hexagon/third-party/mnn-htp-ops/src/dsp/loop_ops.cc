@@ -625,6 +625,32 @@ static inline void htp_ops_loop_hmx_pack_weight_tile(__fp16* tile, const uint8_t
     }
 }
 
+// One deinterleaved output row leaves as a 64-byte fragment inside a 2 KB
+// destination row, so the writeback is a long run of short stores. vstu_variable
+// takes the length as a runtime value, which makes the compiler emit a memcpy
+// call per fragment; at ~50-100 cycles each that call is the whole cost of the
+// phase (527 ms for the 587 MB of L=1024 output, about 1.1 GB/s against the
+// weight fill's 33 GB/s). A row is always a whole number of 32-column tiles, so
+// the common width is a constant 64 bytes and can be an inline store with no
+// length dispatch at all.
+static inline void htp_ops_loop_hmx_store_row(uint8_t* dst, uint32_t rowBytes, HVX_Vector v) {
+    if (rowBytes == 64) {
+        _Alignas(128) uint64_t tmp[16];
+        vmem((HVX_Vector*)tmp) = v;
+        uint64_t* d = (uint64_t*)dst;
+        d[0] = tmp[0];
+        d[1] = tmp[1];
+        d[2] = tmp[2];
+        d[3] = tmp[3];
+        d[4] = tmp[4];
+        d[5] = tmp[5];
+        d[6] = tmp[6];
+        d[7] = tmp[7];
+        return;
+    }
+    vstu_variable(dst, rowBytes, v);
+}
+
 static inline void htp_ops_loop_hmx_store_output_tile(uint8_t* dstBase, const __fp16* vtcmOutput,
                                                      const HtpOpsLoopParam* lp, int eBase,
                                                      int validRows, int N, int nt) {
@@ -644,13 +670,13 @@ static inline void htp_ops_loop_hmx_store_output_tile(uint8_t* dstBase, const __
             HVX_Vector v = Q6_Vh_vdeal_Vh(*src++);
             uint8_t* dst0 = dstBase + (int64_t)(eBase + r) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
             uint8_t* dst1 = dstBase + (int64_t)(eBase + r + 1) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
-            vstu_variable(dst0, rowBytes, v);
-            vstu_variable(dst1, rowBytes, Q6_V_valign_VVR(v, v, 64));
+            htp_ops_loop_hmx_store_row(dst0, rowBytes, v);
+            htp_ops_loop_hmx_store_row(dst1, rowBytes, Q6_V_valign_VVR(v, v, 64));
         }
         if (r < validRows) {
             HVX_Vector v = Q6_Vh_vdeal_Vh(*src++);
             uint8_t* dst0 = dstBase + (int64_t)(eBase + r) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
-            vstu_variable(dst0, rowBytes, v);
+            htp_ops_loop_hmx_store_row(dst0, rowBytes, v);
         }
         return;
     }
