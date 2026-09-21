@@ -1375,18 +1375,21 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     zero-size tensor: RMSNorm has no bias, and a zero-size operand still maps to
     a live address the kernel would read as data.
     """
-    source, eps = node.args
+    source, weight, eps = node.args
     _require_arena_dtype(node, "rms_norm input")
     shape = tuple(node.meta["val"].shape)
     inner = ctx.upper_bound(shape[-1])
     outer = _upper_product(shape[:-1], ctx)
     out = ctx.result_for(node, _numel(node))
+    # The kernel applies gamma itself and reads it as fp32, so the weight is
+    # stored at that width rather than in a following elementwise multiply.
+    gamma = ctx.constant(weight, torch.float32)
     op_index = ctx.builder.add_op(
         Op(
             type=DSP_OP_LAYER_NORM,
-            # gamma and beta are both ABSENT: the scale is a separate multiply,
-            # and the kernel skips the affine step when gamma is null.
-            inputs=[ctx.operand(source), ABSENT, ABSENT],
+            # beta is ABSENT: RMSNorm has no bias, and a zero-size operand still
+            # maps to a live address the kernel would read as data.
+            inputs=[ctx.operand(source), gamma, ABSENT],
             outputs=[out],
             params=[outer, inner, _float_bits(float(eps)), 1],
         )

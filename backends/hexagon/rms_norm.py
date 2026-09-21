@@ -13,10 +13,10 @@ does the same work in one command -- `htp_ops_layer_norm` with its RMSNorm flag,
 fp16 in and out, accumulating in fp32 -- so this keeps the arithmetic and drops
 the fragmentation.
 
-The weight is left alone. The kernel wants gamma as fp32, and a weight reaches a
-subgraph as an fp16 placeholder rather than a constant, so folding it in would
-read half-precision bytes as floats. The scale keeps its own `mul`, which is
-fp16 once this has run and already has a kernel.
+The weight is folded in. The kernel applies gamma itself, and reads it as fp32,
+so the pass keeps the weight operand and the emitter stores it at that width;
+leaving it as a separate multiply cost one elementwise command per norm. The
+weight reaches the subgraph as an fp16 placeholder, which the emitter widens.
 
 The fused node is created after `to_edge`, which is the only place it can be:
 the edge decomposition table takes `aten.rms_norm` back apart, so a fused norm
@@ -34,13 +34,14 @@ NAMESPACE = "et_hexagon"
 _library = torch.library.Library(NAMESPACE, "DEF")
 
 
-def _rms_norm(x, eps):
+def _rms_norm(x, weight, eps):
     """The same arithmetic, written out for anywhere the DSP cannot reach."""
     variance = x.float().pow(2).mean(-1, keepdim=True)
-    return (x.float() * torch.rsqrt(variance + eps)).to(x.dtype)
+    normalized = (x.float() * torch.rsqrt(variance + eps)).to(x.dtype)
+    return normalized * weight
 
 
-_library.define("rms_norm(Tensor x, float eps) -> Tensor")
+_library.define("rms_norm(Tensor x, Tensor weight, float eps) -> Tensor")
 _library.impl("rms_norm", _rms_norm, "CompositeExplicitAutograd")
 
 RMS_NORM = exir_ops.edge.et_hexagon.rms_norm.default
@@ -99,10 +100,10 @@ def _as_float(value) -> Optional[float]:
 
 
 class RmsNormMatch(NamedTuple):
-    # The fp16 node the fused op takes over from, which is the last value the
-    # fp32 chain produces and the thing the weight scale is applied to.
-    replace: torch.fx.Node
+    # The weight multiply the fused op replaces, and its operands.
+    anchor: torch.fx.Node
     source: torch.fx.Node
+    weight: torch.fx.Node
     eps: float
 
 
@@ -119,7 +120,9 @@ def match_rms_norm(anchor: torch.fx.Node) -> Optional[RmsNormMatch]:
     scaled = _pick(anchor, exir_ops.edge.aten.mul.Tensor)
     if scaled is None:
         return None
-    norm_cast, times_rstd, _weight = scaled
+    norm_cast, times_rstd, weight = scaled
+    if not isinstance(weight, torch.fx.Node):
+        return None
     if norm_cast.target not in _CASTS:
         return None
 
@@ -161,7 +164,7 @@ def match_rms_norm(anchor: torch.fx.Node) -> Optional[RmsNormMatch]:
     source = _source_of(squared.args[0])
     if source is not _source_of(source_used):
         return None
-    return RmsNormMatch(norm_cast, source, eps)
+    return RmsNormMatch(anchor, source, weight, eps)
 
 
 def fuse_rms_norm(graph_module: torch.fx.GraphModule) -> int:
@@ -179,14 +182,14 @@ def fuse_rms_norm(graph_module: torch.fx.GraphModule) -> int:
     ]
 
     for _anchor, match in found:
-        with graph.inserting_before(match.replace):
+        with graph.inserting_before(match.anchor):
             fused = graph.create_node(
                 "call_function",
                 RMS_NORM,
-                args=(match.source, match.eps),
+                args=(match.source, match.weight, match.eps),
             )
-        fused.meta["val"] = match.replace.meta["val"]
-        match.replace.replace_all_uses_with(fused)
+        fused.meta["val"] = match.anchor.meta["val"]
+        match.anchor.replace_all_uses_with(fused)
 
     if found:
         graph.eliminate_dead_code()
