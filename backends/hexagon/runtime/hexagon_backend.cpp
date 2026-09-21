@@ -258,6 +258,17 @@ struct HexagonDelegate {
   // outputs. Shared through the pool with every delegate of the same size,
   // because nothing written here outlives an execute.
   Arena scratch;
+  // The packed attention K/V, which the kernel appends to and reads back over
+  // many executes. Kept out of the pooled scratch and never resized, so a
+  // decode step still sees the rows the earlier steps wrote.
+  Arena state;
+  struct StateSlot {
+    HexagonTensorSpace space;
+    uint32_t index;
+    size_t offset;
+    size_t size;
+  };
+  std::vector<StateSlot> state_slots;
 
   // Host-written once at init.
   Region group; // command group array
@@ -600,6 +611,25 @@ const Arena& BlockOf(const HexagonDelegate& delegate, HexagonTensorSpace space) 
                                                : delegate.scratch;
 }
 
+// A packed attention cache is addressed in the persistent state block instead
+// of the pooled scratch, so its rows are not lost between executes. Everything
+// else resolves to the block its space names.
+const Arena* ResolveBlock(
+    const HexagonDelegate& delegate,
+    HexagonTensorSpace space,
+    uint32_t index,
+    size_t ref_offset,
+    size_t* offset) {
+  for (const auto& slot : delegate.state_slots) {
+    if (slot.space == space && slot.index == index) {
+      *offset = slot.offset;
+      return &delegate.state;
+    }
+  }
+  *offset = SectionBase(delegate, space) + ref_offset;
+  return &BlockOf(delegate, space);
+}
+
 bool IsKnownSpace(uint32_t space) {
   return space <= static_cast<uint32_t>(HexagonTensorSpace::kActivation) ||
       space == static_cast<uint32_t>(HexagonTensorSpace::kAbsent);
@@ -618,11 +648,12 @@ flatbuffers::Offset<DSPCOMMAND::Tensor> MakeTensor(
   if (IsAbsent(ref)) {
     return DSPCOMMAND::CreateTensor(builder, -1, 0, 0);
   }
-  const size_t base =
-      SectionBase(delegate, (HexagonTensorSpace)ref.space) + ref.offset;
-  const Arena& block = BlockOf(delegate, (HexagonTensorSpace)ref.space);
+  size_t offset = 0;
+  const Arena* block = ResolveBlock(
+      delegate, static_cast<HexagonTensorSpace>(ref.space), ref.index, ref.offset,
+      &offset);
   return DSPCOMMAND::CreateTensor(
-      builder, block.fd, (int32_t)(base + block.bias), (int32_t)ref.size);
+      builder, block->fd, (int32_t)(offset + block->bias), (int32_t)ref.size);
 }
 
 const HexagonDelegate::DynamicLayout* FindDynamicLayout(
@@ -741,6 +772,14 @@ Error ResizeDynamicDelegate(HexagonDelegate* delegate, int64_t length) {
       if (ref.space != static_cast<uint32_t>(HexagonTensorSpace::kActivation)) {
         return;
       }
+      // A packed attention cache lives in the persistent block, so it takes no
+      // room in the per-call lifetime plan.
+      for (const auto& slot : delegate->state_slots) {
+        if (slot.space == HexagonTensorSpace::kActivation &&
+            slot.index == ref.index) {
+          return;
+        }
+      }
       auto it = std::find_if(
           lifetimes.begin(), lifetimes.end(),
           [&](const Lifetime& value) { return value.index == ref.index; });
@@ -824,22 +863,24 @@ Error ResizeDynamicDelegate(HexagonDelegate* delegate, int64_t length) {
     const auto space = static_cast<HexagonTensorSpace>(patch.source_ref.space);
     const auto* layout = FindRuntimeLayout(*delegate, space, patch.source_ref.index);
     const size_t offset = layout == nullptr ? patch.source_ref.offset : layout->offset;
-    patch.source = static_cast<const uint8_t*>(BlockOf(*delegate, space).ptr) +
-        SectionBase(*delegate, space) + offset;
+    size_t resolved = 0;
+    const Arena* block = ResolveBlock(
+        *delegate, space, patch.source_ref.index, offset, &resolved);
+    patch.source = static_cast<const uint8_t*>(block->ptr) + resolved;
   }
 
   auto update_tensor = [&](DSPCOMMAND::Tensor* tensor, const HexagonTensorRef& ref) {
     if (IsAbsent(ref)) {
       return;
     }
-    const auto* layout = FindRuntimeLayout(*delegate,
-        static_cast<HexagonTensorSpace>(ref.space), ref.index);
+    const auto space = static_cast<HexagonTensorSpace>(ref.space);
+    const auto* layout = FindRuntimeLayout(*delegate, space, ref.index);
     const size_t offset = layout == nullptr ? ref.offset : layout->offset;
     const size_t size = layout == nullptr ? ref.size : layout->size;
-    const auto space = static_cast<HexagonTensorSpace>(ref.space);
-    const Arena& block = BlockOf(*delegate, space);
-    tensor->mutate_fd(block.fd);
-    tensor->mutate_offset(static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias));
+    size_t resolved = 0;
+    const Arena* block = ResolveBlock(*delegate, space, ref.index, offset, &resolved);
+    tensor->mutate_fd(block->fd);
+    tensor->mutate_offset(static_cast<int32_t>(resolved + block->bias));
     tensor->mutate_size(static_cast<int32_t>(size));
   };
 
@@ -905,35 +946,28 @@ Error ResizeDynamicDelegate(HexagonDelegate* delegate, int64_t length) {
   flatbuffers::FlatBufferBuilder builder(1u << 20);
   std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
   std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
+  auto sync_tensor = [&](const HexagonTensorRef& ref) {
+    const auto space = static_cast<HexagonTensorSpace>(ref.space);
+    const auto* layout = FindRuntimeLayout(*delegate, space, ref.index);
+    const size_t offset = layout == nullptr ? ref.offset : layout->offset;
+    const size_t size = layout == nullptr ? ref.size : layout->size;
+    size_t resolved = 0;
+    const Arena* block = ResolveBlock(*delegate, space, ref.index, offset, &resolved);
+    return DSPCOMMAND::CreateTensor(
+        builder,
+        block->fd,
+        static_cast<int32_t>(resolved + block->bias),
+        static_cast<int32_t>(size));
+  };
   for (const auto& op : delegate->ops) {
     for (uint32_t j = 0; j < op.n_inputs; j++) {
       if (!IsAbsent(op.inputs[j])) {
-        const auto& ref = op.inputs[j];
-        const auto* layout = FindRuntimeLayout(*delegate,
-            static_cast<HexagonTensorSpace>(ref.space), ref.index);
-        const size_t offset = layout == nullptr ? ref.offset : layout->offset;
-        const size_t size = layout == nullptr ? ref.size : layout->size;
-        const auto space = static_cast<HexagonTensorSpace>(ref.space);
-        const Arena& block = BlockOf(*delegate, space);
-        sync_in.push_back(DSPCOMMAND::CreateTensor(
-            builder, block.fd,
-            static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias),
-            static_cast<int32_t>(size)));
+        sync_in.push_back(sync_tensor(op.inputs[j]));
       }
     }
     for (uint32_t j = 0; j < op.n_outputs; j++) {
       if (!IsAbsent(op.outputs[j])) {
-        const auto& ref = op.outputs[j];
-        const auto* layout = FindRuntimeLayout(*delegate,
-            static_cast<HexagonTensorSpace>(ref.space), ref.index);
-        const size_t offset = layout == nullptr ? ref.offset : layout->offset;
-        const size_t size = layout == nullptr ? ref.size : layout->size;
-        const auto space = static_cast<HexagonTensorSpace>(ref.space);
-        const Arena& block = BlockOf(*delegate, space);
-        sync_out.push_back(DSPCOMMAND::CreateTensor(
-            builder, block.fd,
-            static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias),
-            static_cast<int32_t>(size)));
+        sync_out.push_back(sync_tensor(op.outputs[j]));
       }
     }
   }
@@ -1088,6 +1122,45 @@ Result<DelegateHandle*> HexagonBackend::init(
       sizeof(HexagonBlobHeader));
   delegate->ops.assign(ops, ops + header->n_ops);
   delegate->command_offsets.reserve(header->n_ops);
+
+  // The packed attention K/V is written a row at a time and read back whole on
+  // every later step: the kernel appends the current row and the attention
+  // consumes the whole packed cache. In the per-call scratch that history is
+  // lost, so each packed cache gets a fixed slot in a block that is allocated
+  // once, zeroed once, and never resized.
+  size_t state_bytes = 0;
+  for (uint32_t i = 0; i < header->n_ops; i++) {
+    const HexagonOp& op = delegate->ops[i];
+    if (op.type != kFlashAttnOp || op.n_inputs < 6) {
+      continue;
+    }
+    for (uint32_t j = 4; j <= 5; j++) {
+      const HexagonTensorRef& ref = op.inputs[j];
+      if (ref.space != static_cast<uint32_t>(HexagonTensorSpace::kActivation)) {
+        continue;
+      }
+      bool seen = false;
+      for (const auto& slot : delegate->state_slots) {
+        seen = seen || slot.index == ref.index;
+      }
+      if (seen) {
+        continue;
+      }
+      const size_t offset = AlignUp(state_bytes, kHexagonAlignment);
+      delegate->state_slots.push_back(
+          {HexagonTensorSpace::kActivation, ref.index, offset, ref.size});
+      state_bytes = offset + ref.size;
+    }
+  }
+  if (state_bytes > 0) {
+    auto state = delegate->driver.Alloc(state_bytes);
+    if (!state.ok()) {
+      ET_LOG(Error, "hexagon: packed attention cache allocation failed");
+      return state.error();
+    }
+    delegate->state = state.get();
+    std::memset(delegate->state.ptr, 0, state_bytes);
+  }
   const uint8_t* blob = reinterpret_cast<const uint8_t*>(processed->data());
   const size_t weights_blob_offset = sizeof(HexagonBlobHeader) + ops_bytes;
   // Only the weights are on disk. Every other section is a size the runtime
@@ -1918,6 +1991,10 @@ void HexagonBackend::destroy(DelegateHandle* handle) const {
   if (delegate->resident.ptr != nullptr) {
     delegate->driver.Free(delegate->resident.ptr);
     delegate->resident.ptr = nullptr;
+  }
+  if (delegate->state.ptr != nullptr) {
+    delegate->driver.Free(delegate->state.ptr);
+    delegate->state.ptr = nullptr;
   }
   // The delegate itself lives in the runtime allocator and is reclaimed with
   // the program, and the scratch block belongs to the pool, so the resident

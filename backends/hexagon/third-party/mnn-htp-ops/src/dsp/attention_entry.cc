@@ -183,56 +183,6 @@ extern "C" AEEResult htp_ops_vision_flash_attention_fp16(uint8_t *pOut, const ui
   return AEE_SUCCESS;
 }
 
-// Decode attention read straight off the plain K/V cache. pK/pV hold
-// [seq, n_kv_heads, head_dim]; going through the packed HMX cache would mean
-// tiling the whole history into a per-call workspace, which a one-token step
-// has no way to fill. The single query sits at seq_current, so every key in
-// [0, seq_current + 1) is visible and no mask is needed. GQA folds through the
-// kv-head index. Accumulate in fp32; the cache is fp16.
-static void flash_attention_decode_plain(
-    uint8_t* pOut, const uint8_t* pQ, const uint8_t* pK, const uint8_t* pV,
-    int32_t n_heads, int32_t n_kv_heads, int32_t head_dim, float scale,
-    int32_t seq_len) {
-  const __fp16* q = (const __fp16*)pQ;
-  const __fp16* k = (const __fp16*)pK;
-  const __fp16* v = (const __fp16*)pV;
-  __fp16* out = (__fp16*)pOut;
-  const int32_t group = n_heads / n_kv_heads;
-  for (int32_t h = 0; h < n_heads; ++h) {
-    const __fp16* q_head = q + (size_t)h * head_dim;
-    const int32_t kv_h = h / group;
-    __fp16* o_head = out + (size_t)h * head_dim;
-    for (int32_t d = 0; d < head_dim; ++d) {
-      o_head[d] = (__fp16)0;
-    }
-    float m = -INFINITY;
-    float l = 0.0f;
-    for (int32_t s = 0; s < seq_len; ++s) {
-      const __fp16* k_row = k + ((size_t)s * n_kv_heads + kv_h) * head_dim;
-      float score = 0.0f;
-      for (int32_t d = 0; d < head_dim; ++d) {
-        score += (float)q_head[d] * (float)k_row[d];
-      }
-      score *= scale;
-      const float new_m = score > m ? score : m;
-      const float alpha = expf(m - new_m);
-      const float weight = expf(score - new_m);
-      l = l * alpha + weight;
-      const __fp16* v_row = v + ((size_t)s * n_kv_heads + kv_h) * head_dim;
-      for (int32_t d = 0; d < head_dim; ++d) {
-        o_head[d] = (__fp16)((float)o_head[d] * alpha + weight * (float)v_row[d]);
-      }
-      m = new_m;
-    }
-    if (l > 0.0f) {
-      const float inv = 1.0f / l;
-      for (int32_t d = 0; d < head_dim; ++d) {
-        o_head[d] = (__fp16)((float)o_head[d] * inv);
-      }
-    }
-  }
-}
-
 AEEResult htp_ops_flash_attn(uint8_t* pOut,
                              uint8_t* pQ,
                              uint8_t* pK,
@@ -247,20 +197,18 @@ AEEResult htp_ops_flash_attn(uint8_t* pOut,
   WP_TRACE("WP entry add=%d qo=%d maskstride=%d", (int)seq_add, (int)qo_len, (int)mask_stride);
   g_attn_dma_fault = 0;
   ATTN_STAGE(1, seq_add, qo_len, mask_stride);
-  // A one-token step reads the plain cache directly. The packed path below
-  // exists for the HMX unit, but it is a per-call workspace: a decode step
-  // would repack the whole history (or, as before, repack nothing and lose it).
-  if (qo_len == 1 && seq_current > 0 && seq_add == 1 && pK && pV &&
-      pMask == NULL && value_c4 == 0 && n_kv_heads > 0 && head_dim > 0 &&
-      n_heads % n_kv_heads == 0) {
-    flash_attention_decode_plain(
-        pOut, pQ, pK, pV, n_heads, n_kv_heads, head_dim, scale,
-        seq_current + seq_add);
-    return 0;
-  }
   if (pK && pV && seq_add > 0) {
       ATTN_STAGE(2, seq_current, max_kv_len, seq_add);
-      htp_ops_push_kv(pPastK, pPastV, pK, pV, seq_current, seq_add, n_kv_heads, head_dim, max_kv_len,
+      // This backend hands attention the whole cache as k/v (the graph advances
+      // it with update_cache first), not just this call's rows. push_kv reads
+      // its source at `global_seq - past_kv_len`, so shift the base to the
+      // current row and every row lands on its absolute cache slot: a decode
+      // step then appends row `seq_current` instead of re-reading row 0.
+      const size_t kv_row_bytes = (size_t)n_kv_heads * head_dim * sizeof(__fp16);
+      htp_ops_push_kv(pPastK, pPastV,
+                      pK + (size_t)seq_current * kv_row_bytes,
+                      pV + (size_t)seq_current * kv_row_bytes,
+                      seq_current, seq_add, n_kv_heads, head_dim, max_kv_len,
                       value_c4, 0, seq_add);
       ATTN_STAGE(3, seq_current, seq_add, 0);
   }
