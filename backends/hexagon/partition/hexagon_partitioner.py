@@ -383,11 +383,23 @@ def _data_placeholders(exported_program: ExportedProgram) -> Set[str]:
 
     Parameters, buffers and lifted constants reach the partitioner as ordinary
     graph inputs. Their names are what says which is which.
+
+    A mutated buffer is excluded: tagging it would hand its bytes to the backend
+    as delegate-owned data, which EXIR then drops from the delegate's arguments.
+    For a KV cache that means the empty initial buffer is baked in as a weight
+    and every execute() after the first reads a cache nothing ever wrote. Left
+    untagged it stays a user input the runtime copies in and reads back out.
     """
     signature = exported_program.graph_signature
+    mutated = set(signature.buffers_to_mutate.values())
+    owned_buffers = {
+        name
+        for name, target in signature.inputs_to_buffers.items()
+        if target not in mutated
+    }
     return (
         set(signature.inputs_to_parameters)
-        | set(signature.inputs_to_buffers)
+        | owned_buffers
         | set(signature.inputs_to_lifted_tensor_constants)
     )
 

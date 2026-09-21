@@ -152,6 +152,25 @@ def _dynamic_scale(ctx, value) -> int:
     return 1
 
 
+def _patch_dynamic_rows(ctx, op_index: int, param_index: int, rows: int, factors) -> None:
+    """Patch a row count that is the exported length times static factors.
+
+    A blit region's row count is the product of the shape the copy runs over.
+    When exactly one of those entries is the sequence symbol the count is linear
+    in the run length, and the runtime's patch recomputes it as
+    `rows // example` per token. Anything else -- a constant cache copy, say --
+    is left alone.
+    """
+    if ctx.dynamic_sequence is None or not ctx.dynamic_example:
+        return
+    if sum(ctx.is_dynamic_dim(factor) for factor in factors) != 1:
+        return
+    example = int(ctx.dynamic_example)
+    if rows <= 0 or rows % example:
+        return
+    ctx.add_dynamic_patch(op_index, param_index, rows // example, 0)
+
+
 def _patch_dynamic_numel(ctx, op_index: int, node: torch.fx.Node, param_index: int = 0) -> None:
     _patch_dynamic_product(ctx, op_index, tuple(_value_of(node).shape), param_index)
 
@@ -336,7 +355,7 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
         inputs.append(ctx.operand(region.patch_source))
         patch = (_SLICE_OFFSET_PARAM, len(inputs) - 1)
     out = ctx.result_for(node, _numel(node))
-    ctx.builder.add_op(
+    op_index = ctx.builder.add_op(
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=inputs,
@@ -347,6 +366,13 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
             patch_scale=region.patch_scale,
         )
     )
+    # Rows are the sliced dimension's leading shape, at index 7 past the header
+    # and the region's three offsets.
+    source_shape = _value_of(node.args[0]).shape
+    dim = node.args[1]
+    if dim < 0:
+        dim += len(source_shape)
+    _patch_dynamic_rows(ctx, op_index, 7, region.region[4], source_shape[:dim])
     return ctx.record(node, out)
 
 
@@ -429,15 +455,27 @@ def cat_region(node: torch.fx.Node):
 def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
     """Each operand is copied into its own slice of a fresh buffer."""
     tensors = node.args[0]
+    params = cat_region(node)
     out = ctx.result_for(node, _numel(node))
-    ctx.builder.add_op(
+    op_index = ctx.builder.add_op(
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(tensor) for tensor in tensors],
             outputs=[out],
-            params=cat_region(node),
+            params=params,
         )
     )
+    # Every region repeats the row count at its own size1 slot, so each one has
+    # to move with the length; the regions that mirror it are patched with it.
+    result_shape = _value_of(node).shape
+    dim = node.args[1] if len(node.args) > 1 else 0
+    if dim < 0:
+        dim += len(result_shape)
+    for region_index in range(params[0]):
+        rows_param = 3 + region_index * 12 + 4
+        _patch_dynamic_rows(
+            ctx, op_index, rows_param, params[rows_param], result_shape[:dim]
+        )
     return ctx.record(node, out)
 
 
@@ -986,7 +1024,7 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
     )
     # dstOffset is the token position times one whole cached position, which is
     # what patch_scale is for. dst is the output, at index 3.
-    ctx.builder.add_op(
+    op_index = ctx.builder.add_op(
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[value, cache, pos],
@@ -996,6 +1034,10 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
             patch_scale=inner,
         )
     )
+    # The rows this writes are the value's tokens, so they scale with the
+    # length; the full-cache copy above does not and is left alone.
+    value_shape = _value_of(value_node).shape
+    _patch_dynamic_rows(ctx, op_index, 7, rows, value_shape[:-1])
     return ctx.record(node, out)
 
 

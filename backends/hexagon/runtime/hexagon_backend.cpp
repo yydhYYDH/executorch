@@ -292,6 +292,9 @@ struct HexagonDelegate {
     const uint8_t* source; // where the value is read from, in either block
     HexagonTensorRef source_ref;
     uint32_t scale; // multiplier between the two
+    // Ints from slot to a second param that has to move with the position, or
+    // zero. Attention carries the sequence extent seven ints past start_pos.
+    uint32_t extent_offset;
   };
   std::vector<Patch> patches;
 
@@ -1359,12 +1362,19 @@ Result<DelegateHandle*> HexagonBackend::init(
         return Error::DelegateInvalidCompatibility;
       }
       const auto space = static_cast<HexagonTensorSpace>(src.space);
+      // The attention extent (max_kv_len) is not the token count but the
+      // position plus it: ResizeDynamicDelegate only sees the tokens in this
+      // call, so a decode step at position p would keep asking for two rows.
+      const uint32_t extent_offset =
+          (op.type == kFlashAttnOp && op.patch_param == 1 && op.n_params > 8) ? 7u
+                                                                             : 0u;
       delegate->patches.push_back(
           {static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor + delta,
            static_cast<const uint8_t*>(BlockOf(*delegate, space).ptr) +
                SectionBase(*delegate, space) + src.offset,
            src,
-           op.patch_scale});
+           op.patch_scale,
+           extent_offset});
     }
 
     if (command_cursor + size >
@@ -1613,10 +1623,16 @@ Error HexagonBackend::execute(
   }
 
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
-    // Not every method input is a tensor: a graph can hand a subgraph an int it
-    // never reads. Nothing in the blob addresses it, so there is nothing to
-    // copy.
+    // A non-tensor input still has an arena slot: a graph hands the attention
+    // its start position as a plain int, and the command reads it back out of
+    // that slot. Leaving it untouched pins the position at zero, so every
+    // decode step attends at the start and the cache never advances.
     if (!args[i]->isTensor()) {
+      if (args[i]->isInt() && delegate->inputs[i].size >= sizeof(int64_t)) {
+        const int64_t value = args[i]->toInt();
+        std::memcpy(
+            scratch + delegate->inputs[i].offset, &value, sizeof(value));
+      }
       continue;
     }
     const auto& tensor = args[i]->toTensor();
@@ -1689,6 +1705,15 @@ Error HexagonBackend::execute(
     // offset, and it overflows int32 well before either factor does.
     value = static_cast<int32_t>(static_cast<int64_t>(value) * patch.scale);
     std::memcpy(patch.slot, &value, sizeof(value));
+    if (patch.extent_offset != 0 && delegate->dynamic_max_length != 0) {
+      // Inclusive extent: the token at this position plus the ones handed in now.
+      const int32_t extent =
+          static_cast<int32_t>(value + dynamic_length + 1);
+      std::memcpy(
+          patch.slot + patch.extent_offset * sizeof(int32_t),
+          &extent,
+          sizeof(extent));
+    }
   }
 
   // The inputs are one contiguous section, so one flush covers them all. The

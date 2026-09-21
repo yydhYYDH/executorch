@@ -59,7 +59,16 @@ def owned_weight(
     caller. The partitioner tags those, so EXIR moves their values into this
     program's own state and out of the delegate's arguments; what is left here
     is to find them.
+
+    A mutated buffer is the exception. It is program state, but it changes every
+    call, so its bytes are not a constant this layer may store once: the cache
+    has to be read back in (and written out) per execute. Baking it in as a
+    weight freezes the empty cache and every later step attends over it.
     """
+    signature = program.graph_signature
+    target = signature.inputs_to_buffers.get(node.name)
+    if target is not None and target in set(signature.buffers_to_mutate.values()):
+        return None
     for fetch in (get_param, get_buffer, get_lifted_tensor_constant):
         tensor = fetch(program, node)
         if tensor is not None:

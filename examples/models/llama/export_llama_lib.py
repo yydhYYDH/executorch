@@ -1172,17 +1172,31 @@ def _to_edge_and_lower_llama_xnnpack(
     # cover; XNNPACK then takes the rest.
     hexagon_transform_passes = []
     if os.environ.get("EXECUTORCH_HEXAGON_PARTITION") == "1":
+        from executorch.backends.hexagon.kv_cache import FuseKvCachePass
         from executorch.backends.hexagon.partition.hexagon_partitioner import (
             HexagonPartitioner,
         )
         from executorch.backends.hexagon.rms_norm import FuseRmsNormPass
 
         partitioners.append(HexagonPartitioner())
+        # The cache advance arrives wrapped in an undelegable
+        # auto_functionalized_v2, so claiming only its getitem strands the wrapper
+        # as a subgraph boundary. Fusing the pair into one et_hexagon.update_cache
+        # node is what lets the splitter keep the cache advance inside the
+        # delegate. The pass belongs to the caller for the same reason the RMSNorm
+        # one does: a partitioner has to return the graph it was given.
+        #
+        # Off by default: with the advance delegated, nothing breaks the graph
+        # between layers, so a model with more than one layer collapses into a
+        # single partition that the runtime rejects as oversized. Leaving the
+        # advance on the CPU keeps a partition per layer, and the cache is a live
+        # buffer either way.
+        if os.environ.get("EXECUTORCH_HEXAGON_KV_FUSE") == "1":
+            hexagon_transform_passes.append(FuseKvCachePass())
         # The DSP's elementwise square runs in fp16, so a decomposed RMSNorm clamps
         # every x^2 above 65504 and normalises by a mean that is far too small.
         # Fusing puts the norm back into one command, which squares and accumulates
-        # in fp32. The pass belongs to the caller: the splitter requires a
-        # partitioner to return the graph it was given.
+        # in fp32.
         if os.environ.get("EXECUTORCH_HEXAGON_NO_RMS_FUSE") != "1":
             hexagon_transform_passes.append(FuseRmsNormPass())
 
