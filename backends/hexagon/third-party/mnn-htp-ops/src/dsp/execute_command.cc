@@ -560,6 +560,28 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                                 intParams[0], seq_current, seq_add, intParams[3], intParams[4],
                                                 intParams[5], floatParams[6], intParams[7], intParams[8],
                                                 page_count, page_size, value_c4);
+            } else if (page_count > 0 && inputs->size() < (uint32_t)(4 + 2 * page_count) &&
+                       inputs->size() >= 6 && mapped_ptrs[4] != NULL && mapped_ptrs[5] != NULL) {
+                // The emitter may keep the packed KV cache in two contiguous operands while
+                // selecting the paged kernel. Expose its 256-token tiles as page pointers here;
+                // this preserves the native paged push path without requiring one FlatBuffer
+                // input per page.
+                const size_t page_bytes = (size_t)intParams[4] * ((intParams[5] + 31) / 32) *
+                    8 * 1024 * sizeof(__fp16);
+                std::vector<uint8_t*> pastKPages(page_count);
+                std::vector<uint8_t*> pastVPages(page_count);
+                for (int i = 0; i < page_count; ++i) {
+                    pastKPages[i] = mapped_ptrs[4] + (size_t)i * page_bytes;
+                    pastVPages[i] = mapped_ptrs[5] + (size_t)i * page_bytes;
+                }
+                ret = htp_ops_flash_attn_pages(outPtr,
+                                                qPtr, kPtr, vPtr,
+                                                maskPtr,
+                                                workspacePtr,
+                                                pastKPages.data(), pastVPages.data(),
+                                                intParams[0], seq_current, seq_add, intParams[3], intParams[4],
+                                                intParams[5], floatParams[6], intParams[7], intParams[8],
+                                                page_count, page_size, value_c4);
             } else if (page_count > 0 && inputs->size() >= (uint32_t)(4 + 2 * page_count)) {
                 std::vector<uint8_t*> pastKPages(page_count);
                 std::vector<uint8_t*> pastVPages(page_count);

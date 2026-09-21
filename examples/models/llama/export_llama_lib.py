@@ -1183,7 +1183,8 @@ def _to_edge_and_lower_llama_xnnpack(
         # Fusing puts the norm back into one command, which squares and accumulates
         # in fp32. The pass belongs to the caller: the splitter requires a
         # partitioner to return the graph it was given.
-        hexagon_transform_passes.append(FuseRmsNormPass())
+        if os.environ.get("EXECUTORCH_HEXAGON_NO_RMS_FUSE") != "1":
+            hexagon_transform_passes.append(FuseRmsNormPass())
 
     # Order matters here, dynamic quantization should be applied first when both xnnpack and xnnpack_extended_ops are enabled
     partitioners.append(

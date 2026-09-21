@@ -29,6 +29,7 @@ constexpr uint32_t kHexagonBlobMagic = 0x4E584748; // 'HXGN'
 // Bumped with the HexagonOp layout, which patch_scale changed from 476 bytes
 // to 480. A v1 blob read as v2 would take an in_place bit for a scale.
 constexpr uint32_t kHexagonBlobVersion = 2;
+constexpr uint32_t kHexagonDynamicTrailerMagic = 0x44594E48; // 'HYND'
 
 constexpr uint32_t kMaxOpInputs = 8;
 constexpr uint32_t kMaxOpOutputs = 4;
@@ -99,6 +100,45 @@ struct HexagonBlobHeader {
   uint32_t outputs_bytes;
 };
 
+// Optional trailer after the weights section. Keeping dynamic metadata out of
+// the v2 header lets existing static blobs remain byte-compatible.
+struct HexagonDynamicTrailer {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t input_index;
+  uint32_t axis;
+  uint32_t max_length;
+  uint32_t n_patches;
+};
+
+struct HexagonDynamicTrailerV3 {
+  HexagonDynamicTrailer base;
+  uint32_t example_length;
+};
+
+// Version 2 appends n_layouts after the v1 fields and then stores one affine
+// size recipe per dynamic tensor. Bytes are evaluated as c0 + c1*L + c2*L*L.
+// Keeping the coefficients in the trailer lets the runtime resize without
+// rerunning the exporter or carrying a graph interpreter on the device.
+struct HexagonDynamicLayoutHeader {
+  uint32_t n_layouts;
+};
+
+struct HexagonDynamicLayout {
+  uint32_t space; // HexagonTensorSpace
+  uint32_t index; // activation id or method input/output index
+  int64_t c0;
+  int64_t c1;
+  int64_t c2;
+};
+
+struct HexagonDynamicPatch {
+  int32_t op_index;
+  int32_t param_index;
+  int32_t scale;
+  int32_t add;
+};
+
 #pragma pack(pop)
 
 // The Python writer in serialization/blob.py derives the same numbers from its
@@ -106,6 +146,11 @@ struct HexagonBlobHeader {
 // field. Asserting them here turns a layout change into a build failure instead
 // of a blob the runtime silently misreads.
 static_assert(sizeof(HexagonBlobHeader) == 36);
+static_assert(sizeof(HexagonDynamicTrailer) == 24);
+static_assert(sizeof(HexagonDynamicTrailerV3) == 28);
+static_assert(sizeof(HexagonDynamicLayoutHeader) == 4);
+static_assert(sizeof(HexagonDynamicLayout) == 32);
+static_assert(sizeof(HexagonDynamicPatch) == 16);
 static_assert(sizeof(HexagonTensorRef) == 24);
 static_assert(sizeof(HexagonOp) == 480);
 static_assert(offsetof(HexagonOp, params) == 16);

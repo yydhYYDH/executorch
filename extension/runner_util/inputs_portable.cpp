@@ -58,15 +58,19 @@ Error fill_and_set_input(
     TensorInfo& tensor_meta,
     size_t input_index,
     void* data_ptr,
-    bool fill_tensor) {
+    bool fill_tensor,
+    executorch::runtime::Span<const int32_t> sizes) {
+  if (sizes.empty()) {
+    sizes = tensor_meta.sizes();
+  }
   TensorImpl impl = TensorImpl(
       tensor_meta.scalar_type(),
-      /*dim=*/tensor_meta.sizes().size(),
+      /*dim=*/sizes.size(),
       // These const pointers will not be modified because we never resize this
       // short-lived TensorImpl. It only exists so that set_input() can verify
       // that the shape is correct; the Method manages its own sizes and
       // dim_order arrays for the input.
-      const_cast<TensorImpl::SizesType*>(tensor_meta.sizes().data()),
+      const_cast<TensorImpl::SizesType*>(sizes.data()),
       data_ptr,
       const_cast<TensorImpl::DimOrderType*>(tensor_meta.dim_order().data()));
   Tensor t(&impl);

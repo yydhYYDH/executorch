@@ -22,6 +22,7 @@ from torch._export.utils import (
     get_param,
 )
 from torch.export import ExportedProgram
+from executorch.exir.sym_util import eval_upper_bound
 
 # node.target -> emitter. The partitioner delegates exactly these, so what the
 # DSP is asked to run and what the AOT step can encode cannot drift apart.
@@ -88,6 +89,8 @@ class BlobContext:
         n_outputs: int,
         output_index: Dict[torch.fx.Node, int],
         weights: Optional[Dict[torch.fx.Node, torch.Tensor]] = None,
+        dynamic_sequence: Optional[Tuple[int, int, int]] = None,
+        dynamic_example: Optional[int] = None,
     ) -> None:
         self.graph_module = graph_module
         # The tensors behind the placeholders this subgraph owns. torch.export
@@ -107,6 +110,114 @@ class BlobContext:
         # bytes back out of the blob to get them.
         self.folded_values: Dict[torch.fx.Node, torch.Tensor] = {}
         self._output_index = output_index
+        self.dynamic_sequence = dynamic_sequence
+        self.dynamic_example = dynamic_example
+        self.has_symbolic_shape = any(
+            isinstance(dim, torch.SymInt)
+            for node in graph_module.graph.nodes
+            for value in (
+                node.meta.get("val") if node.meta.get("val") is not None else (),
+            )
+            for tensor in (value if isinstance(value, tuple) else (value,))
+            for dim in getattr(tensor, "shape", ())
+        )
+        if dynamic_sequence is not None:
+            self.builder.set_dynamic_sequence(*dynamic_sequence, dynamic_example or 0)
+
+    def upper_bound(self, value) -> int:
+        return self.upper_dim(value)
+
+    def is_dynamic_dim(self, value) -> bool:
+        return isinstance(value, torch.SymInt)
+
+    def upper_dim(self, value) -> int:
+        if self.is_dynamic_dim(value):
+            return self.dynamic_sequence[2]
+        if isinstance(value, torch.SymInt):
+            return eval_upper_bound(value)
+        return int(value)
+
+    def upper_shape(self, shape, allow_static_fallback: bool = True) -> tuple:
+        return tuple(self.upper_dim(value) for value in shape)
+
+    def dynamic_bytes_for_shape(self, shape, dtype: torch.dtype, allow_static_fallback: bool = True) -> tuple[int, int, int]:
+        """Return bytes as c0 + c1*L + c2*L^2 for one tensor shape."""
+        coeffs = [1, 0, 0]
+        for dim in shape:
+            factor = [0, 1, 0] if self.is_dynamic_dim(dim) else [int(dim), 0, 0]
+            product = [0, 0, 0]
+            for i, left in enumerate(coeffs):
+                for j, right in enumerate(factor):
+                    if i + j < len(product):
+                        product[i + j] += left * right
+            coeffs = product
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        return tuple(value * itemsize for value in coeffs)
+
+    def activation_for_shape(self, shape, dtype: torch.dtype = torch.float16) -> TensorRef:
+        upper_numel = 1
+        for dim in shape:
+            upper_numel *= self.upper_dim(dim)
+        return self.builder.add_activation(
+            bytes_for(upper_numel, dtype),
+            dynamic_layout=self.dynamic_bytes_for_shape(shape, dtype),
+        )
+
+    def dynamic_bytes_for_function(self, max_bytes: int, function) -> tuple[int, int, int]:
+        """Fit a non-negative quadratic byte formula over the sequence length."""
+        if (
+            self.dynamic_sequence is None
+            and self.dynamic_example is None
+            and not self.has_symbolic_shape
+        ):
+            return (int(max_bytes), 0, 0)
+        if self.dynamic_sequence is not None:
+            upper = int(self.dynamic_sequence[2])
+        else:
+            upper = max(
+                (
+                    eval_upper_bound(dim)
+                    for node in self.graph_module.graph.nodes
+                    for value in (
+                        node.meta.get("val")
+                        if node.meta.get("val") is not None
+                        else (),
+                    )
+                    for tensor in (value if isinstance(value, tuple) else (value,))
+                    for dim in getattr(tensor, "shape", ())
+                    if isinstance(dim, torch.SymInt)
+                ),
+                default=0,
+            )
+        if upper <= 0:
+            return (int(max_bytes), 0, 0)
+        middle = max(1, upper // 2)
+        at_zero, at_middle, at_upper = (
+            int(function(length)) for length in (0, middle, upper)
+        )
+        if at_zero < 0:
+            return (int(max_bytes), 0, 0)
+        # Fit c0 + c1*x + c2*x^2 at x=0, upper/2, upper.  Ceil the
+        # coefficients so alignment rounding cannot make the runtime buffer
+        # smaller than the DSP workspace it describes.
+        slope_middle = at_middle - at_zero
+        slope_upper = at_upper - at_zero
+        numerator = slope_upper * middle - slope_middle * upper
+        denominator = middle * upper * (upper - middle)
+        c2 = max(0, (numerator + denominator - 1) // denominator)
+        c1_numerator = slope_middle - c2 * middle * middle
+        c1 = max(0, (c1_numerator + middle - 1) // middle)
+        if at_zero + c1 * upper + c2 * upper * upper < at_upper:
+            c1 += (at_upper - (at_zero + c1 * upper + c2 * upper * upper) + upper - 1) // upper
+        return (at_zero, c1, c2)
+
+    def add_dynamic_patch(self, op_index: int, param_index: int, scale: int = 1, add: int = 0) -> None:
+        if self.dynamic_sequence is not None:
+            from executorch.backends.hexagon.serialization.blob import DynamicPatch
+
+            self.builder.add_dynamic_patch(
+                DynamicPatch(op_index, param_index, scale, add)
+            )
 
     def constant(
         self, node: torch.fx.Node, dtype: torch.dtype = None
@@ -245,9 +356,25 @@ class BlobContext:
         A node that is also a graph output writes straight into its output slot,
         so the last op of a chain costs no extra copy.
         """
+        value = node.meta.get("val")
+        if isinstance(value, tuple):
+            value = value[0]
+        if isinstance(value, torch.Tensor):
+            numel = 1
+            for dim in value.shape:
+                numel *= self.upper_dim(dim)
+        elif isinstance(numel, torch.SymInt):
+            numel = eval_upper_bound(numel)
         index = self._output_index.get(node)
         if index is not None:
-            return self.builder.method_output(index, bytes_for(numel, dtype))
+            layout = (
+                self.dynamic_bytes_for_shape(value.shape, dtype)
+                if isinstance(value, torch.Tensor)
+                else None
+            )
+            return self.builder.method_output(index, bytes_for(numel, dtype), layout)
+        if isinstance(value, torch.Tensor):
+            return self.activation_for_shape(value.shape, dtype)
         return self.builder.add_activation(bytes_for(numel, dtype))
 
     def is_method_output(self, node: torch.fx.Node) -> bool:
@@ -275,7 +402,6 @@ class HexagonBackend(BackendDetails):
         placeholders = [node for node in graph.nodes if node.op == "placeholder"]
         output_node = next(node for node in graph.nodes if node.op == "output")
         outputs = _flatten_outputs(output_node)
-
         # A weight this subgraph owns is stored in the blob, not handed over as
         # an argument. The runtime uploads the blob's weight section once, at
         # delegate init; a method input is copied into the arena on every
@@ -288,8 +414,97 @@ class HexagonBackend(BackendDetails):
         weights = {node: tensor for node, tensor in weights.items() if tensor is not None}
         inputs = [node for node in placeholders if node not in weights]
 
+        dynamic_sequence = None
+        dynamic_example = None
+        dynamic_symbol = None
+
+        finite_constraint_max = 0
+        for constraint in program.range_constraints.values():
+            if not hasattr(constraint, "upper"):
+                continue
+            try:
+                finite_constraint_max = max(finite_constraint_max, int(constraint.upper))
+            except Exception:
+                pass
+
+        def symbol_upper(symbol) -> int:
+            constraint = next(
+                (value for key, value in program.range_constraints.items() if str(key) == str(symbol)),
+                None,
+            )
+            if constraint is not None and hasattr(constraint, "upper"):
+                try:
+                    return int(constraint.upper)
+                except Exception:
+                    pass
+            return eval_upper_bound(symbol)
+
+        for index, placeholder in enumerate(inputs):
+            value = _val_of(placeholder)
+            if not isinstance(value, torch.Tensor):
+                continue
+            dynamic_axes = [
+                axis for axis, dim in enumerate(value.shape) if isinstance(dim, torch.SymInt)
+            ]
+            if dynamic_axes:
+                axis = dynamic_axes[0]
+                symbols = {str(value.shape[axis]) for axis in dynamic_axes}
+                if len(symbols) != 1:
+                    raise RuntimeError(
+                        "hexagon: one input cannot contain multiple dynamic symbols"
+                    )
+                symbol = symbols.pop()
+                if dynamic_symbol is None:
+                    dynamic_symbol = symbol
+                elif symbol != dynamic_symbol:
+                    raise RuntimeError(
+                        "hexagon: inputs must share one dynamic sequence symbol"
+                    )
+                if dynamic_sequence is not None:
+                    continue
+                dynamic_sequence = (
+                    index,
+                    axis,
+                    max(symbol_upper(value.shape[axis]), finite_constraint_max),
+                )
+
+        has_symbolic_input = any(
+            isinstance(dim, torch.SymInt)
+            for placeholder in inputs
+            for dim in getattr(_val_of(placeholder), "shape", ())
+        )
+        if dynamic_sequence is None and has_symbolic_input and program.range_constraints:
+            max_length = max(
+                eval_upper_bound(upper)
+                for upper in program.range_constraints.values()
+            )
+            candidates = []
+            for index, placeholder in enumerate(inputs):
+                value = _val_of(placeholder)
+                if not isinstance(value, torch.Tensor):
+                    continue
+                for axis, dim in enumerate(value.shape):
+                    if isinstance(dim, int) and 1 < dim <= max_length:
+                        candidates.append((int(dim), index, axis))
+            if candidates:
+                example, index, axis = max(
+                    candidates, key=lambda item: (sum(item[0] == c[0] for c in candidates), item[0])
+                )
+                dynamic_example = example
+                dynamic_sequence = (index, axis, max_length)
+
+        if dynamic_sequence is not None and dynamic_example is None:
+            index, axis, _ = dynamic_sequence
+            dynamic_example = int(_val_of(inputs[index]).shape[axis])
+
         context = BlobContext(
-            graph_module, len(inputs), len(outputs), dict(outputs), weights
+            graph_module,
+            len(inputs),
+            len(outputs),
+            dict(outputs),
+            weights,
+            dynamic_sequence,
+            dynamic_example,
         )
 
         for node, tensor in weights.items():
@@ -301,17 +516,33 @@ class HexagonBackend(BackendDetails):
             # SymInt, not a tensor. It still needs a slot: the runtime patches
             # the position into it before the flush.
             if isinstance(value, torch.Tensor):
+                is_dynamic_input = (
+                    dynamic_sequence is not None and index == dynamic_sequence[0]
+                )
                 # The kernels read activations as fp16, so a fp32 input gets a
                 # half-width slot and the runtime narrows it on the way into the
                 # arena. Other widths, such as the int64 position read the patch
                 # mechanism consumes, keep their own size.
                 narrowed = value.dtype == torch.float32
+                max_numel = 1
+                for dim in context.upper_shape(
+                    value.shape, allow_static_fallback=is_dynamic_input
+                ):
+                    max_numel *= dim
                 size = bytes_for(
-                    value.numel(), torch.float16 if narrowed else value.dtype
+                    max_numel, torch.float16 if narrowed else value.dtype
+                )
+                dynamic_layout = context.dynamic_bytes_for_shape(
+                    value.shape,
+                    torch.float16 if narrowed else value.dtype,
+                    allow_static_fallback=is_dynamic_input,
                 )
             else:
                 size = bytes_for(1, torch.int64)
-            context.producer[placeholder] = context.builder.method_input(index, size)
+                dynamic_layout = None
+            context.producer[placeholder] = context.builder.method_input(
+                index, size, dynamic_layout
+            )
 
         for node in graph.nodes:
             if node.op != "call_function":

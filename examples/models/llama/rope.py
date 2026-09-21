@@ -367,14 +367,12 @@ class Rope(torch.nn.Module):
             ), "input_pos must be provided when use_kv_cache is True"
 
             if self.params.enable_dynamic_shape:
-                # when KV cache is used, seqlen is most likely 1. We want to slice from the start_pos.
-                input_pos_item = input_pos[-1].item()
-                torch._check_is_size(input_pos_item)
-                torch._check(input_pos_item < self.params.max_context_len)
-                # pyre-ignore: Incompatible parameter type [6]: torch.narrow does expect int or Tensor
-                freqs_cos = self.freqs_cos.narrow(0, input_pos_item, seq_len)
-                # pyre-ignore: Incompatible parameter type [6]
-                freqs_sin = self.freqs_sin.narrow(0, input_pos_item, seq_len)
+                # Indexing preserves a symbolic prefill length. For decode,
+                # input_pos has one element; for prefill it contains the full
+                # contiguous position range, so both cases select the same
+                # rows as the old narrow(start_pos, seq_len) path.
+                freqs_cos = self.freqs_cos[input_pos]
+                freqs_sin = self.freqs_sin[input_pos]
             else:
                 # When not using dynamic shape, use of the .item results in
                 # symints, due to querying the data from tensor.

@@ -9,6 +9,8 @@
 
 #include <executorch/extension/runner_util/inputs.h>
 
+#include <vector>
+
 #include <executorch/runtime/executor/method.h>
 #include <executorch/runtime/executor/method_meta.h>
 #include <executorch/runtime/platform/log.h>
@@ -151,6 +153,54 @@ Result<BufferCleanup> prepare_input_tensors(
     }
     // This input is a tensor. Allocate a buffer for it.
     size_t tensor_size = tensor_meta->nbytes();
+    std::vector<int32_t> dynamic_sizes;
+    if (!hard_code_inputs_to_ones) {
+      auto [buffer, buffer_size] = input_buffers.at(i);
+      if (buffer_size != tensor_size) {
+        size_t meta_numel = 1;
+        for (int32_t size : tensor_meta->sizes()) {
+          if (size <= 0) {
+            meta_numel = 0;
+            break;
+          }
+          meta_numel *= static_cast<size_t>(size);
+        }
+        const size_t element_size = meta_numel == 0 ? 0 : tensor_size / meta_numel;
+        const size_t actual_numel =
+            element_size != 0 && buffer_size % element_size == 0
+            ? buffer_size / element_size
+            : 0;
+        if (actual_numel != 0 && actual_numel < meta_numel) {
+          auto meta_sizes = tensor_meta->sizes();
+          for (size_t axis = meta_sizes.size(); axis-- > 0;) {
+            size_t outer = 1;
+            for (size_t dim = 0; dim < meta_sizes.size(); ++dim) {
+              if (dim != axis) {
+                outer *= static_cast<size_t>(meta_sizes[dim]);
+              }
+            }
+            if (outer != 0 && actual_numel % outer == 0) {
+              size_t candidate = actual_numel / outer;
+              if (candidate > 0 && candidate <= static_cast<size_t>(meta_sizes[axis])) {
+                dynamic_sizes.assign(meta_sizes.begin(), meta_sizes.end());
+                dynamic_sizes[axis] = static_cast<int32_t>(candidate);
+                break;
+              }
+            }
+          }
+        }
+        if (dynamic_sizes.empty()) {
+          ET_LOG(
+              Error,
+              "input size (%zu) and tensor size (%zu) mismatch!",
+              buffer_size,
+              tensor_size);
+          BufferCleanup cleanup({inputs, num_allocated});
+          return Error::InvalidArgument;
+        }
+        tensor_size = buffer_size;
+      }
+    }
     total_size += tensor_size;
     if (total_size > options.max_total_allocation_size) {
       ET_LOG(
@@ -174,21 +224,18 @@ Result<BufferCleanup> prepare_input_tensors(
     // Write input data for input tensor
     if (!hard_code_inputs_to_ones) {
       auto [buffer, buffer_size] = input_buffers.at(i);
-      if (buffer_size != tensor_meta->nbytes()) {
-        ET_LOG(
-            Error,
-            "input size (%zu) and tensor size (%zu) mismatch!",
-            buffer_size,
-            tensor_meta->nbytes());
-        BufferCleanup cleanup({inputs, num_allocated});
-        return Error::InvalidArgument;
-      }
       std::memcpy(data_ptr, buffer, buffer_size);
     }
 
     // Create the tensor and set it as the input.
     Error err = internal::fill_and_set_input(
-        method, tensor_meta.get(), i, data_ptr, hard_code_inputs_to_ones);
+        method,
+        tensor_meta.get(),
+        i,
+        data_ptr,
+        hard_code_inputs_to_ones,
+        executorch::runtime::Span<const int32_t>(
+            dynamic_sizes.data(), dynamic_sizes.size()));
 
     if (err != Error::Ok) {
       ET_LOG(

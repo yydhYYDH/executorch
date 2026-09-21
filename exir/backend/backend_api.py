@@ -395,6 +395,18 @@ def _(
     # Fall back to deepcopy if no fake mode is found. TODO(T182910699): Remove this fallback.
     try:
         fake_edge_program = get_fake_program(edge_program)
+        # get_fake_program makes state tensors static to avoid copying large
+        # constants, but graph input/output FakeTensor metadata must retain
+        # symbolic dimensions for dynamic-shape delegates.
+        real_nodes = {node.name: node for node in edge_program.graph.nodes}
+        for node in fake_edge_program.graph.nodes:
+            source = real_nodes.get(node.name)
+            if source is not None and "val" in source.meta:
+                source_value = source.meta["val"]
+                if isinstance(source_value, torch.Tensor) and any(
+                    isinstance(dim, torch.SymInt) for dim in source_value.shape
+                ):
+                    node.meta["val"] = source_value
     except Exception as e:
         logging.warning(
             f"Error in get_fake_program for graph {edge_program.graph_module}, fallback to deepcopy: {e}"

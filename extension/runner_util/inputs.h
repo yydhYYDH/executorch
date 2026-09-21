@@ -100,7 +100,8 @@ executorch::runtime::Error fill_and_set_input(
     TensorInfo& tensor_meta,
     size_t input_index,
     void* data_ptr,
-    bool fill_tensor = true);
+    bool fill_tensor = true,
+    executorch::runtime::Span<const int32_t> sizes = {});
 } // namespace internal
 
 } // namespace extension

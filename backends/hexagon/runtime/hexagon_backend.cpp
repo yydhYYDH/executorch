@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include <executorch/backends/hexagon/serialization/hexagon_schema.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
+#include <executorch/runtime/core/exec_aten/util/tensor_util.h>
 #include <executorch/runtime/platform/compiler.h>
 #include <executorch/runtime/platform/log.h>
 
@@ -50,6 +52,7 @@ using runtime::FreeableBuffer;
 using runtime::MemoryAllocator;
 using runtime::Result;
 using runtime::Span;
+using runtime::resize_tensor;
 
 // Diagnostic knobs, all off unless set in the environment:
 //   HEXAGON_TRACE=1        print the per-command trace
@@ -271,6 +274,8 @@ struct HexagonDelegate {
 
   uint32_t n_ops = 0;
   uint32_t activations_bytes = 0;
+  std::vector<HexagonOp> ops;
+  std::vector<size_t> command_offsets;
   // Order this delegate was created in, for the trace only.
   int index = 0;
   // Host-visible landing zone for the DSP-side per-command trace. Empty unless
@@ -285,9 +290,36 @@ struct HexagonDelegate {
   struct Patch {
     uint8_t* slot; // param slot to overwrite, in the resident block
     const uint8_t* source; // where the value is read from, in either block
+    HexagonTensorRef source_ref;
     uint32_t scale; // multiplier between the two
   };
   std::vector<Patch> patches;
+
+  struct DynamicPatch {
+    uint8_t* slot;
+    int32_t scale;
+    int32_t add;
+  };
+  uint32_t dynamic_input = 0;
+  uint32_t dynamic_axis = 0;
+  uint32_t dynamic_max_length = 0;
+  uint32_t dynamic_example = 0;
+  std::vector<DynamicPatch> dynamic_patches;
+  struct DynamicLayout {
+    HexagonTensorSpace space;
+    uint32_t index;
+    int64_t c0;
+    int64_t c1;
+    int64_t c2;
+  };
+  std::vector<DynamicLayout> dynamic_layouts;
+  struct RuntimeLayout {
+    HexagonTensorSpace space;
+    uint32_t index;
+    size_t offset;
+    size_t size;
+  };
+  std::vector<RuntimeLayout> runtime_layouts;
 
   // Method inputs the subgraph writes to, by signature index. Their scratch
   // slots are copied back to the caller once the command group has run.
@@ -590,6 +622,332 @@ flatbuffers::Offset<DSPCOMMAND::Tensor> MakeTensor(
       builder, block.fd, (int32_t)(base + block.bias), (int32_t)ref.size);
 }
 
+const HexagonDelegate::DynamicLayout* FindDynamicLayout(
+    const HexagonDelegate& delegate,
+    HexagonTensorSpace space,
+    uint32_t index) {
+  for (const auto& layout : delegate.dynamic_layouts) {
+    if (layout.space == space && layout.index == index) {
+      return &layout;
+    }
+  }
+  return nullptr;
+}
+
+bool EvalDynamicBytes(
+    const HexagonDelegate::DynamicLayout& layout,
+    int64_t length,
+    size_t* bytes) {
+  const __int128 value = static_cast<__int128>(layout.c0) +
+      static_cast<__int128>(layout.c1) * length +
+      static_cast<__int128>(layout.c2) * length * length;
+  if (value < 0 || value > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  *bytes = static_cast<size_t>(value);
+  return true;
+}
+
+const HexagonDelegate::RuntimeLayout* FindRuntimeLayout(
+    const HexagonDelegate& delegate,
+    HexagonTensorSpace space,
+    uint32_t index) {
+  for (const auto& layout : delegate.runtime_layouts) {
+    if (layout.space == space && layout.index == index) {
+      return &layout;
+    }
+  }
+  return nullptr;
+}
+
+bool AddLayoutBlock(
+    std::vector<std::pair<size_t, size_t>>& free,
+    size_t requested,
+    size_t* arena_end,
+    size_t* offset) {
+  auto candidate = free.end();
+  for (auto it = free.begin(); it != free.end(); ++it) {
+    if (it->second >= requested &&
+        (candidate == free.end() || it->second < candidate->second)) {
+      candidate = it;
+    }
+  }
+  if (candidate != free.end()) {
+    *offset = candidate->first;
+    free.erase(candidate);
+    return true;
+  }
+  for (auto it = free.begin(); it != free.end(); ++it) {
+    if (it->first + it->second == *arena_end) {
+      *offset = it->first;
+      free.erase(it);
+      *arena_end = *offset + requested;
+      return true;
+    }
+  }
+  *offset = AlignUp(*arena_end, kHexagonAlignment);
+  *arena_end = *offset + requested;
+  return true;
+}
+
+Error ResizeDynamicDelegate(HexagonDelegate* delegate, int64_t length) {
+  if (delegate->dynamic_layouts.empty()) {
+    return Error::Ok;
+  }
+
+  delegate->runtime_layouts.clear();
+  delegate->runtime_layouts.reserve(delegate->dynamic_layouts.size());
+  for (const auto& layout : delegate->dynamic_layouts) {
+    size_t size = 0;
+    if (!EvalDynamicBytes(layout, length, &size)) {
+      ET_LOG(Error, "hexagon: dynamic layout size overflow");
+      return Error::InvalidArgument;
+    }
+    delegate->runtime_layouts.push_back(
+        {layout.space, layout.index, 0, size});
+  }
+
+  auto size_for = [&](HexagonTensorSpace space, uint32_t index, size_t fallback) {
+    const auto* layout = FindRuntimeLayout(*delegate, space, index);
+    return layout == nullptr ? fallback : layout->size;
+  };
+
+  size_t input_bytes = 0;
+  for (uint32_t i = 0; i < delegate->inputs.size(); i++) {
+    auto* layout = const_cast<HexagonDelegate::RuntimeLayout*>(
+        FindRuntimeLayout(*delegate, HexagonTensorSpace::kInput, i));
+    const size_t size =
+        size_for(HexagonTensorSpace::kInput, i, delegate->inputs[i].size);
+    if (layout != nullptr) {
+      layout->offset = input_bytes;
+    }
+    delegate->inputs[i] = Region{input_bytes, size};
+    input_bytes = AlignUp(input_bytes + size, kHexagonAlignment);
+  }
+
+  struct Lifetime {
+    uint32_t index;
+    uint32_t first;
+    uint32_t last;
+    size_t size;
+  };
+  std::vector<Lifetime> lifetimes;
+  for (uint32_t op_index = 0; op_index < delegate->ops.size(); op_index++) {
+    const auto& op = delegate->ops[op_index];
+    auto visit = [&](const HexagonTensorRef& ref) {
+      if (ref.space != static_cast<uint32_t>(HexagonTensorSpace::kActivation)) {
+        return;
+      }
+      auto it = std::find_if(
+          lifetimes.begin(), lifetimes.end(),
+          [&](const Lifetime& value) { return value.index == ref.index; });
+      const size_t size = size_for(
+          HexagonTensorSpace::kActivation, ref.index, ref.size);
+      if (it == lifetimes.end()) {
+        lifetimes.push_back({ref.index, op_index, op_index, size});
+      } else {
+        it->first = std::min(it->first, op_index);
+        it->last = std::max(it->last, op_index);
+        it->size = std::max(it->size, size);
+      }
+    };
+    for (uint32_t i = 0; i < op.n_inputs; i++) {
+      visit(op.inputs[i]);
+    }
+    for (uint32_t i = 0; i < op.n_outputs; i++) {
+      visit(op.outputs[i]);
+    }
+  }
+  std::sort(
+      lifetimes.begin(), lifetimes.end(),
+      [](const Lifetime& lhs, const Lifetime& rhs) {
+        return std::tie(lhs.first, lhs.index) < std::tie(rhs.first, rhs.index);
+      });
+
+  std::vector<std::tuple<uint32_t, size_t, size_t>> active;
+  std::vector<std::pair<size_t, size_t>> free;
+  size_t activation_bytes = 0;
+  for (const auto& lifetime : lifetimes) {
+    for (auto it = active.begin(); it != active.end();) {
+      if (std::get<0>(*it) < lifetime.first) {
+        free.emplace_back(std::get<1>(*it), std::get<2>(*it));
+        it = active.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    size_t offset = 0;
+    AddLayoutBlock(free, lifetime.size, &activation_bytes, &offset);
+    auto* layout = const_cast<HexagonDelegate::RuntimeLayout*>(
+        FindRuntimeLayout(*delegate, HexagonTensorSpace::kActivation, lifetime.index));
+    if (layout != nullptr) {
+      layout->offset = offset;
+      layout->size = lifetime.size;
+    }
+    active.emplace_back(lifetime.last, offset, lifetime.size);
+  }
+
+  size_t cursor = 0;
+  delegate->input_section = Region{cursor, input_bytes};
+  cursor = AlignUp(cursor + input_bytes, kHexagonAlignment);
+  delegate->activations = Region{cursor, activation_bytes};
+  cursor = AlignUp(cursor + activation_bytes, kHexagonAlignment);
+
+  size_t output_bytes = 0;
+  for (uint32_t i = 0; i < delegate->outputs.size(); i++) {
+    auto* layout = const_cast<HexagonDelegate::RuntimeLayout*>(
+        FindRuntimeLayout(*delegate, HexagonTensorSpace::kOutput, i));
+    const size_t size = size_for(
+        HexagonTensorSpace::kOutput, i, delegate->outputs[i].size);
+    if (layout != nullptr) {
+      layout->offset = output_bytes;
+    }
+    delegate->outputs[i] = Region{output_bytes, size};
+    output_bytes = AlignUp(output_bytes + size, kHexagonAlignment);
+  }
+  delegate->output_section = Region{cursor, output_bytes};
+  for (uint32_t i = 0; i < delegate->outputs.size(); i++) {
+    delegate->outputs[i].offset += delegate->output_section.offset;
+  }
+  cursor = AlignUp(cursor + output_bytes, kHexagonAlignment);
+  const size_t scratch_bytes = std::max<size_t>(cursor, kHexagonAlignment);
+
+  auto pooled = SharedArenaPool::Get().Acquire(scratch_bytes);
+  if (!pooled.ok()) {
+    return pooled.error();
+  }
+  delegate->scratch = pooled.get();
+  for (auto& patch : delegate->patches) {
+    const auto space = static_cast<HexagonTensorSpace>(patch.source_ref.space);
+    const auto* layout = FindRuntimeLayout(*delegate, space, patch.source_ref.index);
+    const size_t offset = layout == nullptr ? patch.source_ref.offset : layout->offset;
+    patch.source = static_cast<const uint8_t*>(BlockOf(*delegate, space).ptr) +
+        SectionBase(*delegate, space) + offset;
+  }
+
+  auto update_tensor = [&](DSPCOMMAND::Tensor* tensor, const HexagonTensorRef& ref) {
+    if (IsAbsent(ref)) {
+      return;
+    }
+    const auto* layout = FindRuntimeLayout(*delegate,
+        static_cast<HexagonTensorSpace>(ref.space), ref.index);
+    const size_t offset = layout == nullptr ? ref.offset : layout->offset;
+    const size_t size = layout == nullptr ? ref.size : layout->size;
+    const auto space = static_cast<HexagonTensorSpace>(ref.space);
+    const Arena& block = BlockOf(*delegate, space);
+    tensor->mutate_fd(block.fd);
+    tensor->mutate_offset(static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias));
+    tensor->mutate_size(static_cast<int32_t>(size));
+  };
+
+  for (uint32_t i = 0; i < delegate->ops.size(); i++) {
+    auto* command = flatbuffers::GetMutableRoot<DSPCOMMAND::Command>(
+        static_cast<uint8_t*>(delegate->resident.ptr) + delegate->command_offsets[i]);
+    auto* inputs = command->mutable_inputs();
+    for (uint32_t j = 0; j < delegate->ops[i].n_inputs; j++) {
+      update_tensor(const_cast<DSPCOMMAND::Tensor*>(inputs->Get(j)), delegate->ops[i].inputs[j]);
+    }
+    auto* outputs = command->mutable_outputs();
+    for (uint32_t j = 0; j < delegate->ops[i].n_outputs; j++) {
+      update_tensor(const_cast<DSPCOMMAND::Tensor*>(outputs->Get(j)), delegate->ops[i].outputs[j]);
+    }
+    // The exported KV tensors retain the model's upper-bound cache shape, while
+    // a prefill call only makes length + 1 positions valid (the extra position
+    // is the inclusive cache endpoint used by the attention kernel). Patch the
+    // logical extent independently of the backing allocation.
+    if (delegate->ops[i].type == kFlashAttnOp &&
+        delegate->ops[i].n_inputs > 2 && delegate->ops[i].n_params > 8) {
+      auto* params = command->mutable_params();
+      params->Mutate(8, static_cast<int32_t>(length + 1));
+    }
+    // The prefill graph returns the last token through a raster blit.  Its
+    // traced byte offset is the example length's last row, so update it with
+    // the actual request length before the command group is rebuilt.
+    if (delegate->ops[i].type == 3 && delegate->ops[i].n_params > 8 &&
+        delegate->ops[i].params[4] > 0 && delegate->ops[i].params[7] == 1 &&
+        delegate->ops[i].params[8] > 0 &&
+        delegate->ops[i].params[4] % delegate->ops[i].params[8] == 0) {
+      auto* params = command->mutable_params();
+      params->Mutate(4, static_cast<int32_t>((length - 1) * delegate->ops[i].params[8]));
+      if (delegate->ops[i].n_params > 10 && delegate->dynamic_example != 0) {
+        params->Mutate(10, static_cast<int32_t>(
+            static_cast<int64_t>(delegate->ops[i].params[10]) * length /
+            delegate->dynamic_example));
+      }
+    }
+    if (delegate->ops[i].type == 3 && delegate->ops[i].n_params > 8 &&
+        delegate->ops[i].params[7] > 1 &&
+        (delegate->ops[i].params[8] == 64 || delegate->ops[i].params[8] == 128) &&
+        delegate->ops[i].params[7] % 16 == 0) {
+      auto* params = command->mutable_params();
+      const int32_t rows = delegate->dynamic_example == 0
+          ? static_cast<int32_t>(length * 16)
+          : static_cast<int32_t>(static_cast<int64_t>(delegate->ops[i].params[7]) * length /
+                                 delegate->dynamic_example);
+      params->Mutate(7, rows);
+      if (delegate->ops[i].n_params > 19 && delegate->ops[i].params[19] == delegate->ops[i].params[7]) {
+        params->Mutate(19, rows);
+      }
+    }
+    if (delegate->ops[i].type == 3 && delegate->ops[i].n_params > 8 &&
+        delegate->ops[i].params[7] == 1 && delegate->ops[i].params[4] == 0 &&
+        delegate->ops[i].params[8] > 1 && delegate->dynamic_example != 0) {
+      auto* params = command->mutable_params();
+      params->Mutate(8, static_cast<int32_t>(
+          static_cast<int64_t>(delegate->ops[i].params[8]) * length /
+          delegate->dynamic_example));
+    }
+  }
+
+  flatbuffers::FlatBufferBuilder builder(1u << 20);
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
+  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
+  for (const auto& op : delegate->ops) {
+    for (uint32_t j = 0; j < op.n_inputs; j++) {
+      if (!IsAbsent(op.inputs[j])) {
+        const auto& ref = op.inputs[j];
+        const auto* layout = FindRuntimeLayout(*delegate,
+            static_cast<HexagonTensorSpace>(ref.space), ref.index);
+        const size_t offset = layout == nullptr ? ref.offset : layout->offset;
+        const size_t size = layout == nullptr ? ref.size : layout->size;
+        const auto space = static_cast<HexagonTensorSpace>(ref.space);
+        const Arena& block = BlockOf(*delegate, space);
+        sync_in.push_back(DSPCOMMAND::CreateTensor(
+            builder, block.fd,
+            static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias),
+            static_cast<int32_t>(size)));
+      }
+    }
+    for (uint32_t j = 0; j < op.n_outputs; j++) {
+      if (!IsAbsent(op.outputs[j])) {
+        const auto& ref = op.outputs[j];
+        const auto* layout = FindRuntimeLayout(*delegate,
+            static_cast<HexagonTensorSpace>(ref.space), ref.index);
+        const size_t offset = layout == nullptr ? ref.offset : layout->offset;
+        const size_t size = layout == nullptr ? ref.size : layout->size;
+        const auto space = static_cast<HexagonTensorSpace>(ref.space);
+        const Arena& block = BlockOf(*delegate, space);
+        sync_out.push_back(DSPCOMMAND::CreateTensor(
+            builder, block.fd,
+            static_cast<int32_t>(SectionBase(*delegate, space) + offset + block.bias),
+            static_cast<int32_t>(size)));
+      }
+    }
+  }
+  builder.Finish(DSPCOMMAND::CreateSyncGroup(
+      builder, builder.CreateVector(sync_in), builder.CreateVector(sync_out)));
+  if (builder.GetSize() > delegate->sync.size) {
+    ET_LOG(Error, "hexagon: resized sync group exceeds budget");
+    return Error::Internal;
+  }
+  delegate->sync.size = builder.GetSize();
+  std::memcpy(
+      static_cast<uint8_t*>(delegate->resident.ptr) + delegate->sync.offset,
+      builder.GetBufferPointer(), delegate->sync.size);
+  delegate->activations_bytes = activation_bytes;
+  return Error::Ok;
+}
+
 } // namespace
 
 bool HexagonBackend::is_available() const {
@@ -725,6 +1083,8 @@ Result<DelegateHandle*> HexagonBackend::init(
   const auto* ops = reinterpret_cast<const HexagonOp*>(
       reinterpret_cast<const uint8_t*>(processed->data()) +
       sizeof(HexagonBlobHeader));
+  delegate->ops.assign(ops, ops + header->n_ops);
+  delegate->command_offsets.reserve(header->n_ops);
   const uint8_t* blob = reinterpret_cast<const uint8_t*>(processed->data());
   const size_t weights_blob_offset = sizeof(HexagonBlobHeader) + ops_bytes;
   // Only the weights are on disk. Every other section is a size the runtime
@@ -737,6 +1097,87 @@ Result<DelegateHandle*> HexagonBackend::init(
   if (weights_blob_offset + sections_total > processed->size()) {
     ET_LOG(Error, "hexagon: tensor sections out of bounds");
     return Error::DelegateInvalidCompatibility;
+  }
+
+  const size_t trailer_offset = weights_blob_offset + sections_total;
+  if (processed->size() > trailer_offset) {
+    if (processed->size() - trailer_offset < sizeof(HexagonDynamicTrailer)) {
+      ET_LOG(Error, "hexagon: truncated dynamic trailer");
+      return Error::DelegateInvalidCompatibility;
+    }
+    const auto* trailer = reinterpret_cast<const HexagonDynamicTrailer*>(
+        blob + trailer_offset);
+    if (trailer->magic != kHexagonDynamicTrailerMagic ||
+        (trailer->version < 1 || trailer->version > 3) ||
+        trailer->input_index >= header->n_inputs ||
+        trailer->max_length == 0) {
+      ET_LOG(Error, "hexagon: invalid dynamic trailer");
+      return Error::DelegateInvalidCompatibility;
+    }
+    const size_t trailer_bytes = trailer->version >= 3 ? sizeof(HexagonDynamicTrailerV3) : sizeof(HexagonDynamicTrailer);
+    if (processed->size() - trailer_offset < trailer_bytes) {
+      ET_LOG(Error, "hexagon: truncated dynamic trailer v%u", trailer->version);
+      return Error::DelegateInvalidCompatibility;
+    }
+    const size_t patches_bytes =
+        static_cast<size_t>(trailer->n_patches) * sizeof(HexagonDynamicPatch);
+    const size_t layout_header_bytes =
+        trailer->version >= 2 ? sizeof(HexagonDynamicLayoutHeader) : 0;
+    if (trailer_bytes + patches_bytes + layout_header_bytes >
+        processed->size() - trailer_offset) {
+      ET_LOG(Error, "hexagon: dynamic patch records out of bounds");
+      return Error::DelegateInvalidCompatibility;
+    }
+    delegate->dynamic_input = trailer->input_index;
+    delegate->dynamic_axis = trailer->axis;
+    delegate->dynamic_max_length = trailer->max_length;
+    delegate->dynamic_example = trailer->version >= 3
+        ? reinterpret_cast<const HexagonDynamicTrailerV3*>(trailer)->example_length : 0;
+    const auto* records = reinterpret_cast<const HexagonDynamicPatch*>(
+        blob + trailer_offset + trailer_bytes);
+    delegate->dynamic_patches.reserve(trailer->n_patches);
+    for (uint32_t i = 0; i < trailer->n_patches; i++) {
+      if (records[i].op_index < 0 ||
+          static_cast<uint32_t>(records[i].op_index) >= header->n_ops ||
+          records[i].param_index < 0 || records[i].scale <= 0) {
+        ET_LOG(Error, "hexagon: invalid dynamic patch %u", i);
+        return Error::DelegateInvalidCompatibility;
+      }
+    }
+    if (trailer->version >= 2) {
+      const auto* layout_header = reinterpret_cast<const HexagonDynamicLayoutHeader*>(
+          blob + trailer_offset + trailer_bytes + patches_bytes);
+      const size_t layout_bytes = static_cast<size_t>(layout_header->n_layouts) *
+          sizeof(HexagonDynamicLayout);
+      if (layout_header->n_layouts > 100000 ||
+          trailer_bytes + patches_bytes +
+                  sizeof(HexagonDynamicLayoutHeader) + layout_bytes >
+              processed->size() - trailer_offset) {
+        ET_LOG(Error, "hexagon: dynamic layout records out of bounds");
+        return Error::DelegateInvalidCompatibility;
+      }
+      const auto* layouts = reinterpret_cast<const HexagonDynamicLayout*>(
+          reinterpret_cast<const uint8_t*>(layout_header) +
+          sizeof(HexagonDynamicLayoutHeader));
+      delegate->dynamic_layouts.reserve(layout_header->n_layouts);
+      for (uint32_t i = 0; i < layout_header->n_layouts; i++) {
+        if (layouts[i].space > static_cast<uint32_t>(HexagonTensorSpace::kActivation) ||
+            layouts[i].c0 < 0 || layouts[i].c1 < 0 || layouts[i].c2 < 0) {
+          ET_LOG(Error, "hexagon: invalid dynamic layout %u", i);
+          return Error::DelegateInvalidCompatibility;
+        }
+        delegate->dynamic_layouts.push_back({
+            static_cast<HexagonTensorSpace>(layouts[i].space),
+            layouts[i].index,
+            layouts[i].c0,
+            layouts[i].c1,
+            layouts[i].c2});
+      }
+    }
+    if (delegate->dynamic_axis > 7) {
+      ET_LOG(Error, "hexagon: dynamic axis %u is invalid", delegate->dynamic_axis);
+      return Error::DelegateInvalidCompatibility;
+    }
   }
 
   // The host-written regions go first, each bounded by its own budget: an
@@ -839,7 +1280,7 @@ Result<DelegateHandle*> HexagonBackend::init(
   size_t command_cursor = delegate->commands.offset;
 
   for (uint32_t i = 0; i < header->n_ops; i++) {
-    HexagonOp op = ops[i];
+    HexagonOp op = delegate->ops[i];
     // HEXAGON_FAKE_CACHE: an attention command emitted before the emitter was
     // fixed still points its past key and value slots at fd -1, which the
     // dispatcher turns into the null pointers htp_ops_push_kv writes through.
@@ -850,11 +1291,13 @@ Result<DelegateHandle*> HexagonBackend::init(
       op.inputs[5] = op.inputs[2];
       std::fprintf(stderr, "[hexagon] d%d op %u: past K/V filled from K/V\n", delegate->index, i);
     }
+    delegate->ops[i] = op;
 
     // Reset before the tensors are built, not after: the offsets they return
     // index into this builder, so clearing later leaves CreateCommand holding
     // offsets into a buffer that no longer exists.
     builder.Clear();
+    delegate->command_offsets.push_back(command_cursor);
 
     std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> inputs;
     inputs.reserve(op.n_inputs);
@@ -920,6 +1363,7 @@ Result<DelegateHandle*> HexagonBackend::init(
           {static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor + delta,
            static_cast<const uint8_t*>(BlockOf(*delegate, space).ptr) +
                SectionBase(*delegate, space) + src.offset,
+           src,
            op.patch_scale});
     }
 
@@ -935,6 +1379,35 @@ Result<DelegateHandle*> HexagonBackend::init(
         static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor,
         builder.GetBufferPointer(),
         size);
+
+    if (processed->size() > trailer_offset) {
+      const auto* trailer = reinterpret_cast<const HexagonDynamicTrailer*>(
+          blob + trailer_offset);
+      const size_t trailer_bytes = trailer->version >= 3
+          ? sizeof(HexagonDynamicTrailerV3) : sizeof(HexagonDynamicTrailer);
+      const auto* records = reinterpret_cast<const HexagonDynamicPatch*>(
+          blob + trailer_offset + trailer_bytes);
+      for (uint32_t p = 0; p < trailer->n_patches; p++) {
+        if (records[p].op_index != static_cast<int32_t>(i)) {
+          continue;
+        }
+        if (records[p].param_index >= static_cast<int32_t>(op.n_params)) {
+          ET_LOG(Error, "hexagon: dynamic patch param out of range");
+          return Error::DelegateInvalidCompatibility;
+        }
+        const auto* command = flatbuffers::GetRoot<DSPCOMMAND::Command>(
+            static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor);
+        const size_t delta =
+            reinterpret_cast<const uint8_t*>(command->params()->data()) -
+            static_cast<uint8_t*>(delegate->resident.ptr) - command_cursor +
+            static_cast<size_t>(records[p].param_index) * sizeof(int32_t);
+        delegate->dynamic_patches.push_back(
+            {static_cast<uint8_t*>(delegate->resident.ptr) + command_cursor +
+                 delta,
+             records[p].scale,
+             records[p].add});
+      }
+    }
 
     // The DSP reads entries from group_ptr + 8, so they start at int index 2,
     // not 1; anywhere else shifts every (fd, offset) pair by four bytes.
@@ -1056,7 +1529,7 @@ Error HexagonBackend::execute(
   }
 
   auto* const resident = static_cast<uint8_t*>(delegate->resident.ptr);
-  auto* const scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
+  uint8_t* scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
 
   const bool acct = EnvInt("HEXAGON_ACCT", 0) != 0;
   const bool phase = Trace().phase;
@@ -1066,6 +1539,78 @@ Error HexagonBackend::execute(
         stderr, "[phase] t=%.1f exec d%d enter\n", PhaseNowMs(), delegate->index);
   }
   size_t input_bytes = 0;
+  int64_t dynamic_length = 0;
+  if (delegate->dynamic_max_length != 0) {
+    if (delegate->dynamic_input >= delegate->inputs.size() ||
+        !args[delegate->dynamic_input]->isTensor()) {
+      ET_LOG(Error, "hexagon: dynamic sequence input is not a tensor");
+      return Error::InvalidArgument;
+    }
+    const auto& sequence = args[delegate->dynamic_input]->toTensor();
+    if (delegate->dynamic_axis >= sequence.dim() ||
+        sequence.sizes()[delegate->dynamic_axis] <= 0 ||
+        static_cast<uint32_t>(sequence.sizes()[delegate->dynamic_axis]) >
+            delegate->dynamic_max_length) {
+      ET_LOG(Error, "hexagon: dynamic sequence length exceeds max");
+      return Error::InvalidArgument;
+    }
+    dynamic_length = sequence.sizes()[delegate->dynamic_axis];
+    if (!delegate->dynamic_layouts.empty()) {
+      Error resize_status = ResizeDynamicDelegate(delegate, dynamic_length);
+      if (resize_status != Error::Ok) {
+        return resize_status;
+      }
+      scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
+    }
+    for (size_t i = 0; i < delegate->outputs.size(); i++) {
+      if (!args[delegate->inputs.size() + i]->isTensor()) {
+        continue;
+      }
+      auto& value = args[delegate->inputs.size() + i]->toTensor();
+      const size_t target_bytes = delegate->outputs[i].size;
+      const size_t itemsize =
+          value.scalar_type() == runtime::etensor::ScalarType::Float ? 4 : 2;
+      const size_t logical_target =
+          value.scalar_type() == runtime::etensor::ScalarType::Float
+          && target_bytes * 2 == value.nbytes() ? target_bytes * 2
+                                                : target_bytes;
+      if (value.nbytes() != logical_target && value.dim() != 0) {
+        std::vector<executorch::aten::SizesType> current_sizes(
+            value.sizes().begin(), value.sizes().end());
+        bool resized = false;
+        for (size_t axis = 0; axis < current_sizes.size(); axis++) {
+          if (current_sizes[axis] == dynamic_length) {
+            continue;
+          }
+          const int64_t old = current_sizes[axis];
+          current_sizes[axis] = static_cast<executorch::aten::SizesType>(
+              dynamic_length);
+          size_t candidate_numel = 1;
+          for (auto dim : current_sizes) {
+            candidate_numel *= static_cast<size_t>(dim);
+          }
+          if (candidate_numel * itemsize == logical_target) {
+            Error resize_error = resize_tensor(
+                value,
+                runtime::ArrayRef<executorch::aten::SizesType>(
+                    current_sizes.data(), current_sizes.size()));
+            if (resize_error != Error::Ok) {
+              ET_LOG(Error, "hexagon: dynamic output resize failed: %u",
+                  static_cast<uint32_t>(resize_error));
+              return resize_error;
+            }
+            resized = true;
+            break;
+          }
+          current_sizes[axis] = old;
+        }
+        if (!resized) {
+          ET_LOG(Error, "hexagon: cannot infer dynamic output shape");
+          return Error::InvalidArgument;
+        }
+      }
+    }
+  }
 
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
     // Not every method input is a tensor: a graph can hand a subgraph an int it
@@ -1122,6 +1667,19 @@ Error HexagonBackend::execute(
 
   const double t_input = acct ? AcctNowMs() : 0.0;
 
+  if (delegate->dynamic_max_length != 0) {
+    const int64_t length = dynamic_length;
+    for (const auto& patch : delegate->dynamic_patches) {
+      const int64_t value = length * patch.scale + patch.add;
+      if (value < 0 || value > INT32_MAX) {
+      ET_LOG(Error, "hexagon: dynamic patch value overflows int32");
+      return Error::InvalidArgument;
+      }
+      const int32_t narrowed = static_cast<int32_t>(value);
+      std::memcpy(patch.slot, &narrowed, sizeof(narrowed));
+    }
+  }
+
   // The inputs are in the arena by now, so a patched param can read back what
   // the caller just handed us. This has to precede the flush below.
   for (const auto& patch : delegate->patches) {
@@ -1137,7 +1695,7 @@ Error HexagonBackend::execute(
   // patched slots live in the command section, so flush that as well.
   ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
       scratch + delegate->input_section.offset, delegate->input_section.size));
-  if (!delegate->patches.empty()) {
+  if (!delegate->patches.empty() || !delegate->dynamic_patches.empty()) {
     ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
         resident + delegate->commands.offset, delegate->commands.size));
   }
@@ -1161,12 +1719,9 @@ Error HexagonBackend::execute(
 
   std::fprintf(
       stderr,
-      "[hexagon] enter d%d: ops=%u act=%u first=%u count=%u\n",
-      exec_index,
-      delegate->n_ops,
-      delegate->activations_bytes,
-      first,
-      count);
+      "[hexagon] enter d%d: ops=%u act=%u scratch=%zu first=%u count=%u\n",
+      exec_index, delegate->n_ops, delegate->activations_bytes,
+      delegate->scratch.bytes, first, count);
   if (traced) {
     PrintCommands(*delegate);
   }
@@ -1252,9 +1807,13 @@ Error HexagonBackend::execute(
         scratch + delegate->inputs[index].offset,
         delegate->inputs[index].size);
   }
-
-  ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Invalidate(
-      scratch + delegate->output_section.offset, delegate->output_section.size));
+  Error invalidate_error = delegate->driver.Invalidate(
+      scratch + delegate->output_section.offset, delegate->output_section.size);
+  if (invalidate_error != Error::Ok) {
+    ET_LOG(Error, "hexagon: output invalidate failed: %u",
+        static_cast<uint32_t>(invalidate_error));
+    return invalidate_error;
+  }
 
   for (size_t i = 0; i < delegate->outputs.size(); i++) {
     const auto& out = delegate->outputs[i];
@@ -1263,6 +1822,18 @@ Error HexagonBackend::execute(
       continue;
     }
     auto& tensor = arg->toTensor();
+    if (dynamic_length > 0 && tensor.dim() > delegate->dynamic_axis &&
+        tensor.sizes()[delegate->dynamic_axis] ==
+            static_cast<int64_t>(delegate->dynamic_max_length)) {
+      std::vector<executorch::aten::SizesType> current_sizes(
+          tensor.sizes().begin(), tensor.sizes().end());
+      current_sizes[delegate->dynamic_axis] =
+          static_cast<executorch::aten::SizesType>(dynamic_length);
+      ET_CHECK_OK_OR_RETURN_ERROR(resize_tensor(
+          tensor,
+          runtime::ArrayRef<executorch::aten::SizesType>(
+              current_sizes.data(), current_sizes.size())));
+    }
     // The mirror of the narrow on the way in: a subgraph whose declared result
     // is fp32 still writes fp16, because that is what the kernels produce. Its
     // slot is half the caller's buffer, and the bytes have to be widened back

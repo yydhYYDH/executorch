@@ -332,12 +332,76 @@ static inline void sync_attention_run_causal_qk_block(const SyncAttentionTaskSta
   const __fp16* q_ptr = state->Q + (size_t)q_begin * state->qo_stride + head_id * state->head_dim;
   if (state->page_count > 0) {
     sync_attention_run_page_qk(state, scores, q_ptr, q_rows, state->qo_stride, q_begin, h_kv, block_valid_end);
+  } else if (block_valid_end > 1024) {
+    for (int kv_begin = 0; kv_begin < block_valid_end; kv_begin += 1024) {
+      int kv_valid = block_valid_end - kv_begin;
+      if (kv_valid > 1024) {
+        kv_valid = 1024;
+      }
+      int kv_padded = (kv_valid + 31) & ~31;
+      const __fp16* k_ptr = state->pastK +
+          attn_hmx_k_tile_index(kv_begin / 32, 0, 0, state->n_kv_heads, state->k_icP) * 1024;
+      run_locked_attn_hmx_matmul_ex((uint8_t*)(scores + kv_begin), (uint8_t*)q_ptr, (uint8_t*)k_ptr,
+                                    q_rows, state->head_dim, kv_padded, state->K_dim_padded,
+                                    state->qo_stride, ATTN_HMX_OUT_LINEAR_FP32_SCALED, state->scale,
+                                    ATTN_HMX_WEIGHT_LAYOUT_K_BLOCK256, h_kv, state->n_kv_heads,
+                                    state->N_padded, q_begin);
+    }
   } else {
     run_locked_attn_hmx_matmul_ex((uint8_t*)scores, (uint8_t*)q_ptr, (uint8_t*)state->pastK,
                                   q_rows, state->head_dim, block_valid_end_padded, state->K_dim_padded,
                                   state->qo_stride, ATTN_HMX_OUT_LINEAR_FP32_SCALED, state->scale,
                                   ATTN_HMX_WEIGHT_LAYOUT_K_BLOCK256, h_kv, state->n_kv_heads,
                                   state->N_padded, q_begin);
+  }
+}
+
+static inline void sync_attention_run_nonpaged_sv_chunked(const SyncAttentionTaskState* state, float* scores,
+                                                          __fp16* dst, const __fp16* linear_S, int rows, int output_stride,
+                                                          int row_offset, int h_kv, int valid_end) {
+  const __fp16* block_s = linear_S;
+  // The QK scores are dead after softmax. Keep the SV accumulation scratch in
+  // a disjoint tail of that buffer so packed output and scratch never alias.
+  __fp16* scratch = (__fp16*)scores + (size_t)rows * state->head_dim;
+  const int linear = state->value_c4 == 0;
+  bool wrote = false;
+  if (!linear) {
+    sync_attention_zero_packed_output(dst, rows, output_stride, row_offset, state->head_dim);
+  }
+  for (int kv_begin = 0; kv_begin < valid_end; kv_begin += 1024) {
+    int kv_valid = valid_end - kv_begin;
+    if (kv_valid > 1024) {
+      kv_valid = 1024;
+    }
+    const __fp16* v_ptr = state->pastV +
+        attn_hmx_v_tile_index(0, kv_begin / 32, 0, state->n_kv_heads, state->v_ocP) * 1024;
+    __fp16* out_ptr = !wrote
+        ? (linear ? dst + (size_t)row_offset * output_stride : dst)
+        : scratch;
+    // Temporary packed output is laid out densely by row-pack.  Its stride must
+    // match the row count because the accumulation helper indexes source pack p
+    // at p * rows * 64; head_dim is the output width, not the packed row stride.
+    int out_stride = !wrote ? output_stride : rows;
+    run_locked_attn_hmx_matmul_ex((uint8_t*)out_ptr, (uint8_t*)(block_s + kv_begin), (uint8_t*)v_ptr,
+                                  rows, kv_valid, state->K_dim_padded, (kv_valid + 31) & ~31, state->N_padded,
+                                  linear ? ATTN_HMX_OUT_LINEAR_FP16 : ATTN_HMX_OUT_PACKED_FP16,
+                                  1.0f,
+                                  ATTN_HMX_WEIGHT_LAYOUT_V_BLOCK256, h_kv, state->n_kv_heads,
+                                  out_stride, 0);
+    if (linear) {
+      if (wrote) {
+        for (int r = 0; r < rows; ++r) {
+          __fp16* d = dst + (size_t)(row_offset + r) * output_stride;
+          const __fp16* s = scratch + (size_t)r * state->head_dim;
+          for (int d_i = 0; d_i < state->head_dim; ++d_i) {
+            d[d_i] = (__fp16)((float)d[d_i] + (float)s[d_i]);
+          }
+        }
+      }
+    } else if (wrote) {
+      sync_attention_accumulate_packed_output(dst, scratch, rows, output_stride, row_offset, state->head_dim);
+    }
+    wrote = true;
   }
 }
 
@@ -356,7 +420,7 @@ static inline void sync_attention_normalize_causal_block(const SyncAttentionTask
 }
 
 static inline void sync_attention_run_causal_sv_block(const SyncAttentionTaskState* state, __fp16* head_O,
-                                                      __fp16* temp_O, __fp16* linear_S, int h_kv, int q_begin,
+                                                      __fp16* temp_O, float* scores, __fp16* linear_S, int h_kv, int q_begin,
                                                       int q_rows, int block_valid_end, int head_id) {
   const __fp16* block_s = linear_S + (size_t)q_begin * state->N_padded;
   const int linear = state->value_c4 == 0;
@@ -365,6 +429,10 @@ static inline void sync_attention_run_causal_sv_block(const SyncAttentionTaskSta
     sync_attention_run_page_sv(state, linear ? state->O + (size_t)head_id * state->head_dim : head_O, temp_O, block_s,
                                q_rows, linear ? state->total_heads * state->head_dim : state->qo_total_len,
                                output_row_offset, h_kv, block_valid_end);
+  } else if (block_valid_end > 1024) {
+    sync_attention_run_nonpaged_sv_chunked(state, scores, linear ? state->O + (size_t)head_id * state->head_dim : head_O,
+                                           block_s, q_rows, linear ? state->total_heads * state->head_dim : state->qo_total_len,
+                                           output_row_offset, h_kv, block_valid_end);
   } else {
     __fp16* dst = linear ? state->O + (size_t)head_id * state->head_dim : head_O;
     run_locked_attn_hmx_matmul_ex((uint8_t*)dst, (uint8_t*)block_s, (uint8_t*)state->pastV,
@@ -420,7 +488,7 @@ static void sync_attention_process_head(const SyncAttentionTaskState* state, int
                                             block_valid_end, prezero_linear_s);
       ATTN_STAGE(42, head_id, q_begin, 0);
       ATTN_STAGE(43, head_id, q_begin, 0);
-      sync_attention_run_causal_sv_block(state, head_O, temp_O, linear_S, h_kv, q_begin,
+      sync_attention_run_causal_sv_block(state, head_O, temp_O, scores, linear_S, h_kv, q_begin,
                                          q_rows, block_valid_end, head_id);
       ATTN_STAGE(44, head_id, q_begin, 0);
     }
@@ -587,6 +655,11 @@ static void sync_attention_process_decode_group(const SyncAttentionTaskState *st
       __fp16* packed_O = (__fp16*)scores;
       if (state->page_count > 0) {
         sync_attention_run_page_sv(state, packed_O, temp_O, linear_S, rows, rows, 0, kv_head, block_valid_end);
+      } else if (block_valid_end > 1024) {
+        SyncAttentionTaskState packed_state = *state;
+        packed_state.value_c4 = 1;
+        sync_attention_run_nonpaged_sv_chunked(&packed_state, scores, packed_O, linear_S, rows, rows, 0, kv_head,
+                                               block_valid_end);
       } else {
         run_locked_attn_hmx_matmul((uint8_t*)packed_O, (uint8_t*)linear_S, (uint8_t*)state->pastV,
                                    rows, block_valid_end, state->K_dim_padded, state->N_padded, state->N_padded,

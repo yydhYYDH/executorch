@@ -16,6 +16,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -101,7 +102,18 @@ def _build_blob():
     ]
     for op in ops:
         builder.add_op(op)
-    return builder.build(), ops
+    blob = builder.build()
+    # Weight and activation offsets are assigned in build(), so compare the
+    # reader against the packed references rather than the declared ones.
+    packed_ops = [
+        replace(
+            op,
+            inputs=[builder._remap(ref) for ref in op.inputs],
+            outputs=[builder._remap(ref) for ref in op.outputs],
+        )
+        for op in ops
+    ]
+    return blob, packed_ops
 
 
 def _reader_binary(tmp_path):
@@ -241,3 +253,55 @@ def test_blob_roundtrip(tmp_path):
     # never reads it from the blob, so the file stops at the weights.
     assert sections.keys() == {"weights"}
     assert len(blob_bytes) == B.HEADER_SIZE + len(written_ops) * B.OP_SIZE + 132
+
+
+def test_dynamic_trailer_roundtrip():
+    builder = B.BlobBuilder(n_inputs=1, n_outputs=1)
+    src = builder.method_input(0, 2 * 16 * 1024)
+    dst = builder.method_output(0, 2 * 16 * 1024)
+    builder.add_op(B.Op(type=38, inputs=[src], outputs=[dst], params=[0] * 27))
+    builder.set_dynamic_sequence(input_index=0, axis=1, max_length=1024)
+    builder.add_dynamic_patch(B.DynamicPatch(op_index=0, param_index=2, scale=1, add=0))
+
+    blob = builder.build()
+    trailer_at = B.HEADER_SIZE + B.OP_SIZE + 0
+    # The test has no weights, so the trailer starts immediately after the op.
+    (
+        magic,
+        version,
+        input_index,
+        axis,
+        max_length,
+        n_patches,
+        example_length,
+    ) = B._DYNAMIC_HEADER_V3.unpack_from(blob, trailer_at)
+    assert (magic, version, input_index, axis, max_length, n_patches, example_length) == (
+        B.DYNAMIC_TRAILER_MAGIC,
+        3,
+        0,
+        1,
+        1024,
+        1,
+        0,
+    )
+    assert B._DYNAMIC_PATCH.unpack_from(
+        blob, trailer_at + B._DYNAMIC_HEADER_V3.size
+    ) == (
+        0,
+        2,
+        1,
+        0,
+    )
+
+
+def test_activation_storage_reuses_non_overlapping_lifetimes():
+    builder = B.BlobBuilder(n_inputs=0, n_outputs=0)
+    first = builder.add_activation(1024)
+    second = builder.add_activation(2048)
+    builder.add_op(B.Op(type=1, inputs=[], outputs=[first]))
+    builder.add_op(B.Op(type=2, inputs=[first], outputs=[]))
+    builder.add_op(B.Op(type=3, inputs=[], outputs=[second]))
+    blob = builder.build()
+
+    header = B._HEADER.unpack_from(blob)
+    assert header[7] == 2048

@@ -790,6 +790,15 @@ def create_exported_program_from_submodule(
             been consumed by the delegate (buffer mutation nodes) and should be
             removed from the toplevel ExportedProgram.
     """
+    # Graph extraction can replace symbolic FakeTensor metadata with the
+    # example-sized value. Preserve the owning graph's symbolic values so a
+    # dynamic delegate keeps the same input constraints as the original graph.
+    owning_nodes = {node.name: node for node in owning_program.graph.nodes}
+    for node in submodule.graph.nodes:
+        source = owning_nodes.get(node.name)
+        if source is not None and "val" in source.meta:
+            node.meta["val"] = source.meta["val"]
+
     # Arrange the submodule's placeholders in order
     submodule = arrange_graph_placeholders(submodule, owning_program, tag)
 

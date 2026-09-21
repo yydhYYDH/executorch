@@ -28,10 +28,12 @@ Error fill_and_set_input(
     TensorInfo& tensor_meta,
     size_t input_index,
     void* data_ptr,
-    bool fill_tensor) {
+    bool fill_tensor,
+    executorch::runtime::Span<const int32_t> dynamic_sizes) {
   // Convert the sizes array from int32_t to int64_t.
   std::vector<int64_t> sizes;
-  for (auto s : tensor_meta.sizes()) {
+  auto shape = dynamic_sizes.empty() ? tensor_meta.sizes() : dynamic_sizes;
+  for (auto s : shape) {
     sizes.push_back(s);
   }
   at::Tensor t = at::from_blob(

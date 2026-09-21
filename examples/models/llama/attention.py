@@ -126,12 +126,8 @@ class KVCache(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # input_pos: [S], k_val: [B, H, S, D]
         if self.enable_dynamic_shape:
-            start_pos = input_pos[0].item()
-            torch._check_is_size(start_pos)
-            torch._check(start_pos < self.max_context_length)
             dim_to_slice = 2
-            seq_length = k_val.size(dim_to_slice)
-            indices = torch.arange(seq_length, device=self.k_cache.device) + start_pos
+            indices = input_pos.to(device=self.k_cache.device)
             self.k_cache.index_copy_(dim_to_slice, indices, k_val)
             self.v_cache.index_copy_(dim_to_slice, indices, v_val)
             return self.k_cache, self.v_cache
@@ -347,9 +343,6 @@ class RingKVCache(KVCache):
             input_pos, seq_len
         )
         if self.enable_dynamic_shape:
-            start_pos = input_pos[0].item()
-            torch._check_is_size(start_pos)
-
             self.k_cache.index_copy_(2, indices, k_val)
             self.v_cache.index_copy_(2, indices, v_val)
         else:
@@ -619,12 +612,7 @@ class AttentionMHA(Attention):
                 # exceed max_context_len for sliding window / attention sink.
                 attn_mask = None
             elif self.enable_dynamic_shape:
-                start_pos = input_pos[-1].item()
-                torch._check_is_size(start_pos)
-                torch._check(start_pos < self.max_context_len)
-                seq_length = q.size(2)
-                # pyre-ignore: Incompatible parameter type [6]
-                attn_mask = self.mask.narrow(0, start_pos, seq_length)
+                attn_mask = self.mask[input_pos]
             else:
                 # mask is always 2D
                 attn_mask = self.mask[input_pos]

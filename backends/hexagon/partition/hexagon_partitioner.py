@@ -50,6 +50,7 @@ from executorch.exir.backend.partitioner import (
 )
 from torch.export import ExportedProgram
 from torch.fx.passes.operator_support import OperatorSupportBase
+from executorch.exir.sym_util import eval_shape_upper_bound
 
 
 # Emitters that store a constant at the width their kernel reads rather than the
@@ -161,8 +162,14 @@ def _fits_int32_offsets(node: torch.fx.Node, *operands) -> bool:
     result = node.meta.get("val")
     if result is None:
         return False
-    values = [operand.numel() for operand in operands]
-    values.append(result.numel())
+    def upper_numel(value) -> int:
+        numel = 1
+        for dim in eval_shape_upper_bound(value.shape):
+            numel *= dim
+        return numel
+
+    values = [upper_numel(operand) for operand in operands]
+    values.append(upper_numel(result))
     return all(0 < value < 2**31 for value in values)
 
 

@@ -27,9 +27,12 @@ from executorch.exir.backend.partitioner import Partitioner
 from executorch.exir.backend.utils import format_delegated_graph
 from executorch.exir.capture._config import EdgeCompileConfig, ExecutorchBackendConfig
 
-from executorch.exir.pass_base import ExportPass
+from executorch.exir.pass_base import ExportPass, PassResult
+from executorch.exir.schema import TensorShapeDynamism
 from executorch.exir.passes import MemoryPlanningPass
 from executorch.exir.passes.sym_shape_eval_pass import ConstraintBasedSymShapeEvalPass
+from executorch.exir.sym_util import eval_shape_upper_bound
+from executorch.exir._serialize._serialize import serialize_for_executorch
 
 from executorch.extension.export_util.utils import export_to_edge, save_pte_program
 
@@ -42,6 +45,39 @@ from torchao.quantization.pt2e.quantizer import ComposableQuantizer, Quantizer
 
 FORMAT = "[%(levelname)s %(asctime)s %(filename)s:%(lineno)s] %(message)s"
 logging.basicConfig(level=logging.INFO, format=FORMAT)
+
+
+class DynamicBoundMetadataPass(ExportPass):
+    def __init__(self, max_sequence: int, example_sequence: int):
+        super().__init__()
+        self.max_sequence = max_sequence
+        self.example_sequence = example_sequence
+
+    def call(self, graph_module: torch.fx.GraphModule):
+        for node in graph_module.graph.nodes:
+            value = node.meta.get("val")
+            spec = node.meta.get("spec")
+            if not isinstance(value, torch.Tensor) or spec is None:
+                continue
+            shape = tuple(int(dim) for dim in value.shape)
+            if self.example_sequence not in shape:
+                continue
+            upper = tuple(
+                self.max_sequence if dim == self.example_sequence else dim
+                for dim in shape
+            )
+            if hasattr(spec, "shape_dynamism"):
+                spec.shape_dynamism = TensorShapeDynamism.DYNAMIC_BOUND
+                spec._upper_bound_shape = list(upper)
+                spec.shape = list(upper)
+                spec.stride = tuple(
+                    spec.shape[i + 1] * spec.stride[i + 1]
+                    if i + 1 < len(spec.shape)
+                    else 1
+                    for i in range(len(spec.shape))
+                )
+        return PassResult(graph_module, True)
+
 
 
 class DType(Enum):
@@ -128,6 +164,7 @@ class LLMEdgeManager:
         # https://github.com/pytorch/pytorch/blob/main/torch/export/exported_program.py#L921
         self.pre_autograd_graph_module: Optional[torch.nn.Module] = None
         self.edge_manager: Optional[EdgeProgramManager] = None
+        self._dynamic_upper_shape_cache: Dict[str, Tuple[int, ...]] = {}
         self.canonical_passes = [
             RemoveRedundantTransposes()
         ]  # Graph transformations optimizations.
@@ -144,11 +181,13 @@ class LLMEdgeManager:
                     {1: torch.export.Dim("token_dim", max=self.max_seq_len - 1)},
                 )
             else:
-                # Two input arguments: tokens and input_pos but input_pos is static shape.
-                # Here we use -1 due to export limitation (same as non-kv-cache case above).
+                # Tokens and input_pos advance over the same prefill window. Keep
+                # one symbol for both tensors so a single PTE accepts every
+                # sequence length up to max_seq_len.
+                token_dim = torch.export.Dim("token_dim", max=self.max_seq_len - 1)
                 self.dynamic_shapes = (
-                    {1: torch.export.Dim("token_dim", max=self.max_seq_len - 1)},
-                    {"input_pos": {0: 1}},
+                    {1: token_dim},
+                    {"input_pos": {0: token_dim}},
                 )
 
     def set_output_dir(self, output_dir: str) -> "LLMEdgeManager":
@@ -196,6 +235,51 @@ class LLMEdgeManager:
 
     def _get_dynamic_shape(self) -> Any:
         return self.dynamic_shapes
+
+    def _dynamic_upper_shapes(self, program: ExportedProgram) -> Dict[str, Tuple[int, ...]]:
+        shapes: Dict[str, Tuple[int, ...]] = {}
+        for node in program.graph.nodes:
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            upper = tuple(eval_shape_upper_bound(value.shape))
+            if tuple(int(dim) for dim in value.shape) != upper:
+                shapes[node.name] = upper
+        return shapes
+
+    def _restore_dynamic_upper_shapes(
+        self, program: EdgeProgramManager, shapes: Dict[str, Tuple[int, ...]]
+    ) -> None:
+        if not shapes:
+            return
+        for node in program.exported_program().graph.nodes:
+            upper = shapes.get(node.name)
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            if upper is None:
+                continue
+            node.meta["val"] = value.new_empty(upper)
+
+    def _patch_dynamic_emitter_inputs(self) -> None:
+        if not self._dynamic_upper_shape_cache:
+            return
+        uppers = list(self._dynamic_upper_shape_cache.values())
+        values = self.export_program._emitter_output.program.execution_plan[0].values
+        for value in values:
+            tensor = value.val
+            if not hasattr(tensor, "sizes") or tensor.allocation_info is not None:
+                continue
+            current = tuple(tensor.sizes)
+            if len(current) == 1 and current[0] < self.max_seq_len - 1:
+                tensor.sizes = [self.max_seq_len - 1]
+                continue
+            for upper in uppers:
+                if len(current) == len(upper) and all(
+                    old <= new for old, new in zip(current, upper)
+                ) and current != upper:
+                    tensor.sizes = list(upper)
+                    break
 
     def _get_edge_config(self) -> EdgeCompileConfig:
         edge_config = EdgeCompileConfig(
@@ -464,7 +548,7 @@ class LLMEdgeManager:
             override_export_behaviour = contextlib.nullcontext()
             with override_export_behaviour:
                 self.edge_manager = export_to_edge(
-                    self.pre_autograd_graph_module,  # pyre-fixme[6]
+                self.pre_autograd_graph_module,  # pyre-fixme[6]
                     self.example_inputs,
                     example_kwarg_inputs=self.example_kwarg_inputs,
                     dynamic_shapes=dynamic_shape,
@@ -515,16 +599,37 @@ class LLMEdgeManager:
 
         # Need to construct ExportedProgram with the new transformed graph module.
         exported_module = self._export(self.pre_autograd_graph_module)
+        dynamic_upper_shapes = self._dynamic_upper_shapes(exported_module)
 
         edge_config = self._get_edge_config()
-        self.edge_manager = to_edge_transform_and_lower(
-            exported_module,
-            transform_passes=transform_passes,
-            partitioner=partitioners,
-            compile_config=edge_config,
-            constant_methods=self.metadata,
-            generate_etrecord=self.generate_etrecord,
-        )
+        if self.enable_dynamic_shape:
+            # Keep symbolic metadata through backend extraction. The combined
+            # API materializes top-level shapes while constructing partitions;
+            # the two-stage API preserves the dynamic input contract.
+            self.edge_manager = export_to_edge(
+                self.pre_autograd_graph_module,
+                self.example_inputs,
+                example_kwarg_inputs=self.example_kwarg_inputs,
+                dynamic_shapes=self._get_dynamic_shape(),
+                edge_constant_methods=self.metadata,
+                edge_compile_config=edge_config,
+                verbose=self.verbose,
+                generate_etrecord=self.generate_etrecord,
+            )
+            if transform_passes is not None:
+                self.edge_manager = self.edge_manager.transform(transform_passes)
+            for partitioner in partitioners or []:
+                self.edge_manager = self.edge_manager.to_backend(partitioner)
+        else:
+            self.edge_manager = to_edge_transform_and_lower(
+                exported_module,
+                transform_passes=transform_passes,
+                partitioner=partitioners,
+                compile_config=edge_config,
+                constant_methods=self.metadata,
+                generate_etrecord=self.generate_etrecord,
+            )
+        self._dynamic_upper_shape_cache = dynamic_upper_shapes
         if self.verbose:
             logging.info(f"Exported graph:\n{self.edge_manager.exported_program()}")
         return self
@@ -557,6 +662,13 @@ class LLMEdgeManager:
         # https://github.com/pytorch/executorch/issues/10499
         self.edge_manager.transform([ConvertToLinearPass()])
 
+        shape_eval_pass = ConstraintBasedSymShapeEvalPass()
+        if self.enable_dynamic_shape and self.example_inputs:
+            example_sequence = int(self.example_inputs[0].shape[1])
+            shape_eval_pass = DynamicBoundMetadataPass(
+                self.max_seq_len - 1, example_sequence
+            )
+
         self.export_program = self.edge_manager.to_executorch(
             ExecutorchBackendConfig(
                 extract_delegate_segments=True,
@@ -570,10 +682,25 @@ class LLMEdgeManager:
                     alloc_graph_input=False,
                     share_mutable_buffers=share_mutable_buffers,
                 ),
-                sym_shape_eval_pass=ConstraintBasedSymShapeEvalPass(),
+                sym_shape_eval_pass=shape_eval_pass,
                 external_constants=external_constants_tag,
             )
         )
+        self._patch_dynamic_emitter_inputs()
+        if self.enable_dynamic_shape:
+            self.export_program._pte_data, self.export_program._tensor_data = (
+                serialize_for_executorch(
+                    self.export_program._emitter_output,
+                    ExecutorchBackendConfig(
+                        extract_delegate_segments=True,
+                        do_quant_fusion_and_const_prop=True,
+                    ),
+                    self.export_program._data_serializer,
+                    self.export_program._named_data
+                    if self.export_program._named_data is not None
+                    else None,
+                )
+            )
         logging.info(
             "Required memory for activation in bytes: {}".format(
                 self.export_program._emitter_output.program.execution_plan[
