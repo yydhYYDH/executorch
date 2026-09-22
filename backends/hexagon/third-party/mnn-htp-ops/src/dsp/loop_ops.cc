@@ -501,6 +501,130 @@ static inline void htp_ops_loop_hmx_pack_activation_tile(__fp16* dst, const uint
     }
 }
 
+// Packs every kt tile of one 32-row activation block in a single pass. The
+// single-tile path loads 64 fp16 starting at each tile's columns, so loads of
+// consecutive kt overlap by half, and its kt-outer/row-inner order touches 32
+// rows 2 KB apart in turn. Here a row pair is the outer loop and two tiles are
+// packed per aligned 128-byte load, so each row is read straight through in
+// 128-byte steps, one stream per row pair instead of 32 interleaved streams.
+// The vdeal splits the loaded [kBegin, kBegin+64) columns into the two tiles.
+static inline void htp_ops_loop_hmx_pack_activation_block(__fp16* dst, const uint8_t* src0Base,
+                                                          const HtpOpsLoopParam* lp, int K, int eBase,
+                                                          int validRows) {
+    const int kp = htp_ops_loop_up_div(K, 32);
+    if (lp->src0StrideXYZ[1] != 2) {
+        for (int kt = 0; kt < kp; ++kt) {
+            htp_ops_loop_hmx_pack_activation_tile(dst, src0Base, lp, K, kt, eBase, validRows);
+        }
+        return;
+    }
+    if (validRows < 32) {
+        memset(dst, 0, (size_t)kp * 1024 * sizeof(__fp16));
+    }
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        const uint8_t* src1 = src0Base + (int64_t)(eBase + r + 1) * lp->src0StrideXYZ[0];
+        int kt = 0;
+        for (; kt + 1 < kp && K - kt * 32 >= 64; kt += 2) {
+            const size_t off = (size_t)kt * 64;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(vmemu((const HVX_Vector*)(src1 + off)),
+                                                vmemu((const HVX_Vector*)(src0 + off)), 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const int kBegin = kt * 32;
+            int kRemain = K - kBegin;
+            if (kRemain > 32) {
+                kRemain = 32;
+            }
+            const bool canRead64 = kBegin + 64 <= K;
+            HVX_Vector v0 = htp_ops_loop_hmx_load_row32(src0 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_Vector v1 = htp_ops_loop_hmx_load_row32(src1 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+    if (r < validRows) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        int kt = 0;
+        for (; kt + 1 < kp && K - kt * 32 >= 64; kt += 2) {
+            const size_t off = (size_t)kt * 64;
+            HVX_Vector a0 = vmemu((const HVX_Vector*)(src0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const int kBegin = kt * 32;
+            int kRemain = K - kBegin;
+            if (kRemain > 32) {
+                kRemain = 32;
+            }
+            const bool canRead64 = kBegin + 64 <= K;
+            HVX_Vector v0 = htp_ops_loop_hmx_load_row32(src0 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), v0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+}
+
+// Raw activation rows (row-major, one 128-byte pair-pack per 64 columns) turned
+// into the HMX pair-interleaved tile layout. This is the second half of the DMA
+// staging: the source is now VTCM, so the loads never stall on DDR. Tile/row
+// layout and the vdeal+vshuff rearrange are identical to the DDR pack above.
+static inline void htp_ops_loop_hmx_transform_activation_block(__fp16* dst, const __fp16* srcRaw, int K,
+                                                               int validRows) {
+    const int kp = htp_ops_loop_up_div(K, 32);
+    const int pairPacks = htp_ops_loop_up_div(K, 64);
+    const size_t rawStride = (size_t)pairPacks * 64;
+    if (validRows < 32) {
+        memset(dst, 0, (size_t)kp * 1024 * sizeof(__fp16));
+    }
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        const __fp16* row0 = srcRaw + (size_t)r * rawStride;
+        const __fp16* row1 = srcRaw + (size_t)(r + 1) * rawStride;
+        int kt = 0;
+        for (; kt + 1 < kp; kt += 2) {
+            const size_t off = (size_t)(kt / 2) * 64;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(vmem((const HVX_Vector*)(row1 + off)),
+                                                vmem((const HVX_Vector*)(row0 + off)), 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const size_t off = (size_t)kt * 32;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_Vector a1 = vmem((const HVX_Vector*)(row1 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(a1, a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+    if (r < validRows) {
+        const __fp16* row0 = srcRaw + (size_t)r * rawStride;
+        int kt = 0;
+        for (; kt + 1 < kp; kt += 2) {
+            const size_t off = (size_t)(kt / 2) * 64;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const size_t off = (size_t)kt * 32;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+}
+
 // A straight copy of a pre-packed weight block into VTCM. libc's memcpy walks
 // this byte wide, and the source is DDR, which made the copy 2.4x slower than
 // the element rearrange it replaces even though it reads less and in a better
@@ -834,7 +958,11 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 
     const int kp = htp_ops_loop_up_div(K, 32);
     const int np = htp_ops_loop_up_div(N, 32);
+    const int pairPacks = htp_ops_loop_up_div(K, 64);
     const size_t blockBytes = (size_t)kp * 1024 * sizeof(__fp16);
+    // Raw activation staging: the 32-row block is copied in as one contiguous
+    // run (a single 1D DMA out of DDR), then rearranged in VTCM.
+    const size_t rawBytes = (size_t)pairPacks * 32 * 64 * sizeof(__fp16);
     // Two 32x32 accumulator tiles are buffered so a pair of adjacent column
     // groups can be written as one full 128-byte store per row.
     const size_t outputBytes = 2048 * sizeof(__fp16);
@@ -848,7 +976,7 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     uint8_t* vtcmEnd = (uint8_t*)vtcm_manager_get_vtcm_alloc_end();
     int ntPerPass = 1;
     if (vtcmPtr != NULL && vtcmEnd != NULL) {
-        const uint8_t* fixedEnd = vtcmPtr + blockBytes + outputBytes + 256;
+        const uint8_t* fixedEnd = vtcmPtr + blockBytes + rawBytes + outputBytes + 256;
         if (vtcmEnd > fixedEnd) {
             ntPerPass = (int)((size_t)(vtcmEnd - fixedEnd) / blockBytes);
         }
@@ -859,6 +987,7 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     if (ntPerPass < 1 || ntPerPass > np) {
         ntPerPass = (np > 0) ? np : 1;
     }
+    __fp16* vtcmActivationRaw = (__fp16*)vtcm_seq_alloc(&vtcmPtr, rawBytes);
     __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, blockBytes);
     // Every operand the unit loads has to be in VTCM: its loads address VTCM and
     // a weights-section pointer hangs the command instead of reading it, so the
@@ -866,7 +995,8 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)ntPerPass * blockBytes);
     __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, outputBytes);
     __fp16* vtcmScales = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 256);
-    if (vtcmActivation == nullptr || vtcmWeight == nullptr || vtcmOutput == nullptr || vtcmScales == nullptr) {
+    if (vtcmActivationRaw == nullptr || vtcmActivation == nullptr || vtcmWeight == nullptr ||
+        vtcmOutput == nullptr || vtcmScales == nullptr) {
         return false;
     }
 
@@ -912,8 +1042,17 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 #if HTP_MM_PHASE_PROFILE
             mm_t = MM_T0();
 #endif
-            for (int kt = 0; kt < kp; ++kt) {
-                htp_ops_loop_hmx_pack_activation_tile(vtcmActivation, src0Base, lp, K, kt, eBase, validRows);
+            const bool contiguousCols = lp->src0StrideXYZ[1] == 2;
+            if (contiguousCols && lp->src0StrideXYZ[0] == K * 2) {
+                if (K % 64 != 0 || validRows < 32) {
+                    memset(vtcmActivationRaw, 0, rawBytes);
+                }
+                htp_ops_loop_hmx_copy_block(vtcmActivationRaw,
+                                            (const __fp16*)(src0Base + (int64_t)eBase * lp->src0StrideXYZ[0]),
+                                            (size_t)validRows * K * 2);
+                htp_ops_loop_hmx_transform_activation_block(vtcmActivation, vtcmActivationRaw, K, validRows);
+            } else {
+                htp_ops_loop_hmx_pack_activation_block(vtcmActivation, src0Base, lp, K, eBase, validRows);
             }
             int nt = nt0;
             const bool contiguous = lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0;
