@@ -689,6 +689,37 @@ static inline void htp_ops_loop_hmx_store_output_tile(uint8_t* dstBase, const __
     }
 }
 
+// Two adjacent 32-column tiles land in consecutive columns of the same output
+// row, so storing them one at a time writes half of a 128-byte line twice. The
+// unit can only retire one 32x32 accumulator at a time, so both tiles are
+// buffered in VTCM and each row's two 64-byte halves are rebuilt into a single
+// 128-byte vector, then written with one store per row. This halves the store
+// instructions and gives every store a full cache line.
+// Caller guarantees the pair is contiguous and N - nBegin >= 64.
+static inline void htp_ops_loop_hmx_store_output_pair(uint8_t* dstBase, const __fp16* vtcmOutput,
+                                                      const HtpOpsLoopParam* lp, int eBase,
+                                                      int validRows, int N, int nt) {
+    const int nBegin = nt * 32;
+    const int64_t rowStride = lp->dstStrideXYZ[0];
+    uint8_t* base = dstBase + (int64_t)nBegin * lp->dstStrideXYZ[2];
+    const HVX_Vector* src0 = (const HVX_Vector*)vtcmOutput;
+    const HVX_Vector* src1 = (const HVX_Vector*)(vtcmOutput + 1024);
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        // vdealh separates each tile's two interleaved rows; the 64-byte vdeal
+        // then pairs the two tiles' matching halves: lo=[row_r(t0)|row_r(t1)],
+        // hi=[row_{r+1}(t0)|row_{r+1}(t1)]. One instruction does what the
+        // vmux+vror shape needs four for.
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_Vh_vdeal_Vh(*src1++), Q6_Vh_vdeal_Vh(*src0++), 64);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r) * rowStride)) = Q6_V_lo_W(vp);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r + 1) * rowStride)) = Q6_V_hi_W(vp);
+    }
+    if (r < validRows) {
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_Vh_vdeal_Vh(*src1++), Q6_Vh_vdeal_Vh(*src0++), 64);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r) * rowStride)) = Q6_V_lo_W(vp);
+    }
+}
+
 static inline bool htp_ops_loop_matmul_hmx_general_eligible(const HtpOpsLoopParam* lp) {
     const int E = lp->sizeXYZ[0];
     const int K = lp->sizeXYZ[1];
@@ -804,7 +835,9 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     const int kp = htp_ops_loop_up_div(K, 32);
     const int np = htp_ops_loop_up_div(N, 32);
     const size_t blockBytes = (size_t)kp * 1024 * sizeof(__fp16);
-    const size_t outputBytes = 1024 * sizeof(__fp16);
+    // Two 32x32 accumulator tiles are buffered so a pair of adjacent column
+    // groups can be written as one full 128-byte store per row.
+    const size_t outputBytes = 2048 * sizeof(__fp16);
     // Keep as many 32-column weight blocks in VTCM as it takes and no more: the
     // whole matrix is K*N*2 bytes, past the unit's capacity for every transformer
     // shape, and the allocator cannot tell when it has run off the end.
@@ -882,7 +915,37 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
             for (int kt = 0; kt < kp; ++kt) {
                 htp_ops_loop_hmx_pack_activation_tile(vtcmActivation, src0Base, lp, K, kt, eBase, validRows);
             }
-            for (int nt = nt0; nt < ntEnd; ++nt) {
+            int nt = nt0;
+            const bool contiguous = lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0;
+            for (; contiguous && nt + 1 < ntEnd && N - nt * 32 >= 64; nt += 2) {
+#if HTP_MM_PHASE_PROFILE
+                mm_act += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                for (int which = 0; which < 2; ++which) {
+                    // One 32-column group of a pre-packed weight is contiguous, so
+                    // the unit's own loads run straight down the weights section.
+                    const __fp16* weightBlock = vtcmWeight + (size_t)(nt + which - nt0) * kp * 1024;
+                    for (int k = 0; k < kp; k += HMX_FP16_MAX_TILES_PER_LOAD) {
+                        int tiles = kp - k;
+                        if (tiles > HMX_FP16_MAX_TILES_PER_LOAD) {
+                            tiles = HMX_FP16_MAX_TILES_PER_LOAD;
+                        }
+                        hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
+                    }
+                    hmx_consume_accumulator_fp16(vtcmOutput + (size_t)which * 1024);
+                }
+#if HTP_MM_PHASE_PROFILE
+                mm_hmx += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                htp_ops_loop_hmx_store_output_pair(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+                mm_store += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+            }
+            for (; nt < ntEnd; ++nt) {
                 // One 32-column group of a pre-packed weight is contiguous, so
                 // the unit's own loads run straight down the weights section.
                 const __fp16* weightBlock = vtcmWeight + (size_t)(nt - nt0) * kp * 1024;
