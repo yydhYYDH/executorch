@@ -1123,7 +1123,12 @@ static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src
     bool contiguous = true;
     int32_t stride = 1;
     for (int i = dims - 1; i >= 0; --i) {
-      if (in0Strides[i] != stride || in1Strides[i] != stride) {
+      // A dimension of size one is walked over a single index, so its stride is
+      // never exercised; the emitter writes 0 there for the leading batch dim of
+      // a transformer activation. Treating that as non-contiguous sent every
+      // residual add and SwiGLU multiply through the per-row broadcast walker
+      // (1024 calls per op) instead of one flat run over the whole tensor.
+      if (outDims[i] != 1 && (in0Strides[i] != stride || in1Strides[i] != stride)) {
         contiguous = false;
         break;
       }
@@ -1718,6 +1723,90 @@ AEEResult htp_ops_binary_blit(uint8_t* dst, const uint8_t* src0, const uint8_t* 
 // The same-shape case is one flat run of vectors. It used to go through the
 // task and worker path, whose bookkeeping costs far more than the arithmetic:
 // a residual add over 64x1024 elements took 80 ms that way.
+//
+// Resolving the operation once, outside the loop, matters as much as the flat
+// walk itself: keeping `opType` runtime made the vector body jump through the
+// operation switch on every 128-byte iteration (an indirect `jumpr` into a jump
+// table, visible in the disassembly), which the compiler could not pipeline
+// against the loads. The body is also unrolled four vectors deep: each of the
+// four independent load pairs can then be in flight while the previous one's
+// arithmetic retires, which is what a pure DDR stream needs (there is nothing
+// else to overlap).
+#define HTP_ELEM_LOAD(ALIGNED, P) \
+  ((ALIGNED) ? vmem((const HVX_Vector*)(P)) : vmemu((const HVX_Vector*)(P)))
+#define HTP_ELEM_STORE(ALIGNED, P, V)          \
+  do {                                         \
+    if (ALIGNED) {                             \
+      *(HVX_Vector*)(P) = (V);                 \
+    } else {                                   \
+      vmemu((HVX_Vector*)(P)) = (V);           \
+    }                                          \
+  } while (0)
+
+#define HTP_ELEM_OP_ADD(a, b)      Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf((a), (b)))
+#define HTP_ELEM_OP_ADD_RELU(a, b) Q6_Vhf_vmax_VhfVhf(HTP_ELEM_OP_ADD((a), (b)), Q6_V_vzero())
+#define HTP_ELEM_OP_SUB(a, b)      Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf((a), (b)))
+#define HTP_ELEM_OP_MUL(a, b)      Q6_Vhf_vmpy_VhfVhf((a), (b))
+#define HTP_ELEM_OP_SQDIFF(a, b)   htp_ops_binary_squared_difference_fp16_vec((a), (b))
+#define HTP_ELEM_OP_MAX(a, b)      Q6_Vhf_vmax_VhfVhf((a), (b))
+#define HTP_ELEM_OP_MIN(a, b)      Q6_Vhf_vmin_VhfVhf((a), (b))
+#define HTP_ELEM_OP_MUL_SILU(a, b) htp_ops_binary_mul_silu_fp16_vec((a), (b))
+
+#define HTP_ELEM_FLAT_LOOP(ALIGNED, OPFUNC, OP)                             \
+  do {                                                                      \
+    int i = 0;                                                              \
+    for (; i + 4 * vec_len <= size; i += 4 * vec_len) {                      \
+      HVX_Vector a0 = HTP_ELEM_LOAD(ALIGNED, src0 + i);                      \
+      HVX_Vector b0 = HTP_ELEM_LOAD(ALIGNED, src1 + i);                      \
+      HVX_Vector a1 = HTP_ELEM_LOAD(ALIGNED, src0 + i + vec_len);            \
+      HVX_Vector b1 = HTP_ELEM_LOAD(ALIGNED, src1 + i + vec_len);            \
+      HVX_Vector a2 = HTP_ELEM_LOAD(ALIGNED, src0 + i + 2 * vec_len);        \
+      HVX_Vector b2 = HTP_ELEM_LOAD(ALIGNED, src1 + i + 2 * vec_len);        \
+      HVX_Vector a3 = HTP_ELEM_LOAD(ALIGNED, src0 + i + 3 * vec_len);        \
+      HVX_Vector b3 = HTP_ELEM_LOAD(ALIGNED, src1 + i + 3 * vec_len);        \
+      HTP_ELEM_STORE(ALIGNED, dst + i, OPFUNC(a0, b0));                      \
+      HTP_ELEM_STORE(ALIGNED, dst + i + vec_len, OPFUNC(a1, b1));            \
+      HTP_ELEM_STORE(ALIGNED, dst + i + 2 * vec_len, OPFUNC(a2, b2));        \
+      HTP_ELEM_STORE(ALIGNED, dst + i + 3 * vec_len, OPFUNC(a3, b3));        \
+    }                                                                         \
+    for (; i <= size - vec_len; i += vec_len) {                               \
+      HVX_Vector a0 = HTP_ELEM_LOAD(ALIGNED, src0 + i);                      \
+      HVX_Vector b0 = HTP_ELEM_LOAD(ALIGNED, src1 + i);                      \
+      HTP_ELEM_STORE(ALIGNED, dst + i, OPFUNC(a0, b0));                      \
+    }                                                                         \
+    for (; i < size; ++i) {                                                   \
+      dst[i] = htp_ops_binary_apply_fp16(src0[i], src1[i], OP);               \
+    }                                                                         \
+  } while (0)
+
+#define HTP_ELEM_FLAT_DISPATCH(ALIGNED)                                              \
+  switch (opType) {                                                                  \
+    case HTP_OPS_BINARY_ADD:                                                         \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_ADD, HTP_OPS_BINARY_ADD);              \
+      break;                                                                         \
+    case HTP_OPS_BINARY_ADD_RELU:                                                    \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_ADD_RELU, HTP_OPS_BINARY_ADD_RELU);    \
+      break;                                                                         \
+    case HTP_OPS_BINARY_SUB:                                                         \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_SUB, HTP_OPS_BINARY_SUB);              \
+      break;                                                                         \
+    case HTP_OPS_BINARY_MUL:                                                         \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_MUL, HTP_OPS_BINARY_MUL);              \
+      break;                                                                         \
+    case HTP_OPS_BINARY_SQUARED_DIFFERENCE:                                          \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_SQDIFF, HTP_OPS_BINARY_SQUARED_DIFFERENCE); \
+      break;                                                                         \
+    case HTP_OPS_BINARY_MAX:                                                         \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_MAX, HTP_OPS_BINARY_MAX);              \
+      break;                                                                         \
+    case HTP_OPS_BINARY_MIN:                                                         \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_MIN, HTP_OPS_BINARY_MIN);              \
+      break;                                                                         \
+    case HTP_OPS_BINARY_MUL_SILU:                                                    \
+      HTP_ELEM_FLAT_LOOP(ALIGNED, HTP_ELEM_OP_MUL_SILU, HTP_OPS_BINARY_MUL_SILU);    \
+      break;                                                                         \
+  }
+
 static inline bool htp_ops_binary_compute_fp16_flat(__fp16* dst, const __fp16* src0,
                                                    const __fp16* src1, int size, int opType) {
   if (!htp_ops_binary_supports_fp16_vector_tail(opType)) {
@@ -1726,22 +1815,25 @@ static inline bool htp_ops_binary_compute_fp16_flat(__fp16* dst, const __fp16* s
   const bool aligned = htp_ops_binary_is_aligned_128(dst) && htp_ops_binary_is_aligned_128(src0) &&
                        htp_ops_binary_is_aligned_128(src1);
   const int vec_len = 128 / (int)sizeof(__fp16);
-  int i = 0;
-  for (; i <= size - vec_len; i += vec_len) {
-    HVX_Vector v0 = aligned ? *(const HVX_Vector*)(src0 + i) : vmemu((const HVX_Vector*)(src0 + i));
-    HVX_Vector v1 = aligned ? *(const HVX_Vector*)(src1 + i) : vmemu((const HVX_Vector*)(src1 + i));
-    HVX_Vector vr = htp_ops_binary_compute_fp16_vector(v0, v1, opType);
-    if (aligned) {
-      *(HVX_Vector*)(dst + i) = vr;
-    } else {
-      vmemu((HVX_Vector*)(dst + i)) = vr;
-    }
-  }
-  for (; i < size; ++i) {
-    dst[i] = htp_ops_binary_apply_fp16(src0[i], src1[i], opType);
+  if (aligned) {
+    HTP_ELEM_FLAT_DISPATCH(1);
+  } else {
+    HTP_ELEM_FLAT_DISPATCH(0);
   }
   return true;
 }
+#undef HTP_ELEM_FLAT_DISPATCH
+#undef HTP_ELEM_FLAT_LOOP
+#undef HTP_ELEM_OP_MUL_SILU
+#undef HTP_ELEM_OP_MIN
+#undef HTP_ELEM_OP_MAX
+#undef HTP_ELEM_OP_SQDIFF
+#undef HTP_ELEM_OP_MUL
+#undef HTP_ELEM_OP_SUB
+#undef HTP_ELEM_OP_ADD_RELU
+#undef HTP_ELEM_OP_ADD
+#undef HTP_ELEM_STORE
+#undef HTP_ELEM_LOAD
 
 AEEResult htp_ops_binary_elementwise(uint8_t* dst, uint8_t* src0_ptr, uint8_t* src1_ptr,
                                      int32_t outSize, int32_t in0Size, int32_t in1Size,
