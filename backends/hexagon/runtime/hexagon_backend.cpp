@@ -1013,8 +1013,12 @@ Result<DelegateHandle*> HexagonBackend::init(
         header->version);
     return Error::DelegateInvalidCompatibility;
   }
-  if (header->n_ops > 4096 || header->n_inputs > 64 ||
-      header->n_outputs > 64) {
+  // A single delegate can cover a whole transformer, whose KV caches are one
+  // method input each (two per layer) on top of the token, position and rope
+  // tensors, so the ceiling is not 64. n_ops stays bounded because the command
+  // offsets are int32.
+  if (header->n_ops > 65536 || header->n_inputs > 4096 ||
+      header->n_outputs > 4096) {
     ET_LOG(Error, "hexagon: implausible blob dimensions");
     return Error::DelegateInvalidCompatibility;
   }
