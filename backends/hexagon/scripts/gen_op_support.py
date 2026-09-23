@@ -52,6 +52,9 @@ FLASH_ATTN = "DSP_OP_FLASH_ATTN"
 # BATCH_MATMUL, so both matmul rows below name three commands.
 Q4A16_GEMV = "DSP_OP_MATMUL_Q4A16_GEMV_I8"
 W8A16_GEMV = "DSP_OP_MATMUL_W8A16_GEMV_I8"
+# The row gather. One command reads a run of rows out of a fp16 table whose
+# bytes the export step rearranged into the 32x32 tiles the kernel walks.
+SHARED_GATHER = "DSP_OP_SHARED_GATHER"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -332,7 +335,10 @@ SUPPORTED: List[OpSupport] = [
         "Registered lazily, once the LLM extension defines llama.custom_sdpa, and "
         "only while SDPA_DELEGATION is true. Four-dimensional q/k/v, matching "
         "head_dim, n_kv_heads dividing the query heads; start_pos must be a "
-        "constant or a run-time tensor read. One non-paged FLASH_ATTN.",
+        "constant or a run-time tensor read; no attention mask (the emitter "
+        "has no stride to hand the kernel, and the fp32 workspace the mask would "
+        "be copied into is sized for the unmasked shape, so a masked node stays "
+        "portable). One non-paged FLASH_ATTN.",
     ),
     OpSupport(
         "llama.custom_sdpa.out",
@@ -407,6 +413,30 @@ SUPPORTED: List[OpSupport] = [
         "Re-points a producer's result. Only the getitem reading a layer norm's "
         "output 0, or one of the fused add+norm's outputs 0/1, is placed.",
     ),
+    # --- row gathers (DSP_OP_SHARED_GATHER) -------------------------------
+    OpSupport(
+        "aten.embedding.default",
+        SHARED_GATHER,
+        "fp16 table",
+        "The table must be a parameter, buffer or lifted constant whose bytes are "
+        "tiled at export, and the indices an int32 tensor: the kernel reads "
+        "`const int32_t[]` into a 32x32 tiled fp16 table. An index outside the "
+        "table clears its row rather than raising, which torch does not.",
+    ),
+    OpSupport(
+        "aten.index_select.default",
+        SHARED_GATHER,
+        "fp16 table",
+        "As embedding.default, and dim must be 0: another dim is a strided read "
+        "across rows the command cannot make.",
+    ),
+    OpSupport(
+        "aten.index.Tensor",
+        SHARED_GATHER,
+        "fp16 table",
+        "As embedding.default, and exactly one index, on axis 0. A second entry "
+        "indexes a second axis, which is not this command.",
+    ),
 ]
 
 # Exclusions worth naming: each is something a reader might expect to work.
@@ -418,10 +448,24 @@ NOT_SUPPORTED = [
         "rewritten to a matmul by conv_patch_embed.py.",
     ),
     (
-        "aten.embedding.default",
-        "The fp16 gather kernel (DSP_OP_SHARED_GATHER) indexes a 32x32-blocked "
-        "table; a row-major weight would return other rows' values, so it stays on "
-        "the host.",
+        "aten.gather.default",
+        "An element-wise index along one axis: out[i][j] = input[index[i][j]][j] "
+        "coincides with a whole-row read only for particular index shapes, so an "
+        "approximation would be a wrong answer rather than a slow one.",
+    ),
+    (
+        "aten.embedding.default with int64 indices, or a table that is not a "
+        "constant",
+        "The kernel reads `const int32_t[]` and its table is tiled at export, so "
+        "neither a width-8 index nor a tensor that only exists at run time has a "
+        "command form. A `tokens.to(torch.int32)` in the model is enough to reach "
+        "the DSP: the cast itself stays portable.",
+    ),
+    (
+        "aten.index_select.default with dim != 0, and aten.index.Tensor with more "
+        "than one index",
+        "The command takes one run of whole rows; a second axis is a strided read "
+        "it cannot describe.",
     ),
     (
         "aten.copy_.default (KV writeback)",
@@ -558,6 +602,20 @@ def _rows() -> List[OpSupport]:
     if missing:
         raise SystemExit(
             "gen_op_support: no OP_SUPPORT row for emitter(s): " + ", ".join(missing)
+        )
+
+    # The two tables are one document, so an op named as an exclusion and as a
+    # supported row at once is a contradiction -- what an emitter landing on an
+    # op the exclusion list still leaves on the host looks like. Only an
+    # exclusion that names an op and nothing else counts: the rest are
+    # conditional ("with non-adjacent reduced dims", "over a non-last axis") and
+    # have to say which form they mean.
+    both = sorted(op for op, _ in NOT_SUPPORTED if op in by_op)
+    if both:
+        raise SystemExit(
+            "gen_op_support: row(s) in both tables: "
+            + ", ".join(both)
+            + " -- an emitter now exists, so drop the exclusion or name the form"
         )
 
     # The attention overloads resolve lazily; when the extension is loaded, make
