@@ -29,13 +29,22 @@ constexpr uint32_t kHexagonBlobMagic = 0x4E584748; // 'HXGN'
 // Bumped with the HexagonOp layout, which patch_scale changed from 476 bytes
 // to 480. A v1 blob read as v2 would take an in_place bit for a scale.
 constexpr uint32_t kHexagonBlobVersion = 2;
+// A blob that leaves weights behind when it is copied out of the .pte. Bytes up
+// to the end of the weights section are laid out exactly as in v2; the
+// HexagonExternalWeightsTrailer that follows says where the rest of the weights
+// live, and init() copies them in from the named data map.
+constexpr uint32_t kHexagonBlobVersionExternalWeights = 3;
 constexpr uint32_t kHexagonDynamicTrailerMagic = 0x44594E48; // 'HYND'
+constexpr uint32_t kHexagonExternalWeightsMagic = 0x57455848; // 'HXEW'
+constexpr uint32_t kHexagonExternalWeightsVersion = 1;
 
 constexpr uint32_t kMaxOpInputs = 8;
 constexpr uint32_t kMaxOpOutputs = 4;
 // BATCH_MATMUL carries a packed HtpOpsLoopParam in its params, which needs 26.
 constexpr uint32_t kMaxOpParams = 40;
 constexpr size_t kHexagonAlignment = 128;
+// A lookup key is a NUL-padded fixed-width field, so a key is at most 31 bytes.
+constexpr uint32_t kHexagonExternalKeyBytes = 32;
 
 // Sentinel patch_param: every param is already known at export time.
 constexpr uint32_t kNoOpPatch = 0xFFFFFFFF;
@@ -94,10 +103,36 @@ struct HexagonBlobHeader {
   uint32_t n_ops;
   uint32_t n_inputs; // method inputs, in signature order
   uint32_t n_outputs; // method outputs, in signature order
-  uint32_t weights_bytes; // on disk, right after the ops
+  // Bytes of weights in the file, right after the ops. The arena's weights
+  // section is this much followed by whatever the external trailer names, so
+  // this is a prefix length and not the section's size in the arena.
+  uint32_t weights_bytes;
   uint32_t inputs_bytes; // arena sizes, not regions of the blob
   uint32_t activations_bytes;
   uint32_t outputs_bytes;
+};
+
+// Written after the weights section, when some of them are not in the file.
+// Each entry's offset is measured from the start of the arena's weights
+// section, so it is always past HexagonBlobHeader::weights_bytes; the runtime
+// copies the bytes it looks up under `key` to that offset before any command
+// runs. A weight the .pte does not carry is a weight that does not have to be
+// in every copy of the model, not a weight the DSP can read where it lies: the
+// bytes still reach resident memory, because an rpcmem mapping is the only
+// address the DSP has.
+struct HexagonExternalWeightsTrailer {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t n_ext;
+  uint32_t reserved; // zero, so the entry array stays 8-byte aligned
+  // The arena's weights section: what the header counts plus every entry below.
+  uint64_t weights_bytes;
+};
+
+struct HexagonExternalWeight {
+  uint64_t offset; // from the start of the arena's weights section
+  uint64_t size;
+  char key[kHexagonExternalKeyBytes]; // NUL-padded lookup key
 };
 
 // Optional trailer after the weights section. Keeping dynamic metadata out of
@@ -151,6 +186,9 @@ static_assert(sizeof(HexagonDynamicTrailerV3) == 28);
 static_assert(sizeof(HexagonDynamicLayoutHeader) == 4);
 static_assert(sizeof(HexagonDynamicLayout) == 32);
 static_assert(sizeof(HexagonDynamicPatch) == 16);
+static_assert(sizeof(HexagonExternalWeightsTrailer) == 24);
+static_assert(sizeof(HexagonExternalWeight) == 48);
+static_assert(offsetof(HexagonExternalWeight, key) == 16);
 static_assert(sizeof(HexagonTensorRef) == 24);
 static_assert(sizeof(HexagonOp) == 480);
 static_assert(offsetof(HexagonOp, params) == 16);
@@ -159,9 +197,14 @@ static_assert(offsetof(HexagonOp, patch_scale) == 184);
 static_assert(offsetof(HexagonOp, in_place) == 188);
 static_assert(offsetof(HexagonOp, inputs) == 192);
 
-// Layout: header, then n_ops of HexagonOp, then the weights, 128-byte aligned.
-// The other three sections are sizes the header carries and the runtime uses to
-// lay out its own arenas; only the weights are on disk, because they are the
-// only section it copies out of the blob.
+// Layout: header, then n_ops of HexagonOp, then the weights the file carries,
+// 128-byte aligned. The other three sections are sizes the header carries and
+// the runtime uses to lay out its own arenas; only the weights are on disk,
+// because they are the only section it copies out of the blob.
+//
+// A version 3 blob continues with HexagonExternalWeightsTrailer and its
+// entries, and then with the dynamic trailer if there is one. The external
+// trailer is where the weights section ends in the file, so a reader finds it
+// with the same arithmetic it uses for everything else.
 
 } // namespace executorch::backends::hexagon

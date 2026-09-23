@@ -5,11 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import hashlib
+from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from executorch.backends.hexagon.hexagon_ops import EMITTERS, pack_hmx_weight
-from executorch.backends.hexagon.serialization.blob import BlobBuilder, TensorRef
+from executorch.backends.hexagon.serialization.blob import (
+    ALIGNMENT,
+    BlobBuilder,
+    TensorRef,
+)
+from executorch.exir._serialize._named_data_store import (
+    NamedDataStore,
+    NamedDataStoreOutput,
+)
 from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec
 from executorch.exir.sym_util import eval_upper_bound
@@ -23,6 +33,126 @@ SUPPORTED_TARGETS: Dict[Callable, Callable] = EMITTERS
 # Emitter contract: append this node's DSP commands to the context and return
 # the ref holding its result.
 Emitter = Callable[[torch.fx.Node, "BlobContext"], TensorRef]
+
+HMX_PREPACK_SPEC = "hexagon_hmx_prepack"
+ATTN_PAGED_SPEC = "hexagon_attn_paged"
+EXTERNAL_WEIGHTS_MAX_BYTES_SPEC = "hexagon_external_weights_max_bytes"
+
+#: Every key this backend accepts, so an unknown one is reported by name.
+KNOWN_SPEC_KEYS = frozenset(
+    {HMX_PREPACK_SPEC, ATTN_PAGED_SPEC, EXTERNAL_WEIGHTS_MAX_BYTES_SPEC}
+)
+
+
+@dataclass(frozen=True)
+class HexagonCompileOptions:
+    """The choices that change what the blob contains.
+
+    These are compile specs rather than runtime options because each of them
+    changes the bytes the .pte carries. A knob a runner could flip at load time
+    would let it ask for a layout this program was never compiled for, and the
+    DSP would read the weights in the wrong order without saying so. Written
+    into the .pte instead, the same value is available to init(), which
+    re-derives it from the blob and refuses a load where the two disagree.
+
+    Both sides of every choice therefore come from one object: the partitioner
+    stamps these into the delegate, and preprocess reads them back out.
+    """
+
+    #: Store each matmul weight in the order the HMX unit reads its tiles. The
+    #: reorder is the same size as what it replaces, so the blob does not grow;
+    #: what it buys is the unit's weight fill, which is most of what a matmul
+    #: costs. No other kernel reads that layout, so a matmul whose weight was
+    #: packed has to be the one that says so, and the packer will not pack a
+    #: shape that kernel refuses.
+    hmx_prepack: bool = True
+    #: Run attention through the paged entry point. One page covers the whole
+    #: packed cache, so the buffer layout is unchanged and the choice reaches
+    #: the kernel as a page size in the command.
+    attn_paged: bool = False
+    #: Move weights larger than this many bytes out of the .pte and into a .ptd
+    #: next to it. None keeps every weight inline, which is what the format did
+    #: before this existed. What it saves is the size of the .pte and the work
+    #: of copying it to a device; it does not save the rpcmem copy, because a
+    #: mapped buffer is the only address the DSP can read.
+    external_weights_max_bytes: Optional[int] = None
+
+    def to_compile_specs(self) -> List[CompileSpec]:
+        """The delegate's compile specs, in a fixed order."""
+        specs = [
+            CompileSpec(HMX_PREPACK_SPEC, bytes([1 if self.hmx_prepack else 0])),
+            CompileSpec(ATTN_PAGED_SPEC, bytes([1 if self.attn_paged else 0])),
+        ]
+        if self.external_weights_max_bytes is not None:
+            specs.append(
+                CompileSpec(
+                    EXTERNAL_WEIGHTS_MAX_BYTES_SPEC,
+                    int(self.external_weights_max_bytes).to_bytes(8, "little"),
+                )
+            )
+        return specs
+
+    @classmethod
+    def from_compile_specs(
+        cls, compile_specs: List[CompileSpec]
+    ) -> "HexagonCompileOptions":
+        """Reads what the .pte carries, rejecting anything it cannot mean.
+
+        No key is mandatory: every one of them has a default, and a caller that
+        passes no specs at all is asking for exactly the defaults. What is
+        rejected is a key this backend does not define, a key given twice, and
+        a value whose width or contents cannot be what the key says.
+        """
+        options = cls()
+        seen = set()
+        for spec in compile_specs:
+            if spec.key in seen:
+                raise ValueError(f"hexagon: compile spec {spec.key} appears twice")
+            seen.add(spec.key)
+            if spec.key == HMX_PREPACK_SPEC:
+                options = replace(options, hmx_prepack=_spec_bool(spec))
+            elif spec.key == ATTN_PAGED_SPEC:
+                options = replace(options, attn_paged=_spec_bool(spec))
+            elif spec.key == EXTERNAL_WEIGHTS_MAX_BYTES_SPEC:
+                options = replace(
+                    options, external_weights_max_bytes=_spec_uint64(spec)
+                )
+            else:
+                raise ValueError(
+                    f"hexagon: unknown compile spec {spec.key!r}; this backend "
+                    f"defines {sorted(KNOWN_SPEC_KEYS)}"
+                )
+        return options
+
+
+def _spec_payload(spec: CompileSpec, width: int) -> bytes:
+    if len(spec.value) != width:
+        raise ValueError(
+            f"hexagon: compile spec {spec.key} must be {width} bytes, "
+            f"got {len(spec.value)}"
+        )
+    return spec.value
+
+
+def _spec_bool(spec: CompileSpec) -> bool:
+    value = _spec_payload(spec, 1)[0]
+    if value not in (0, 1):
+        raise ValueError(
+            f"hexagon: compile spec {spec.key} must be 0 or 1, got {value}"
+        )
+    return bool(value)
+
+
+def _spec_uint64(spec: CompileSpec) -> int:
+    # The same boundary Vulkan validates for its external constants cap: a
+    # compile spec can bypass parse_compile_options, so the width and the
+    # domain are checked here rather than trusted.
+    value = int.from_bytes(_spec_payload(spec, 8), byteorder="little")
+    if value <= 0:
+        raise ValueError(
+            f"hexagon: compile spec {spec.key} must be a positive uint64, got {value}"
+        )
+    return value
 
 
 def bytes_for(numel: int, dtype: torch.dtype) -> int:
@@ -92,13 +222,20 @@ class BlobContext:
         weights: Optional[Dict[torch.fx.Node, torch.Tensor]] = None,
         dynamic_sequence: Optional[Tuple[int, int, int]] = None,
         dynamic_example: Optional[int] = None,
+        options: Optional[HexagonCompileOptions] = None,
     ) -> None:
         self.graph_module = graph_module
         # The tensors behind the placeholders this subgraph owns. torch.export
         # leaves a fake in a lifted weight's metadata, so this is the only way an
         # emitter can look at the value it is being asked to store.
         self.weights: Dict[torch.fx.Node, torch.Tensor] = dict(weights or {})
-        self.builder = BlobBuilder(n_inputs, n_outputs)
+        # What the exporters chose. The emitters read these rather than the
+        # environment, so the blob and the specs that describe it cannot come
+        # from two different sets of defaults.
+        self.options = options or HexagonCompileOptions()
+        self.builder = BlobBuilder(
+            n_inputs, n_outputs, self.options.external_weights_max_bytes
+        )
         self.producer: Dict[torch.fx.Node, TensorRef] = {}
         self._constants: Dict[torch.fx.Node, TensorRef] = {}
         # Placeholder targets whose stored bytes were rewritten into the HMX tile
@@ -403,7 +540,7 @@ class HexagonBackend(BackendDetails):
         edge_program: ExportedProgram,
         compile_specs: List[CompileSpec],
     ) -> PreprocessResult:
-        # No compile specs are defined for this backend yet.
+        options = HexagonCompileOptions.from_compile_specs(compile_specs)
         # The program is copied because emitters may rewrite the graph, while
         # the original still has to serialize into the .pte unchanged.
         program = copy.deepcopy(edge_program)
@@ -533,6 +670,7 @@ class HexagonBackend(BackendDetails):
             weights,
             dynamic_sequence,
             dynamic_example,
+            options,
         )
 
         for node, tensor in weights.items():
@@ -591,7 +729,32 @@ class HexagonBackend(BackendDetails):
                     f"({node.op}: {node.target}), which no emitter produced"
                 )
 
-        return PreprocessResult(processed_bytes=context.builder.build())
+        return PreprocessResult(
+            processed_bytes=context.builder.build(),
+            data_store_output=_named_data_store(context.builder),
+        )
+
+
+def _named_data_store(builder: BlobBuilder) -> Optional[NamedDataStoreOutput]:
+    """The weights that left the .pte, as a store the .ptd writer can serialize.
+
+    One tag, so one file: a Module is handed a single data map at load time, and
+    a second shard would be a second file nothing could open. Keys carry the
+    weight's content rather than its position, so two delegates that store equal
+    bytes share one buffer in the file, and the file's contents do not depend on
+    the order the graph happened to reach its weights in.
+    """
+    blobs = builder.external_weight_data()
+    if not blobs:
+        return None
+    keys = sorted(key for key, _ in blobs)
+    tag = (
+        "hexagon_weights_" + hashlib.sha256("\0".join(keys).encode("utf-8")).hexdigest()
+    )
+    store = NamedDataStore()
+    for key, data in sorted(blobs):
+        store.add_named_data(key, data, alignment=ALIGNMENT, external_tag=tag)
+    return store.get_named_data_store_output()
 
 
 def _flatten_outputs(output_node: torch.fx.Node) -> List[Tuple[torch.fx.Node, int]]:

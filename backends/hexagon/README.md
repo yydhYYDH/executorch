@@ -32,17 +32,21 @@ need for DspQueue.
 tagged with `HexagonBackend` and handed to `BackendDetails.preprocess`, which
 serializes a blob:
 
-    [HexagonBlobHeader][HexagonOp × n_ops][weights][activations]
+    [HexagonBlobHeader][HexagonOp × n_ops][weights][external weights][activations]
 
 The blob is a plain packed layout (`serialization/hexagon_schema.h`), not
 FlatBuffers, so the Python side needs no code generation. Weights are packed in
 the layout the DSP kernels expect at this point; anything that needs a runtime
-reorder is delegated to `htp_ops_weight_reorder` at init instead.
+reorder is delegated to `htp_ops_weight_reorder` at init instead. What goes into
+the blob and what is left outside it is decided by `HexagonCompileOptions` --
+see [Tunables](#tunables) below.
 
 **Init.** `HexagonBackend::init` opens the FastRPC session, picks the skel for
 the device's arch, and turns the blob into the wire format the DSP wants:
 
-1. allocate the delegate's resident block and copy the weights in,
+1. check the compile specs against the blob, then allocate the delegate's
+   resident block and copy the weights in, fetching any weight the blob left
+   out from the named data map,
 2. build one `DSPCOMMAND::Command` FlatBuffer per op and one `SyncGroup`,
 3. fill the command group array with `(resident_fd, command_offset, size)`.
 
@@ -88,6 +92,87 @@ host access, but no chance of a stale cache line reaching the DSP.
 
 The sync group carries the same information to the DSP side: it invalidates its
 own view of the tensors on the way in and flushes them on the way out.
+
+## Tunables
+
+A hexagon knob has to be on one of two sides, and the side is decided by whether
+it changes a byte of the blob:
+
+- a **compile spec** (`HexagonCompileOptions`, `hexagon_backend.py`) is part of
+  what the DSP will read, so it is fixed when the blob is built and travels in
+  the `.pte`. A runner that flipped it at load time would be running a layout the
+  program was never compiled for.
+- a **backend option** (`HexagonBackendOptions`, `runtime/`) only changes what
+  the delegate does with those bytes -- what it traces, what it caps, when it
+  gives up -- so it can be set per load.
+
+| spec | width | meaning |
+|---|---|---|
+| `hexagon_hmx_prepack` | 1 byte | weights are stored in the HMX tile order (default 1) |
+| `hexagon_attn_paged` | 1 byte | attention reads a paged cache (default 0) |
+| `hexagon_external_weights_max_bytes` | 8 bytes, little endian | per-weight inline threshold; a weight larger than this is left out of the blob |
+
+The specs are a claim about the blob, and `init()` does not take the claim on
+faith. `hexagon_compat.h` re-derives the same three facts from the bytes --
+whether a matmul's flags carry the plan magic with the prepacked bit set,
+whether an attention command is the paged entry point, whether the blob has an
+external weights trailer -- and compares them. A program whose weights are
+packed and whose spec says they are not fails to load with
+`DelegateInvalidCompatibility` rather than running with the DSP reading the
+wrong order. An unknown key or a payload of the wrong width is `InvalidArgument`
+instead, because that is a broken caller rather than a broken program.
+`hexagon_compat.h` includes no ExecuTorch, FlatBuffers or rpcmem header, so it
+can be compiled and driven on the host, which is what
+`test/test_compile_specs.py` does.
+
+Options are resolved once per delegate at `init()`. Each one keeps the
+environment variable it has always had as its fallback, so a process that sets
+neither an option nor a variable behaves exactly as it did before options
+existed:
+
+| option | fallback | effect |
+|---|---|---|
+| `trace` | `HEXAGON_TRACE` | per-command trace |
+| `delegate` | `HEXAGON_DELEGATE` | which delegate to trace, by execute order (`-1` = all) |
+| `cmd_start` | `HEXAGON_CMD_START` | first command of that delegate |
+| `cmd_limit` | `HEXAGON_CMD_LIMIT` | how many commands from there |
+| `stop_after` | `HEXAGON_STOP_AFTER` | exit once delegate n has run |
+| `fake_cache` | `HEXAGON_FAKE_CACHE` | fill an empty attention cache from K/V |
+| `phase` | `HEXAGON_PHASE` | init/execute phase timeline |
+| `kv_state` | `HEXAGON_KV_STATE` | keep the attention state in the arena |
+| `watchdog_seconds` | `HEXAGON_WATCHDOG_SECONDS` | how long an invoke may block |
+| `tile_budget` | `HEXAGON_HMX_TILE_BUDGET` | VTCM tile cap for matmul (`-1` = the blob's) |
+| `acct` | `HEXAGON_ACCT` | per-stage accounting |
+
+`tile_budget` is the one option that reaches into a command: it overwrites the
+tile cap in a matmul's params at load time, because a cap is not a layout. An
+unset option leaves the blob's own value alone. The two knobs that *do* change
+the layout -- `HEXAGON_HMX_PREPACK` and `HEXAGON_ATTN_PAGED` -- are not options
+any more but the specs above, and the runtime no longer reads them.
+
+### Weights outside the `.pte`
+
+With `hexagon_external_weights_max_bytes` set, every weight larger than the
+threshold is left out of the blob, which gains a trailer naming them:
+
+    [HexagonOp × n_ops][inline weights][{n_ext, {offset, size, key[32]} × n_ext}][activations]
+
+The key is `hx` plus 29 hex digits of the weight's SHA-256, so two equal weights
+share one entry in the store -- worth more than the `.pte` size on a model whose
+layers tie tensors. `preprocess` returns them as a `NamedDataStore`
+(`data_store_output`), the same path Vulkan's external constants take, and the
+runner writes it as a `.ptd` beside the `.pte`. A blob with nothing externalized
+is still version 2 and byte-identical to what the writer produced before this
+existed; only a blob that left something out is version 3.
+
+At `init()` each key is read with `NamedDataMap::get_data` and copied into the
+resident block, at the offset the trailer names. What this saves is the size of
+the `.pte` and the store-level dedup. What it does not save is the rpcmem copy:
+the weight still has to be in the block the DSP reads from, so a model that
+externalizes everything moves the same bytes at load time that it did before.
+Removing that copy needs a runner that can hand the delegate a file-backed
+mapping the DSP mappings itself, which is a new contract with the runner rather
+than a change here.
 
 ## Building
 
@@ -201,7 +286,20 @@ Working and verified without a device:
   layer, with all 28 attention nodes among them -- and leaves 825 on the
   portable kernels, 711 of which are shape guards. With the fusion passes
   switched off the export splits into 169 subgraphs and leaves 2121 nodes
-  behind.
+  behind;
+- the compile-spec check is exercised on the host over real blobs, from both
+  sides: the writer's side in `test/test_compile_specs.py` and the runtime's in
+  the ET-free `hexagon_compat.h`, which the same test compiles and drives. That
+  is where the plan-magic mask in the checker was caught reading a packed weight
+  as unpacked;
+- the runtime options are resolved against a real `BackendInitContext` on the
+  host (`test/test_runtime_options.py`), including the fallback to the variable
+  each one has always had and the refusal of a value of the wrong type;
+- the external-weights path round-trips without a device: the `.ptd` a
+  `preprocess` returns deserializes to the same bytes the blob left out, a blob
+  that externalizes nothing is byte-identical to one written before the option
+  existed, and a blob whose weight is missing or short is refused
+  (`test/test_external_weights.py`).
 
 Not done yet:
 
@@ -210,6 +308,11 @@ Not done yet:
   a host model of the same command stream. The simulator is a functional model,
   so it says what the kernels compute and nothing about what the DSP costs or
   whether the FastRPC path and the skeleton deployment work;
+- the external-weight copy at `init()` and the tile-budget override, which run
+  only inside the delegate and are therefore code-only here. This checkout cannot
+  write a `.pte` at all -- `exir/_serialize/program.fbs` is missing -- so the
+  `.pte`/`.ptd` pair is exercised through the store `preprocess` returns, not
+  through files on disk;
 - of the 20 registered emitters, the ones that have produced a command on a real
   graph are `mm`, the binary and unary families, `custom_sdpa`, `rms_norm`,
   `mul_silu`, `update_cache` and the narrowing blits. The view and cast

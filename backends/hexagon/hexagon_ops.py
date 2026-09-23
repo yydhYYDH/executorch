@@ -13,7 +13,6 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 """
 
 import operator
-import os
 import struct
 from typing import Dict, List, NamedTuple, Optional
 
@@ -914,7 +913,6 @@ def _loop_param(
     in1_elems: int,
     steps=(0, 0, 0),
     hmx_prepacked: bool = False,
-    hmx_tile_budget: int = 0,
 ):
     """The descriptor BATCH_MATMUL reads out of params[1:].
 
@@ -939,7 +937,11 @@ def _loop_param(
         in0_elems,
         in1_elems,
         _HMX_PLAN_MAGIC | (_HMX_PLAN_PREPACKED_WEIGHTS if hmx_prepacked else 0),
-        hmx_tile_budget,
+        # hmxTileBudget: zero asks the unit to fit itself to the VTCM it finds.
+        # A runner can raise or lower this slot at load time (the tile_budget
+        # option), which is a cap on what the unit keeps resident rather than a
+        # change to the weights, so the blob does not have to be rebuilt for it.
+        0,
     )
     return list(struct.unpack("<27i", packed))
 
@@ -1091,36 +1093,6 @@ def hmx_general_eligible(m: int, k: int, n: int) -> bool:
     return m * k * n >= HMX_GENERAL_MIN_ELEMS
 
 
-def _hmx_prepack_enabled() -> bool:
-    """HEXAGON_HMX_PREPACK=0 leaves matmul weights in their row-major order.
-
-    On by default. Packing a weight here forces that matmul onto the HMX route,
-    because no other kernel reads that layout, and it costs the model nothing:
-    the reordered bytes are the same size, so the blob is unchanged in size and
-    the output is bit-identical.
-
-    What it buys is the DSP's weight fill. A row-major (k, n) weight gives the
-    unit 32 rows of 64 bytes at a pitch of n * 2, which is a stride no prefetcher
-    likes; the tile order turns the same read into one straight run per 32-column
-    group. On the 24-layer vision tower that is the difference between 430 and
-    315 ms an image, and the DSP call drops from 465 to 310 ms.
-    """
-    import os
-
-    return os.environ.get("HEXAGON_HMX_PREPACK", "") not in ("0", "false")
-
-
-def _hmx_tile_budget() -> int:
-    """HEXAGON_HMX_TILE_BUDGET caps the 32-column weight tiles held in VTCM.
-
-    A cap, not a size: the DSP fits itself to the VTCM it actually finds, so
-    planning for more than the part has cannot overflow it.
-    """
-    import os
-
-    return int(os.environ.get("HEXAGON_HMX_TILE_BUDGET", "0"))
-
-
 def _hmx_weight_operand(ctx, rhs, k: int, n: int):
     """The weight operand: packed at export when the graph stores it as one."""
     if getattr(rhs, "target", None) in ctx.packed_targets:
@@ -1166,7 +1138,7 @@ def _weight_operand(ctx, rhs, m: int, k: int, n: int):
     """
     value = ctx.constant_value(rhs)
     if (
-        _hmx_prepack_enabled()
+        ctx.options.hmx_prepack
         and hmx_prefers_general(k, n)
         and hmx_general_eligible(m, k, n)
         and value is not None
@@ -1187,7 +1159,6 @@ def _matmul_command(
     k: int,
     n: int,
     hmx_prepacked: bool = False,
-    hmx_tile_budget: int = 0,
 ) -> None:
     """One BATCH_MATMUL over contiguous (m, k) @ (k, n) tiles.
 
@@ -1223,7 +1194,6 @@ def _matmul_command(
                 batches * k_plan * n_plan,
                 steps=steps,
                 hmx_prepacked=hmx_prepacked,
-                hmx_tile_budget=hmx_tile_budget,
             ),
         )
     )
@@ -1262,7 +1232,6 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
         k,
         n,
         hmx_prepacked=prepacked,
-        hmx_tile_budget=_hmx_tile_budget(),
     )
     return ctx.record(node, out)
 
@@ -1301,7 +1270,6 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
         k,
         n,
         hmx_prepacked=prepacked,
-        hmx_tile_budget=_hmx_tile_budget(),
     )
     return ctx.record(node, out)
 
@@ -1340,7 +1308,6 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
         k,
         n,
         hmx_prepacked=prepacked,
-        hmx_tile_budget=_hmx_tile_budget(),
     )
     if beta == 0.0:
         return ctx.record(node, out)
@@ -1874,11 +1841,14 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
         ),
     )
 
-    # HEXAGON_ATTN_PAGED=1 takes the paged entry (htp_ops_flash_attn_pages) that MNN's
-    # HexagonAttention.cpp always uses: one page spanning the whole packed cache, so the
-    # buffer layout is unchanged. page_size must be a multiple of 32 and must exceed
-    # seq_current, or push_kv_pages skips the insert.
-    paged = bool(os.environ.get("HEXAGON_ATTN_PAGED"))
+    # The paged entry (htp_ops_flash_attn_pages) is what MNN's
+    # HexagonAttention.cpp always uses: one page spanning the whole packed cache,
+    # so the buffer layout is unchanged. page_size must be a multiple of 32 and
+    # must exceed seq_current, or push_kv_pages skips the insert. The choice is a
+    # compile spec, because it is a page size in the command and so a byte of the
+    # blob; init() reads it back out of the command when it checks the specs
+    # against what the file actually holds.
+    paged = ctx.options.attn_paged
     page_size = 256 if paged else 0
 
     op_index = ctx.builder.add_op(

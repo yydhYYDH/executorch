@@ -25,7 +25,7 @@ layout change cannot make this agree with a writer it no longer matches.
 
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from executorch.backends.hexagon.serialization import blob as B
@@ -84,6 +84,22 @@ class Command:
     in_place: int
 
 
+@dataclass(frozen=True)
+class ExternalWeights:
+    """Where the weights the .pte does not carry have to be filled in.
+
+    `weights_bytes` is the arena's weights section -- the file's own bytes
+    followed by every entry -- which is what the runtime sizes that section
+    from. The entries' offsets are measured from the start of it, so each one
+    lands at `weights_base + entry.offset` and the file's half is a prefix.
+    """
+
+    weights_bytes: int
+    entries: List[B.ExternalWeight]
+    #: Where the section after the weights starts in the file.
+    trailer_at: int
+
+
 def read_blob(data: bytes) -> Tuple[Header, List[Command]]:
     """Decodes a blob exactly as the runtime does."""
     if len(data) < B.HEADER_SIZE:
@@ -125,16 +141,77 @@ def read_blob(data: bytes) -> Tuple[Header, List[Command]]:
     return header, commands
 
 
+def read_external_weights(data: bytes) -> ExternalWeights:
+    """Reads the trailer listing the weights the file does not carry.
+
+    Mirrors the runtime: a blob that is not v3 has none, and the bytes between
+    the end of the weights and the dynamic trailer belong to the file's own
+    weights section and to nothing else.
+    """
+    header, _ = read_blob(data)
+    weights_at = B.HEADER_SIZE + header.n_ops * B.OP_SIZE
+    weights_end = weights_at + header.weights_bytes
+    if weights_end > len(data):
+        raise ValueError("hexagon: truncated weights section")
+    if header.version != B.BLOB_VERSION_EXTERNAL_WEIGHTS:
+        return ExternalWeights(header.weights_bytes, [], weights_end)
+
+    if len(data) - weights_end < B._EXTERNAL_HEADER.size:
+        raise ValueError("hexagon: truncated external weights trailer")
+    magic, version, n_ext, _reserved, weights_bytes = B._EXTERNAL_HEADER.unpack_from(
+        data, weights_end
+    )
+    if magic != B.EXTERNAL_WEIGHTS_MAGIC:
+        raise ValueError(f"hexagon: bad external weights magic 0x{magic:08x}")
+    if version != B.EXTERNAL_WEIGHTS_VERSION:
+        raise ValueError(f"hexagon: unknown external weights version {version}")
+    if weights_bytes < header.weights_bytes:
+        raise ValueError("hexagon: the trailer's weights section is too small")
+
+    entries_at = weights_end + B._EXTERNAL_HEADER.size
+    if n_ext == 0 or entries_at + n_ext * B._EXTERNAL_WEIGHT.size > len(data):
+        raise ValueError("hexagon: external weight records out of bounds")
+
+    entries: List[B.ExternalWeight] = []
+    end = header.weights_bytes
+    for i in range(n_ext):
+        offset, size, raw_key = B._EXTERNAL_WEIGHT.unpack_from(
+            data, entries_at + i * B._EXTERNAL_WEIGHT.size
+        )
+        key = raw_key.split(b"\x00", 1)[0]
+        if not key:
+            raise ValueError("hexagon: an external weight has no name")
+        if size == 0 or offset < end or offset + size > weights_bytes:
+            raise ValueError(
+                f"hexagon: external weight {key!r} is out of bounds at {offset}"
+            )
+        end = offset + size
+        entries.append(B.ExternalWeight(offset, size, key.decode("ascii")))
+    return ExternalWeights(
+        weights_bytes, entries, entries_at + n_ext * B._EXTERNAL_WEIGHT.size
+    )
+
+
 class Arena:
     """The four sections the runtime lays out, in the order it lays them out."""
 
-    def __init__(self, header: Header, data: bytes, name: str) -> None:
+    def __init__(
+        self,
+        header: Header,
+        data: bytes,
+        name: str,
+        named_data: Optional[Dict[str, bytes]] = None,
+    ) -> None:
         self.header = header
         self.name = name
         self.base: Dict[int, int] = {}
+        external = read_external_weights(data)
+        # The weights section is the file's bytes followed by the weights the
+        # file left out, so it is the trailer's size that bounds it, not the
+        # header's: the header's is a file offset, this is an arena size.
         cursor = 0
         for space, size in (
-            (B.TensorSpace.WEIGHTS, header.weights_bytes),
+            (B.TensorSpace.WEIGHTS, external.weights_bytes),
             (B.TensorSpace.INPUT, header.inputs_bytes),
             (B.TensorSpace.ACTIVATION, header.activations_bytes),
             (B.TensorSpace.OUTPUT, header.outputs_bytes),
@@ -148,12 +225,27 @@ class Arena:
         # runtime reserves from the header size and never reads back, so they
         # are zero here exactly as they would be if the file carried them.
         host_at = B.HEADER_SIZE + header.n_ops * B.OP_SIZE
-        self.bytes[
-            self.base[int(B.TensorSpace.WEIGHTS)] : self.base[
-                int(B.TensorSpace.WEIGHTS)
-            ]
-            + header.weights_bytes
-        ] = data[host_at : host_at + header.weights_bytes]
+        weights_base = self.base[int(B.TensorSpace.WEIGHTS)]
+        self.bytes[weights_base : weights_base + header.weights_bytes] = data[
+            host_at : host_at + header.weights_bytes
+        ]
+
+        # The rest of the section comes from the caller, key by key, the way the
+        # runtime copies it out of the named data map.
+        store = named_data or {}
+        for entry in external.entries:
+            supply = store.get(entry.key)
+            if supply is None:
+                raise ValueError(
+                    f"{self.name}: the blob needs external weight {entry.key!r} "
+                    f"and no data map has it"
+                )
+            if len(supply) != entry.size:
+                raise ValueError(
+                    f"{self.name}: external weight {entry.key!r} is "
+                    f"{len(supply)} bytes, the blob expects {entry.size}"
+                )
+            _store(self, weights_base + entry.offset, supply)
 
     def address(self, ref: B.TensorRef) -> int:
         if ref.space == ABSENT:
@@ -693,17 +785,22 @@ _EXECUTORS = {
 }
 
 
-def execute(data: bytes, inputs: Sequence[np.ndarray]) -> List[np.ndarray]:
+def execute(
+    data: bytes,
+    inputs: Sequence[np.ndarray],
+    named_data: Optional[Dict[str, bytes]] = None,
+) -> List[np.ndarray]:
     """Runs a blob over the host arena and returns its outputs by index.
 
     `inputs` is indexed by method input index, which is the order the emitters
-    declared their placeholders in.
+    declared their placeholders in. `named_data` is the named data map a blob
+    with external weights needs, keyed the way the trailer names its entries.
     """
     header, commands = read_blob(data)
     if len(inputs) != header.n_inputs:
         raise ValueError(f"blob wants {header.n_inputs} inputs, got {len(inputs)}")
 
-    arena = Arena(header, data, "blob")
+    arena = Arena(header, data, "blob", named_data)
     for index, tensor in enumerate(inputs):
         ref = _slot(commands, B.TensorSpace.INPUT, index)
         raw = tensor.tobytes()

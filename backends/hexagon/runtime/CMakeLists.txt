@@ -7,7 +7,10 @@
 # Host side of the Hexagon backend: the FastRPC session and the BackendInterface
 # implementation that ExecuTorch registers.
 
-add_library(hexagon_backend STATIC hexagon_driver.cpp hexagon_backend.cpp)
+add_library(
+  hexagon_backend STATIC hexagon_driver.cpp hexagon_backend.cpp
+                        HexagonBackendOptions.cpp
+)
 
 # BUILD_INTERFACE keeps source- and build-tree paths out of the exported
 # interface; the headers here are build inputs, not part of an installed SDK.

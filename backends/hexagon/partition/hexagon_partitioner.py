@@ -4,11 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, final, Set
+from typing import Dict, final, Optional, Set
 
 import torch
 from executorch.backends.hexagon.hexagon_backend import (
     HexagonBackend,
+    HexagonCompileOptions,
     SUPPORTED_TARGETS,
 )
 from executorch.backends.hexagon.hexagon_ops import (
@@ -428,8 +429,13 @@ class HexagonPartitioner(Partitioner):
     own arena, so a partition per node would be correct but pointless.
     """
 
-    def __init__(self) -> None:
-        self.delegation_spec = DelegationSpec(HexagonBackend.__name__, [])
+    def __init__(self, compile_options: Optional[HexagonCompileOptions] = None) -> None:
+        # Stamped into the .pte with the delegate, so preprocess and the runtime
+        # both see the same choices and the blob can be checked against them.
+        self.compile_options = compile_options or HexagonCompileOptions()
+        self.delegation_spec = DelegationSpec(
+            HexagonBackend.__name__, self.compile_options.to_compile_specs()
+        )
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         graph_module = exported_program.graph_module

@@ -11,6 +11,7 @@ runtime reads this once, in HexagonBackend::init, and turns each op into a
 FlatBuffers command descriptor, so the two layouts have to agree exactly.
 """
 
+import hashlib
 import struct
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -23,17 +24,31 @@ BLOB_MAGIC = 0x4E584748  # 'HXGN'
 # Bumped with the HexagonOp layout, which patch_scale changed from 476 bytes to
 # 480. A v1 blob read as v2 would take an in_place bit for a scale.
 BLOB_VERSION = 2
+# A blob that leaves weights behind when it is copied out of the .pte. The two
+# share a layout up to the end of the weights section; what follows it says
+# where the rest of the weights live, so an all-inline blob stays v2 and stays
+# byte-for-byte what it was before this existed.
+BLOB_VERSION_EXTERNAL_WEIGHTS = 3
 DYNAMIC_TRAILER_MAGIC = 0x44594E48  # 'HYND'
+EXTERNAL_WEIGHTS_MAGIC = 0x57455848  # 'HXEW'
+EXTERNAL_WEIGHTS_VERSION = 1
 ALIGNMENT = 128
 MAX_OP_INPUTS = 8
 MAX_OP_OUTPUTS = 4
 # BATCH_MATMUL carries a packed HtpOpsLoopParam in its params, which needs 26.
 MAX_OP_PARAMS = 40
+# The trailer names each external weight by a NUL-padded fixed-width key, so a
+# key the runtime can look up is at most 31 bytes.
+EXTERNAL_KEY_BYTES = 32
+EXTERNAL_KEY_MAX = EXTERNAL_KEY_BYTES - 1
 
 _DYNAMIC_HEADER = struct.Struct("<6I")
 _DYNAMIC_HEADER_V3 = struct.Struct("<7I")
 _DYNAMIC_PATCH = struct.Struct("<4i")
 _DYNAMIC_LAYOUT = struct.Struct("<IIqqq")
+# magic, version, n_ext, reserved, weights_bytes
+_EXTERNAL_HEADER = struct.Struct("<4IQ")
+_EXTERNAL_WEIGHT = struct.Struct("<2Q" + f"{EXTERNAL_KEY_BYTES}s")
 
 
 class TensorSpace(IntEnum):
@@ -169,6 +184,65 @@ class DynamicLayout:
         )
 
 
+def external_weight_key(data: bytes) -> str:
+    """The key a weight stored outside the .pte is looked up under.
+
+    Derived from the bytes, so the same weight exported twice lands on one key
+    and the store keeps one copy of it. Thirty-one characters is what the
+    trailer's fixed-width key field holds; twenty-nine hex digits of SHA-256
+    distinguishes far more weights than any model has, and a collision is a hard
+    error in the store rather than a silent mix-up.
+    """
+    digest = hashlib.sha256(data).hexdigest()[: EXTERNAL_KEY_MAX - 2]
+    return "hx" + digest
+
+
+@dataclass(frozen=True)
+class ExternalWeight:
+    """One weight the .pte does not carry.
+
+    `offset` is measured from the start of the arena's weights section, which
+    the runtime builds as the bytes from the file followed by these entries, so
+    it is always past `HexagonBlobHeader::weights_bytes`.
+    """
+
+    offset: int
+    size: int
+    key: str
+    #: Index into the builder's weight list, so the store can be handed the
+    #: bytes without the trailer having to carry them. Not part of the format,
+    #: the way TensorRef::index is not.
+    index: int = 0
+
+    def pack(self) -> bytes:
+        key = self.key.encode("ascii")
+        if not key or len(key) > EXTERNAL_KEY_MAX:
+            raise ValueError(
+                f"external weight key {self.key!r} needs 1 to {EXTERNAL_KEY_MAX} bytes"
+            )
+        return _EXTERNAL_WEIGHT.pack(self.offset, self.size, key)
+
+
+@dataclass(frozen=True)
+class ExternalWeights:
+    """The trailer listing them, written only when there are any."""
+
+    #: Bytes the arena reserves for the weights section: the file's own inline
+    #: bytes plus every entry below. Never a length of the file.
+    weights_bytes: int
+    entries: List[ExternalWeight]
+
+    def pack(self) -> bytes:
+        trailer = _EXTERNAL_HEADER.pack(
+            EXTERNAL_WEIGHTS_MAGIC,
+            EXTERNAL_WEIGHTS_VERSION,
+            len(self.entries),
+            0,
+            self.weights_bytes,
+        )
+        return trailer + b"".join(entry.pack() for entry in self.entries)
+
+
 def _align_up(value: int, alignment: int = ALIGNMENT) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
 
@@ -183,9 +257,17 @@ class BlobBuilder:
     the caller, so neither is a region on disk.
     """
 
-    def __init__(self, n_inputs: int, n_outputs: int) -> None:
+    def __init__(
+        self,
+        n_inputs: int,
+        n_outputs: int,
+        external_weights_max_bytes: Optional[int] = None,
+    ) -> None:
         self._n_inputs = n_inputs
         self._n_outputs = n_outputs
+        # A weight larger than this is stored outside the .pte. None keeps every
+        # weight inline, which is the format as it was.
+        self._external_weights_max_bytes = external_weights_max_bytes
         self._ops: List[Op] = []
         self._weight_data: List[bytes] = []
         self._activations_bytes = 0
@@ -199,6 +281,10 @@ class BlobBuilder:
         self._dynamic_example: Optional[int] = None
         self._dynamic_patches: List[DynamicPatch] = []
         self._dynamic_layouts: Dict[Tuple[TensorSpace, int], DynamicLayout] = {}
+        # Filled in by _pack_weights, which is where the sizes are final.
+        self._weights_disk_bytes = 0
+        self._weights_arena_bytes = 0
+        self._external_weights: List[ExternalWeight] = []
 
     def set_dynamic_sequence(
         self, input_index: int, axis: int, max_length: int, example_length: int = 0
@@ -388,6 +474,13 @@ class BlobBuilder:
 
         Order follows first use, which is what keeps a delegate's weights in the
         order its ops were emitted in.
+
+        A weight too large to belong in the .pte is not written to the section;
+        it is appended past it instead, in the arena the runtime builds, and the
+        trailer records where. That leaves the inline entries at exactly the
+        offsets they would have had, so the section in the file is a prefix of
+        the section in the arena and the runtime can copy both halves without a
+        map between them.
         """
         used: List[int] = []
         seen: set = set()
@@ -396,14 +489,53 @@ class BlobBuilder:
                 if ref.space == TensorSpace.WEIGHTS and ref.index not in seen:
                     seen.add(ref.index)
                     used.append(ref.index)
+
+        inline: List[int] = []
+        external: List[int] = []
+        for index in used:
+            data = self._weight_data[index]
+            if (
+                self._external_weights_max_bytes is not None
+                and len(data) > self._external_weights_max_bytes
+            ):
+                external.append(index)
+            else:
+                inline.append(index)
+
         offsets: Dict[int, int] = {}
         data = bytearray()
-        for index in used:
+        for index in inline:
             offset = _align_up(len(data))
             data.extend(b"\x00" * (offset - len(data)))
             data.extend(self._weight_data[index])
             offsets[index] = offset
+        self._weights_disk_bytes = len(data)
+
+        self._external_weights = []
+        cursor = _align_up(self._weights_disk_bytes)
+        for index in external:
+            blob = self._weight_data[index]
+            offset = _align_up(cursor)
+            offsets[index] = offset
+            cursor = offset + len(blob)
+            self._external_weights.append(
+                ExternalWeight(
+                    offset, len(blob), external_weight_key(blob), index=index
+                )
+            )
+        self._weights_arena_bytes = _align_up(cursor)
         return bytes(data), offsets
+
+    def external_weight_data(self) -> List[Tuple[str, bytes]]:
+        """The externalized weights as (key, bytes), for the .ptd store.
+
+        One entry per weight rather than one per key: two weights that are equal
+        bytes share a key, and the store turns those into one buffer.
+        """
+        return [
+            (entry.key, self._weight_data[entry.index])
+            for entry in self._external_weights
+        ]
 
     def _remap(self, ref: TensorRef) -> TensorRef:
         if ref.space == TensorSpace.INPUT:
@@ -451,6 +583,7 @@ class BlobBuilder:
             self._output_slots, self._n_outputs, "output"
         )
         weights, self._weight_offsets = self._pack_weights()
+        external = ExternalWeights(self._weights_arena_bytes, self._external_weights)
 
         # rebuild via replace() so every other field survives automatically:
         # listing them by hand silently dropped patch and in_place.
@@ -465,17 +598,20 @@ class BlobBuilder:
 
         header = _HEADER.pack(
             BLOB_MAGIC,
-            BLOB_VERSION,
+            BLOB_VERSION_EXTERNAL_WEIGHTS if external.entries else BLOB_VERSION,
             len(self._ops),
             self._n_inputs,
             self._n_outputs,
-            len(weights),
+            self._weights_disk_bytes,
             inputs_bytes,
             self._activations_bytes,
             outputs_bytes,
         )
+        body = header + ops + weights
+        if external.entries:
+            body += external.pack()
         if self._dynamic_input is None:
-            return header + ops + weights
+            return body
         self._record_default_dynamic_layouts()
         input_index, axis, max_length = self._dynamic_input
         trailer = _DYNAMIC_HEADER_V3.pack(
@@ -489,4 +625,4 @@ class BlobBuilder:
         ) + b"".join(patch.pack() for patch in self._dynamic_patches)
         trailer += struct.pack("<I", len(self._dynamic_layouts))
         trailer += b"".join(layout.pack() for layout in self._dynamic_layouts.values())
-        return header + ops + weights + trailer
+        return body + trailer

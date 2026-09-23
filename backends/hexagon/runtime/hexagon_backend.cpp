@@ -31,9 +31,12 @@
 #include <Command_generated.h>
 
 #include <executorch/backends/hexagon/serialization/hexagon_schema.h>
+#include <executorch/backends/hexagon/runtime/HexagonBackendOptions.h>
+#include <executorch/backends/hexagon/runtime/hexagon_compat.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/tensor_util.h>
+#include <executorch/runtime/core/named_data_map.h>
 #include <executorch/runtime/platform/compiler.h>
 #include <executorch/runtime/platform/log.h>
 
@@ -50,54 +53,31 @@ using runtime::Error;
 using runtime::EValue;
 using runtime::FreeableBuffer;
 using runtime::MemoryAllocator;
+using runtime::NamedDataMap;
 using runtime::Result;
 using runtime::Span;
 using runtime::resize_tensor;
 
-// Diagnostic knobs, all off unless set in the environment:
-//   HEXAGON_TRACE=1        print the per-command trace
-//   HEXAGON_DELEGATE=n     which delegate, by execute order (-1 = every one)
-//   HEXAGON_CMD_START=s    first command of that delegate to run
-//   HEXAGON_CMD_LIMIT=k    how many commands to run from there
-//   HEXAGON_STOP_AFTER=n   exit once delegate n has run
-//   HEXAGON_FAKE_CACHE=1   fill an empty attention past-key/value operand from
+// Diagnostic knobs, resolved per delegate from the load-time backend options
+// with the environment as the fallback:
+//   trace=1                print the per-command trace
+//   delegate=n             which delegate, by execute order (-1 = every one)
+//   cmd_start=s            first command of that delegate to run
+//   cmd_limit=k            how many commands to run from there
+//   stop_after=n           exit once delegate n has run
+//   fake_cache=1           fill an empty attention past-key/value operand from
 //                          the key and value operands, which is what the fixed
 //                          emitter does, so the null-pointer write can be
 //                          isolated from every other defect in the same blob
 // start/limit cut the group array at a command boundary, the cheapest way to
 // bracket the command that kills the DSP without touching the exported blob. A
 // suffix (start > 0) is how one command is run on its own.
-struct TraceConfig {
-  bool trace = false;
-  int delegate = -1;
-  int start = 0;
-  int limit = 0;
-  int stop_after = -1;
-  bool fake_cache = false;
-  // HEXAGON_PHASE=1: emit a steady-clock timeline of the init and execute
-  // phases, so the host-side setup and per-inference overhead can be split.
-  bool phase = false;
-};
-
-int EnvInt(const char* name, int fallback) {
-  const char* value = std::getenv(name);
-  return value == nullptr ? fallback : std::atoi(value);
-}
-
-const TraceConfig& Trace() {
-  static const TraceConfig config = [] {
-    TraceConfig c;
-    c.trace = EnvInt("HEXAGON_TRACE", 0) != 0;
-    c.delegate = EnvInt("HEXAGON_DELEGATE", -1);
-    c.start = EnvInt("HEXAGON_CMD_START", 0);
-    c.limit = EnvInt("HEXAGON_CMD_LIMIT", 0);
-    c.stop_after = EnvInt("HEXAGON_STOP_AFTER", -1);
-    c.fake_cache = EnvInt("HEXAGON_FAKE_CACHE", 0) != 0;
-    c.phase = EnvInt("HEXAGON_PHASE", 0) != 0;
-    return c;
-  }();
-  return config;
-}
+//   phase=1                emit a steady-clock timeline of the init and execute
+//                          phases, so the host-side setup and per-inference
+//                          overhead can be split.
+// What these may not do is change the blob: the ones that would have are
+// compile specs, and init() checks them against the bytes it was handed. See
+// HexagonBackendOptions.h and hexagon_compat.h.
 
 // Layout owned by execute_command.cc: four header ints at kProbeBaseInts inside
 // the profile buffer, then one eight-int record per command index.
@@ -111,8 +91,10 @@ constexpr int kProbeBytes =
     (kProbeBaseInts + kProbeHeaderInts + kProbeRecords * kProbeRecordInts + kProbeStages * 4) * 4;
 constexpr int32_t kProbeMagic = 0x48455850; // "HEXP"
 
-// DSP_OP_FLASH_ATTN, the one command whose empty cache slots are fatal.
-constexpr int32_t kFlashAttnOp = 18;
+// DSP_OP_FLASH_ATTN, the one command whose empty cache slots are fatal. Its
+// type number and its page_size param come from hexagon_compat.h, which reads
+// the same two things when it checks the attention spec against the blob.
+constexpr uint32_t kFlashAttnOp = kFlashAttnType;
 // DSP_OP_RASTER_BLIT. Its three-input, patched form is the KV-cache advance.
 constexpr int32_t kRasterBlitOp = 3;
 
@@ -291,6 +273,9 @@ struct HexagonDelegate {
   std::vector<size_t> command_offsets;
   // Order this delegate was created in, for the trace only.
   int index = 0;
+  // Resolved once, from the load-time options with the environment behind them.
+  // Held here because execute() has no init context to resolve against.
+  HexagonRuntimeOptions options;
   // Host-visible landing zone for the DSP-side per-command trace. Empty unless
   // the environment asked for a trace.
   Arena probe;
@@ -493,13 +478,12 @@ void PrintStages(const HexagonDelegate& delegate) {
 // A blocked invoke never returns, and nothing can interrupt the DSP once its side stops
 // answering: the calling thread sits in fastrpc_wait_for_completion until the process dies.
 // Whatever the DSP already wrote into the probe ring is then the only evidence left, so read
-// it out on a timer instead of after the return. HEXAGON_WATCHDOG_SECONDS (default 15, 0
+// it out on a timer instead of after the return. `watchdog_seconds` (15 by default, 0
 // disables) sets the interval; only a traced delegate has a probe ring to read.
 class ProbeWatchdog {
  public:
   ProbeWatchdog(const HexagonDelegate* delegate, bool traced) : delegate_(delegate) {
-    const char* env = std::getenv("HEXAGON_WATCHDOG_SECONDS");
-    seconds_ = env != nullptr ? std::atoi(env) : 15;
+    seconds_ = delegate->options.watchdog_seconds;
     if (!traced || seconds_ <= 0 || delegate_->probe.ptr == nullptr) {
       return;
     }
@@ -1025,8 +1009,6 @@ Result<DelegateHandle*> HexagonBackend::init(
     BackendInitContext& context,
     FreeableBuffer* processed,
     ArrayRef<CompileSpec> compile_specs) const {
-  (void)compile_specs;
-
   if (processed == nullptr || processed->size() < sizeof(HexagonBlobHeader)) {
     ET_LOG(Error, "hexagon: blob too small");
     return Error::DelegateInvalidCompatibility;
@@ -1034,8 +1016,11 @@ Result<DelegateHandle*> HexagonBackend::init(
 
   const auto* header =
       reinterpret_cast<const HexagonBlobHeader*>(processed->data());
+  // Two versions, one layout: a v3 blob differs only past the end of the
+  // weights section, where it says which weights the file does not carry.
   if (header->magic != kHexagonBlobMagic ||
-      header->version != kHexagonBlobVersion) {
+      (header->version != kHexagonBlobVersion &&
+       header->version != kHexagonBlobVersionExternalWeights)) {
     ET_LOG(
         Error,
         "hexagon: bad blob magic 0x%08x or version %u",
@@ -1059,6 +1044,48 @@ Result<DelegateHandle*> HexagonBackend::init(
     return Error::DelegateInvalidCompatibility;
   }
 
+  // The compile specs say what this blob is; the blob is what runs. Checking
+  // one against the other is what keeps a spec from being a guess: a program
+  // whose weights were stored in the HMX tile order and whose spec says they
+  // were not is either a mismatch nobody noticed or a layout the DSP will read
+  // as rubbish, and neither should reach the DSP as a silent success.
+  {
+    std::vector<HexagonSpec> specs;
+    specs.reserve(compile_specs.size());
+    for (const CompileSpec& spec : compile_specs) {
+      specs.push_back(HexagonSpec{
+          spec.key,
+          static_cast<const uint8_t*>(spec.value.buffer),
+          spec.value.nbytes});
+    }
+    const auto* blob = reinterpret_cast<const uint8_t*>(processed->data());
+    const HexagonSpecVerdict verdict = CheckCompileSpecs(
+        specs.data(), specs.size(), blob, processed->size());
+    if (verdict.status == HexagonSpecStatus::kUnknownKey ||
+        verdict.status == HexagonSpecStatus::kBadPayload) {
+      ET_LOG(Error, "%s", verdict.reason);
+      return Error::InvalidArgument;
+    }
+    if (verdict.status != HexagonSpecStatus::kOk) {
+      ET_LOG(Error, "%s", verdict.reason);
+      return Error::DelegateInvalidCompatibility;
+    }
+  }
+
+  // Where the weights the file does not carry have to land, and how much room
+  // they need. Read before anything is allocated, because the answer is what
+  // the weights section is sized from.
+  HexagonExternalWeights external{};
+  {
+    const auto* blob = reinterpret_cast<const uint8_t*>(processed->data());
+    const HexagonWeightVerdict verdict =
+        ParseExternalWeights(blob, processed->size(), &external);
+    if (!verdict.ok) {
+      ET_LOG(Error, "%s", verdict.reason);
+      return Error::DelegateInvalidCompatibility;
+    }
+  }
+
   MemoryAllocator* allocator = context.get_runtime_allocator();
   auto* delegate = allocator->allocateInstance<HexagonDelegate>();
   if (delegate == nullptr) {
@@ -1071,7 +1098,17 @@ Result<DelegateHandle*> HexagonBackend::init(
     static int next_delegate = 0;
     delegate->index = next_delegate++;
   }
-  const bool phase = Trace().phase;
+  // Before anything that could read them: every diagnostic below comes from
+  // here rather than from the environment directly.
+  {
+    auto options = HexagonBackendOptions().resolve(context);
+    if (!options.ok()) {
+      ET_LOG(Error, "hexagon: bad backend options");
+      return options.error();
+    }
+    delegate->options = options.get();
+  }
+  const bool phase = delegate->options.phase;
   auto stamp = [&](const char* what) {
     if (phase) {
       std::fprintf(
@@ -1100,7 +1137,10 @@ Result<DelegateHandle*> HexagonBackend::init(
   const size_t group_bytes = 8 + header->n_ops * 3 * sizeof(int32_t);
 
   size_t resident_bytes = command_budget + sync_budget;
-  resident_bytes = AlignUp(resident_bytes + header->weights_bytes, kHexagonAlignment);
+  // The weights section in the arena is the file's own bytes followed by every
+  // weight the file left out: they are filled in below, from the named data
+  // map, but they need room in the same block the DSP reads.
+  resident_bytes = AlignUp(resident_bytes + external.weights_bytes, kHexagonAlignment);
   resident_bytes = AlignUp(resident_bytes + group_bytes, kHexagonAlignment);
 
   size_t scratch_bytes = 0;
@@ -1113,10 +1153,12 @@ Result<DelegateHandle*> HexagonBackend::init(
 
   std::fprintf(
       stderr,
-      "[hexagon] arena: resident %zu, scratch %zu (weights %zu, activations %zu)\n",
+      "[hexagon] arena: resident %zu, scratch %zu (weights %zu + %zu external, "
+      "activations %zu)\n",
       resident_bytes,
       scratch_bytes,
       (size_t)header->weights_bytes,
+      (size_t)(external.weights_bytes - header->weights_bytes),
       (size_t)header->activations_bytes);
   auto arena = delegate->driver.Alloc(resident_bytes);
   if (!arena.ok()) {
@@ -1142,7 +1184,7 @@ Result<DelegateHandle*> HexagonBackend::init(
   delegate->scratch = pooled.get();
   stamp("scratch_alloc");
 
-  const TraceConfig& config = Trace();
+  const HexagonRuntimeOptions& config = delegate->options;
   if (config.trace || config.delegate >= 0) {
     auto probe = delegate->driver.Alloc(kProbeBytes);
     if (probe.ok()) {
@@ -1169,7 +1211,7 @@ Result<DelegateHandle*> HexagonBackend::init(
   // that history is lost, and the caller's copy is the ~235 MB this delegate
   // moved in and out on every execute. Giving the pair one persistent slot lets
   // the graph mutate the cache in place and removes both copies.
-  const bool kv_state = EnvInt("HEXAGON_KV_STATE", 1) != 0;
+  const bool kv_state = delegate->options.kv_state;
   size_t state_bytes = 0;
   auto add_state = [&](HexagonTensorSpace space,
                        uint32_t index,
@@ -1239,15 +1281,12 @@ Result<DelegateHandle*> HexagonBackend::init(
   // works from -- the input and output sizes are arena budgets it copies to and
   // from the caller, and the activation section is scratch it reserves for
   // itself and never reads out of the blob -- so only the weights have to be
-  // present. A blob written before the padding was dropped still carries the
-  // zeros, which this accepts too: it is a lower bound, not an equality.
-  const size_t sections_total = static_cast<size_t>(header->weights_bytes);
-  if (weights_blob_offset + sections_total > processed->size()) {
-    ET_LOG(Error, "hexagon: tensor sections out of bounds");
-    return Error::DelegateInvalidCompatibility;
-  }
-
-  const size_t trailer_offset = weights_blob_offset + sections_total;
+  // present, and of those only the ones the file carries. Their bounds were
+  // checked when the external trailer was read.
+  // The dynamic trailer starts where the weights section ends in the file,
+  // which for a blob with external weights is past their trailer and not past
+  // the arena's weights section.
+  const size_t trailer_offset = external.dynamic_trailer_at;
   if (processed->size() > trailer_offset) {
     if (processed->size() - trailer_offset < sizeof(HexagonDynamicTrailer)) {
       ET_LOG(Error, "hexagon: truncated dynamic trailer");
@@ -1367,6 +1406,42 @@ Result<DelegateHandle*> HexagonBackend::init(
       static_cast<uint8_t*>(delegate->resident.ptr) + delegate->weights.offset,
       blob + weights_blob_offset,
       header->weights_bytes);
+  // Followed by the weights that are not in the file, each copied to the one
+  // place the DSP can read it: this block. The rpcmem copy is what the .ptd
+  // does not save -- a weight travels as a file instead of as part of the .pte,
+  // but it still has to arrive in mapped memory before a command can run.
+  for (uint32_t i = 0; i < external.count; i++) {
+    const HexagonExternalWeight& entry = external.entries[i];
+    const NamedDataMap* map = context.get_named_data_map();
+    if (map == nullptr) {
+      ET_LOG(
+          Error,
+          "hexagon: the blob needs external weight %s but no data map was "
+          "loaded",
+          entry.key);
+      return Error::InvalidArgument;
+    }
+    auto data = map->get_data(std::string_view(entry.key));
+    if (!data.ok()) {
+      ET_LOG(
+          Error, "hexagon: external weight %s is not in the data map", entry.key);
+      return data.error();
+    }
+    if (data.get().size() != entry.size) {
+      ET_LOG(
+          Error,
+          "hexagon: external weight %s is %zu bytes, the blob expects %zu",
+          entry.key,
+          data.get().size(),
+          (size_t)entry.size);
+      return Error::DelegateInvalidCompatibility;
+    }
+    std::memcpy(
+        static_cast<uint8_t*>(delegate->resident.ptr) +
+            delegate->weights.offset + entry.offset,
+        data.get().data(),
+        static_cast<size_t>(entry.size));
+  }
   stamp("weights_copy");
 
   cursor = 0;
@@ -1438,6 +1513,16 @@ Result<DelegateHandle*> HexagonBackend::init(
       op.inputs[4] = op.inputs[1];
       op.inputs[5] = op.inputs[2];
       std::fprintf(stderr, "[hexagon] d%d op %u: past K/V filled from K/V\n", delegate->index, i);
+    }
+    // A tile budget names a cap on what the unit keeps resident, not a layout,
+    // so a runner may set it for the part it is on without a new .pte. What the
+    // blob asked for stays unless the option is set.
+    if (delegate->options.tile_budget >= 0 &&
+        op.type == kBatchMatMulType &&
+        op.n_params > kMatmulTileBudgetParam &&
+        (static_cast<uint32_t>(op.params[kMatmulHmxFlagsParam]) &
+         kHmxPlanMagicMask) == kHmxPlanMagic) {
+      op.params[kMatmulTileBudgetParam] = delegate->options.tile_budget;
     }
     delegate->ops[i] = op;
 
@@ -1686,8 +1771,8 @@ Error HexagonBackend::execute(
   auto* const resident = static_cast<uint8_t*>(delegate->resident.ptr);
   uint8_t* scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
 
-  const bool acct = EnvInt("HEXAGON_ACCT", 0) != 0;
-  const bool phase = Trace().phase;
+  const bool acct = delegate->options.acct;
+  const bool phase = delegate->options.phase;
   const double t_begin = acct ? AcctNowMs() : 0.0;
   if (phase) {
     std::fprintf(
@@ -1877,17 +1962,17 @@ Error HexagonBackend::execute(
   }
   const double t_flush = acct ? AcctNowMs() : 0.0;
 
-  const TraceConfig& config = Trace();
+  const HexagonRuntimeOptions& config = delegate->options;
   static int next_execute = 0;
   const int exec_index = next_execute++;
   const bool traced = config.trace && (config.delegate < 0 || config.delegate == exec_index);
   uint32_t first = 0;
   uint32_t count = delegate->n_ops;
   if (config.delegate < 0 || config.delegate == exec_index) {
-    first = (uint32_t)std::min<int>(std::max(config.start, 0), (int)delegate->n_ops);
+    first = (uint32_t)std::min<int>(std::max(config.cmd_start, 0), (int)delegate->n_ops);
     count = delegate->n_ops - first;
-    if (config.limit > 0) {
-      count = (uint32_t)std::min<int>(config.limit, (int)count);
+    if (config.cmd_limit > 0) {
+      count = (uint32_t)std::min<int>(config.cmd_limit, (int)count);
     }
   }
   const int32_t group_offset = (int32_t)(
