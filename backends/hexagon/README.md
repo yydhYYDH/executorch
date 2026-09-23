@@ -634,8 +634,10 @@ Working and verified without a device:
   middle, multi-axis, negative, missing and empty dim, and `amax` returns torch's
   values exactly. `fmod` lowers to one BINARY command with subtype 12 and
   reproduces the truncated remainder, and the floored `remainder` is pinned as
-  not delegated. See `test/test_pool.py`, `test/test_sum_amax.py` and
-  `test/test_fmod.py`.
+  not delegated. `FuseAddReluPass` rewrites `relu(x + y)` into the one
+  `BINARY_ELEMENTWISE` command that does `max(a + b, 0)`, which is the only form
+  of a rectifier the DSP has. See `test/test_pool.py`, `test/test_sum_amax.py`,
+  `test/test_fmod.py` and `test/test_add_relu.py`.
 
 Not done yet:
 
@@ -711,11 +713,16 @@ Not done yet:
   dispatcher takes for subtype 12; and that the reduction's accumulator really is
   fp32 with an fp16 store, which the `bytes` param asserts and no test can
   observe;
-- `add_relu` (subtype 8) is in the emitter's table but unreachable: no ATen op
-  that `torch.export` produces maps onto `max(a+b, 0)`, so reaching it needs a
-  fusion pass in the caller's `transform_passes` (the pattern `mul_silu` and
-  `add_rms_norm` follow) and nothing here builds one. Nothing emits it today, so
-  nothing is at risk either.
+- **the fused rectified sum (`add_relu`, subtype 8) has never run anywhere but on
+  the host**, because no ATen op produces `max(a + b, 0)`: `relu(x + y)` reaches
+  the graph as two nodes and the DSP has no unary relu for the second one.
+  `FuseAddReluPass` in the caller's `transform_passes` rewrites the pair into the
+  node the emitter table has the subtype for, and `test/test_add_relu.py` pins
+  the rewrite, the command and its numbers -- all on the host. Unverified on
+  device: that the fp16 vector path's `max(a + b, 0)` propagates a NaN where
+  torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour is not documented here;
+  and that an add whose sum has another reader still gets the command, which is a
+  partition question rather than a kernel one.
 
 ## Open design points
 

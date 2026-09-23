@@ -293,6 +293,16 @@ SUPPORTED: List[OpSupport] = [
         "divisor_override has no command form and keeps the node portable.",
     ),
     OpSupport(
+        "et_hexagon.add_relu.default",
+        BINARY,
+        ARENA_FP16,
+        "The fused `max(a + b, 0)`, which no ATen op produces: it is reached by "
+        "putting `FuseAddReluPass` (add_relu.py) in the caller's "
+        "`transform_passes`, which rewrites `relu(x + y)` into this node. Both "
+        "operands must be fp16 tensors, and the operands broadcast the way the "
+        "other binary ops do.",
+    ),
+    OpSupport(
         "aten.fmod.Tensor",
         BINARY,
         ARENA_FP16,

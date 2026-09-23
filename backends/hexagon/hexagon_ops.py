@@ -20,7 +20,8 @@ import torch
 from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 
-# After rms_norm, which opens the et_hexagon namespace this fragment joins.
+# After rms_norm, which opens the et_hexagon namespace these fragments join.
+from executorch.backends.hexagon.add_relu import ADD_RELU
 from executorch.backends.hexagon.mul_silu import MUL_SILU
 from executorch.backends.hexagon.rms_norm import RMS_NORM
 from executorch.backends.hexagon.rope import ROPE
@@ -3171,6 +3172,7 @@ EMITTERS = {
     RMS_NORM: _emit_rms_norm,
     ADD_RMS_NORM: _emit_add_rms_norm,
     MUL_SILU: _binary("mul_silu"),
+    ADD_RELU: _binary("add_relu"),
     ROPE: _emit_rope,
     EMBEDDING: _emit_gather,
     INDEX_SELECT: _emit_gather,
@@ -3192,6 +3194,7 @@ BINARY_TARGETS = frozenset(
         exir_ops.edge.aten.minimum.default,
         exir_ops.edge.aten.fmod.Tensor,
         MUL_SILU,
+        ADD_RELU,
     }
 )
 
