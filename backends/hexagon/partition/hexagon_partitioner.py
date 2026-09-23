@@ -25,8 +25,10 @@ from executorch.backends.hexagon.hexagon_ops import (
     CAST_TARGETS,
     cat_region,
     CAT_TARGETS,
+    _dequantize_is_fused,
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
+    DQ_PER_CHANNEL,
     GETITEM,
     LAYER_NORM,
     layer_norm_getitem,
@@ -37,6 +39,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     NATIVE_LAYER_NORM,
     permute_region,
     PERMUTE_TARGETS,
+    quantized_matmul_is_refused,
     sdpa_targets,
     select_region,
     SELECT_TARGETS,
@@ -321,6 +324,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # fp32 emits the same commands as its fp16 twin. Any other width
             # would leave the kernels reading int64 bits as half floats.
             return False
+        if node.target is DQ_PER_CHANNEL:
+            # The weight-only pattern's dequantize. It is delegated only when
+            # every reader is a quantized matmul the GEMV kernels can run; the
+            # node itself emits nothing.
+            return _dequantize_is_fused(node)
         if node.target in sdpa and not _sdpa_fits_dsp_limits(node):
             return False
         if node.target in BINARY_TARGETS and not _broadcast_fits_dsp_limits(node):
@@ -330,6 +338,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in BMM_TARGETS and not _batched_operands_fit(node):
             return False
         if node.target in ADDMM_TARGETS and not _addmm_fits_flat_path(node):
+            return False
+        if quantized_matmul_is_refused(node):
+            # A weight-only matmul goes to a GEMV kernel, and the conditions the
+            # flat path just checked are not the ones that decide it.
             return False
         if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
             return False

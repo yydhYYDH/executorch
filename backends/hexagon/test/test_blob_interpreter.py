@@ -776,6 +776,7 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
     """Pins the set, so a new emitter is a failure here rather than a silent
     hole in the interpreter's coverage."""
     # 3 blit, 4 unary, 8 layer norm, 14 rope, 16 add+fused norm, 18 flash
-    # attention, 19 element-wise, 28 softmax, 29 reduction, 38 batch matmul.
+    # attention, 19 element-wise, 28 softmax, 29 reduction, 38 batch matmul,
+    # 41 q4a16 GEMV, 45 w8a16 GEMV.
     # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
-    assert _emitted_op_types() == {3, 4, 8, 14, 16, 18, 19, 28, 29, 38}
+    assert _emitted_op_types() == {3, 4, 8, 14, 16, 18, 19, 28, 29, 38, 41, 45}

@@ -40,6 +40,18 @@ DSP_OP_SOFTMAX = 28
 DSP_OP_REDUCTION = 29
 DSP_OP_BATCH_MATMUL = 38
 DSP_OP_FLASH_ATTN = 18
+# The quantized matmuls, from the DSP's enum (htp_command.h pins both numbers
+# with a static_assert). They take an fp16 activation and a packed low-bit
+# weight, and each kernel quantizes that activation to symmetric per-token int8
+# inside itself: what reaches the multiply is int4/int8, whatever the annotation
+# said. The GEMV entries are the M == 1 (decode) kernels -- they read K
+# contiguous fp16, which for one row is the row-major layout the graph already
+# holds, and write the output linear by output channel, so neither the 64-channel
+# activation blocking nor the output repack the prefill entries need is involved.
+# The prefill entries (Q4A16_FP16, Q4A16_BLOCK_FP16, W8A16_BLOCK_FP16) are not
+# emitted here.
+DSP_OP_MATMUL_Q4A16_GEMV_I8 = 41
+DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 
 # HtpOpsReductionType, from the DSP's eltwise_ops.cc.
 REDUCTION_MEAN = 3
@@ -1149,6 +1161,412 @@ def _weight_operand(ctx, rhs, m: int, k: int, n: int):
     return ctx.operand(rhs), False
 
 
+# The PT2E weight-only pattern: a matmul's weight reaches it through a
+# quantized_decomposed.dequantize_per_channel whose input is the stored low-bit
+# weight and whose scales are per output channel. The dequantize is fused into
+# the matmul, so it emits no command of its own.
+DQ_PER_CHANNEL = exir_ops.edge.quantized_decomposed.dequantize_per_channel.default
+
+
+class QuantizedWeight(NamedTuple):
+    """The parts of a dequantize_per_channel a quantized matmul reads."""
+
+    weight: torch.fx.Node
+    scale: torch.fx.Node
+    zero_point: torch.fx.Node
+    axis: int
+    bits: int
+
+
+def quantized_weight(node) -> Optional[QuantizedWeight]:
+    """The quantized weight behind a matmul operand, or None.
+
+    Only symmetric per-channel int4/int8 dequantizes are understood: the GEMV
+    kernels carry one fp32 scale per output channel and no zero point, so
+    anything else has to stay on a portable kernel rather than be read wrong.
+    """
+    if not isinstance(node, torch.fx.Node) or node.target is not DQ_PER_CHANNEL:
+        return None
+    args = node.args
+    if len(args) < 7:
+        return None
+    weight, scale, zero_point, axis = args[0], args[1], args[2], args[3]
+    quant_min, quant_max, dtype = args[4], args[5], args[6]
+    if not all(
+        isinstance(part, torch.fx.Node) for part in (weight, scale, zero_point)
+    ):
+        return None
+    if dtype is not torch.int8 or not isinstance(axis, int) or isinstance(axis, bool):
+        return None
+    if (
+        isinstance(quant_min, bool)
+        or isinstance(quant_max, bool)
+        or not isinstance(quant_min, int)
+        or not isinstance(quant_max, int)
+    ):
+        return None
+    span = quant_max - quant_min + 1
+    if span == 16:
+        bits = 4
+    elif span in (255, 256):
+        bits = 8
+    else:
+        return None
+    return QuantizedWeight(weight, scale, zero_point, axis, bits)
+
+
+def quantized_matmul_geometry(activation, quantized: QuantizedWeight):
+    """(m, k, n) of a matmul over a quantized weight, or None.
+
+    The weight is stored as [k, n] or as its transpose, whichever way the
+    quantizer spelled it: the axis the per-channel scale is indexed by is the
+    output-feature axis, and the packers put the weight back into the [k, n]
+    order the kernels read. A dynamic or non-1 M is refused here because only
+    the M == 1 GEMV kernels are wired up.
+    """
+    if not isinstance(activation, torch.fx.Node):
+        return None
+    lhs = activation.meta.get("val")
+    weight = quantized.weight.meta.get("val")
+    if not isinstance(lhs, torch.Tensor) or not isinstance(weight, torch.Tensor):
+        return None
+    if lhs.dim() != 2 or weight.dim() != 2:
+        return None
+    try:
+        if quantized.axis == 1:
+            k, n = int(weight.shape[0]), int(weight.shape[1])
+        elif quantized.axis == 0:
+            n, k = int(weight.shape[0]), int(weight.shape[1])
+        else:
+            return None
+        inner = lhs.shape[1]
+        if isinstance(inner, torch.SymInt):
+            return None
+        if int(inner) != k:
+            return None
+        m = lhs.shape[0]
+        if isinstance(m, torch.SymInt):
+            return None
+        return int(m), k, n
+    except (TypeError, ValueError):
+        return None
+
+
+def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
+    """Whether the M == 1 GEMV kernels can run this matmul.
+
+    Both GEMV entries require K to be a multiple of the 64-element block and N a
+    multiple of the 32-channel tile; a shape outside that has no kernel that
+    reads the packed weight, so it stays on a portable kernel.
+    """
+    geometry = quantized_matmul_geometry(activation, quantized)
+    if geometry is None:
+        return False
+    m, k, n = geometry
+    return m == 1 and k % 64 == 0 and n % 32 == 0
+
+
+def quantized_matmul_weight(node) -> Optional[torch.fx.Node]:
+    """The operand a matmul's weight-only weight arrives through, if any.
+
+    mm and addmm both put the weight last, and it is a `dequantize_per_channel`
+    rather than a tensor once PT2E has converted the graph.
+    """
+    if node.target in MM_TARGETS and len(node.args) > 1:
+        return node.args[1]
+    if node.target in ADDMM_TARGETS and len(node.args) >= 3:
+        return node.args[2]
+    return None
+
+
+def quantized_matmul_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this matmul is one the GEMV emitter can place, in full.
+
+    The support check, the dequantize's fusion test and the emitter all call
+    this, so the three cannot disagree: a node the partitioner delegates is one
+    the emitter accepts, and a dequantize is only fused away when every matmul
+    reading it is one this accepts. The emitter cannot fall back -- it is past
+    the partition boundary -- so a condition missing here is an export failure
+    or, worse, a command the kernel reads past.
+    """
+    if node.target in MM_TARGETS:
+        if len(node.args) < 2:
+            return False
+        bias, activation = None, node.args[0]
+    elif node.target in ADDMM_TARGETS:
+        if len(node.args) < 3:
+            return False
+        bias, activation = node.args[0], node.args[1]
+        # alpha and beta are the same two the plain path checks: alpha has no
+        # kernel here, and beta 0 or 1 is what decides whether the kernel's own
+        # bias operand is the graph's or absent.
+        if _scalar_arg(node, "alpha", 4, 1.0) != 1.0:
+            return False
+        beta = _scalar_arg(node, "beta", 3, 1.0)
+        if beta not in (0.0, 1.0):
+            return False
+        if beta == 0.0:
+            bias = None
+    else:
+        return False
+
+    quantized = quantized_weight(quantized_matmul_weight(node))
+    if quantized is None:
+        return False
+    value = activation.meta.get("val")
+    if not isinstance(value, torch.Tensor) or not value.is_contiguous():
+        # The kernel reads K contiguous fp16 with aligned 128-byte loads; a
+        # strided activation is one no kernel here walks.
+        return False
+    geometry = quantized_matmul_geometry(activation, quantized)
+    if geometry is None or not _quantized_gemv_fits(activation, quantized):
+        return False
+    if bias is None:
+        return True
+    return _bias_is_one_value_per_channel(bias, geometry[2])
+
+
+def quantized_matmul_is_refused(node: torch.fx.Node) -> bool:
+    """Whether this matmul carries a weight-only weight nothing here can run.
+
+    A matmul whose weight is the weight-only pattern goes to a GEMV kernel
+    rather than to the flat path, and that kernel has conditions of its own.
+    One that fails them has to fall back whole -- the dequantize with it -- so
+    this is asked about the matmul and answered for both.
+    """
+    if quantized_weight(quantized_matmul_weight(node)) is None:
+        return False
+    return not quantized_matmul_is_emittable(node)
+
+
+def _bias_is_one_value_per_channel(bias, n: int) -> bool:
+    """Whether addmm's bias is the n-element row the GEMV kernel adds.
+
+    The kernel adds one fp16 value per output channel, read as n contiguous
+    halfs, so a bias torch would broadcast to anything but a single row of n
+    has no command that can carry it: the kernel would read past it rather than
+    refuse. A scalar bias is the sharp case -- it is legal in the graph and
+    would have the kernel add whatever follows it in the arena.
+    """
+    if not isinstance(bias, torch.fx.Node):
+        return False
+    value = bias.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.numel() != n:
+        return False
+    try:
+        return tuple(torch.broadcast_shapes(tuple(value.shape), (1, n))) == (1, n)
+    except RuntimeError:
+        return False
+
+
+def _dequantize_is_fused(node: torch.fx.Node) -> bool:
+    """Whether every reader of this dequantize is a quantized matmul we can run.
+
+    The dequantize emits nothing; it exists so the matmul's weight arrives as a
+    pattern rather than as an int8 constant the support check would refuse. If
+    any reader is not a runnable quantized matmul, the whole chain has to stay
+    on the portable kernels, so the check is all-or-nothing: a dequantize
+    delegated on its own would be a partition whose output nothing ever wrote.
+    """
+    if not node.users or quantized_weight(node) is None:
+        return False
+    return all(
+        quantized_matmul_weight(user) is node
+        and quantized_matmul_is_emittable(user)
+        for user in node.users
+    )
+
+
+def pack_q4a16_gemv_weight(weight, scale, k: int, n: int) -> bytes:
+    """A (k, n) int4 weight in the vrmpy tile order the GEMV kernel reads.
+
+    Transcribed from the weight layout contract in
+    third-party/mnn-htp-ops/src/dsp/ops/matmul_q4block_gemv_i8.c. The weight
+    blob is `icP*ocP` tiles of 512 bytes, tile (ocTile y, kTile x) at
+    `(y*icP + x)*512`; inside a tile, group g holds the four k values
+    `x*32 + 4g + {0,1,2,3}` for the tile's 32 output channels, and byte
+    `g*64 + ocIn*2 + p` packs k = `x*32 + 4g + 2p` in its low nibble and
+    `+1` in its high nibble, each stored as `value + 8`. The per-output-channel
+    fp32 scales follow the tiles, which is where the kernel's `b_scale` pointer
+    lands (`weight + icP*ocP*512`, matmul_q4block_ops.cc).
+
+    What is checked, and what is not: the tile order above is written down
+    twice in the vendored tree -- in the kernel header and again in
+    include/dsp/vrmpy_to_hmx.h, which the vendored tree says was verified
+    byte-exact against MNN's own host reorder -- and the kernel's read path
+    agrees with it (unpack_vrmpy_weight_128 nibble-expands byte p lane-wise and
+    pairs the group at byte offset 128*l with `a_splat[kt*8 + 2l]`, while
+    `a_splat` is qa splatted 4 k values at a time, so the k a lane multiplies
+    are the k this packs). No DSP has run it: the upstream host reorder function
+    is not in the vendored tree (`src/host/` was dropped at vendoring), so the
+    hardware is the only thing left that could disagree, and nothing here has
+    compared against it.
+    """
+    import numpy as np
+
+    w = np.asarray(weight, dtype=np.int32)
+    if w.shape != (k, n):
+        raise RuntimeError(f"hexagon: q4a16 weight is {w.shape}, expected ({k}, {n})")
+    if k % 64 or n % 32:
+        raise RuntimeError(
+            f"hexagon: q4a16 needs K a multiple of 64 and N of 32, got {k}x{n}"
+        )
+    kp, np_ = k // 32, n // 32
+    padded = np.zeros((np_ * 32, kp * 32), dtype=np.int32)
+    padded[:n, :k] = np.clip(w.T, -8, 7) + 8
+    # (y, ocIn, x, kk) -> (y, x, ocIn, g, four)
+    t = padded.reshape(np_, 32, kp, 32).transpose(0, 2, 1, 3)
+    t = t.reshape(np_, kp, 32, 8, 4)
+    low = t[..., 0] | (t[..., 1] << 4)
+    high = t[..., 2] | (t[..., 3] << 4)
+    # (y, x, ocIn, g, p) -> (y, x, g, ocIn, p), which is the tile's byte order.
+    packed = np.stack([low, high], axis=-1).transpose(0, 1, 3, 2, 4)
+    tiles = packed.astype(np.uint8).reshape(np_ * kp, 512).tobytes()
+    scales = np.asarray(scale, dtype=np.float32).reshape(-1)
+    if scales.size != n:
+        raise RuntimeError(f"hexagon: q4a16 has {scales.size} scales, expected {n}")
+    return tiles + scales.tobytes()
+
+
+def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
+    """A (k, n) int8 weight in the HMX tile order the GEMV kernel reads.
+
+    Transcribed from the weight layout contract in
+    third-party/mnn-htp-ops/src/dsp/ops/matmul_w8a16_gemv_i8.c. The weight blob
+    is `kp*np` tiles of 1024 bytes, tile (oy, kx) at `(oy*kp + kx)*1024`; inside
+    a tile, group g covers the four k values `kx*32 + 4g + {0,1,2,3}` for the
+    tile's 32 output channels, and byte `g*128 + ocIn*4 + p` holds the weight
+    for k = `kx*32 + 4g + perm[p]` with perm = {0, 2, 1, 3}. The per-channel
+    fp32 scales are a separate operand the emitter stores on its own.
+
+    What is checked, and what is not: the pair-interleave is checked against the
+    kernel's own read path, which is the one place that has to agree with it --
+    `splat_group_permuted` swaps bytes 1 and 2 of each 4-k activation word, so
+    the activation arrives in the same {0, 2, 1, 3} order and every byte of a
+    32-bit vrmpy lane multiplies the weight of the same k. Nothing else here can
+    confirm the tile order offline: unlike the int4 layout, this one is written
+    down only in the kernel header, and the host reorder that produces it
+    (`reorderInt8SymWeightForHmx`) is not in the vendored tree. No DSP has run
+    it.
+    """
+    import numpy as np
+
+    w = np.asarray(weight, dtype=np.int32)
+    if w.shape != (k, n):
+        raise RuntimeError(f"hexagon: w8a16 weight is {w.shape}, expected ({k}, {n})")
+    if k % 64 or n % 32:
+        raise RuntimeError(
+            f"hexagon: w8a16 needs K a multiple of 64 and N of 32, got {k}x{n}"
+        )
+    kp, np_ = k // 32, n // 32
+    padded = np.zeros((np_ * 32, kp * 32), dtype=np.int32)
+    padded[:n, :k] = np.clip(w.T, -128, 127)
+    # (oy, ocIn, kx, kk) -> (oy, kx, ocIn, g, four), then permute the four k
+    # values within each group to the kernel's byte order.
+    t = padded.reshape(np_, 32, kp, 32).transpose(0, 2, 1, 3)
+    t = t.reshape(np_, kp, 32, 8, 4)[..., (0, 2, 1, 3)]
+    packed = t.transpose(0, 1, 3, 2, 4)
+    return packed.astype(np.uint8).reshape(np_ * kp, 1024).tobytes()
+
+
+def _emit_quantized_matmul(
+    node: torch.fx.Node,
+    ctx,
+    quantized: QuantizedWeight,
+    activation: torch.fx.Node,
+    bias: Optional[torch.fx.Node],
+) -> TensorRef:
+    """A quantized matmul as one M == 1 GEMV command.
+
+    The weight is packed at export into the layout the kernel reads and stored
+    in the weights section; the activation is the graph's own fp16 row, K
+    contiguous halfs, which the kernel then quantizes to int8 per token. The
+    low-bit weight never goes through `weight_bytes`: that narrows a fp32 tensor
+    to fp16 silently, which is right for a kernel that reads halfs and wrong for
+    one that reads packed int4, so this reads the stored tensor and packs it.
+    """
+    import numpy as np
+
+    geometry = quantized_matmul_geometry(activation, quantized)
+    if geometry is None:
+        raise RuntimeError("hexagon: quantized matmul has no static geometry")
+    m, k, n = geometry
+    if not quantized_matmul_is_emittable(node):
+        raise RuntimeError(
+            f"hexagon: quantized matmul {m}x{k}x{n} is not one the support check "
+            "admits; the partitioner should not have delegated it"
+        )
+
+    weight = ctx.constant_value(quantized.weight)
+    scale = ctx.constant_value(quantized.scale)
+    if weight is None or scale is None:
+        raise RuntimeError("hexagon: quantized matmul weight is not a constant")
+    zero_point = ctx.constant_value(quantized.zero_point)
+    if zero_point is not None and bool((zero_point != 0).any()):
+        raise RuntimeError("hexagon: quantized matmul weight is not symmetric")
+
+    weight = weight.detach().to(torch.int8).cpu().numpy()
+    scale = scale.detach().to(torch.float32).cpu().numpy().reshape(-1)
+    if quantized.axis == 0:
+        weight = weight.T
+    if weight.shape != (k, n):
+        raise RuntimeError(
+            f"hexagon: quantized matmul weight is {weight.shape}, expected ({k}, {n})"
+        )
+
+    out = ctx.result_for(node, n)
+    bias_ref = ABSENT if bias is None else ctx.operand(bias)
+    # The GEMV dispatch reads K and N out of params[1] and params[2] and the
+    # scale block count out of params[8] (execute_command.cc); params[0] is the
+    # M the commands that carry one use, and is not read here.
+    #
+    # params[8] == 1 is the per-channel granularity, not a placeholder: the
+    # kernel derives blocksize = K/nblk, so one block spans all of K and
+    # compute_oc_tile_i8 walks kp k-tiles reading the entry's 32 fp32 scales,
+    # one per output channel of the tile. That is exactly the per_channel
+    # scale the quantizer produced. The kernel's own producer contract
+    # (nblk = K/blocksize) describes blocksize 64 group quantization, which is
+    # a different weight operand this path does not build.
+    params = [1, k, n, 0, 0, 0, 0, 0, 1, 0]
+    if quantized.bits == 4:
+        packed = pack_q4a16_gemv_weight(weight, scale, k, n)
+        ctx.builder.add_op(
+            Op(
+                type=DSP_OP_MATMUL_Q4A16_GEMV_I8,
+                inputs=[ctx.operand(activation), ctx.builder.add_weights(packed), bias_ref],
+                outputs=[out],
+                params=params,
+            )
+        )
+    else:
+        packed = pack_w8a16_gemv_weight(weight, k, n)
+        ctx.builder.add_op(
+            Op(
+                type=DSP_OP_MATMUL_W8A16_GEMV_I8,
+                inputs=[
+                    ctx.operand(activation),
+                    ctx.builder.add_weights(packed),
+                    ctx.builder.add_weights(scale.astype(np.float32).tobytes()),
+                    bias_ref,
+                ],
+                outputs=[out],
+                params=params,
+            )
+        )
+    return ctx.record(node, out)
+
+
+def _emit_dequantize(node: torch.fx.Node, ctx) -> TensorRef:
+    """A dequantize is fused into the matmul that reads it.
+
+    The support check only admits one whose every reader is a quantized matmul
+    this can run, so nothing reads the result this returns: the matmul packs the
+    stored low-bit weight itself. ABSENT records that, and keeps the low-bit
+    weight from being materialized a second time.
+    """
+    return ctx.record(node, ABSENT)
+
+
 def _matmul_command(
     ctx,
     lhs,
@@ -1205,8 +1623,11 @@ def _matmul_command(
 
 
 def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
-    """aten.mm as BATCH_MATMUL with a single loop iteration."""
+    """aten.mm as BATCH_MATMUL, or as one GEMV when its weight is quantized."""
     lhs, rhs = node.args[0], node.args[1]
+    quantized = quantized_weight(rhs)
+    if quantized is not None:
+        return _emit_quantized_matmul(node, ctx, quantized, lhs, None)
     _require_arena_dtype(node, "mm")
     lhs_val, rhs_val = lhs.meta["val"], rhs.meta["val"]
     if not (lhs_val.is_contiguous() and rhs_val.is_contiguous()):
@@ -1284,6 +1705,14 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     """
     bias, lhs, rhs = node.args[0], node.args[1], node.args[2]
     beta = _scalar_arg(node, "beta", 3, 1.0)
+    quantized = quantized_weight(rhs)
+    if quantized is not None:
+        # The quantized kernel has a bias operand of its own, so the graph's bias
+        # goes to the kernel rather than to a second command; beta == 0 is the
+        # one other spelling the support check lets through, and it drops it.
+        return _emit_quantized_matmul(
+            node, ctx, quantized, lhs, None if beta == 0.0 else bias
+        )
     _require_arena_dtype(node, "addmm")
     m, k = lhs.meta["val"].shape
     contracted, n = rhs.meta["val"].shape
@@ -1922,6 +2351,9 @@ EMITTERS = {
     exir_ops.edge.aten.mm.default: _emit_mm,
     exir_ops.edge.aten.bmm.default: _emit_bmm,
     exir_ops.edge.aten.addmm.default: _emit_addmm,
+    # The weight-only quantized matmul's weight arrives through this node; the
+    # matmul emitter reads it and the node itself emits nothing.
+    DQ_PER_CHANNEL: _emit_dequantize,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,

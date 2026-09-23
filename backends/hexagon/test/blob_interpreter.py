@@ -19,6 +19,13 @@ the mistakes have been: a region that walks the wrong axis, a patch that lands i
 the wrong param, a stride in the wrong slot. All of those are byte-level and
 visible here.
 
+The arithmetic it does model is a model, not the kernels' instruction sequence:
+the quantized GEMV ops reproduce what the HVX code computes -- the per-token
+activation quantization and the scales -- in numpy, float by float, and numpy
+does not round the way a vector unit with two roundings in a row does in every
+last case. Read those ops as "the numbers this should produce", not as a
+bit-exact emulator.
+
 The structs come from `serialization/blob.py` rather than being restated, so a
 layout change cannot make this agree with a writer it no longer matches.
 """
@@ -39,6 +46,8 @@ BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
 FLASH_ATTN = 18
 ROPE = 14
+MATMUL_Q4A16_GEMV_I8 = 41
+MATMUL_W8A16_GEMV_I8 = 45
 
 #: fp16, the only element size any op this backend emits carries.
 FP16_BYTES = 2
@@ -771,6 +780,149 @@ def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     _store(arena, arena.address(command.outputs[0]), out.astype(np.float16).tobytes())
 
 
+def _unpack_vrmpy_int4(raw: bytes, k: int, n: int) -> np.ndarray:
+    """The inverse of `pack_q4a16_gemv_weight`, back to a signed (n, k) int4.
+
+    Tile (y, x) at `(y*icP + x)*512`; group g holds k = `x*32 + 4g + {0,1,2,3}`
+    for the tile's 32 output channels, and byte `g*64 + ocIn*2 + p` packs
+    k = `x*32 + 4g + 2p` low and `+1` high, each offset by 8.
+    """
+    kp, np_ = k // 32, n // 32
+    tiles = np.frombuffer(raw[: kp * np_ * 512], dtype=np.uint8).reshape(
+        np_, kp, 8, 32, 2
+    )
+    w = np.zeros((n, k), dtype=np.int32)
+    for y in range(np_):
+        for x in range(kp):
+            for g in range(8):
+                base = x * 32 + 4 * g
+                for oc_in in range(32):
+                    low = int(tiles[y, x, g, oc_in, 0])
+                    high = int(tiles[y, x, g, oc_in, 1])
+                    oc = y * 32 + oc_in
+                    w[oc, base + 0] = (low & 0x0F) - 8
+                    w[oc, base + 1] = (low >> 4) - 8
+                    w[oc, base + 2] = (high & 0x0F) - 8
+                    w[oc, base + 3] = (high >> 4) - 8
+    return w
+
+
+def _unpack_hmx_int8(raw: bytes, k: int, n: int) -> np.ndarray:
+    """The inverse of `pack_w8a16_gemv_weight`, back to a signed (n, k) int8.
+
+    Tile (oy, kx) at `(oy*kp + kx)*1024`; group g covers k = `kx*32 + 4g +
+    {0,1,2,3}` for the tile's 32 output channels, and byte `g*128 + ocIn*4 + p`
+    holds k = `kx*32 + 4g + perm[p]` with perm = {0, 2, 1, 3}.
+    """
+    kp, np_ = k // 32, n // 32
+    tiles = np.frombuffer(raw[: kp * np_ * 1024], dtype=np.int8).reshape(
+        np_, kp, 8, 32, 4
+    )
+    perm = (0, 2, 1, 3)
+    w = np.zeros((n, k), dtype=np.int32)
+    for oy in range(np_):
+        for kx in range(kp):
+            for g in range(8):
+                base = kx * 32 + 4 * g
+                for oc_in in range(32):
+                    oc = oy * 32 + oc_in
+                    for p in range(4):
+                        w[oc, base + perm[p]] = int(tiles[oy, kx, g, oc_in, p])
+    return w
+
+
+def _quantize_activation_row(a: np.ndarray):
+    """Per-token symmetric int8 quantization, as the GEMV kernels do it.
+
+    `quantize_activation_row` in both kernels takes the row's absmax, narrows
+    127/absmax to fp16, multiplies, narrows the product back to fp16, converts
+    that to int16 round-to-nearest, and finally clamps to [-127, 127] because
+    the int8 saturation would leave -128 in place. The two roundings are both
+    modelled: fp16(a*inv) is exact in fp32, so the narrowing here is the one the
+    kernel's Q6_Vhf_equals_Vqf16 does. This is an arithmetic model, not the
+    kernel's instruction sequence -- the HVX maximum, its horizontal reduction
+    and the saturation order are not reproduced, only what they compute.
+    """
+    x = a.astype(np.float32)
+    absmax = float(np.max(np.abs(x))) if x.size else 0.0
+    if absmax <= 0.0:
+        absmax = 1.0
+    inv = np.float16(127.0 / absmax)
+    scaled = (x * np.float32(inv)).astype(np.float16).astype(np.float32)
+    qa = np.rint(scaled)
+    return np.clip(qa, -127, 127).astype(np.int32), np.float32(absmax / 127.0)
+
+
+def _gemv_bias(command: Command, arena: Arena, index: int, n: int):
+    if len(command.inputs) <= index:
+        return None
+    ref = command.inputs[index]
+    if ref.space == ABSENT:
+        return None
+    return np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)[:n].astype(np.float32)
+
+
+def _run_matmul_q4a16_gemv(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_matmul_q4a16_gemv_i8, one scale block per output channel.
+
+    The weight is int4 in the vrmpy tile order with its fp32 scales appended,
+    the activation is fp16 and quantized to int8 per token, and the int dot
+    product is scaled once by the activation scale and the channel scale. The
+    kernel's N-block machinery is only exercised at one block here, which is
+    what the emitter writes.
+    """
+    k, n = params[1], params[2]
+    nblk = params[8] if len(params) > 8 else 1
+    if nblk != 1:
+        raise UnsupportedOp(f"blob: a q4a16 gemv over {nblk} scale blocks")
+    if k % 64 or n % 32:
+        raise UnsupportedOp(f"blob: a q4a16 gemv of {k}x{n}")
+
+    refs = list(command.inputs) + list(command.outputs)
+    dst = refs[len(command.inputs)]
+    raw = bytes(arena.view(command.inputs[1]))
+    w = _unpack_vrmpy_int4(raw, k, n)
+    tiles_bytes = (k // 32) * (n // 32) * 512
+    scales = np.frombuffer(raw[tiles_bytes:], dtype=np.float32)[:n]
+
+    a = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)[:k]
+    qa, sa = _quantize_activation_row(a)
+    acc = w @ qa
+    out = (sa * scales * acc.astype(np.float32)).astype(np.float16)
+    bias = _gemv_bias(command, arena, 2, n)
+    if bias is not None:
+        out = (out.astype(np.float32) + bias).astype(np.float16)
+    _store(arena, arena.address(dst), out.tobytes())
+
+
+def _run_matmul_w8a16_gemv(command: Command, params: List[int], arena: Arena) -> None:
+    """hmx_matmulw8a16block_gemv_i8, one scale block per output channel.
+
+    Same arithmetic as the q4a16 GEMV, but the weight is int8 in the HMX tile
+    order and its fp32 scales are a separate operand.
+    """
+    k, n = params[1], params[2]
+    nblk = params[8] if len(params) > 8 else 1
+    if nblk != 1:
+        raise UnsupportedOp(f"blob: a w8a16 gemv over {nblk} scale blocks")
+    if k % 64 or n % 32:
+        raise UnsupportedOp(f"blob: a w8a16 gemv of {k}x{n}")
+
+    refs = list(command.inputs) + list(command.outputs)
+    dst = refs[len(command.inputs)]
+    w = _unpack_hmx_int8(bytes(arena.view(command.inputs[1])), k, n)
+    scales = np.frombuffer(bytes(arena.view(command.inputs[2])), dtype=np.float32)[:n]
+
+    a = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)[:k]
+    qa, sa = _quantize_activation_row(a)
+    acc = w @ qa
+    out = (sa * scales * acc.astype(np.float32)).astype(np.float16)
+    bias = _gemv_bias(command, arena, 3, n)
+    if bias is not None:
+        out = (out.astype(np.float32) + bias).astype(np.float16)
+    _store(arena, arena.address(dst), out.tobytes())
+
+
 _EXECUTORS = {
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
@@ -782,6 +934,8 @@ _EXECUTORS = {
     ROPE: _run_rope,
     BATCH_MATMUL: _run_batch_matmul,
     FLASH_ATTN: _run_flash_attn,
+    MATMUL_Q4A16_GEMV_I8: _run_matmul_q4a16_gemv,
+    MATMUL_W8A16_GEMV_I8: _run_matmul_w8a16_gemv,
 }
 
 

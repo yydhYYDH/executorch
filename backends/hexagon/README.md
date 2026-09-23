@@ -233,6 +233,8 @@ produces wrong numbers, not an error. These are the facts the emitters in
 | BINARY_ELEMENTWISE (19) | outSize, in0Size, in1Size, kind, bytes, inputBytes, inputIsFloat, outputIsFloat | 2 in, 1 out |
 | SOFTMAX (28) | outside, channel, inside, bytes (must be 2) | 1 in, 1 out |
 | LAYER_NORM (8) | outer, inner, **epsilon as float bits**, rmsNorm | src, gamma, beta; 1 out |
+| MATMUL_Q4A16_GEMV_I8 (41) | (unused), K, N, 0…0, **scale block count**, asymmetric | activation, weight+scales, bias; 1 out |
+| MATMUL_W8A16_GEMV_I8 (45) | (unused), K, N, 0…0, **scale block count** | activation, weight, scales, bias; 1 out |
 
 Things that bite:
 
@@ -249,18 +251,79 @@ Things that bite:
   params than a command carries, so only same-shape and scalar operands work;
   the emitter raises instead of emitting a command that would leave the output
   stale.
-- **q4a16 activations and outputs are pack64-blocked**, `[ceil(K/64)][M][64]` and
-  `[ceil(N/64)][M][64]`, not row-major. This coincides with row-major only when
-  `M == 1` or the dimension is at most 64. Prefill (`M > 1`) therefore needs a
-  host-side repack, and that is the main reason the quantized matmul is not
-  wired up yet.
+- **The fp16 quantized matmul's activations and outputs are pack64-blocked**,
+  `[ceil(K/64)][M][64]` and `[ceil(N/64)][M][64]`, not row-major. This coincides
+  with row-major only when `M == 1` or the dimension is at most 64, which is why
+  prefill needs a host-side repack. The integer GEMV entries (41, 45) that the
+  M == 1 path uses read and write linearly instead, so they need no repack --
+  see "Quantized matmuls" below.
 - **`htp_ops_matmul_q4a16_fp16` returns success even when the kernel fails.** The
-  block variant propagates the error; the plain one logs and returns 0.
-- **The q4a16 weight tensor also carries its scales**: tiles of `icP*ocP*512`
-  bytes followed by `ocP*32` fp16 scales, with `icP=(k+31)/32`,
-  `ocP=(n+31)/32`. `DSP_OP_WEIGHT_REORDER_INT4` produces exactly that layout, so
-  weight packing can be delegated to the DSP at init rather than reimplemented
-  on the host.
+  block variant propagates the error; the plain one logs and returns 0. The two
+  GEMV entries propagate and are checked by `execute_command.cc`.
+- **The fp16 q4a16 weight tensor also carries its scales**: tiles of
+  `icP*ocP*512` bytes followed by `ocP*32` **fp16** scales, with
+  `icP=(k+31)/32`, `ocP=(n+31)/32`. `DSP_OP_WEIGHT_REORDER_INT4` produces exactly
+  that layout, so weight packing can be delegated to the DSP at init rather than
+  reimplemented on the host. The **integer** GEMV entries use **fp32** scales,
+  which is what `hexagon_ops.pack_q4a16_gemv_weight` appends; the two layouts are
+  not interchangeable.
+
+## Quantized matmuls
+
+Weight-only quantization lands on the two integer GEMV entries, for `M == 1`
+(decode). The AOT side is `quantizer.py`, the pattern and packers are in
+`hexagon_ops.py`:
+
+```
+quantizer = get_hexagon_quantizer("q4a16")          # or "w8a16"
+prepared  = prepare_pt2e(exported.module(), quantizer)
+prepared(*calibration_inputs)
+converted = convert_pt2e(prepared)                  # -> dequantize_per_channel
+blob      = HexagonBackend.preprocess(to_edge(exported).exported_program(), [])
+```
+
+What the graph says and what the DSP does are different, and this is the part
+worth reading twice:
+
+- **The annotation is weight-only.** No observer is inserted on an activation,
+  so activations keep the width the graph was exported at (the runtime narrows a
+  fp32 operand to fp16 at the arena boundary) and the weight is symmetric,
+  per-output-channel, int4 or int8.
+- **The arithmetic is int8 x int4/int8.** Both kernels quantize the fp16
+  activation *inside the kernel*, per token: absmax over the row, scale
+  `absmax/127`, round, clamp to `[-127, 127]`. There is no calibration for it
+  and no static activation scale anywhere. The scheme names (`q4a16`, `w8a16`)
+  describe the operand widths at the command boundary, not the multiply.
+- **True static-scale w8a8 is not reachable from here.** No vendored kernel
+  takes an int8 activation tensor, and the runtime reads every non-`Float` arena
+  entry as two bytes per element. A w8a8 graph would need both of those to
+  change.
+- The accuracy cost is therefore the weight error *plus* the per-token int8
+  activation error, and `test/test_hexagon_quantizer.py` measures it against the
+  dequantized reference instead of assuming it away.
+
+The granularity is one fp32 scale per output channel, which is what the kernel
+sees as `scale_block_num == 1`: it derives `blocksize = K/nblk`, so that one
+block spans all of K. The kernel's own producer contract (`nblk = K/blocksize`)
+describes 64-element group quantization instead, which would be a different
+scale operand; nothing here builds that.
+
+Delegated only when all of these hold, since the emitter is past the partition
+boundary and cannot fall back: `M == 1`; `K % 64 == 0` and `N % 32 == 0` (the
+kernels' own guards, which they answer with an error code); a symmetric
+per-channel dequantize whose every reader is a runnable quantized matmul; and,
+for `addmm`, `alpha == 1`, `beta` in `{0, 1}` and a bias of exactly `n` values
+(the kernel adds `n` contiguous halfs and would otherwise read past the
+operand). Prefill (`M > 1`) needs the pack64 activation and output repack, so it
+stays on the portable kernels.
+
+Verified offline: the pattern is matched, the weight is packed at export, the
+command decodes, and `test/blob_interpreter.py` runs the bytes with the same
+arithmetic the kernels use. Not verified: no DSP has executed either entry, and
+the packers' tile orders are transcriptions -- the int4 one is written down
+twice in the vendored tree and cross-checked against the kernel's read path, the
+int8 one only against the kernel's own permuted activation splat. The speedup,
+the real numbers and the FastRPC/skel deployment all need a device.
 
 ## Status
 
@@ -299,7 +362,13 @@ Working and verified without a device:
   `preprocess` returns deserializes to the same bytes the blob left out, a blob
   that externalizes nothing is byte-identical to one written before the option
   existed, and a blob whose weight is missing or short is refused
-  (`test/test_external_weights.py`).
+  (`test/test_external_weights.py`);
+- a weight-only quantized matmul goes all the way through: the PT2E-annotated
+  graph partitions into one delegate, `preprocess` emits one
+  `MATMUL_Q4A16_GEMV_I8` (41) or `MATMUL_W8A16_GEMV_I8` (45) command, and the
+  host interpreter reads the blob back and reproduces the kernels' arithmetic
+  within a few percent of the dequantized reference. See "Quantized matmuls" for
+  what that arithmetic is and what is still unverified.
 
 Not done yet:
 
@@ -308,15 +377,19 @@ Not done yet:
   a host model of the same command stream. The simulator is a functional model,
   so it says what the kernels compute and nothing about what the DSP costs or
   whether the FastRPC path and the skeleton deployment work;
-- the external-weight copy at `init()` and the tile-budget override, which run
-  only inside the delegate and are therefore code-only here. This checkout cannot
-  write a `.pte` at all -- `exir/_serialize/program.fbs` is missing -- so the
-  `.pte`/`.ptd` pair is exercised through the store `preprocess` returns, not
-  through files on disk;
-- of the 20 registered emitters, the ones that have produced a command on a real
-  graph are `mm`, the binary and unary families, `custom_sdpa`, `rms_norm`,
-  `mul_silu`, `update_cache` and the narrowing blits. The view and cast
-  emitters have run as well but emit nothing by design;
+- the external-weight copy at `init()` and the tile-budget override run only
+  inside the delegate, so they are code-only here. The `.pte`/`.ptd` pair is
+  checked on disk instead: `test_external_weights.py` writes a real `.pte`, reads
+  the `.ptd` back and pins the exact account `len(external .pte) ==
+  len(inline .pte) - weight + trailer` (9860 - 8192 + 72 = 1740). That test
+  needs the generated `exir/_serialize/{program,scalar_type}.fbs`, which are
+  gitignored and have to be copied into a fresh worktree; without them it skips
+  rather than passing silently;
+- of the registered emitters, the ones that have produced a command on a real
+  graph are `mm` (including the quantized weight-only form), `bmm`, the binary
+  and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache` and
+  the narrowing blits. The view, cast, getitem and dequantize emitters have run
+  as well but emit nothing by design;
 - attention delegates on fp32 operands that the runtime narrows to fp16 on the
   way into the arena, so the DSP runs fp16 attention. That trade is deliberate
   but unmeasured, and it means a working delegation is not yet a correct one;
@@ -324,7 +397,10 @@ Not done yet:
   `mean`/`rsqrt`/`sigmoid` chain is fused into an `rms_norm` op and the casts
   around it are absorbed, since the arena holds fp16 and the vendored kernels
   take fp16 in and out;
-- the quantized matmul path, which needs the pack64 repack described above;
+- the quantized matmul path is wired up for `M == 1` only. Prefill needs the
+  pack64 activation and the output repack, and neither is built: the GEMV
+  entries wired up here read a single row linearly, which is why they needed no
+  repack at all;
 - softmax is delegated on its last axis only. The kernel's strided path, for a
   reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
