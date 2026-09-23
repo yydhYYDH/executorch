@@ -465,6 +465,80 @@ derived by hand from that source, and end to end against `torch.embedding` throu
 `blob_interpreter`. What none of that covers is the device: see below.
 
 
+## Delegating a vision tower's attention
+
+A vision transformer's attention is the decomposed form: split the projections
+into heads, `q @ k.T * scale`, `softmax`, `@ v`, merge the heads back. Lowered as
+it stands, a ViT block is three partitions -- the three projections, the
+attention core (two `BATCH_MATMUL` and one `SOFTMAX`), and the output projection
+-- with all four head transposes left on the portable kernels, because a permute
+at a partition boundary is not something the backend can keep. One
+`VISION_ATTENTION_FP16` replaces the middle of that, so the shape is worth
+having; what it costs is that the kernel reads its operands in the layout the
+*cache* path uses, and the two are not the same.
+
+`htp_ops_vision_attention_fp16` (`third-party/mnn-htp-ops/src/dsp/attention_entry.cc:18`)
+is unmasked, non-causal, and walks a token-major source: a token's rows are
+`heads * headDim` apart (`:36`), and the query, key, value and
+output rows are all `((b * tokens + t) * heads * headDim) + h * headDim + d`
+(`:41`, `:43`, `:57`, `:61`). That is `[batch, tokens, heads, headDim]`, not the
+`[batch, heads, tokens, headDim]` a `bmm` in torch already holds. An emitter
+cannot paper over that difference -- the head transpose is not a detail of the
+command, it is part of which tensor the command is handed -- so the operands have
+to arrive already token-major, which means the fusion has to consume the
+transposes rather than sit after them.
+
+That is what `vision_attention.py` does. `et_hexagon.vision_attention` is the
+whole pattern stated once, with the operands *under* the head splits, and
+`FuseVisionAttention` (opt-in, via `transform_passes`) replaces the transpose
+that follows the second matmul with that one node. Its operands are then exactly
+the `[batch, tokens, heads, headDim]` views, its own output is that layout, and
+the caller's dim-order copy and view back to `[batch, tokens, embed]` are
+aliases that emit nothing. In a ViT block the whole thing becomes one delegate
+with ten commands -- the three projections, their bias adds and their head-split
+blits, the attention, and the output projection -- where before the same block
+was three partitions and four portable permutes.
+
+Two things are refused where they are seen rather than in the emitter, because a
+refusal during emit fails the whole export:
+
+- **a mask, and a causal bias.** The command binds three operands, so the
+  dispatcher hands the kernel a null mask pointer, so `maskStride > 0`
+  (`attention_entry.cc:49`) never passes and no mask is read. The emitter could
+  write any stride it liked and it would never be consulted -- which is exactly
+  how masked attention came to be silently ignored in the FLASH_ATTN emitter,
+  where `mask_stride = -1` looks like a mask is being passed and means the
+  opposite. Here there is no operand for a mask to arrive in, and the fusion
+  pattern refuses the shapes a mask would have (`_Attention(masked=True)` and
+  `is_causal=True` both stay portable).
+- **anything but a square attention.** Query and key runs share one `tokens`
+  param, so a cross-attention with different lengths is another function.
+
+`scaled_dot_product_attention` decomposes to the same matmuls plus `row_guard`,
+which is where the masked-row guard lives. The kernel returns NaN for a row of
+all `-inf` and the guard returns 0, so the guard is not the identity on the
+inputs attention can actually see, and the pattern refuses it: a graph written
+with `F.scaled_dot_product_attention` does not fuse even when it is not causal.
+The explicit `(q @ k.T) * scale -> softmax -> @ v` form, which is what
+`CLIPAttention` and `SiglipAttention` write, does.
+
+`batch`, `heads` and `headDim` reach the command as params, so they have to be
+static; `tokens` is patched from the run-time sequence length the way the matmul
+patches its rows, and the workspace is sized for the longest export. The
+workspace is not optional: the kernel aligns the pointer up by 127 bytes and
+refuses the command without `tokens * 4 + 128` (`:26-31`), which is why the
+command has two outputs and the second one is scratch.
+
+Where the numbers here come from: the interpreter's
+`vision_attention_kernel_offset` is a transcription of the kernel's own index
+expression and `vision_attention_row_major_offset` is the same index derived from
+the shape, sharing no term with it, and `test/test_vision_attention.py` checks
+them against each other over a shape with four different extents, checks that the
+head-major reading would disagree, and then runs the real command stream end to
+end against torch's own answer. What none of that covers is the device: see
+below.
+
+
 ## Status
 
 Working and verified without a device:
@@ -518,6 +592,12 @@ Working and verified without a device:
   host interpreter reads the blob back and reproduces the kernels' arithmetic
   within a few percent of the dequantized reference. See "Quantized matmuls" for
   what that arithmetic is and what is still unverified.
+- a vision attention block goes all the way through: a three-projection ViT
+  attention over a dynamic patch count partitions into one delegate, whose blob
+  carries one `VISION_ATTENTION_FP16` (43) command with the geometry the graph
+  had, three token-major operands and the fp32 workspace the kernel requires. The
+  host interpreter runs that command and reproduces the module to 3.1e-4 in fp16.
+  See "Delegating a vision tower's attention".
 
 Not done yet:
 
@@ -537,9 +617,9 @@ Not done yet:
 - of the registered emitters, the ones that have produced a command on a real
   graph are `mm` (including the quantized weight-only form), `bmm`, the binary
   and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache`,
-  `mean`, `embedding`/`index_select`/`index.Tensor` and the narrowing and
-  transpose blits. The view, cast, getitem and dequantize emitters have run as
-  well but emit nothing by design;
+  `mean`, `embedding`/`index_select`/`index.Tensor`, `vision_attention` and the
+  narrowing and transpose blits. The view, cast, getitem and dequantize emitters
+  have run as well but emit nothing by design;
 - **the row gather has never run anywhere but on the host.** Its tiling is a
   second implementation of the same source, so the tests agree with the reading
   and not with the hardware. Unverified on device: that the fp16 path's tile
@@ -558,6 +638,22 @@ Not done yet:
   pack64 activation and the output repack, and neither is built: the GEMV
   entries wired up here read a single row linearly, which is why they needed no
   repack at all;
+- **the vision attention has never run anywhere but on the host.** Its layout is
+  a second reading of `attention_entry.cc`, and the interpreter agrees with that
+  reading rather than with the hardware. Unverified on device: the layout itself
+  (`[batch, tokens, heads, headDim]` against the kernel's own stride arithmetic,
+  which is the single highest-risk claim in the emitter); the param order
+  (`batch, tokens, heads, headDim, scale, maskStride, workspaceBytes`);
+  `floatParams[4]` reading the scale's bit pattern; the workspace operand being
+  the second output and being large enough after the kernel's own 128-byte
+  alignment; and the scale's fp32 precision, which the kernel applies per score
+  while this backend's `bmm` and `softmax` are separate commands. Nothing here
+  has been through hexagon-sim, and no build was run for it;
+- **no multimodal model runs end to end.** The vision attention is one block of a
+  vision tower, and a tower still needs the patch embedding, the layer norms, the
+  MLP and the projection into the text embedding space; on this backend the
+  `DecomposePatchEmbed` pass handles the conv-to-matmul step only. Nothing in
+  this checkout splices a tower's output into a language model's inputs.
 - softmax is delegated on its last axis only. The kernel's strided path, for a
   reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by

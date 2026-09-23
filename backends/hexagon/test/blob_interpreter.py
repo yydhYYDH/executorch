@@ -49,6 +49,7 @@ ROPE = 14
 MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
 SHARED_GATHER = 23
+VISION_ATTENTION_FP16 = 43
 
 #: The isInt4 slot of htp_ops_shared_gather that names an fp16 table, which is
 #: the only kind this backend stores; 2 and 3 are int4 and int8 tables.
@@ -785,6 +786,128 @@ def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     _store(arena, arena.address(command.outputs[0]), out.astype(np.float16).tobytes())
 
 
+def vision_attention_kernel_offset(
+    batch_index: int,
+    token: int,
+    head: int,
+    dimension: int,
+    tokens: int,
+    heads: int,
+    head_dim: int,
+) -> int:
+    """The element `htp_ops_vision_attention_fp16` reads one row's value at.
+
+    A transcription of the kernel rather than the inverse of a formula, so the
+    two can disagree: `attention_entry.cc:36` makes a token's stride
+    `heads * headDim`, `:41` and `:43` index the query and the key rows as
+    `((b * tokens + q) * tokenStride) + h * headDim`, the value rows the same
+    way at `:61`, and the output rows at `:57`. The dimension runs contiguously
+    inside that. That is a token-major layout -- heads inside a token's row --
+    and not the head-major one a batched matmul would read.
+    """
+    token_stride = heads * head_dim
+    return ((batch_index * tokens + token) * token_stride) + head * head_dim + dimension
+
+
+def vision_attention_row_major_offset(
+    batch_index: int,
+    token: int,
+    head: int,
+    dimension: int,
+    tokens: int,
+    heads: int,
+    head_dim: int,
+) -> int:
+    """The same element, derived from the shape instead of from the source.
+
+    A `[batch, tokens, heads, headDim]` tensor in row-major order holds its
+    element `(b, t, h, d)` at the products of the extents to its right. Written
+    that way it shares no expression with the transcription above.
+    """
+    return ((batch_index * tokens + token) * heads + head) * head_dim + dimension
+
+
+def _run_vision_attention(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_vision_attention_fp16 (`attention_entry.cc:18-70`).
+
+    Unmasked, non-causal attention over three tensors that are already
+    token-major: every query row reads every key, which is what a vision tower
+    computes and what a language model's causal attention does not. The mask
+    operand is absent here -- bound to nothing, which is the pointer the
+    dispatcher passes for a slot the command does not carry -- and the second
+    output is the fp32 score row the kernel uses as scratch.
+
+    The arithmetic is modelled rather than emulated: the kernel exponentiates
+    with an HVX approximation (`hvx_my_exp2_vsf`) and accumulates a row in
+    fp32, so a comparison against this has to be a tolerance, and the shape of
+    the computation is what is being checked here.
+    """
+    batch, tokens, heads, head_dim = params[:4]
+    scale = struct.unpack("<f", struct.pack("<i", params[4]))[0]
+    mask_stride, workspace_bytes = params[5], params[6]
+    if mask_stride > 0:
+        raise UnsupportedOp("blob: a masked vision attention is not modelled")
+    # The kernel refuses the command below this (`attention_entry.cc:26-29`),
+    # because it aligns the buffer up by 127 bytes and then writes `tokens`
+    # fp32 scores into it.
+    if workspace_bytes < tokens * 4 + 127:
+        raise UnsupportedOp(
+            f"blob: a workspace of {workspace_bytes} bytes cannot hold "
+            f"{tokens} fp32 scores"
+        )
+    count = batch * tokens * heads * head_dim
+    refs = list(command.inputs) + list(command.outputs)
+    if any(arena.view(ref).nbytes < count * FP16_BYTES for ref in refs[:4]):
+        raise UnsupportedOp(
+            f"blob: a vision attention operand is short of {count} values"
+        )
+
+    def rows(ref):
+        values = np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)
+        out = np.zeros(count, dtype=np.float32)
+        for b in range(batch):
+            for token in range(tokens):
+                for head in range(heads):
+                    for dimension in range(head_dim):
+                        at = vision_attention_kernel_offset(
+                            b, token, head, dimension, tokens, heads, head_dim
+                        )
+                        out[
+                            (b * tokens + token) * heads * head_dim
+                            + head * head_dim
+                            + dimension
+                        ] = values[at]
+        return out
+
+    query = rows(refs[0]).reshape(batch * tokens, heads, head_dim)
+    key = rows(refs[1]).reshape(batch * tokens, heads, head_dim)
+    value = rows(refs[2]).reshape(batch * tokens, heads, head_dim)
+
+    result = np.zeros((batch * tokens, heads, head_dim), dtype=np.float32)
+    for row in range(batch * tokens):
+        # The kernel's outer loop is over the batch (`attention_entry.cc:37`),
+        # so a query row reads the keys of its own batch and no others.
+        batch_index = row // tokens
+        window = slice(batch_index * tokens, (batch_index + 1) * tokens)
+        for head in range(heads):
+            scores = (query[row, head] @ key[window, head].T) * scale
+            weights = np.exp(scores - scores.max())
+            weights /= weights.sum()
+            result[row, head] = weights @ value[window, head]
+
+    flat = np.zeros(count, dtype=np.float16)
+    for b in range(batch):
+        for token in range(tokens):
+            for head in range(heads):
+                for dimension in range(head_dim):
+                    flat[
+                        vision_attention_kernel_offset(
+                            b, token, head, dimension, tokens, heads, head_dim
+                        )
+                    ] = result[b * tokens + token, head, dimension]
+    _store(arena, arena.address(command.outputs[0]), flat.tobytes())
+
+
 def _unpack_vrmpy_int4(raw: bytes, k: int, n: int) -> np.ndarray:
     """The inverse of `pack_q4a16_gemv_weight`, back to a signed (n, k) int4.
 
@@ -999,6 +1122,7 @@ _EXECUTORS = {
     MATMUL_Q4A16_GEMV_I8: _run_matmul_q4a16_gemv,
     MATMUL_W8A16_GEMV_I8: _run_matmul_w8a16_gemv,
     SHARED_GATHER: _run_shared_gather,
+    VISION_ATTENTION_FP16: _run_vision_attention,
 }
 
 

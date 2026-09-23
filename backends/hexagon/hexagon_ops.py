@@ -26,6 +26,7 @@ from executorch.backends.hexagon.rms_norm import RMS_NORM
 from executorch.backends.hexagon.rope import ROPE
 from executorch.backends.hexagon.row_guard import ROW_GUARD
 from executorch.backends.hexagon.serialization.blob import ABSENT, Op, TensorRef
+from executorch.backends.hexagon.vision_attention import VISION_ATTENTION
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.sym_util import eval_upper_bound
 
@@ -55,6 +56,12 @@ DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 # The row gather, from the same enum: one command reads selectSize rows out of
 # an fp16 table the export step laid out as 32x32 tiles.
 DSP_OP_SHARED_GATHER = 23
+# The vision tower's attention, from the same enum. Unmasked and non-causal: it
+# reads query, key and value as [batch, tokens, heads, headDim] -- heads inside
+# a token's row -- and writes the result in that layout, which is why the fused
+# op it serves carries the operands under the head transposes rather than the
+# head-major tensors a matmul wants.
+DSP_OP_VISION_ATTENTION_FP16 = 43
 
 # HtpOpsReductionType, from the DSP's eltwise_ops.cc.
 REDUCTION_MEAN = 3
@@ -2260,7 +2267,8 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     # attention_entry.cc strides it by tokens * heads * headDim, which is the
     # layout the upstream caller builds by transposing a head-major cache
     # (examples/models/llama/source_transformation/sdpa.py), and the layout the
-    # vision path hands the same kernel. Slots four and five are the packed cache
+    # vision entry point reads its operands in (attention_entry.cc:36,41).
+    # Slots four and five are the packed cache
     # the kernel writes, not the cache itself -- attn_hmx_k_tile_index lays it
     # out by tile: 256 tokens per block, eight 32-row sequence tiles per block,
     # one 1024-element tile per (32 dim x 32 seq) sub-block. Any cache length
@@ -2371,6 +2379,104 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     if ctx.is_dynamic_dim(q_shape[1]):
         ctx.add_dynamic_patch(op_index, 0, 1, 0)
         ctx.add_dynamic_patch(op_index, 2, 1, 0)
+    return ctx.record(node, out)
+
+
+# The vision tower's attention. `et_hexagon.vision_attention` is the decomposed
+# pattern -- head split, q k^T, scale, softmax, v -- stated once, and its
+# operands are the tensors under the head transposes because that is the layout
+# the kernel walks.
+VISION_ATTENTION_TARGETS = frozenset({VISION_ATTENTION})
+
+
+def _vision_attention_workspace_bytes(length) -> int:
+    """htp_ops_vision_attention_fp16's scratch, as a function of the token count.
+
+    The kernel wants `tokens` fp32 scores and aligns the pointer up by 127 bytes
+    itself (`attention_entry.cc:26-31`); it refuses the command outright below
+    that, and there is no workspace it will allocate for itself.
+    """
+    return int(length) * 4 + 128
+
+
+def vision_attention_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this fused attention is one the kernel can be handed.
+
+    The batch, head count and head width reach the command as params and are
+    never patched, so a symbolic one would emit the traced example and compute a
+    different function at run time. The token count is the one number the
+    run-time sequence length can supply, which is what a dynamic patch is for.
+    """
+    if node.target not in VISION_ATTENTION_TARGETS or len(node.args) < 4:
+        return False
+    query, key, value = node.args[0], node.args[1], node.args[2]
+    if not all(isinstance(operand, torch.fx.Node) for operand in (query, key, value)):
+        return False
+    shape = _shape_of(query)
+    if len(shape) != 4 or _shape_of(key) != shape or _shape_of(value) != shape:
+        return False
+    if any(isinstance(dim, torch.SymInt) for dim in (shape[0], shape[2], shape[3])):
+        return False
+    if any(not int(dim) > 0 for dim in (shape[0], shape[2], shape[3])):
+        return False
+    # The scale is a param rather than an operand, so it has to be a number the
+    # pass could read out of the graph at export time.
+    scale = node.args[3]
+    return isinstance(scale, (int, float)) and not isinstance(scale, bool)
+
+
+def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
+    """et_hexagon.vision_attention as one VISION_ATTENTION_FP16.
+
+    `execute_command.cc:784-789` hands the kernel input 0/1/2 as query, key and
+    value, slot three as the mask, the first output as the result and the second
+    as the workspace, with `intParams[0..3]` the batch, token count, head count
+    and head width, `floatParams[4]` the scale, `intParams[5]` the mask stride
+    and `intParams[6]` the workspace size. Only three operands are bound, so the
+    dispatcher passes a null mask pointer and the kernel's `maskStride > 0` test
+    never reads one (`attention_entry.cc:49`) -- a mask has no operand to hide
+    in, which is the mistake the FLASH_ATTN emitter made with `-1`.
+
+    The operands are bound as the graph carries them: `[batch, tokens, heads,
+    headDim]`, which `attention_entry.cc:36,41,57` strides by `heads * headDim`
+    per token and reads `headDim` at a time inside it.
+    """
+    if not vision_attention_is_emittable(node):
+        raise RuntimeError(f"hexagon: vision attention shape {_shape_of(node.args[0])}")
+    query, key, value = node.args[0], node.args[1], node.args[2]
+    scale = float(node.args[3])
+    batch, tokens, heads, head_dim = _shape_of(query)
+    batch, heads, head_dim = int(batch), int(heads), int(head_dim)
+    # The token count is a param the run-time length recomputes, so the value
+    # that goes in the blob is the longest the export declared.
+    token_upper = ctx.upper_bound(tokens)
+    workspace_bytes = _vision_attention_workspace_bytes(token_upper)
+
+    out = ctx.result_for(node, _numel(node))
+    workspace = ctx.builder.add_activation(
+        workspace_bytes,
+        dynamic_layout=ctx.dynamic_bytes_for_function(
+            workspace_bytes, _vision_attention_workspace_bytes
+        ),
+    )
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_VISION_ATTENTION_FP16,
+            inputs=[ctx.operand(query), ctx.operand(key), ctx.operand(value)],
+            outputs=[out, workspace],
+            params=[
+                batch,  # batch
+                token_upper,  # tokens, the same count for query and key
+                heads,  # heads
+                head_dim,  # headDim
+                _float_bits(scale),  # scale, read through a float* cast
+                0,  # maskStride, which no operand lets the kernel read
+                workspace_bytes,  # providedWorkspaceBytes
+            ],
+        ),
+    )
+    _patch_dynamic_product(ctx, op_index, [tokens], 1)
     return ctx.record(node, out)
 
 
@@ -2643,6 +2749,8 @@ EMITTERS = {
     EMBEDDING: _emit_gather,
     INDEX_SELECT: _emit_gather,
     INDEX_TENSOR: _emit_gather,
+    # A vision tower's attention, which `FuseVisionAttention` states once.
+    VISION_ATTENTION: _emit_vision_attention,
 }
 
 # Ops whose operands must match the output's shape or be scalar. The support

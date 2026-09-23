@@ -55,6 +55,11 @@ W8A16_GEMV = "DSP_OP_MATMUL_W8A16_GEMV_I8"
 # The row gather. One command reads a run of rows out of a fp16 table whose
 # bytes the export step rearranged into the 32x32 tiles the kernel walks.
 SHARED_GATHER = "DSP_OP_SHARED_GATHER"
+# The vision tower's attention. One command computes a whole unmasked
+# `softmax(q k^T scale) v` over operands the export laid out token-major, which
+# is why the fused op carries the head transposes rather than the head-major
+# tensors a matmul wants.
+VISION_ATTENTION = "DSP_OP_VISION_ATTENTION_FP16"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -346,6 +351,20 @@ SUPPORTED: List[OpSupport] = [
         "fp16; fp32 narrowed on entry",
         "Same emitter as llama.custom_sdpa.default; both overloads are registered.",
     ),
+    OpSupport(
+        "et_hexagon.vision_attention.default",
+        VISION_ATTENTION,
+        ARENA_FP16,
+        "Inserted by FuseVisionAttention, which is opt-in (transform_passes). Three "
+        "fp16 [batch, tokens, heads, headDim] operands, a constant scale, and a "
+        "square attention: query and key runs have to be equal, which is what a "
+        "vision tower's bidirectional attention is and what a causal one is not. No "
+        "mask and no causal bias, by construction: the command binds no mask "
+        "operand, so the kernel's stride test never reads one. Batch, head count and "
+        "head width are params and must be static; the token count is patched from "
+        "the run-time length. Emitted as one VISION_ATTENTION_FP16 plus an fp32 "
+        "workspace activation.",
+    ),
     # --- views / casts / dim-order (no command) --------------------------
     OpSupport(
         "aten.alias_copy.default",
@@ -541,6 +560,13 @@ NOT_SUPPORTED = [
         "Non-4-D operands, a head_dim mismatch, or n_kv_heads that does not divide "
         "the query heads stay portable.",
     ),
+    (
+        "a vision attention the fusion pass did not state as one op",
+        "The fused op is the only thing the emitter knows: the decomposed pattern, a "
+        "mask, a causal bias, an unequal query and key run, a scale that is not a "
+        "constant, or operands that are not the head transposes of `[batch, tokens, "
+        "heads, headDim]` tensors all stay on the portable kernels.",
+    ),
 ]
 
 # Support predicates the constraints above are taken from. Imported so a rename
@@ -559,6 +585,7 @@ PREDICATES = [
     "layer_norm_is_emittable",
     "add_rms_norm_is_emittable",
     "quantized_matmul_is_emittable",
+    "vision_attention_is_emittable",
 ]
 
 

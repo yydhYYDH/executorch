@@ -50,6 +50,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     softmax_reduces_the_inner_axis,
     SOFTMAX_TARGETS,
     update_cache_layout,
+    VISION_ATTENTION_TARGETS,
+    vision_attention_is_emittable,
 )
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
@@ -396,6 +398,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
             if node.target is NATIVE_LAYER_NORM and not layer_norm_is_emittable(node):
                 return False
         if node.target is ADD_RMS_NORM and not add_rms_norm_is_emittable(node):
+            return False
+        if (
+            node.target in VISION_ATTENTION_TARGETS
+            and not vision_attention_is_emittable(node)
+        ):
+            # The batch, head count and head width are params the run-time length
+            # cannot refresh, so a symbolic one would be the traced example at
+            # run time: a wrong answer rather than a failure.
             return False
         if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
             return False
