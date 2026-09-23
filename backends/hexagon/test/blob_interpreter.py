@@ -48,6 +48,11 @@ FLASH_ATTN = 18
 ROPE = 14
 MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
+SHARED_GATHER = 23
+
+#: The isInt4 slot of htp_ops_shared_gather that names an fp16 table, which is
+#: the only kind this backend stores; 2 and 3 are int4 and int8 tables.
+SHARED_GATHER_FP16 = 0
 
 #: fp16, the only element size any op this backend emits carries.
 FP16_BYTES = 2
@@ -859,7 +864,9 @@ def _gemv_bias(command: Command, arena: Arena, index: int, n: int):
     ref = command.inputs[index]
     if ref.space == ABSENT:
         return None
-    return np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)[:n].astype(np.float32)
+    return np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)[:n].astype(
+        np.float32
+    )
 
 
 def _run_matmul_q4a16_gemv(command: Command, params: List[int], arena: Arena) -> None:
@@ -923,6 +930,61 @@ def _run_matmul_w8a16_gemv(command: Command, params: List[int], arena: Arena) ->
     _store(arena, arena.address(dst), out.tobytes())
 
 
+def untile_shared_gather(flat: np.ndarray, oc: int, ic: int) -> np.ndarray:
+    """The fp16 table htp_ops_shared_gather reads, back to a row-major (oc, ic).
+
+    A transcription of the kernel's own read rather than the inverse of a
+    formula, so the two can disagree: the kernel walks the table as a grid of
+    32x32 tiles with the column pairs inside a tile first, reading element
+    (index, c) of tile (index // 32, c // 32) at
+    ((c % 32) // 2) * 64 + (index % 32) * 2 + ((c % 32) & 1)
+    (`shared_gather_ops.cc:296-311`). The last column tile is short whenever ic is
+    not a multiple of 32, which is what the odd tail below stands for.
+    """
+    rows = np.zeros((oc, ic), dtype=np.float16)
+    tile_columns = -(-ic // 32)
+    for index in range(oc):
+        tile_row, yi = divmod(index, 32)
+        for x in range(tile_columns):
+            base = (tile_row * tile_columns + x) * 32 * 32
+            channels = min(ic - x * 32, 32)
+            pairs = channels // 2
+            for pair in range(pairs):
+                source = base + pair * 64 + yi * 2
+                rows[index, x * 32 + 2 * pair] = flat[source]
+                rows[index, x * 32 + 2 * pair + 1] = flat[source + 1]
+            if channels & 1:
+                rows[index, x * 32 + channels - 1] = flat[base + pairs * 64 + yi * 2]
+    return rows
+
+
+def _run_shared_gather(command: Command, params: List[int], arena: Arena) -> None:
+    """The fp16 path of htp_ops_shared_gather (`shared_gather_ops.cc:287-315`).
+
+    selectSize rows are copied out of the table into as many output rows, and an
+    index outside [0, oc) clears its row instead of failing -- the kernel's own
+    answer, and not torch's: `embedding` raises there. The count and the table
+    come from the graph while the index comes from the caller, so the only thing
+    standing between the two is the vocabulary, which is why the tests pin this
+    boundary down rather than assume it.
+    """
+    select_size, ic, oc, width, kind = params[:5]
+    if kind != SHARED_GATHER_FP16:
+        raise UnsupportedOp(f"blob: shared_gather table kind {kind} is not modelled")
+    if width != FP16_BYTES:
+        raise UnsupportedOp(f"blob: shared_gather writes {width}-byte elements")
+    indices = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.int32)
+    table = untile_shared_gather(
+        np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16), oc, ic
+    )
+    out = np.zeros((select_size, ic), dtype=np.float16)
+    for row in range(select_size):
+        index = int(indices[row])
+        if 0 <= index < oc:
+            out[row] = table[index]
+    _store(arena, arena.address(command.outputs[0]), out.tobytes())
+
+
 _EXECUTORS = {
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
@@ -936,6 +998,7 @@ _EXECUTORS = {
     FLASH_ATTN: _run_flash_attn,
     MATMUL_Q4A16_GEMV_I8: _run_matmul_q4a16_gemv,
     MATMUL_W8A16_GEMV_I8: _run_matmul_w8a16_gemv,
+    SHARED_GATHER: _run_shared_gather,
 }
 
 

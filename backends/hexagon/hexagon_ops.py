@@ -52,9 +52,17 @@ DSP_OP_FLASH_ATTN = 18
 # emitted here.
 DSP_OP_MATMUL_Q4A16_GEMV_I8 = 41
 DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
+# The row gather, from the same enum: one command reads selectSize rows out of
+# an fp16 table the export step laid out as 32x32 tiles.
+DSP_OP_SHARED_GATHER = 23
 
 # HtpOpsReductionType, from the DSP's eltwise_ops.cc.
 REDUCTION_MEAN = 3
+
+# The isInt4 slot of htp_ops_shared_gather. 0 is a plain fp16 table, the only
+# kind stored here; 2 and 3 are int4 and int8 tables with the extra scale
+# params those paths read, and nothing in this backend produces them.
+SHARED_GATHER_FP16 = 0
 
 # HtpOpsUnaryOpType, declared in the DSP's unary_ops.cc. Transcribed whole so
 # the numbering can be checked against one place; only the entries with an
@@ -1211,9 +1219,7 @@ def quantized_weight(node) -> Optional[QuantizedWeight]:
         return None
     weight, scale, zero_point, axis = args[0], args[1], args[2], args[3]
     quant_min, quant_max, dtype = args[4], args[5], args[6]
-    if not all(
-        isinstance(part, torch.fx.Node) for part in (weight, scale, zero_point)
-    ):
+    if not all(isinstance(part, torch.fx.Node) for part in (weight, scale, zero_point)):
         return None
     if dtype is not torch.int8 or not isinstance(axis, int) or isinstance(axis, bool):
         return None
@@ -1390,8 +1396,7 @@ def _dequantize_is_fused(node: torch.fx.Node) -> bool:
     if not node.users or quantized_weight(node) is None:
         return False
     return all(
-        quantized_matmul_weight(user) is node
-        and quantized_matmul_is_emittable(user)
+        quantized_matmul_weight(user) is node and quantized_matmul_is_emittable(user)
         for user in node.users
     )
 
@@ -1553,7 +1558,11 @@ def _emit_quantized_matmul(
             node,
             Op(
                 type=DSP_OP_MATMUL_Q4A16_GEMV_I8,
-                inputs=[ctx.operand(activation), ctx.builder.add_weights(packed), bias_ref],
+                inputs=[
+                    ctx.operand(activation),
+                    ctx.builder.add_weights(packed),
+                    bias_ref,
+                ],
                 outputs=[out],
                 params=params,
             ),
@@ -2365,6 +2374,210 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+# The row gathers: one command reads k rows out of a table that lives in the
+# weights section. `embedding` is every LLM's token table -- the largest single
+# weight in the model, and one the DSP could not read at all before this -- and
+# `index_select`/`index.Tensor` over axis 0 are the same read written another
+# way.
+EMBEDDING = exir_ops.edge.aten.embedding.default
+INDEX_SELECT = exir_ops.edge.aten.index_select.default
+INDEX_TENSOR = exir_ops.edge.aten.index.Tensor
+
+GATHER_TARGETS = frozenset({EMBEDDING, INDEX_SELECT, INDEX_TENSOR})
+
+
+class GatherTable(NamedTuple):
+    """The operands and geometry of one row gather."""
+
+    #: The constant whose rows are gathered.
+    table: torch.fx.Node
+    #: The runtime int32 tensor naming those rows.
+    indices: torch.fx.Node
+    #: Table rows, as htp_ops_shared_gather's `oc`.
+    oc: int
+    #: Elements per table row, as its `ic`.
+    ic: int
+    #: Rows the command gathers, as its `selectSize`.
+    select_size: int
+    indices_shape: tuple
+
+
+def gather_table(node: torch.fx.Node, is_constant) -> Optional[GatherTable]:
+    """The table and indices this node gathers rows with, or None.
+
+    Returns None for every shape whose result is *not* a row gather, because an
+    emitter that cannot express a node has no way to say so without failing the
+    whole export: the node has to be rejected here instead, which puts it back on
+    a portable kernel.
+
+    The two checks that are not geometry are about what the DSP can be handed.
+    The table has to be a value this layer can read now -- the kernel reads a
+    tiled table, so its bytes are rearranged at export (`pack_shared_gather_table`)
+    and a table that only exists at run time has no bytes to rearrange. The
+    indices have to be the caller's own int32 tensor: the kernel reads them as
+    `const int32_t[]`, and an int64 index tensor is not one, so the whole op stays
+    on a portable kernel until the runtime can narrow it (see README).
+
+    `is_constant` is the caller's own test for "a value I can read now". The
+    support check passes the graph's, keyed on the names the partitioner tags as
+    delegate data, and the emitter passes `ctx.constant_value`, which is the one
+    that can actually see the tensor. They agree on every operand: a parameter,
+    buffer or lifted constant is both tagged and visible, and a method input is
+    neither. Both call this function, so the shape one accepts is the shape the
+    other emits.
+    """
+    table_arg, index_arg = _gather_operands(node)
+    if table_arg is None or index_arg is None:
+        return None
+    table_value = table_arg.meta.get("val")
+    indices_value = index_arg.meta.get("val")
+    if not isinstance(table_value, torch.Tensor) or not isinstance(
+        indices_value, torch.Tensor
+    ):
+        return None
+    if not is_constant(table_arg) or is_constant(index_arg):
+        return None
+    # The kernel reads the indices as `const int32_t[]`, and a method input keeps
+    # the width its own dtype declares, so an int64 index tensor would be read as
+    # alternating low and high words. The narrower type is also what makes the
+    # operand safe to read at four bytes an element wherever it comes from: an
+    # op whose result is int32 is never delegated -- the support check only
+    # accepts fp16 and fp32 results -- so an int32 tensor can only reach a
+    # command as a method input, which is the width the emitter declares for it.
+    if indices_value.dtype is not torch.int32:
+        return None
+    if indices_value.dim() < 1:
+        return None
+    indices_shape = tuple(indices_value.shape)
+    # One run of rows per call is what the command's selectSize describes, so a
+    # second moving axis has no way to reach it. The exported sequence symbol is
+    # the one dynamic axis these graphs carry.
+    if sum(isinstance(dim, torch.SymInt) for dim in indices_shape) > 1:
+        return None
+    if table_value.dim() != 2 or not table_value.is_contiguous():
+        return None
+    # Both widths the arena holds reach the same two-byte table.
+    if table_value.dtype not in (torch.float16, torch.float32):
+        return None
+    oc, ic = table_value.shape
+    if not (isinstance(oc, int) and isinstance(ic, int)) or oc <= 0 or ic <= 0:
+        return None
+    # The command carries oc and ic as int32 params and the kernel derives every
+    # element offset from them, so a table past that is refused rather than
+    # emitted with arithmetic that would have wrapped. No model is close: this is
+    # 4 GiB of fp16 across ceil(oc/32) * ceil(ic/32) whole 32x32 tiles.
+    if oc > 2**31 - 1 or ic > 2**31 - 1:
+        return None
+    if -(-oc // 32) * -(-ic // 32) * 1024 > 2**31 - 1:
+        return None
+    return GatherTable(
+        table_arg,
+        index_arg,
+        int(oc),
+        int(ic),
+        _upper_product(indices_shape),
+        indices_shape,
+    )
+
+
+def _gather_operands(node: torch.fx.Node):
+    """The (table, indices) operands of a row gather, or (None, None).
+
+    `embedding(weight, indices)` reads rows of its weight; `index_select` and
+    `index.Tensor` read rows of their first operand, and are the same read only
+    where they name axis 0 and nothing else.
+    """
+    if node.target is EMBEDDING:
+        if len(node.args) < 2:
+            return None, None
+        return node.args[0], node.args[1]
+    if node.target is INDEX_SELECT:
+        if len(node.args) < 3 or node.args[1] != 0:
+            return None, None
+        return node.args[0], node.args[2]
+    if node.target is INDEX_TENSOR:
+        names = node.args[1] if len(node.args) > 1 else None
+        # A list of one index reads axis 0; a second entry indexes a second
+        # axis, which is a gather over two axes and not this command.
+        if not isinstance(names, (list, tuple)) or len(names) != 1:
+            return None, None
+        return node.args[0], names[0]
+    return None, None
+
+
+def pack_shared_gather_table(weight, oc: int, ic: int) -> bytes:
+    """A (oc, ic) fp16 table in the order htp_ops_shared_gather reads it.
+
+    The fp16 path of the kernel is not a row gather over a row-major table: the
+    table is a grid of 32x32 tiles in which adjacent column pairs come first, so
+    element (row, col) of the tile at (row // 32, col // 32) sits at
+    ((col % 32) // 2) * 64 + (row % 32) * 2 + ((col % 32) & 1), which is what
+    shared_gather_ops.cc:296-311 computes. Tiles run row-major over the grid, and
+    a tile is 1024 elements whether or not the table fills it, so this costs
+    ceil(oc/32) * ceil(ic/32) * 2048 bytes: the row-major size itself when both
+    sides are multiples of 32, and up to 32x it when the row is one element wide.
+    """
+    import numpy as np
+
+    w = weight.astype(np.float16, copy=False)
+    if w.shape != (oc, ic):
+        raise RuntimeError(f"hexagon: table is {w.shape}, expected ({oc}, {ic})")
+    rows = -(-oc // 32)
+    columns = -(-ic // 32)
+    padded = np.zeros((rows * 32, columns * 32), dtype=np.float16)
+    padded[:oc, :ic] = w
+    # (row tile, row in tile, column tile, column pair, element of pair), read
+    # back in the order the kernel walks it.
+    tiles = padded.reshape(rows, 32, columns, 16, 2).transpose(0, 2, 3, 1, 4)
+    return np.ascontiguousarray(tiles).tobytes()
+
+
+def _emit_gather(node: torch.fx.Node, ctx) -> TensorRef:
+    """One SHARED_GATHER command for the whole row gather.
+
+    The command's operands are the indices and then the table, in that order:
+    `htp_ops_shared_gather(mapped_ptrs[inputs->size()], mapped_ptrs[0],
+    mapped_ptrs[1], ...)` reads the output past every input and takes the first
+    input as the indices and the second as the table (execute_command.cc:806-811).
+    Five params are enough for it: the two the quantized paths read past them
+    (scaleBlockNum, scaleAsymmetric) have no slot here and the dispatcher supplies
+    its own defaults, which the fp16 path never looks at.
+    """
+    fit = gather_table(node, lambda operand: ctx.constant_value(operand) is not None)
+    if fit is None:
+        raise RuntimeError(
+            f"hexagon: no SHARED_GATHER command for {node.name}; the partitioner "
+            "should not have delegated it"
+        )
+    table = ctx.constant_value(fit.table)
+    if table is None:
+        raise RuntimeError(f"hexagon: no value for the table of {node.name}")
+    out = ctx.result_for(node, _numel(node))
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_SHARED_GATHER,
+            inputs=[
+                ctx.operand(fit.indices),
+                ctx.gather_table(fit.table, table, fit.oc, fit.ic),
+            ],
+            outputs=[out],
+            params=[
+                fit.select_size,
+                fit.ic,
+                fit.oc,
+                FP16_BYTES,
+                SHARED_GATHER_FP16,
+            ],
+        ),
+    )
+    # The rows gathered are the run of tokens this call was handed, so the count
+    # is the exported symbol's value rather than the length the graph was traced
+    # at.
+    _patch_dynamic_product(ctx, op_index, fit.indices_shape, 0)
+    return ctx.record(node, out)
+
+
 # torch's dim-order copies, which `to_edge` leaves behind where a memory format
 # had to be named. Both reach `_emit_alias` through `dim_order_keeps_the_bytes`,
 # which is also what keeps a non-identity order on a portable kernel.
@@ -2427,6 +2640,9 @@ EMITTERS = {
     ADD_RMS_NORM: _emit_add_rms_norm,
     MUL_SILU: _binary("mul_silu"),
     ROPE: _emit_rope,
+    EMBEDDING: _emit_gather,
+    INDEX_SELECT: _emit_gather,
+    INDEX_TENSOR: _emit_gather,
 }
 
 # Ops whose operands must match the output's shape or be scalar. The support

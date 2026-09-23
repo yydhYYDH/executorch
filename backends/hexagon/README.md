@@ -173,6 +173,7 @@ externalizes everything moves the same bytes at load time that it did before.
 Removing that copy needs a runner that can hand the delegate a file-backed
 mapping the DSP mappings itself, which is a new contract with the runner rather
 than a change here.
+
 ## Profiling
 
 A whole subgraph is one delegate call, so an ETDump of a hexagon model would
@@ -312,6 +313,7 @@ produces wrong numbers, not an error. These are the facts the emitters in
 | BINARY_ELEMENTWISE (19) | outSize, in0Size, in1Size, kind, bytes, inputBytes, inputIsFloat, outputIsFloat | 2 in, 1 out |
 | SOFTMAX (28) | outside, channel, inside, bytes (must be 2) | 1 in, 1 out |
 | LAYER_NORM (8) | outer, inner, **epsilon as float bits**, rmsNorm | src, gamma, beta; 1 out |
+| SHARED_GATHER (23) | selectSize (rows out), ic (row width), oc (table rows), bytes (2), isInt4 (0) | in0 = **indices**, in1 = table; 1 out |
 | MATMUL_Q4A16_GEMV_I8 (41) | (unused), K, N, 0…0, **scale block count**, asymmetric | activation, weight+scales, bias; 1 out |
 | MATMUL_W8A16_GEMV_I8 (45) | (unused), K, N, 0…0, **scale block count** | activation, weight, scales, bias; 1 out |
 
@@ -325,7 +327,9 @@ Things that bite:
   the emitter bit-casts the f32 rather than rounding it.
 - **Outputs are hard-coded by input count.** Layer norm writes
   `mapped_ptrs[3]` and binary elementwise `mapped_ptrs[2]`, so an extra input
-  silently retargets the output.
+  silently retargets the output. SHARED_GATHER takes the output at
+  `mapped_ptrs[inputs->size()]`, so its two operands have to stay in the order
+  above and no more may be added.
 - **Binary broadcasting is unreachable.** The DSP's broadcast path wants 25 more
   params than a command carries, so only same-shape and scalar operands work;
   the emitter raises instead of emitting a command that would leave the output
@@ -336,6 +340,31 @@ Things that bite:
   prefill needs a host-side repack. The integer GEMV entries (41, 45) that the
   M == 1 path uses read and write linearly instead, so they need no repack --
   see "Quantized matmuls" below.
+- **The gather's table is not row-major, and the tiling is not optional.** The
+  fp16 path reads a grid of 32x32 tiles in which the column pairs inside a tile
+  come first: element `(row, col)` of the tile at `(row // 32, col // 32)` sits at
+  `((col % 32) // 2) * 64 + (row % 32) * 2 + ((col % 32) & 1)`
+  (`shared_gather_ops.cc:296-311`). There is no row-major mode: `isInt4 = 0` is
+  the only value that reaches an unquantized table, and it reaches this layout.
+  So the table is rearranged at export by `pack_shared_gather_table`, one pass,
+  and a tile costs 1024 elements whether the table fills it or not.
+- **A tiled table is padded to whole tiles, so it can be larger than the weight.**
+  It costs `ceil(oc/32) * ceil(ic/32) * 2048` bytes: equal to the row-major size
+  when both sides are multiples of 32, and 32x when the row width is one element.
+  A 1024-wide token embedding -- the case this exists for -- is exactly its
+  row-major size.
+- **The gather's indices are read as `int32`, so an `int64` index tensor stays on
+  a portable kernel.** The kernel takes `const int32_t*`, and a method input keeps
+  the width its own dtype declares, so five int64 tokens would read as five low
+  words interleaved with five zero high words. `gather_table` refuses the node
+  instead, which leaves `nn.Embedding` on the CPU for a graph whose tokens are
+  int64 -- the dtype `torch.export` gives you by default. Adding a
+  `tokens.to(torch.int32)` in the model is enough: the cast is not delegated, so
+  it stays on a portable kernel and only the gather after it reaches the DSP.
+- **An index outside the table clears the row rather than raising**
+  (`shared_gather_ops.cc:292-295`). Torch's `embedding` raises there. The count
+  and the table come from the graph and the index comes from the caller, so a
+  token outside the vocabulary is a zero row on the DSP and an error on the CPU.
 - **`htp_ops_matmul_q4a16_fp16` returns success even when the kernel fails.** The
   block variant propagates the error; the plain one logs and returns 0. The two
   GEMV entries propagate and are checked by `execute_command.cc`.
@@ -404,6 +433,37 @@ twice in the vendored tree and cross-checked against the kernel's read path, the
 int8 one only against the kernel's own permuted activation splat. The speedup,
 the real numbers and the FastRPC/skel deployment all need a device.
 
+## Delegating a row gather
+
+`embedding`, `index_select(dim=0)` and `index.Tensor` over a single axis are the
+same read: k rows out of a table that lives in the weights section, one
+SHARED_GATHER command. The target case is the token table of an LLM, which is the
+largest single weight in the model. Three things have to hold, and
+`gather_table` is the one place that decides them:
+
+- the table is a parameter, buffer or lifted constant, because its bytes are
+  tiled at export and a table that only exists at run time has none to tile;
+- the indices are an `int32` tensor, for the reason above;
+- the read is over axis 0 of a contiguous 2-D table, and the indices are at most
+  one moving axis (the exported sequence symbol).
+
+Anything else is refused in the support check, so it stays on a portable kernel:
+a refusal that happened while emitting would fail the whole export instead.
+
+A table only this gather reads is stored tiled and nothing else: `preprocess`
+writes the row-major copy of every weight first, and `BlobBuilder.build` drops
+every weight no command reads, so the file carries one copy rather than two. A
+table that is *also* a matmul's weight -- tied embeddings, where `lm_head` shares
+`embed_tokens.weight` -- does keep both, since the matmul reads rows and the
+gather reads tiles: expect the file to grow by one table's size there.
+
+Where the numbers here come from: `pack_shared_gather_table` and the interpreter's
+`untile_shared_gather` are two independent readings of `shared_gather_ops.cc`, and
+`test/test_shared_gather.py` checks them against each other, against offsets
+derived by hand from that source, and end to end against `torch.embedding` through
+`blob_interpreter`. What none of that covers is the device: see below.
+
+
 ## Status
 
 Working and verified without a device:
@@ -424,6 +484,13 @@ Working and verified without a device:
   64 elements, a flat binary multiply whose scalar operand is materialized as a
   one-element buffer, and a softmax reduced over `[1][64][1]` — with the last
   command writing straight into the output slot;
+- an `embedding` reaches the DSP: a 64x8 table with five int32 tokens lowers to
+  one delegate whose blob carries one SHARED_GATHER command, the table spanning
+  exactly `ceil(oc/32) * ceil(ic/32) * 2048` bytes of the 4096 in the weight
+  section, and the host interpreter reproduces `torch.embedding` on it bit for
+  bit. `index_select(dim=0)` and `index.Tensor` take the same path, and the
+  count of tokens gathered is patched from the runtime sequence length the way
+  the matmul patches its rows;
 - on Qwen3-0.6B the partitioner takes 1967 nodes into 29 subgraphs -- one per
   layer, with all 28 attention nodes among them -- and leaves 825 on the
   portable kernels, 711 of which are shape guards. With the fusion passes
@@ -466,9 +533,17 @@ Not done yet:
   rather than passing silently;
 - of the registered emitters, the ones that have produced a command on a real
   graph are `mm` (including the quantized weight-only form), `bmm`, the binary
-  and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache` and
-  the narrowing blits. The view, cast, getitem and dequantize emitters have run
-  as well but emit nothing by design;
+  and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache`,
+  `mean`, `embedding`/`index_select`/`index.Tensor` and the narrowing and
+  transpose blits. The view, cast, getitem and dequantize emitters have run as
+  well but emit nothing by design;
+- **the row gather has never run anywhere but on the host.** Its tiling is a
+  second implementation of the same source, so the tests agree with the reading
+  and not with the hardware. Unverified on device: that the fp16 path's tile
+  order is what `pack_shared_gather_table` writes; the `bytes = 4` (fp32 output)
+  path, which no emitter here reaches; the int4 and int8 table paths; the
+  out-of-range index clearing a row; and what a 311 MB tiled table costs to read
+  against a row-major one;
 - attention delegates on fp32 operands that the runtime narrows to fp16 on the
   way into the arena, so the DSP runs fp16 attention. That trade is deliberate
   but unmeasured, and it means a working delegation is not yet a correct one;

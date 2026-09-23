@@ -10,7 +10,11 @@ from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from executorch.backends.hexagon.hexagon_ops import EMITTERS, pack_hmx_weight
+from executorch.backends.hexagon.hexagon_ops import (
+    EMITTERS,
+    pack_hmx_weight,
+    pack_shared_gather_table,
+)
 from executorch.backends.hexagon.serialization.blob import (
     ALIGNMENT,
     BlobBuilder,
@@ -410,6 +414,27 @@ class BlobContext:
         ref = self.builder.add_weights(pack_hmx_weight(tensor.cpu().numpy(), k, n))
         self._constants[key] = ref
         self.packed_targets.add(getattr(node, "target", node))
+        return ref
+
+    def gather_table(self, node: torch.fx.Node, tensor, oc: int, ic: int) -> TensorRef:
+        """Materializes a table in the order SHARED_GATHER reads its rows.
+
+        Same arrangement as the HMX weight above, for the same reason: the kernel
+        reads a 32x32 tiled table and writes each gathered row out row-major, so
+        the rearrange belongs at export where it costs one pass rather than on the
+        DSP at every token. The caller keeps the row-major copy that `preprocess`
+        stored for any other consumer of the same placeholder, and drops it from
+        the file when there is none.
+        """
+        key = (node, "gather")
+        cached = self._constants.get(key)
+        if cached is not None:
+            return cached
+        tensor = tensor.detach().to(torch.float16)
+        ref = self.builder.add_weights(
+            pack_shared_gather_table(tensor.cpu().numpy(), oc, ic)
+        )
+        self._constants[key] = ref
         return ref
 
     def lifted_value(self, node: torch.fx.Node):

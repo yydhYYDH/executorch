@@ -29,6 +29,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
     DQ_PER_CHANNEL,
+    GATHER_TARGETS,
+    gather_table,
     GETITEM,
     LAYER_NORM,
     layer_norm_getitem,
@@ -324,6 +326,19 @@ class HexagonOperatorSupport(OperatorSupportBase):
     whereas one rejected while emitting fails the whole export.
     """
 
+    def __init__(self, data_names: Optional[frozenset] = None) -> None:
+        # The placeholders the program owns rather than the caller handing them
+        # in, which is the question a row gather's table has to answer. Without
+        # the program there is no way to tell one from a method input, and the
+        # only operand provably a constant on its own is a get_attr.
+        self.data_names = frozenset(data_names or ())
+
+    def is_data_placeholder(self, node: torch.fx.Node) -> bool:
+        """Whether this operand is a parameter, buffer or lifted constant."""
+        return node.op == "get_attr" or (
+            node.op == "placeholder" and node.name in self.data_names
+        )
+
     def is_node_supported(self, _submodules, node: torch.fx.Node) -> bool:
         if node.op != "call_function":
             return False
@@ -360,6 +375,15 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # flat path just checked are not the ones that decide it.
             return False
         if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
+            return False
+        if (
+            node.target in GATHER_TARGETS
+            and gather_table(node, self.is_data_placeholder) is None
+        ):
+            # The DSP reads a tiled table and four-byte indices, so a table whose
+            # bytes this layer cannot see at export -- or an index tensor that is
+            # not an int32 method input -- has no command form: those stay on a
+            # portable kernel rather than reach a kernel that reads them wrong.
             return False
         if node.target in (LAYER_NORM, NATIVE_LAYER_NORM):
             # A run-time epsilon is not a number the command can carry, and a
@@ -467,7 +491,7 @@ class HexagonPartitioner(Partitioner):
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         graph_module = exported_program.graph_module
-        support = HexagonOperatorSupport()
+        support = HexagonOperatorSupport(_data_placeholders(exported_program))
 
         supported = [
             node
