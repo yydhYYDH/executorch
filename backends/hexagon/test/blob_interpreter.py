@@ -38,6 +38,7 @@ import numpy as np
 from executorch.backends.hexagon.serialization import blob as B
 
 #: DSPOpType values this can execute.
+POOL2D_FP16 = 1
 RASTER_BLIT = 3
 LAYER_NORM = 8
 ADD_FUSE_LAYERNORM = 16
@@ -65,6 +66,13 @@ REDUCTION = 29
 REDUCTION_SUM = 1
 REDUCTION_MAXIMUM = 2
 REDUCTION_MEAN = 3
+
+#: The DSP pool kernel's two selectors and its channel block
+#: (`hvx_pool2d_fp16`).
+POOL_MAX = 0
+POOL_COUNT_VALID = 0
+POOL_COUNT_KERNEL = 1
+POOL_PACK = 64
 
 #: Operands the DSP reads as a null pointer.
 ABSENT = B.TensorSpace.ABSENT
@@ -649,7 +657,25 @@ _BINARY = {
     11: lambda a, b: ((a.astype(np.float32) - b.astype(np.float32)) ** 2).astype(
         np.float16
     ),
+    12: lambda a, b: _binary_fmod(a, b),  # mod, the truncated remainder
 }
+
+
+def _binary_fmod(a, b):
+    """HTP_OPS_BINARY_MOD's fp16 scalar path, element by element.
+
+    `a - trunc(a/b) * b` in fp32 with the kernel's two guards: a zero divisor and
+    a quotient outside int32 both answer zero rather than the NaN fmodf would
+    give (eltwise_ops.cc:148-166). This is torch's `fmod`, not its `remainder`,
+    which is the floored one -- the two differ in sign whenever the operands do.
+    """
+    a32, b32 = a.astype(np.float32), b.astype(np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        quotient = a32 / b32
+    safe = (b32 != 0.0) & (quotient > -2147483648.0) & (quotient < 2147483648.0)
+    truncated = np.trunc(np.where(safe, quotient, 0.0)).astype(np.int32)
+    result = np.where(safe, a32 - truncated.astype(np.float32) * b32, 0.0)
+    return result.astype(np.float16)
 
 
 def _run_binary(command: Command, params: List[int], arena: Arena) -> None:
@@ -707,6 +733,83 @@ def _run_softmax(command: Command, params: List[int], arena: Arena) -> None:
     rows = src.reshape(outside, channel, inside).astype(np.float32)
     shifted = np.exp(rows - rows.max(axis=1, keepdims=True))
     out = (shifted / shifted.sum(axis=1, keepdims=True)).astype(np.float16)
+    _store(arena, arena.address(command.outputs[0]), out.tobytes())
+
+
+def _run_pool2d(command: Command, params: List[int], arena: Arena) -> None:
+    """hvx_pool2d_fp16, one vector lane at a time.
+
+    The kernel walks one lane of a whole HVX vector per spatial position, which
+    is a channel of the 64-channel block its activation is stored in, so the
+    element addressing below is `((c//64) * batch + n) * ih * iw * 64 +
+    (y * iw + x) * 64 + c % 64` (pool_fp16.c:22 and :44) written out lane by
+    lane. It skips a window position that is outside the input and, when the
+    whole window is, stores zero rather than a maximum over nothing.
+    """
+    (
+        batch,
+        ih,
+        iw,
+        oh,
+        ow,
+        c4,
+        kernel_y,
+        kernel_x,
+        stride_y,
+        stride_x,
+        pad_y,
+        pad_x,
+        _pad_type,
+        count_type,
+        pool_type,
+    ) = params[:15]
+    if pool_type not in (POOL_MAX, 1):
+        raise UnsupportedOp(f"blob: pool type {pool_type} is not modelled")
+    source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    if source.size != batch * c4 * ih * iw * POOL_PACK:
+        raise UnsupportedOp(
+            f"blob: {source.size} values do not fill the {batch}x{c4} blocks of "
+            f"{ih}x{iw} the pool was told about"
+        )
+    out = np.zeros((batch, c4, oh, ow, POOL_PACK), dtype=np.float16)
+    blocks = source.reshape(batch, c4, ih, iw, POOL_PACK)
+    for n in range(batch):
+        for cb in range(c4):
+            for oy in range(oh):
+                for ox in range(ow):
+                    window = []
+                    for ky in range(kernel_y):
+                        iy = oy * stride_y - pad_y + ky
+                        if not 0 <= iy < ih:
+                            continue
+                        for kx in range(kernel_x):
+                            ix = ox * stride_x - pad_x + kx
+                            if not 0 <= ix < iw:
+                                continue
+                            window.append(blocks[n, cb, iy, ix])
+                    if not window:
+                        continue
+                    # The kernel seeds the accumulator from the first position
+                    # that landed inside and rounds every step to fp16, so the
+                    # walk order is part of the arithmetic.
+                    accumulated = window[0]
+                    for value in window[1:]:
+                        if pool_type == POOL_MAX:
+                            accumulated = np.maximum(accumulated, value)
+                        else:
+                            accumulated = (accumulated + value).astype(np.float16)
+                    if pool_type == POOL_MAX:
+                        out[n, cb, oy, ox] = accumulated
+                        continue
+                    # The divisor is one over the count, narrowed to fp16 before
+                    # the multiply (pool_fp16.c:74-86).
+                    divisor = (
+                        kernel_y * kernel_x
+                        if count_type == POOL_COUNT_KERNEL
+                        else len(window)
+                    )
+                    inverse = np.float16(1.0 / max(1, divisor))
+                    out[n, cb, oy, ox] = (accumulated * inverse).astype(np.float16)
     _store(arena, arena.address(command.outputs[0]), out.tobytes())
 
 
@@ -1109,6 +1212,7 @@ def _run_shared_gather(command: Command, params: List[int], arena: Arena) -> Non
 
 
 _EXECUTORS = {
+    POOL2D_FP16: _run_pool2d,
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,

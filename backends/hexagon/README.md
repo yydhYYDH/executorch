@@ -313,6 +313,8 @@ produces wrong numbers, not an error. These are the facts the emitters in
 | UNARY (4) | size in **elements**, op kind, element bytes | 1 in, 1 out |
 | BINARY_ELEMENTWISE (19) | outSize, in0Size, in1Size, kind, bytes, inputBytes, inputIsFloat, outputIsFloat | 2 in, 1 out |
 | SOFTMAX (28) | outside, channel, inside, bytes (must be 2) | 1 in, 1 out |
+| REDUCTION (29) | outside, reduce, inside, kind (sum 1, maximum 2, mean 3), bytes | 1 in, 1 out |
+| POOL2D_FP16 (1) | batch, ih, iw, oh, ow, **c4**, kY, kX, sY, sX, pY, pX, padType, countType, poolType | 1 in, 1 out |
 | LAYER_NORM (8) | outer, inner, **epsilon as float bits**, rmsNorm | src, gamma, beta; 1 out |
 | SHARED_GATHER (23) | selectSize (rows out), ic (row width), oc (table rows), bytes (2), isInt4 (0) | in0 = **indices**, in1 = table; 1 out |
 | MATMUL_Q4A16_GEMV_I8 (41) | (unused), K, N, 0…0, **scale block count**, asymmetric | activation, weight+scales, bias; 1 out |
@@ -331,6 +333,30 @@ Things that bite:
   silently retargets the output. SHARED_GATHER takes the output at
   `mapped_ptrs[inputs->size()]`, so its two operands have to stay in the order
   above and no more may be added.
+- **The pool kernel reads its activation pack64-blocked, and `c4` counts channel
+  blocks rather than channels.** `hvx_pool2d_fp16` addresses element `(n, c, y,
+  x)` at `((c//64)*batch + n)*ih*iw*64 + (y*iw + x)*64 + c%64`
+  (`ops/pool_fp16.c:22`), and the dispatch's sixth param is `ceil(C/64)` -- the
+  pool command carries **fifteen** ints, not twelve (`execute_command.cc:324`).
+  The arena holds row-major NCHW, so the emitter brackets the command with two
+  `RASTER_BLIT`s, one into that layout and one back out; both are the geometry
+  the DSP's own pack-area fast paths take (`blit_ops.cc:843-857`). They are free
+  only when the spatial extent is one, where the two layouts agree element for
+  element. A channel count that is not exactly one block is refused rather than
+  emitted with padded lanes.
+- **The reduction enum has no minimum.** `HtpOpsReductionOpType` is `sum = 1,
+  maximum = 2, mean = 3` (`eltwise_ops.cc:2441-2445`) and the dispatcher rejects
+  every other value, so `aten.amin` is not reachable by writing an emitter: it
+  needs a kernel that does not exist, and stays on the portable kernels.
+  `argmax`/`argmin` are in the same position, since the kernel returns values
+  only. Sum and maximum are one command each, over a single contiguous span of
+  the buffer.
+- **`fmod` is the truncated remainder, `remainder` is not.** `HTP_OPS_BINARY_MOD`
+  computes `a - trunc(a/b)*b` with a zero divisor answering zero
+  (`eltwise_ops.cc:148-166`), which is torch's `fmod`; the floored remainder
+  agrees with it only when the dividend is non-negative, so `aten.remainder` is
+  refused. Where the remainder is exactly zero the kernel lands on `+0` and torch
+  on `-0` for a negative dividend: equal, not bit-identical.
 - **Binary broadcasting is unreachable.** The DSP's broadcast path wants 25 more
   params than a command carries, so only same-shape and scalar operands work;
   the emitter raises instead of emitting a command that would leave the output
@@ -591,13 +617,25 @@ Working and verified without a device:
   `MATMUL_Q4A16_GEMV_I8` (41) or `MATMUL_W8A16_GEMV_I8` (45) command, and the
   host interpreter reads the blob back and reproduces the kernels' arithmetic
   within a few percent of the dequantized reference. See "Quantized matmuls" for
-  what that arithmetic is and what is still unverified.
+  what that arithmetic is and what is still unverified;
 - a vision attention block goes all the way through: a three-projection ViT
   attention over a dynamic patch count partitions into one delegate, whose blob
   carries one `VISION_ATTENTION_FP16` (43) command with the geometry the graph
   had, three token-major operands and the fp32 workspace the kernel requires. The
   host interpreter runs that command and reproduces the module to 3.1e-4 in fp16.
-  See "Delegating a vision tower's attention".
+  See "Delegating a vision tower's attention";
+- pooling, `sum`, `amax` and `fmod` reach the DSP, blob and numbers included. A
+  `max_pool2d` or `avg_pool2d` over 64 channels lowers to one delegate whose blob
+  carries a blit into the kernel's blocked layout, one POOL2D command and a blit
+  back out; the host interpreter reproduces torch exactly on maxima and to fp16
+  precision on both average divisor modes, for kernel, stride and padding
+  combinations that hang off every edge. `sum` and `amax` each lower to one
+  REDUCTION command, with the three span params pinned for an inner, outer,
+  middle, multi-axis, negative, missing and empty dim, and `amax` returns torch's
+  values exactly. `fmod` lowers to one BINARY command with subtype 12 and
+  reproduces the truncated remainder, and the floored `remainder` is pinned as
+  not delegated. See `test/test_pool.py`, `test/test_sum_amax.py` and
+  `test/test_fmod.py`.
 
 Not done yet:
 
@@ -653,12 +691,31 @@ Not done yet:
   vision tower, and a tower still needs the patch embedding, the layer norms, the
   MLP and the projection into the text embedding space; on this backend the
   `DecomposePatchEmbed` pass handles the conv-to-matmul step only. Nothing in
-  this checkout splices a tower's output into a language model's inputs.
+  this checkout splices a tower's output into a language model's inputs;
 - softmax is delegated on its last axis only. The kernel's strided path, for a
   reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
   1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
-  keeps that form off the delegate until the kernel is checked.
+  keeps that form off the delegate until the kernel is checked;
+- **pooling, `sum`, `amax` and `fmod` have never run anywhere but on the host.**
+  Their layouts and arithmetic are second implementations of the same sources, so
+  the tests agree with the reading and not with the hardware. Unverified on
+  device: that the two pool blits really take the DSP's pack-area fast path
+  (`try_pack_area_blit` takes the geometry the emitter checks for, but the
+  fallback's numbers were never compared against the fast path on hardware); that
+  `hvx_pool2d_fp16`'s window origin, its out-of-range handling and its `countType`
+  divisor are what the tests model, including its rounding of the fp16 reciprocal
+  and its fp16 accumulation; that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
+  zero-divisor guard agree with the host model, and which of the two paths
+  (`htp_ops_binary_elementwise`'s scalar `apply_fp16` or the fp16 vector tail) the
+  dispatcher takes for subtype 12; and that the reduction's accumulator really is
+  fp32 with an fp16 store, which the `bytes` param asserts and no test can
+  observe;
+- `add_relu` (subtype 8) is in the emitter's table but unreachable: no ATen op
+  that `torch.export` produces maps onto `max(a+b, 0)`, so reaching it needs a
+  fusion pass in the caller's `transform_passes` (the pattern `mul_silu` and
+  `add_rms_norm` follow) and nothing here builds one. Nothing emits it today, so
+  nothing is at risk either.
 
 ## Open design points
 

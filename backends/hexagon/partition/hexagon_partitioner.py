@@ -39,9 +39,17 @@ from executorch.backends.hexagon.hexagon_ops import (
     MEAN_TARGETS,
     MM_TARGETS,
     NATIVE_LAYER_NORM,
+    operand_dtypes_are_readable,
     permute_region,
     PERMUTE_TARGETS,
+    max_pool_getitem,
+    max_pool_is_emittable,
+    MAX_POOL2D_WITH_INDICES,
+    pool_spec,
+    POOL_TARGETS,
     quantized_matmul_is_refused,
+    reduction_dims,
+    REDUCTION_TARGETS,
     sdpa_targets,
     select_region,
     SELECT_TARGETS,
@@ -49,6 +57,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     SLICE_TARGETS,
     softmax_reduces_the_inner_axis,
     SOFTMAX_TARGETS,
+    sum_dim_is_emittable,
+    SUM_TARGETS,
     update_cache_layout,
     VISION_ATTENTION_TARGETS,
     vision_attention_is_emittable,
@@ -357,6 +367,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # fp32 emits the same commands as its fp16 twin. Any other width
             # would leave the kernels reading int64 bits as half floats.
             return False
+        if not operand_dtypes_are_readable(node):
+            # A bool operand is one byte per element where the kernels read two,
+            # which is a wrong answer rather than an error. No emitter here takes
+            # one, so any node that carries one stays portable.
+            return False
         if node.target is DQ_PER_CHANNEL:
             # The weight-only pattern's dequantize. It is delegated only when
             # every reader is a quantized matmul the GEMV kernels can run; the
@@ -377,6 +392,28 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # flat path just checked are not the ones that decide it.
             return False
         if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
+            return False
+        if node.target in REDUCTION_TARGETS:
+            # One contiguous span, the same shape rule mean has; sum additionally
+            # has to be the fp16 sum, since the kernel's accumulator is fp32 and
+            # its result fp16.
+            if reduction_dims(node) is None:
+                return False
+            if node.target in SUM_TARGETS and not sum_dim_is_emittable(node):
+                return False
+        if (
+            node.target is MAX_POOL2D_WITH_INDICES
+            and not max_pool_is_emittable(node)
+        ):
+            # The indices come out of the same node and no kernel here produces
+            # them, so a graph that reads them keeps the pool portable.
+            return False
+        if node.target in POOL_TARGETS and pool_spec(node) is None:
+            # The kernel walks its activation in the DSP's 64-channel blocked
+            # layout, and only the C == 64 form of it is one this backend
+            # rearranges; a dilation, a ceil_mode window, a divisor this kernel
+            # cannot take, or a shape whose windows would fall outside the input
+            # all have to stay on a portable kernel rather than reach it.
             return False
         if (
             node.target in GATHER_TARGETS
@@ -417,6 +454,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
             if source is not None:
                 if not layer_norm_is_emittable(source):
                     return False
+            elif max_pool_getitem(node) is not None:
+                # The max pool's values; that node's own check has already
+                # refused a pool whose indices anything else reads.
+                pass
             else:
                 source = add_rms_norm_getitem(node)
                 if source is None or not add_rms_norm_is_emittable(source):

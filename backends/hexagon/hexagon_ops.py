@@ -31,6 +31,7 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.sym_util import eval_upper_bound
 
 # DSPOpType, from third-party/mnn-htp-ops/include/htp_command.h.
+DSP_OP_POOL2D_FP16 = 1
 DSP_OP_RASTER_BLIT = 3
 DSP_OP_UNARY = 4
 DSP_OP_LAYER_NORM = 8
@@ -63,8 +64,30 @@ DSP_OP_SHARED_GATHER = 23
 # head-major tensors a matmul wants.
 DSP_OP_VISION_ATTENTION_FP16 = 43
 
-# HtpOpsReductionType, from the DSP's eltwise_ops.cc.
+# HtpOpsReductionType, from the DSP's eltwise_ops.cc (the whole enum: there is
+# no minimum, so `amin` has no kernel behind it and stays on the host).
+REDUCTION_SUM = 1
+REDUCTION_MAXIMUM = 2
 REDUCTION_MEAN = 3
+
+# The DSP's pool kernel selects on two ints rather than on op types
+# (pool_fp16.c:18-19 and :46): poolType picks max or the sum, and countType
+# picks the average's divisor -- the kernel window's area, which is torch's
+# count_include_pad=True, or the positions that landed inside the input, which
+# is count_include_pad=False. padType is read by neither.
+POOL_MAX = 0
+POOL_AVERAGE = 1
+POOL_COUNT_VALID = 0
+POOL_COUNT_KERNEL = 1
+POOL_PAD_TYPE = 0
+
+# One HVX vector of fp16, which is also the block the DSP's activation layout
+# groups channels in: element (n, c, y, x) of an NCHW tensor sits at
+# ((c // 64) * batch + n) * height * width * 64 + (y * width + x) * 64 + c % 64,
+# where `c` is a channel block index (hvx_pool2d_fp16,
+# src/dsp/ops/pool_fp16.c:13 and :22). 64 is __HVX_LENGTH__ / sizeof(__fp16) for
+# the -mhvx-length=128b the skel is built with (skel/CMakeLists.txt:38).
+POOL_CHANNEL_BLOCK = 64
 
 # The isInt4 slot of htp_ops_shared_gather. 0 is a plain fp16 table, the only
 # kind stored here; 2 and 3 are int4 and int8 tables with the extra scale
@@ -1808,30 +1831,397 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
-def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
-    """aten.mean.dim as a single REDUCTION.
+# The pooling family. The kernel is `hvx_pool2d_fp16`, which walks one window
+# per output position accumulating whole HVX vectors, so every lane is one
+# channel and the window is a strided walk over the same lane of a run of
+# spatial positions.
+MAX_POOL2D = exir_ops.edge.aten.max_pool2d.default
+# to_edge rewrites max_pool2d into the indices form plus a getitem, so the
+# values here are what a graph actually carries; the indices have no kernel and
+# only a getitem 0 reader can be placed.
+MAX_POOL2D_WITH_INDICES = exir_ops.edge.aten.max_pool2d_with_indices.default
+AVG_POOL2D = exir_ops.edge.aten.avg_pool2d.default
+POOL_TARGETS = frozenset({MAX_POOL2D, MAX_POOL2D_WITH_INDICES, AVG_POOL2D})
+MAX_POOL_TARGETS = frozenset({MAX_POOL2D, MAX_POOL2D_WITH_INDICES})
 
-    The DSP collapses one contiguous (outside, reduce, inside) span, so the
-    reduced dims have to be adjacent; the caller's support check enforces that.
+
+def max_pool_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The max pool a getitem reads, when it reads the values and not the indices.
+
+    max_pool2d_with_indices returns (values, indices); the kernel produces the
+    values, so getitem 0 is the only reader a partition can carry.
+    """
+    if node.target is not GETITEM or len(node.args) != 2:
+        return None
+    source, index = node.args
+    if index != 0 or not isinstance(source, torch.fx.Node):
+        return None
+    return source if source.target is MAX_POOL2D_WITH_INDICES else None
+
+
+def max_pool_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this max pool takes the values.
+
+    The indices come out of the same node and nothing here produces them, so a
+    graph that reads them -- or the tuple itself -- keeps the whole node on the
+    portable kernels, readers of the values included.
+    """
+    if node.target is not MAX_POOL2D_WITH_INDICES:
+        return True
+    return bool(node.users) and all(
+        max_pool_getitem(reader) is node for reader in node.users
+    )
+
+
+def operand_dtypes_are_readable(node: torch.fx.Node) -> bool:
+    """Whether every tensor operand is a width the arena holds.
+
+    A bool is one byte per element in the `.pte` and two in the arena's
+    arithmetic, so a kernel handed one reads the neighbouring slot's bytes as
+    the value: no error, just the wrong numbers. The case is reachable from an
+    ordinary `x + (a > b)`, whose comparison is portable for a dtype reason of
+    its own, so the consumer is refused here rather than left to read it.
+    """
+    for arg in node.args:
+        value = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
+        if isinstance(value, torch.Tensor) and value.dtype is torch.bool:
+            return False
+    return True
+
+
+class PoolSpec(NamedTuple):
+    """Everything the pool command carries, once the node is known to fit."""
+
+    batch: int
+    ih: int
+    iw: int
+    oh: int
+    ow: int
+    kernel_y: int
+    kernel_x: int
+    stride_y: int
+    stride_x: int
+    pad_y: int
+    pad_x: int
+    count_type: int
+    pool_type: int
+
+
+def _pool_arg(node: torch.fx.Node, name: str, index: int, default):
+    """A pool argument from wherever the graph put it.
+
+    A keyword argument lives in kwargs and a positional one in args, and the two
+    are the same argument to the op; either spelling may carry the kernel size,
+    the count_include_pad flag or the missing optional.
+    """
+    if name in node.kwargs:
+        return node.kwargs[name]
+    return node.args[index] if len(node.args) > index else default
+
+
+def _int_pair(value, default) -> Optional[tuple]:
+    """A two-entry kernel/stride/padding argument, or None if it is not one.
+
+    The exported graph spells these as ``[n, n]``, and the schema defaults to an
+    empty list (`int[2] stride=[]`), which torch reads as "the same as the
+    kernel"; a bare int is accepted too because the schema's type is a list of
+    ints but a module built with ints exports either way.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, (list, tuple)) and 1 <= len(value) <= 2:
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in value):
+            return None
+        return (value[0], value[-1])
+    return None
+
+
+def _pool_window_intersects(
+    size: int, output: int, kernel: int, stride: int, pad: int
+) -> bool:
+    """Whether every window holds at least one input row/column.
+
+    A window is ``[oy * stride - pad, oy * stride - pad + kernel)``
+    (`pool_fp16.c:26`); the kernel skips whatever falls outside and writes zero
+    when nothing is left, where torch's max would be -inf. For the paddings
+    torch itself accepts (at most half the kernel) this can never happen, so the
+    answer is a guard rather than a shape rule, and it is checked on both axes.
+    """
+    for index in range(output):
+        origin = index * stride - pad
+        if origin + kernel <= 0 or origin >= size:
+            return False
+    return True
+
+
+def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
+    """The pool command's parameters, or None when this node is not that shape.
+
+    Both the support check and the emitter call this, so they cannot disagree:
+    anything the emitter would refuse has to be refused here instead, or the
+    whole export fails rather than the node staying on a portable kernel.
+    """
+    if node.target not in POOL_TARGETS:
+        return None
+    args = node.args
+    if not args or not isinstance(args[0], torch.fx.Node):
+        return None
+    value = args[0].meta.get("val")
+    result = node.meta.get("val")
+    # max_pool2d_with_indices carries (values, indices); the values are the
+    # tensor the pool writes.
+    if isinstance(result, tuple):
+        result = result[0] if result else None
+    if not isinstance(value, torch.Tensor) or not isinstance(result, torch.Tensor):
+        return None
+    if value.dtype not in (torch.float16, torch.float32):
+        return None
+    shape = list(value.shape)
+    if len(shape) not in (3, 4) or len(result.shape) != len(shape):
+        return None
+    # The pooled buffer is described by three ints per axis, and this emitter
+    # derives them from static shapes only: a symbolic extent is refused here
+    # rather than emitted with the wrong stride.
+    if any(isinstance(dim, torch.SymInt) for dim in shape + list(result.shape)):
+        return None
+    if len(shape) == 4:
+        batch, channels, ih, iw = shape
+    else:
+        batch, channels, ih, iw = 1, shape[0], shape[1], shape[2]
+    # The kernel reads its activation as [ceil(C/64)][batch][h*w][64] blocks,
+    # which is not the row-major [batch][C][h*w] the arena holds. At C == 64
+    # there is exactly one block and this emitter can hand the kernel that block
+    # with one blit either side; any other channel count is a padded or
+    # multi-block grid this batch does not build.
+    if channels != POOL_CHANNEL_BLOCK:
+        return None
+
+    kernel = _int_pair(_pool_arg(node, "kernel_size", 1, None), None)
+    if kernel is None or kernel[0] <= 0 or kernel[1] <= 0:
+        return None
+    stride = _int_pair(_pool_arg(node, "stride", 2, None), kernel)
+    if stride is None or stride[0] <= 0 or stride[1] <= 0:
+        return None
+    padding = _int_pair(_pool_arg(node, "padding", 3, None), (0, 0))
+    if padding is None or padding[0] < 0 or padding[1] < 0:
+        return None
+
+    if node.target in MAX_POOL_TARGETS:
+        dilation = _int_pair(_pool_arg(node, "dilation", 4, None), (1, 1))
+        if dilation != (1, 1):
+            # The kernel has no dilation: it steps the window by one
+            # (pool_fp16.c:34-39).
+            return None
+        ceil_mode = _pool_arg(node, "ceil_mode", 5, False)
+        count_type = POOL_COUNT_KERNEL  # ignored by the max path
+        pool_type = POOL_MAX
+    else:
+        ceil_mode = _pool_arg(node, "ceil_mode", 4, False)
+        count_include_pad = _pool_arg(node, "count_include_pad", 5, True)
+        divisor_override = _pool_arg(node, "divisor_override", 6, None)
+        if divisor_override is not None:
+            # The divisor is what the kernel's countType selects; an arbitrary
+            # one has no command form.
+            return None
+        count_type = (
+            POOL_COUNT_KERNEL if count_include_pad else POOL_COUNT_VALID
+        )
+        pool_type = POOL_AVERAGE
+    if ceil_mode:
+        # ceil_mode adds windows past the input that this kernel's geometry (one
+        # window per output position at oy * stride - pad) does not describe.
+        return None
+
+    oh, ow = result.shape[-2], result.shape[-1]
+    # torch's floor-mode output size, which is also the one the emitter is about
+    # to describe with strides.
+    if oh != (ih + 2 * padding[0] - kernel[0]) // stride[0] + 1:
+        return None
+    if ow != (iw + 2 * padding[1] - kernel[1]) // stride[1] + 1:
+        return None
+    if not _pool_window_intersects(ih, oh, kernel[0], stride[0], padding[0]):
+        return None
+    if not _pool_window_intersects(iw, ow, kernel[1], stride[1], padding[1]):
+        return None
+
+    return PoolSpec(
+        batch=batch,
+        ih=ih,
+        iw=iw,
+        oh=oh,
+        ow=ow,
+        kernel_y=kernel[0],
+        kernel_x=kernel[1],
+        stride_y=stride[0],
+        stride_x=stride[1],
+        pad_y=padding[0],
+        pad_x=padding[1],
+        count_type=count_type,
+        pool_type=pool_type,
+    )
+
+
+def _channel_block_region(batch: int, area: int, channels: int, packing: bool) -> list:
+    """The blit region that moves one 64-channel block between the two layouts.
+
+    `packing` reads row-major ``[batch][channels][area]`` and writes the
+    kernel's ``[batch][area][64]``; the other direction is the same region with
+    the two stride triples exchanged. The two are exactly the geometries the
+    DSP's own pack paths are written for: with `channels == 64` and this stride
+    pair, `htp_ops_try_pack_area_blit` (blit_ops.cc:816-831) takes the case and
+    reads/writes element ``(b, c, x)`` as
+    ``dst[b * area * 64 + x * 64 + c] = src[b * 64 * area + c * area + x]``,
+    which is the same mapping this region describes.
+    """
+    inner = ([channels * area, area, 1], [area * POOL_CHANNEL_BLOCK, 1, POOL_CHANNEL_BLOCK])
+    if not packing:
+        inner = (inner[1], inner[0])
+    return [0, 0, 0, batch, POOL_CHANNEL_BLOCK, area] + list(inner[0]) + list(inner[1])
+
+
+def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
+    """max_pool2d / avg_pool2d as one POOL2D_FP16, blocked either side.
+
+    The kernel reads and writes its activation in the DSP's 64-channel blocked
+    layout, so the row-major buffer the arena holds has to be rearranged into it
+    before the window walk and back out after. That is two blits around the
+    command, and they are not optional: reading the blocked layout's
+    ``(y * width + x) * 64`` step over a row-major buffer would return other
+    channels' values at every position. A spatial extent of one is the one case
+    where the two layouts agree element for element, and the blit is dropped.
+    """
+    spec = pool_spec(node)
+    if spec is None:
+        raise RuntimeError(
+            "hexagon: this pool2d is not one the DSP kernel can run (see pool_spec)"
+        )
+    _require_arena_dtype(node, "pool2d")
+    source = ctx.operand(node.args[0])
+    # max_pool2d_with_indices hands its values on through a getitem, and that
+    # getitem is what downstream reads, so its output slot is the one to fill.
+    sink = next(
+        (reader for reader in node.users if max_pool_getitem(reader) is node),
+        node,
+    )
+    out = ctx.result_for(sink, _numel(node))
+    area = spec.ih * spec.iw
+    out_area = spec.oh * spec.ow
+    channels = POOL_CHANNEL_BLOCK
+
+    packed_in = source
+    if area != 1:
+        packed_in = ctx.builder.add_activation(
+            spec.batch * area * channels * FP16_BYTES
+        )
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[packed_in],
+                params=[1, FP16_BYTES, 1]
+                + _channel_block_region(spec.batch, area, channels, True),
+            ),
+        )
+
+    pooled = (
+        out
+        if out_area == 1
+        else ctx.builder.add_activation(spec.batch * out_area * channels * FP16_BYTES)
+    )
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_POOL2D_FP16,
+            inputs=[packed_in],
+            outputs=[pooled],
+            params=[
+                spec.batch,
+                spec.ih,
+                spec.iw,
+                spec.oh,
+                spec.ow,
+                # One block: the support check only lets C == 64 through.
+                1,
+                spec.kernel_y,
+                spec.kernel_x,
+                spec.stride_y,
+                spec.stride_x,
+                spec.pad_y,
+                spec.pad_x,
+                POOL_PAD_TYPE,
+                spec.count_type,
+                spec.pool_type,
+            ],
+        ),
+    )
+    if out_area != 1:
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[pooled],
+                outputs=[out],
+                params=[1, FP16_BYTES, 1]
+                + _channel_block_region(spec.batch, out_area, channels, False),
+            ),
+        )
+    return ctx.record(node, out)
+
+
+# The reductions. The DSP collapses one contiguous (outside, reduce, inside)
+# span of the buffer, so the reduced dims have to be adjacent; the caller's
+# support checks enforce that before an emitter ever runs.
+SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
+AMAX = exir_ops.edge.aten.amax.default
+REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX})
+SUM_TARGETS = frozenset({SUM_DIM})
+
+
+def reduction_dims(node: torch.fx.Node) -> Optional[list]:
+    """The reduced axes as positive indices, or None when they are not a span.
+
+    A missing dim and an empty list both mean every dim -- torch reduces the
+    whole tensor for either -- which is the single span the kernel wants.
+    """
+    src = node.args[0] if node.args else None
+    if not isinstance(src, torch.fx.Node):
+        return None
+    value = src.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dim() == 0:
+        return None
+    dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    rank = value.dim()
+    if dims is None or (isinstance(dims, (list, tuple)) and not dims):
+        return list(range(rank))
+    dims = [dims] if isinstance(dims, int) else list(dims)
+    if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims):
+        return None
+    norm = sorted(dim % rank for dim in dims)
+    if norm != list(range(norm[0], norm[0] + len(norm))):
+        return None
+    return norm
+
+
+def _emit_reduction(node: torch.fx.Node, ctx, kind: int) -> TensorRef:
+    """One command for a reduction over one contiguous span.
+
+    The three params are that span as ``[outside][reduce][inside]``, which is
+    what `htp_ops_reduction` walks (eltwise_ops.cc:2812-2862). Sum and maximum
+    are both accumulated per lane there -- the maximum seeds from the first
+    element rather than from zero, so an all-negative window is not clamped.
     """
     src = node.args[0]
-    _require_arena_dtype(node, "mean")
-    dims = node.args[1]
-    shape = src.meta["val"].shape
-    rank = len(shape)
-    # An omitted dim means every dim, which is the whole tensor as one span.
+    _require_arena_dtype(node, "reduction")
+    dims = reduction_dims(node)
     if dims is None:
-        norm = list(range(rank))
-    else:
-        dims = [dims] if isinstance(dims, int) else list(dims)
-        norm = sorted(d % rank for d in dims)
-
-    def _prod(values) -> int:
-        n = 1
-        for v in values:
-            n *= v
-        return n
-
+        raise RuntimeError("hexagon: this reduction's dims are not one span")
+    shape = src.meta["val"].shape
+    span = shape[dims[0] : dims[-1] + 1]
     out = ctx.result_for(node, _numel(node))
     ctx.emit(
         node,
@@ -1840,15 +2230,45 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(src)],
             outputs=[out],
             params=[
-                _prod(shape[: norm[0]]),
-                _prod(shape[norm[0] : norm[-1] + 1]),
-                _prod(shape[norm[-1] + 1 :]),
-                REDUCTION_MEAN,
+                _upper_product(shape[: dims[0]], ctx),
+                _upper_product(span, ctx),
+                _upper_product(shape[dims[-1] + 1 :], ctx),
+                kind,
                 FP16_BYTES,
             ],
         ),
     )
     return ctx.record(node, out)
+
+
+def _emit_sum_dim(node: torch.fx.Node, ctx) -> TensorRef:
+    if not sum_dim_is_emittable(node):
+        raise RuntimeError("hexagon: this sum reduces into another dtype")
+    return _emit_reduction(node, ctx, REDUCTION_SUM)
+
+
+def _emit_amax(node: torch.fx.Node, ctx) -> TensorRef:
+    return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
+
+
+def sum_dim_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this sum is the fp16 sum the kernel computes.
+
+    An accumulator of another width is a different op, not a narrower command:
+    the kernel sums in fp32 and stores fp16 (`htp_ops_reduce_fp16_scalar_range`,
+    eltwise_ops.cc:2507-2525). The schema makes dtype keyword-only, so the graph
+    carries it in kwargs; the positional slot is checked as well because a
+    hand-built node may put it there.
+    """
+    dtype = node.kwargs.get("dtype")
+    if dtype is None and len(node.args) > 3:
+        dtype = node.args[3]
+    return dtype is None
+
+
+def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.mean.dim as a single REDUCTION."""
+    return _emit_reduction(node, ctx, REDUCTION_MEAN)
 
 
 def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
@@ -2727,6 +3147,12 @@ EMITTERS = {
     # matmul emitter reads it and the node itself emits nothing.
     DQ_PER_CHANNEL: _emit_dequantize,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
+    SUM_DIM: _emit_sum_dim,
+    AMAX: _emit_amax,
+    MAX_POOL2D: _emit_pool2d,
+    MAX_POOL2D_WITH_INDICES: _emit_pool2d,
+    AVG_POOL2D: _emit_pool2d,
+    exir_ops.edge.aten.fmod.Tensor: _binary("mod"),
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
     exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
@@ -2764,6 +3190,7 @@ BINARY_TARGETS = frozenset(
         exir_ops.edge.aten.div.Tensor,
         exir_ops.edge.aten.maximum.default,
         exir_ops.edge.aten.minimum.default,
+        exir_ops.edge.aten.fmod.Tensor,
         MUL_SILU,
     }
 )

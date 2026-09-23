@@ -60,6 +60,9 @@ SHARED_GATHER = "DSP_OP_SHARED_GATHER"
 # is why the fused op carries the head transposes rather than the head-major
 # tensors a matmul wants.
 VISION_ATTENTION = "DSP_OP_VISION_ATTENTION_FP16"
+# The pool kernel. It carries no op type of its own beyond this one: max and the
+# average are selected by a param the emitter fills in.
+POOL = "DSP_OP_POOL2D_FP16"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -243,6 +246,60 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "Reduced dims must be one contiguous span (the kernel collapses a single "
         "[outside][reduce][inside] view); rank >= 1.",
+    ),
+    OpSupport(
+        "aten.sum.dim_IntList",
+        REDUCTION,
+        ARENA_FP16,
+        "Same single-span rule as mean.dim, with a missing or empty dim read as "
+        "every dim. The dtype argument must be absent: the kernel's accumulator is "
+        "fp32 and its result fp16, so summing into any other width is a different "
+        "op rather than a narrower command.",
+    ),
+    OpSupport(
+        "aten.amax.default",
+        REDUCTION,
+        ARENA_FP16,
+        "Same single-span rule as mean.dim. There is no minimum in "
+        "HtpOpsReductionOpType (sum, maximum, mean), so amin stays portable.",
+    ),
+    OpSupport(
+        "aten.max_pool2d.default",
+        POOL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "C == 64 only, which is the one channel count whose DSP activation "
+        "blocking coincides with a single 64-channel block; 3-D or 4-D operand; "
+        "static shapes; dilation 1, ceil_mode false, and every window holding at "
+        "least one input element. Three commands: one blit into the blocked "
+        "layout, the pool, one blit back out (a 1x1 spatial extent needs neither "
+        "blit, the layouts already agree).",
+    ),
+    OpSupport(
+        "aten.max_pool2d_with_indices.default",
+        POOL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "What max_pool2d.default becomes: to_edge decomposes the value-only op "
+        "into this one plus a getitem, so this is the form a graph carries. Same "
+        "constraints as max_pool2d.default, and every reader must be getitem 0 -- "
+        "the kernel produces the values, and a graph that reads the indices keeps "
+        "the pool portable.",
+    ),
+    OpSupport(
+        "aten.avg_pool2d.default",
+        POOL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "As max_pool2d.default. count_include_pad selects the divisor the kernel "
+        "takes (the window's area, or the positions that landed inside); "
+        "divisor_override has no command form and keeps the node portable.",
+    ),
+    OpSupport(
+        "aten.fmod.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar, as the other binary ops. "
+        "The kernel computes the truncated remainder (a - trunc(a/b)*b), which is "
+        "fmod and not torch's floored remainder; a zero divisor answers 0 where "
+        "torch gives NaN.",
     ),
     OpSupport(
         "aten._softmax.default",
@@ -430,7 +487,8 @@ SUPPORTED: List[OpSupport] = [
         None,
         ARENA_FP16,
         "Re-points a producer's result. Only the getitem reading a layer norm's "
-        "output 0, or one of the fused add+norm's outputs 0/1, is placed.",
+        "output 0, a max pool's values, or one of the fused add+norm's outputs "
+        "0/1, is placed.",
     ),
     # --- row gathers (DSP_OP_SHARED_GATHER) -------------------------------
     OpSupport(
@@ -586,6 +644,10 @@ PREDICATES = [
     "add_rms_norm_is_emittable",
     "quantized_matmul_is_emittable",
     "vision_attention_is_emittable",
+    "pool_spec",
+    "reduction_dims",
+    "sum_dim_is_emittable",
+    "max_pool_is_emittable",
 ]
 
 
