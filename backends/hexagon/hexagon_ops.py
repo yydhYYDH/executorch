@@ -1530,7 +1530,8 @@ def _emit_quantized_matmul(
     params = [1, k, n, 0, 0, 0, 0, 0, 1, 0]
     if quantized.bits == 4:
         packed = pack_q4a16_gemv_weight(weight, scale, k, n)
-        ctx.builder.add_op(
+        ctx.emit(
+            node,
             Op(
                 type=DSP_OP_MATMUL_Q4A16_GEMV_I8,
                 inputs=[ctx.operand(activation), ctx.builder.add_weights(packed), bias_ref],
@@ -1540,7 +1541,8 @@ def _emit_quantized_matmul(
         )
     else:
         packed = pack_w8a16_gemv_weight(weight, k, n)
-        ctx.builder.add_op(
+        ctx.emit(
+            node,
             Op(
                 type=DSP_OP_MATMUL_W8A16_GEMV_I8,
                 inputs=[
