@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Generate ``backends/hexagon/OP_SUPPORT.md`` from the emitter table.
+
+The set of supported ops is read from ``hexagon_ops.EMITTERS`` (re-exported as
+``hexagon_backend.SUPPORTED_TARGETS``), so the table cannot drift from the code:
+an emitter added without a row here fails the generator instead of silently
+leaving the documentation stale. The DSP op type, dtype and constraints are
+curated from the emitters and the support predicates in
+``partition/hexagon_partitioner.py``; the predicate functions themselves are
+imported so the generator breaks loudly if they are renamed.
+
+Run from the repository root:
+
+    PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py
+
+Pass ``--check`` to fail instead of writing when the checked-in file is stale.
+"""
+
+import argparse
+import operator
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from executorch.backends.hexagon import hexagon_ops as ops
+from executorch.backends.hexagon.hexagon_backend import SUPPORTED_TARGETS
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+OUTPUT = REPO_ROOT / "backends" / "hexagon" / "OP_SUPPORT.md"
+
+# DSP op type constants, named rather than numbered so a change in
+# hexagon_ops.py is picked up here.
+UNARY = "DSP_OP_UNARY"
+BINARY = "DSP_OP_BINARY_ELEMENTWISE"
+SOFTMAX = "DSP_OP_SOFTMAX"
+REDUCTION = "DSP_OP_REDUCTION"
+MATMUL = "DSP_OP_BATCH_MATMUL"
+LAYER_NORM = "DSP_OP_LAYER_NORM"
+ADD_LAYER_NORM = "DSP_OP_ADD_FUSE_LAYERNORM"
+ROPE = "DSP_OP_ROPE"
+BLIT = "DSP_OP_RASTER_BLIT"
+FLASH_ATTN = "DSP_OP_FLASH_ATTN"
+
+# The arena holds two bytes per element, so every kernel reads and writes fp16.
+# A fp32 operand is narrowed on the way in and a fp32 result widened on the way
+# out (hexagon_backend.cpp), which is why both widths reach the same command.
+ARENA_FP16 = "fp16 (arena); fp32 narrowed on entry"
+
+
+@dataclass(frozen=True)
+class OpSupport:
+    #: Canonical edge op name, e.g. ``aten.abs.default``.
+    op: str
+    #: DSP op type constant name in hexagon_ops.py, or None when the emitter
+    #: produces no command.
+    dsp_op: Optional[str]
+    #: What the kernels actually read and write.
+    dtype: str
+    #: Constraints taken from the emitters and the support predicates.
+    constraints: str
+    #: Quantization support. "none" unless a real quantized path exists.
+    quantization: str = "none"
+
+
+SUPPORTED: List[OpSupport] = [
+    # --- unary family (DSP_OP_UNARY) -------------------------------------
+    OpSupport(
+        "aten.abs.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.neg.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.gelu.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.sigmoid.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.exp.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.log.default",
+        UNARY,
+        ARENA_FP16,
+        "One input; the DSP's own fast approximation, not the exact logarithm.",
+    ),
+    OpSupport(
+        "aten.silu.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.tanh.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.sqrt.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.rsqrt.default",
+        UNARY,
+        ARENA_FP16,
+        "One input; the DSP's own fast approximation, not the exact reciprocal sqrt.",
+    ),
+    OpSupport(
+        "aten.clamp.default",
+        UNARY,
+        ARENA_FP16,
+        "Either bound may be omitted; absent bounds are +/-inf. Bounds are narrowed "
+        "to the fp16 bit patterns the kernel compares against.",
+    ),
+    OpSupport(
+        "aten.clamp.out",
+        UNARY,
+        ARENA_FP16,
+        "Same kernel as clamp.default; the out= variant is registered separately.",
+    ),
+    OpSupport(
+        "aten.mul.Scalar",
+        UNARY,
+        ARENA_FP16,
+        "The scalar must be a python number, not a tensor. It is widened to fp32 "
+        "for the multiply and rounded back, matching torch's promotion.",
+    ),
+    OpSupport(
+        "et_hexagon.row_guard.default",
+        UNARY,
+        ARENA_FP16,
+        "Walks whole rows of the last dimension: the mask selects rows that are "
+        "entirely the masked value. Row length and pad value ride in params.",
+    ),
+    # --- binary family (DSP_OP_BINARY_ELEMENTWISE) -----------------------
+    OpSupport(
+        "aten.add.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; the DSP's broadcast path "
+        "is unreachable (it needs 25 more params than a command carries). Rank <= 8.",
+    ),
+    OpSupport(
+        "aten.sub.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+    ),
+    OpSupport(
+        "aten.mul.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+    ),
+    OpSupport(
+        "aten.div.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+    ),
+    OpSupport(
+        "aten.maximum.default",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+    ),
+    OpSupport(
+        "aten.minimum.default",
+        BINARY,
+        ARENA_FP16,
+        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+    ),
+    OpSupport(
+        "et_hexagon.mul_silu.default",
+        BINARY,
+        ARENA_FP16,
+        "Fused gated activation `a * silu(b)`; produced by mul_silu.py from "
+        "`mul(sigmoid(x), x)`. Same shape/scalar operand rule as the binary family.",
+    ),
+    # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
+    OpSupport(
+        "aten.mm.default",
+        MATMUL,
+        ARENA_FP16,
+        "Contiguous 2-D operands only; contraction dims must match; all sizes and "
+        "steps must fit int32. A visible constant weight with m*k*n >= 32768 is "
+        "pre-packed in the HMX tile order at export.",
+    ),
+    OpSupport(
+        "aten.bmm.default",
+        MATMUL,
+        ARENA_FP16,
+        "Contiguous 3-D operands with equal batch and matching contraction; one "
+        "iteration per batch element. No broadcast batch.",
+    ),
+    OpSupport(
+        "aten.addmm.default",
+        MATMUL,
+        ARENA_FP16,
+        "alpha must be 1 and beta 0 or 1; 2-D contiguous matmuls; the bias is read "
+        "right-aligned against the 2-D result, so at most 2-D and broadcastable. "
+        "Emitted as the matmul plus one broadcast add.",
+    ),
+    # --- reductions / softmax --------------------------------------------
+    OpSupport(
+        "aten.mean.dim",
+        REDUCTION,
+        ARENA_FP16,
+        "Reduced dims must be one contiguous span (the kernel collapses a single "
+        "[outside][reduce][inside] view); rank >= 1.",
+    ),
+    OpSupport(
+        "aten._softmax.default",
+        SOFTMAX,
+        ARENA_FP16,
+        "Last axis only. The kernel's strided reduction over any other axis "
+        "disagrees with torch on hardware, so softmax_reduces_the_inner_axis keeps "
+        "those nodes portable.",
+    ),
+    # --- norms -----------------------------------------------------------
+    OpSupport(
+        "aten.layer_norm.default",
+        LAYER_NORM,
+        "src fp16; gamma/beta fp32",
+        "Normalized shape must be the trailing dims; eps must be a compile-time "
+        "scalar. The kernel reads gamma and beta as fp32, which no delegate input "
+        "holds, so the affine is emitted as separate elementwise mul/add.",
+    ),
+    OpSupport(
+        "aten.native_layer_norm.default",
+        LAYER_NORM,
+        "src fp16; gamma/beta fp32",
+        "Same as layer_norm.default. Every reader must be getitem 0; a graph that "
+        "reads mean or rstd keeps the whole node portable.",
+    ),
+    OpSupport(
+        "et_hexagon.rms_norm.default",
+        LAYER_NORM,
+        "src fp16; gamma fp32",
+        "RMSNorm flavour (beta ABSENT, rms flag set). eps must be a compile-time "
+        "scalar; gamma is applied by the kernel as fp32.",
+    ),
+    OpSupport(
+        "et_hexagon.add_rms_norm.default",
+        ADD_LAYER_NORM,
+        "src fp16; gamma fp32",
+        "Fused residual add + RMSNorm. Every reader must be getitem 0 or 1; the "
+        "command writes the normalized tensor and the residual sum together.",
+    ),
+    # --- rope ------------------------------------------------------------
+    OpSupport(
+        "et_hexagon.rope.default",
+        ROPE,
+        ARENA_FP16,
+        "Input is [..., seq, num_head, head_dim] (a one-wide batch folds into seq). "
+        "cos/sin are [seq, head_dim] with the even angles in the first half. The k "
+        "operand is the same tensor with kv_num_head = 0, so it is inert.",
+    ),
+    # --- raster blits ----------------------------------------------------
+    OpSupport(
+        "aten.slice_copy.Tensor",
+        BLIT,
+        ARENA_FP16,
+        "Narrowing slices only; step must be None or 1; rank preserved and only the "
+        "sliced dim may change. A run-time start is patched through the source "
+        "offset; the extent comes from the result shape.",
+    ),
+    OpSupport(
+        "aten.cat.default",
+        BLIT,
+        ARENA_FP16,
+        "One to three inputs (a region is 12 ints and only 3 fit in a command); all "
+        "contiguous fp16; only the concatenated axis differs and the lengths add "
+        "up. Every length must be known when the command is built.",
+    ),
+    OpSupport(
+        "aten.permute_copy.default",
+        BLIT,
+        ARENA_FP16,
+        "A permutation of all axes whose axes split into at most three ordered "
+        "consecutive groups; reversing axes inside a group is refused. A constant "
+        "2-D [1, 0] weight transpose is folded at export instead.",
+    ),
+    OpSupport(
+        "aten.select_copy.int",
+        BLIT,
+        ARENA_FP16,
+        "The narrowing form is a one-entry slice emitted as a blit; the form that "
+        "keeps the operand's bytes re-points it and emits nothing. int64 position "
+        "reads stay on the host.",
+    ),
+    OpSupport(
+        "et_hexagon.update_cache.default",
+        BLIT,
+        ARENA_FP16,
+        "cache and value fp16 and contiguous, rank >= 3, value.shape[2:] == "
+        "cache.shape[2:]. Emitted as two blits; the destination row is patched from "
+        "the position tensor scaled by one cached position's element count.",
+    ),
+    # --- attention -------------------------------------------------------
+    OpSupport(
+        "llama.custom_sdpa.default",
+        FLASH_ATTN,
+        "fp16; fp32 narrowed on entry",
+        "Registered lazily, once the LLM extension defines llama.custom_sdpa, and "
+        "only while SDPA_DELEGATION is true. Four-dimensional q/k/v, matching "
+        "head_dim, n_kv_heads dividing the query heads; start_pos must be a "
+        "constant or a run-time tensor read. One non-paged FLASH_ATTN.",
+    ),
+    OpSupport(
+        "llama.custom_sdpa.out",
+        FLASH_ATTN,
+        "fp16; fp32 narrowed on entry",
+        "Same emitter as llama.custom_sdpa.default; both overloads are registered.",
+    ),
+    # --- views / casts / dim-order (no command) --------------------------
+    OpSupport(
+        "aten.alias_copy.default",
+        None,
+        ARENA_FP16,
+        "Re-points the operand's TensorRef; requires both sides contiguous with "
+        "equal element count. A view that would be a partition boundary, or that is "
+        "a graph output, is copied instead.",
+    ),
+    OpSupport(
+        "aten.unsqueeze_copy.default",
+        None,
+        ARENA_FP16,
+        "View: re-points the operand; contiguous, equal element count.",
+    ),
+    OpSupport(
+        "aten.squeeze_copy.dims",
+        None,
+        ARENA_FP16,
+        "View: re-points the operand; contiguous, equal element count.",
+    ),
+    OpSupport(
+        "aten.view_copy.default",
+        None,
+        ARENA_FP16,
+        "View: re-points the operand; contiguous, equal element count.",
+    ),
+    OpSupport(
+        "aten.expand_copy.default",
+        None,
+        ARENA_FP16,
+        "View: re-points the operand; contiguous, equal element count (a real "
+        "broadcast is not described by the operand's TensorRef).",
+    ),
+    OpSupport(
+        "aten._to_copy.default",
+        None,
+        ARENA_FP16,
+        "fp16 <-> fp32 only: the runtime already converts at the arena boundary, so "
+        "no command is emitted. A cast from/to int64 stays portable.",
+    ),
+    OpSupport(
+        "aten.to.dtype",
+        None,
+        ARENA_FP16,
+        "Same as _to_copy.default: fp16 <-> fp32 only, no command.",
+    ),
+    OpSupport(
+        "dim_order_ops._to_dim_order_copy.default",
+        None,
+        ARENA_FP16,
+        "Identity dim_order (or none) only: the arena is row-major two-byte. Any "
+        "other order stays on a portable kernel.",
+    ),
+    OpSupport(
+        "dim_order_ops._clone_dim_order.default",
+        None,
+        ARENA_FP16,
+        "Identity dim_order (or none) only; otherwise portable.",
+    ),
+    OpSupport(
+        "operator.getitem",
+        None,
+        ARENA_FP16,
+        "Re-points a producer's result. Only the getitem reading a layer norm's "
+        "output 0, or one of the fused add+norm's outputs 0/1, is placed.",
+    ),
+]
+
+# Exclusions worth naming: each is something a reader might expect to work.
+NOT_SUPPORTED = [
+    (
+        "aten.convolution.default",
+        "No generic convolution kernel. Only the exact patch-embed Conv3d pattern "
+        "(kernel == stride, no padding/dilation/groups, one output window) is "
+        "rewritten to a matmul by conv_patch_embed.py.",
+    ),
+    (
+        "aten.embedding.default",
+        "The fp16 gather kernel (DSP_OP_SHARED_GATHER) indexes a 32x32-blocked "
+        "table; a row-major weight would return other rows' values, so it stays on "
+        "the host.",
+    ),
+    (
+        "aten.copy_.default (KV writeback)",
+        "No emitter. Delegating the auto_functionalized writeback would move the "
+        "same bytes back through in_place with nothing gained.",
+    ),
+    (
+        "q4a16 quantized matmul",
+        "The pack64 activation/output repack is not wired up; the quantized matmul "
+        "path is not implemented.",
+    ),
+    (
+        "softmax over a non-last axis",
+        "The kernel's strided reduction path disagrees with torch on hardware.",
+    ),
+    (
+        "broadcasting binary ops",
+        "The DSP's broadcast path needs 25 more params than a command carries, so "
+        "only same-shape and scalar operands work.",
+    ),
+    (
+        "aten.addmm.default with alpha != 1 or beta not in {0, 1}",
+        "alpha has no kernel and beta is the bias's own scale; anything else would "
+        "need a multiply the emitter does not produce.",
+    ),
+    (
+        "aten.layer_norm / native_layer_norm with a non-trailing normalized shape "
+        "or a run-time eps",
+        "The kernel describes the norm as one inner span repeated; a run-time eps is "
+        "not a number the command can carry.",
+    ),
+    (
+        "aten.mean.dim with non-adjacent reduced dims",
+        "REDUCTION collapses one contiguous span only.",
+    ),
+    (
+        "aten.cat.default with more than three operands",
+        "A command holds at most three 12-int regions.",
+    ),
+    (
+        "aten.permute_copy.default reversing axes inside a group, or needing more "
+        "than three groups",
+        "No single blit region describes it; the emitter refuses rather than "
+        "reading the wrong elements.",
+    ),
+    (
+        "aten.slice_copy.Tensor with step != 1",
+        "A region describes one run per row, so a step is out.",
+    ),
+    (
+        "casts from/to int64, and int64 select_copy",
+        "The kernels read two-byte elements; int64 values (such as start_pos) stay "
+        "where the patch mechanism can reach them.",
+    ),
+    (
+        "aten.split / getitem of a split",
+        "No producer for the extra outputs; only layer-norm and fused add+norm "
+        "getitems are placed.",
+    ),
+    (
+        "aten.bmm.default with a broadcast batch",
+        "One tile geometry and one step are derived from the shapes; a broadcast "
+        "batch is not described by them.",
+    ),
+    (
+        "llama.custom_sdpa shapes other than the one FLASH_ATTN form",
+        "Non-4-D operands, a head_dim mismatch, or n_kv_heads that does not divide "
+        "the query heads stay portable.",
+    ),
+]
+
+# Support predicates the constraints above are taken from. Imported so a rename
+# fails here rather than leaving the documentation claiming a check that no
+# longer exists.
+PREDICATES = [
+    "softmax_reduces_the_inner_axis",
+    "slice_region",
+    "select_region",
+    "cat_region",
+    "permute_region",
+    "dim_order_keeps_the_bytes",
+    "update_cache_layout",
+    "sdpa_targets",
+    "layer_norm_normalizes_the_trailing_dims",
+    "layer_norm_is_emittable",
+    "add_rms_norm_is_emittable",
+]
+
+
+def _canonical(target) -> str:
+    """The edge op's canonical name, matching the keys used above.
+
+    An ``EdgeOpOverload``'s ``__name__`` is its qualified overload name
+    (``aten.abs.default``); ``str`` renders the whole schema and is not a key.
+    """
+    if target is operator.getitem:
+        return "operator.getitem"
+    return target.__name__
+
+
+def _verify_predicates() -> None:
+    missing = [name for name in PREDICATES if not hasattr(ops, name)]
+    if missing:
+        raise SystemExit(
+            "gen_op_support: hexagon_ops no longer defines " + ", ".join(missing)
+        )
+
+
+def _dsp_cell(support: OpSupport) -> str:
+    if support.dsp_op is None:
+        return "none (no command)"
+    return f"`{support.dsp_op}` ({getattr(ops, support.dsp_op)})"
+
+
+def _rows() -> List[OpSupport]:
+    by_op = {support.op: support for support in SUPPORTED}
+    _verify_predicates()
+
+    # Every emitter must have a row: this is the drift guard.
+    missing = sorted(
+        _canonical(target)
+        for target in SUPPORTED_TARGETS
+        if _canonical(target) not in by_op
+    )
+    if missing:
+        raise SystemExit(
+            "gen_op_support: no OP_SUPPORT row for emitter(s): " + ", ".join(missing)
+        )
+
+    # The attention overloads resolve lazily; when the extension is loaded, make
+    # sure the targets it registers are covered too.
+    for target in ops.sdpa_targets():
+        name = _canonical(target)
+        if name not in by_op:
+            raise SystemExit(f"gen_op_support: no OP_SUPPORT row for {name}")
+
+    # The table is the emitter set plus the lazily-registered attention rows,
+    # sorted so the output is stable across runs and environments.
+    listed = {_canonical(target) for target in SUPPORTED_TARGETS}
+    if ops.SDPA_DELEGATION:
+        listed.update({"llama.custom_sdpa.default", "llama.custom_sdpa.out"})
+    return sorted((by_op[name] for name in listed), key=lambda support: support.op)
+
+
+def render() -> str:
+    lines: List[str] = []
+    lines.append("<!-- Generated by backends/hexagon/scripts/gen_op_support.py. -->")
+    lines.append("<!-- Do not edit by hand; regenerate with the command below. -->")
+    lines.append("")
+    lines.append("# Hexagon op support")
+    lines.append("")
+    lines.append(
+        "The DSP kernels read and write two bytes per element, so every delegated op "
+        "runs fp16 in the arena. A node the graph declares fp32 is emitted exactly as "
+        "its fp16 twin: the runtime narrows a fp32 operand on the way in and widens a "
+        "fp32 result on the way out. An op is delegated exactly when "
+        "`hexagon_ops.EMITTERS` has an entry for it and the support predicate in "
+        "`partition/hexagon_partitioner.py` accepts the node."
+    )
+    lines.append("")
+    lines.append(
+        "Regenerate with `PYTHONPATH=src python "
+        "backends/hexagon/scripts/gen_op_support.py`."
+    )
+    lines.append("")
+    lines.append("## Supported ops")
+    lines.append("")
+    lines.append(
+        "| PyTorch edge op | DSP op type | Compute dtype | Quantization | Constraints |"
+    )
+    lines.append("|---|---|---|---|---|")
+    for support in _rows():
+        lines.append(
+            "| `{}` | {} | {} | {} | {} |".format(
+                support.op,
+                _dsp_cell(support),
+                support.dtype,
+                support.quantization,
+                support.constraints,
+            )
+        )
+    lines.append("")
+    lines.append("## Not supported")
+    lines.append("")
+    lines.append(
+        "Each of these is a deliberate exclusion: the node stays on the portable "
+        "kernels rather than reaching an emitter that would read it wrong."
+    )
+    lines.append("")
+    lines.append("| PyTorch edge op | Reason |")
+    lines.append("|---|---|")
+    for op, reason in NOT_SUPPORTED:
+        lines.append(f"| `{op}` | {reason} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit nonzero if OP_SUPPORT.md differs from the generated content.",
+    )
+    args = parser.parse_args(argv)
+
+    content = render()
+    if args.check:
+        existing = OUTPUT.read_text() if OUTPUT.exists() else ""
+        if existing != content:
+            print(f"{OUTPUT} is stale; run the generator", file=sys.stderr)
+            return 1
+        return 0
+
+    OUTPUT.write_text(content)
+    print(f"wrote {OUTPUT} ({len(content)} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

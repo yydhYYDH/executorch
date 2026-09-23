@@ -256,6 +256,29 @@ cmake -S backends/hexagon/skel -B build-skel \
   -DSKEL_ARCH=v79 -DIDL_DIR=${IDL_DIR}
 ```
 
+## Tests
+
+```sh
+pytest backends/hexagon/test                                          # this backend's own tests
+pytest backends/test/suite/operators -m flow_hexagon -q               # the shared operator suite
+PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py      # regenerate OP_SUPPORT.md
+```
+
+The first directory is in `pytest.ini`'s `testpaths`, so the generic CI unittest
+job runs it. The cases that need the SDK's toolchain or its simulator skip when
+it is absent, so the run is meaningful on a machine without the SDK.
+`test/test_op_support.py` is the guard that keeps `OP_SUPPORT.md` equal to what
+`gen_op_support.py` renders from `hexagon_ops.EMITTERS`; add an emitter and that
+test fails until the table is regenerated.
+
+The second command reaches the shared operator suite through
+`backends/test/suite/flows/hexagon.py`. The flow is registered unconditionally,
+so `-m flow_hexagon` collects the backend's cases wherever it runs; each case
+exports, partitions and emits its blob, and then the run stage skips, because a
+serialized program needs the DSP. Executing a collected case needs a runner built
+with `EXECUTORCH_BUILD_HEXAGON=ON`, the matching skel on the device, and a way to
+hand the `.pte` over; see the execution policy note in `test/tester/tester.py`.
+
 ## The skel must be built with optimization
 
 `skel/CMakeLists.txt` sets `-O2`, and it is not a performance preference. The
