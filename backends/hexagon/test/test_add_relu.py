@@ -170,7 +170,8 @@ def test_without_the_pass_the_rectifier_is_a_second_command():
     # The op the test is about is still in the graph; it is inside the delegate
     # now rather than in the part the portable kernels keep.
     assert any(
-        "aten.relu.default" in target for target in _call_targets(_edge(_RectifiedSum(), (x, y)))
+        "aten.relu.default" in target
+        for target in _call_targets(_edge(_RectifiedSum(), (x, y)))
     )
 
 

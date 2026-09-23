@@ -38,10 +38,10 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
-    mean_result_width_is_emittable,
+    _mean_reduces_one_span,
     HexagonOperatorSupport,
     HexagonPartitioner,
-    _mean_reduces_one_span,
+    mean_result_width_is_emittable,
 )
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
