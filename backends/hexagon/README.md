@@ -671,9 +671,11 @@ Working and verified without a device:
   values exactly. `fmod` lowers to one BINARY command with subtype 12 and
   reproduces the truncated remainder, and the floored `remainder` is pinned as
   not delegated. `FuseAddReluPass` rewrites `relu(x + y)` into the one
-  `BINARY_ELEMENTWISE` command that does `max(a + b, 0)`, which is the only form
-  of a rectifier the DSP has. See `test/test_pool.py`, `test/test_sum_amax.py`,
-  `test/test_fmod.py` and `test/test_add_relu.py`.
+  `BINARY_ELEMENTWISE` command that does `max(a + b, 0)`, the only command here
+  that adds and rectifies in one step; without the pass the pair delegates as an
+  add and a unary clamp, so the pass buys a command rather than a round trip. See
+  `test/test_pool.py`, `test/test_sum_amax.py`, `test/test_fmod.py` and
+  `test/test_add_relu.py`.
 - the overloads the ops above were missing reach the DSP too. `torch.mean(x)`
   lowers to one REDUCTION over `[1][numel][1]`, the same command
   `torch.mean(x, dim=None)` produces; `torch.max(x)` lowers to one REDUCTION of
@@ -769,14 +771,16 @@ Not done yet:
   observe;
 - **the fused rectified sum (`add_relu`, subtype 8) has never run anywhere but on
   the host**, because no ATen op produces `max(a + b, 0)`: `relu(x + y)` reaches
-  the graph as two nodes and the DSP has no unary relu for the second one.
-  `FuseAddReluPass` in the caller's `transform_passes` rewrites the pair into the
-  node the emitter table has the subtype for, and `test/test_add_relu.py` pins
-  the rewrite, the command and its numbers -- all on the host. Unverified on
-  device: that the fp16 vector path's `max(a + b, 0)` propagates a NaN where
-  torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour is not documented here;
-  and that an add whose sum has another reader still gets the command, which is a
-  partition question rather than a kernel one.
+  the graph as an add and a relu, and `FuseAddReluPass` in the caller's
+  `transform_passes` is what rewrites them into the node the emitter table has the
+  subtype for. Without the pass the pair still reaches the DSP, as a binary add
+  and a unary clamp, so the pass buys a command rather than a round trip -- a
+  smaller claim than it made before `aten.relu.default` had an emitter.
+  `test/test_add_relu.py` pins the rewrite, the command and its numbers -- all on
+  the host. Unverified on device: that the fp16 vector path's `max(a + b, 0)`
+  propagates a NaN where torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour
+  is not documented here; and that an add whose sum has another reader still gets
+  the command, which is a partition question rather than a kernel one.
 - **the clamp entry point has never run anywhere but on the host.** Four edge
   ops now reach it -- `clamp`, `hardtanh`, `relu` and `relu6` -- and the
   arithmetic the tests model is a transcription of `htp_ops_clamp_fp16_chunk`
