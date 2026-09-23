@@ -441,7 +441,7 @@ CommandProfiles ReadCommandProfiles(const HexagonDelegate& delegate) {
   profiles.timed = header[kProbeHeaderVersionInt] == kProbeVersionCommandTime;
   const int32_t sent = header[1];
   const int32_t count =
-      std::max(0, std::min(sent, (int32_t)kProbeRecords));
+      std::max(0, std::min(sent, kProbeRecords));
   profiles.commands.reserve(count);
   for (int i = 0; i < count; i++) {
     const int32_t* rec =
@@ -531,7 +531,8 @@ bool ArmProbe(HexagonDelegate& delegate) {
 class PhaseEvent {
  public:
   PhaseEvent(runtime::EventTracer* tracer, const char* name) : tracer_(tracer) {
-    entry_ = event_tracer_start_profiling_delegate(tracer_, name, -1);
+    entry_ = event_tracer_start_profiling_delegate(
+        tracer_, name, /* delegate_debug_id = */ -1);
   }
   ~PhaseEvent() {
     if (open_) {
@@ -588,7 +589,7 @@ void PublishCommandProfiles(
         command.op_type, command.microseconds, command.ret};
     event_tracer_log_profiling_delegate(
         tracer,
-        nullptr,
+        /* name = */ nullptr,
         static_cast<runtime::DelegateDebugIntId>(first + i),
         start,
         end,
