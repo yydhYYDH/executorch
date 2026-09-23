@@ -2223,23 +2223,34 @@ def _emit_reduction(node: torch.fx.Node, ctx, kind: int) -> TensorRef:
     if dims is None:
         raise RuntimeError("hexagon: this reduction's dims are not one span")
     shape = src.meta["val"].shape
+    outside = shape[: dims[0]]
     span = shape[dims[0] : dims[-1] + 1]
+    inside = shape[dims[-1] + 1 :]
     out = ctx.result_for(node, _numel(node))
-    ctx.emit(
+    op_index = ctx.emit(
         node,
         Op(
             type=DSP_OP_REDUCTION,
             inputs=[ctx.operand(src)],
             outputs=[out],
             params=[
-                _upper_product(shape[: dims[0]], ctx),
+                _upper_product(outside, ctx),
                 _upper_product(span, ctx),
-                _upper_product(shape[dims[-1] + 1 :], ctx),
+                _upper_product(inside, ctx),
                 kind,
                 FP16_BYTES,
             ],
         ),
     )
+    # Each of the three is the upper bound of a product that may hold the
+    # run-time length, so each is patched with the length it was written for --
+    # the pairing every other shape-derived param here has. Without it the
+    # command describes the allocation rather than the buffer: a sum over the
+    # sequence, or a whole-tensor mean, folds in whatever the arena holds past
+    # the run-time length and answers with it.
+    _patch_dynamic_product(ctx, op_index, outside, 0)
+    _patch_dynamic_product(ctx, op_index, span, 1)
+    _patch_dynamic_product(ctx, op_index, inside, 2)
     return ctx.record(node, out)
 
 
