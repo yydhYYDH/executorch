@@ -622,9 +622,16 @@ def _fold_constant_transpose(node: torch.fx.Node, ctx):
 
 def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     """A transpose is a strided read and a strided write, which is one region."""
-    folded = _fold_constant_transpose(node, ctx)
-    if folded is not None:
-        return folded
+    # A folded transpose is stored in the weights section and reached through
+    # the folded table, which only a consumer reads. A node the caller reads
+    # from a delegate output has no consumer, and an output slot is a region of
+    # the arena the runtime copies out, so there the transpose is emitted as the
+    # blit it is -- reading the weight, which is where its operand lives either
+    # way.
+    if not ctx.is_method_output(node):
+        folded = _fold_constant_transpose(node, ctx)
+        if folded is not None:
+            return folded
     out = ctx.result_for(node, _numel(node))
     ctx.emit(
         node,
