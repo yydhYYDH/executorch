@@ -44,6 +44,13 @@ target_link_libraries(
   hexagon_backend PUBLIC executorch ${HEXAGON_DSPRPC_LIB} ${CMAKE_DL_LIBS}
 )
 
+# The backend registers itself from a static initializer and nothing references
+# it, so a consumer that links this archive the ordinary way drops the object and
+# gets an unregistered backend at run time rather than a link error. For an
+# archive this emits whole-archive retention into every consumer, the same call
+# backends/xnnpack and backends/vulkan make.
+executorch_target_link_options_shared_lib(hexagon_backend)
+
 # executorch_backends is exported and links this target, so leaving it out of
 # the export set fails the generate step rather than the build.
 install(
