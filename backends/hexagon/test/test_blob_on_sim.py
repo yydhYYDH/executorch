@@ -19,6 +19,7 @@ with its patch and scale, a matmul and a broadcast.
 
 import os
 import pathlib
+import struct
 import sys
 from types import SimpleNamespace
 
@@ -34,7 +35,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 import blob_interpreter  # noqa: E402
 import hexagon_sim  # noqa: E402
-from blob_interpreter import Arena, execute, read_blob  # noqa: E402
+from blob_interpreter import Arena, execute, read_blob, UnsupportedOp  # noqa: E402
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
@@ -418,7 +419,15 @@ def _case(
     # is stated because a dynamic case hands over the whole bound-sized slot
     # rather than the run-time tensor; it is the same number the simulator is
     # given, and the trailer's own longest length is asserted against both.
-    host = execute(blob, [t.numpy() for t in args], length=length or None)
+    if kind == "refused":
+        # The host model checks this one too, and refuses it in its own words
+        # rather than answering wrongly: the case is about the refusal, and the
+        # disagreement the DSP shows is with torch, not with the host model.
+        with pytest.raises(UnsupportedOp):
+            execute(blob, [t.numpy() for t in args], length=length or None)
+        host = None
+    else:
+        host = execute(blob, [t.numpy() for t in args], length=length or None)
     arena = Arena(header, blob, "fixture")
     return SimpleNamespace(
         tag=tag,
@@ -697,6 +706,48 @@ def _strip_trailer(blob):
     at = blob.find(blob_interpreter.B.DYNAMIC_TRAILER_MAGIC.to_bytes(4, "little"))
     assert at >= 0, "a dynamic blob carries a trailer"
     return blob[:at] + b"\0\0\0\0" + blob[at + 4 :]
+
+
+def _param_at(blob, op_index, param_index):
+    """Where one command's param slot sits, from the struct's own layout.
+
+    The command opens with four int32s -- type, input count, output count, param
+    count -- and the params follow them, before the tensor refs. The offset does
+    not depend on how many params the command carries.
+    """
+    return (
+        blob_interpreter.B.HEADER_SIZE
+        + op_index * blob_interpreter.B.OP_SIZE
+        + 4 * 4
+        + 4 * param_index
+    )
+
+
+def _set_param(param_index, value, op_index=0):
+    """A mutation that overwrites one 4-byte param slot."""
+
+    def mutate(blob):
+        data = bytearray(blob)
+        at = _param_at(data, op_index, param_index)
+        data[at : at + 4] = value
+        return data
+
+    return mutate
+
+
+def _swap_params(first, second, op_index=0):
+    """A mutation that exchanges two param slots and changes nothing else."""
+
+    def mutate(blob):
+        data = bytearray(blob)
+        at, other = _param_at(data, op_index, first), _param_at(data, op_index, second)
+        data[at : at + 4], data[other : other + 4] = (
+            data[other : other + 4],
+            data[at : at + 4],
+        )
+        return data
+
+    return mutate
 
 
 def _cases():
@@ -1042,16 +1093,56 @@ def _branch_cases():
         operands = [
             (torch.rand(shape, generator=generator) * 2 - 1).half() for _ in range(3)
         ]
+        program = _vision_graph(batch, tokens, heads, head_dim, scale)
+        expected = _bits(_vision_reference(*operands, scale=scale).half())
         cases.append(
             _case(
                 tag,
-                _vision_graph(batch, tokens, heads, head_dim, scale),
+                program,
                 tuple(operands),
-                _bits(_vision_reference(*operands, scale=scale).half()),
+                expected,
                 kind="close",
                 tolerance=_VISION_TOLERANCE,
             )
         )
+        # The vision command's params are positional and nothing in the ABI
+        # names them: the reasons to believe slot 1 is `tokens` and slot 4 the
+        # scale are the emitter and this reading. Moving one slot at a time is
+        # what a run can falsify -- the answer has to move, or the slot is not
+        # read where the reading says it is.
+        if tag == "AD":
+            for control, mutate in (
+                ("AG", _swap_params(1, 2)),
+                # A scale of zero makes attention uniform over the keys, which
+                # both models compute exactly: a scale of 2 would do the same job
+                # but leaves the softmax smooth enough that the fp32 kernel and
+                # the fp64 model part company in the last bits, and a control
+                # asserts that they agree.
+                ("AH", _set_param(4, struct.pack("<f", 0.0))),
+            ):
+                cases.append(
+                    _case(
+                        control,
+                        program,
+                        tuple(operands),
+                        expected,
+                        kind="teeth",
+                        mutate=mutate,
+                    )
+                )
+            # The kernel rejects a workspace shorter than one fp32 per token
+            # (attention_entry.cc:26-29) and writes nothing, so this says which
+            # operand that check is about.
+            cases.append(
+                _case(
+                    "AI",
+                    program,
+                    tuple(operands),
+                    expected,
+                    kind="refused",
+                    mutate=_set_param(6, struct.pack("<i", 1)),
+                )
+            )
     return cases
 
 
@@ -1184,8 +1275,18 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
 def test_every_blob_agrees_three_ways(cases, simulated):
     for case in cases:
         dsp = simulated[f"{case.tag}0"]
-        host = _from_bits([int(value) for value in _host_bits(case.host[0])])
         expected = case.expected
+        if case.kind == "refused":
+            # A control both models are expected to reject outright: the kernel
+            # writes nothing, so the slot stays as the arena's fill and the
+            # answer is not the one torch computed. The host model raises its own
+            # refusal rather than producing a host answer to compare against.
+            assert dsp == [0] * len(dsp), (
+                f"{case.tag}: the kernel answered {_from_bits(dsp)[:4]} where it "
+                "should have refused and written nothing"
+            )
+            continue
+        host = _from_bits([int(value) for value in _host_bits(case.host[0])])
         if case.kind == "teeth":
             # A control case: its bytes are the ones a wrong assumption would
             # have produced. The two models still have to agree with each other
@@ -1339,6 +1440,36 @@ def test_the_vision_case_can_tell_the_two_layouts_apart(cases):
         f"the two readings answer within {worst}, so the tolerance above cannot "
         "tell them apart"
     )
+
+
+def test_a_vision_param_slot_is_where_the_emitter_put_it(cases):
+    """The vision command's params are positional and the ABI does not name them.
+
+    Exchanging `tokens` with `heads`, and replacing the scale bits, each has to
+    move the answer. The case above cannot tell a slot that is read from a slot
+    that is ignored: this is the run that does.
+    """
+    expected = _tagged(cases, "AD").expected.view("uint16").tolist()
+    for tag in ("AG", "AH"):
+        assert _host_bits(_tagged(cases, tag).host[0]) != expected, (
+            f"{tag}: the mutated slot left the answer where it was, so the slot "
+            "is not read where the emitter puts it"
+        )
+
+
+def test_the_vision_workspace_operand_is_the_one_the_kernel_checks(cases):
+    """Shrinking the workspace operand makes the kernel refuse and write nothing.
+
+    The host model implements the same check, in its own words, so this is the
+    one vision case where both models refuse: the DSP agrees with the host model
+    about the workspace being too small and with neither about an answer.
+    """
+    case = _tagged(cases, "AI")
+    assert case.host is None, (
+        "the host model answered a one-byte workspace, so the DSP's silence "
+        "cannot be read as a check on the operand the emitter passes"
+    )
+    assert case.args, "the refused case is still handed the real operands"
 
 
 def test_the_pool_case_can_tell_the_packed_layout_apart(cases):

@@ -762,7 +762,17 @@ Not done yet:
   workspace operand the second output the kernel requires. The layout is checked
   by separation rather than by agreement: the head-major reading (`[batch,
   heads, tokens, headDim]`) answers 1.2 away on these operands, so a case that
-  could not tell the two apart would fail its own control. Still unverified on
+  could not tell the two apart would fail its own control. The params are
+  positional and nothing in the ABI names them, so three more cases move one
+  slot each and require the answer to follow: exchanging `tokens` with `heads`
+  moves it 0.83, a scale of zero (uniform attention over the keys) moves it 0.41,
+  and shrinking the workspace operand to one byte makes the kernel refuse -- the
+  host model refuses it in its own words, and the DSP writes nothing, so that
+  operand is the one the check is about and not merely one the answer ignores.
+  Note which attention this is: the flash kernel behind `llama.custom_sdpa`
+  starts a worker pool, which the simulated QuRT cannot (`qurt_cb_fwk_worker_init`
+  returns -4), and that entry point stays out of the suite; the vision kernel is
+  a plain loop over the head, so it runs. Still unverified on
   device: the masked path, which no emitter reaches here; whether the workspace
   size the emitter reserves holds for every `tokens` the kernel's own 128-byte
   alignment asks for, since the simulator does not enforce the allocation; and
