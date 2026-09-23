@@ -2224,13 +2224,25 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     """
     args = node.args
     query, key = args[0], args[1]
+    if len(args) > 4 and args[4] is not None:
+        # The mask slot has no stride this emitter can fill in: the kernel reads
+        # the mask as fp16 rows of `mask_stride` columns and copies them into a
+        # fp32 region it places after the per-task rows, out of a workspace this
+        # backend sizes for the unmasked shape. A command with mask_stride = -1
+        # binds a mask the kernel then ignores, which is a wrong answer rather
+        # than a failure, so a masked node is refused where it is delegated and
+        # again here, for a graph that reaches preprocess without the
+        # partitioner (the tests call it that way).
+        raise RuntimeError(
+            "hexagon: sdpa with an attention mask is not emittable: the mask "
+            "stride and the fp32 workspace it is copied into are unsized"
+        )
     # Unlike the other ops, attention accepts fp32: the runtime narrows those
     # operands to fp16 as they enter the arena, so the DSP still sees fp16.
     _dtype = node.meta["val"].dtype
     if _dtype not in (torch.float16, torch.float32):
         raise RuntimeError(f"hexagon: sdpa input must be fp16 or fp32, got {_dtype}")
 
-    mask = args[4] if len(args) > 4 else None
     scale = args[7] if len(args) > 7 else None
     q_shape = query.meta["val"].shape
     kv_shape = key.meta["val"].shape
@@ -2272,7 +2284,9 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
         ctx.operand(args[0]),
         ctx.operand(args[1]),
         ctx.operand(args[2]),
-        ABSENT if mask is None else ctx.operand(mask),
+        # Slot three carries no mask: the dispatcher maps an absent ref to a
+        # null pointer, which is the "no mask" the command below asks for.
+        ABSENT,
         ctx.builder.add_activation(packed_bytes),
         ctx.builder.add_activation(packed_bytes),
     ]
@@ -2334,7 +2348,7 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
                 _float_bits(
                     scale if isinstance(scale, (int, float)) else q_shape[3] ** -0.5
                 ),
-                -1,  # mask_stride
+                -1,  # mask_stride: no mask, which is also the causal mode
                 # push_kv only reads this as the capacity its writes must stay
                 # inside, so it is the operand's length, not the cache's.
                 cache_capacity,  # max_kv_len
