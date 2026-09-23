@@ -31,6 +31,7 @@ from executorch.backends.hexagon.test.blob_interpreter import (  # noqa: E402
     BATCH_MATMUL,
     BINARY_ELEMENTWISE,
     execute,
+    RASTER_BLIT,
     read_blob,
 )
 from executorch.exir import to_edge, to_edge_transform_and_lower  # noqa: E402
@@ -166,11 +167,17 @@ def test_the_whole_patch_embed_lands_in_one_hexagon_partition():
     assert census == {"HexagonBackend": 1}, census
     assert _CONVOLUTION not in _nodes(lowered)
     assert all(_CONVOLUTION not in op for op in ops["HexagonBackend"])
+    # The model's own flatten and the two views the rewrite adds -- flattening
+    # the patches, then folding the result back to the convolution's shape --
+    # are all aliases the emitters elide, so the partition is mm and add over
+    # four reshapes.
     assert sorted(ops["HexagonBackend"]) == sorted(
         [
             "aten.view_copy.default",
+            "aten.view_copy.default",
             "aten.mm.default",
             "aten.add.Tensor",
+            "aten.view_copy.default",
             "aten.view_copy.default",
         ]
     ), ops["HexagonBackend"]
@@ -275,13 +282,16 @@ def test_the_rewrite_survives_a_dynamic_patch_count():
 
 
 def test_the_emitted_commands_are_the_matmul_and_the_bias():
-    """The two commands, run through the host model of the DSP.
+    """The two arithmetic commands, run through the host model of the DSP.
 
-    Both commands are shared with paths already on the device; what this pins is
-    that the rewrite reaches them, and with a bias whose broadcast strides the
-    kernel can walk. The operands are built from the delegate's own placeholders
-    rather than from a list written by hand: a delegate is fed positionally, so
-    a wrong guess here compares the wrong tensor and still looks like a pass.
+    The matmul and the broadcast bias are shared with paths already on the
+    device; what this pins is that the rewrite reaches them, and with a bias
+    whose broadcast strides the kernel can walk. The trailing blit materializes
+    the delegate's output, since the view the convolution left behind stops the
+    add from writing the output slot directly. The activation operand is taken
+    from the delegate's own placeholders rather than from a list written by hand:
+    a delegate is fed positionally, so a wrong guess here compares the wrong
+    tensor and still looks like a pass.
     """
     model = _PatchEmbed(3, 8, 2, 4).eval().to(torch.float16)
     inner = 3 * 2 * 4 * 4
@@ -294,24 +304,28 @@ def test_the_emitted_commands_are_the_matmul_and_the_bias():
     (delegate,) = _delegates(lowered)
 
     _, commands = read_blob(delegate.processed_bytes)
-    assert [command.type for command in commands] == [BATCH_MATMUL, BINARY_ELEMENTWISE]
+    assert [command.type for command in commands] == [
+        BATCH_MATMUL,
+        BINARY_ELEMENTWISE,
+        RASTER_BLIT,
+    ]
 
     weight = model.proj.weight.detach().float().reshape(8, inner).t().contiguous()
     placeholders = _delegate_inputs(delegate)
-    names = [node.name for node in placeholders]
-    # The transposed weight is the constant the pass lifted, under the generated
-    # name the lift gives it (the only lifted constant in this graph).
-    (lifted,) = [name for name in names if name.startswith("_lifted_tensor_constant")]
-    by_name = {
-        "p_proj_bias": model.proj.bias.detach().to(torch.float16).numpy(),
-        lifted: weight.to(torch.float16).numpy(),
-        "x": x.numpy(),
-    }
-    # What the order is, pinned: the constants the graph carries come ahead of
-    # the activation. The mapping from name to tensor is the part that is read.
-    assert names == ["p_proj_bias", lifted, "x"], names
-    operands = [by_name[name] for name in names]
-    assert [tuple(node.meta["val"].shape) for node in placeholders] == [
+    signature = delegate.original_module.graph_signature
+    # The lifted weight and the bias are the delegate's own constants, so the
+    # blob stores them and the caller passes only the activation.
+    owned = (
+        set(signature.inputs_to_parameters)
+        | set(signature.inputs_to_buffers)
+        | set(signature.inputs_to_lifted_tensor_constants)
+    )
+    method_inputs = [node for node in placeholders if node.name not in owned]
+    assert [node.name for node in method_inputs] == ["x"], [
+        node.name for node in placeholders
+    ]
+    operands = [x.numpy()]
+    assert [tuple(node.meta["val"].shape) for node in method_inputs] == [
         operand.shape for operand in operands
     ]
 

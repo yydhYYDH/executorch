@@ -38,6 +38,7 @@ UNARY = 4
 BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
 FLASH_ATTN = 18
+ROPE = 14
 
 #: fp16, the only element size any op this backend emits carries.
 FP16_BYTES = 2
@@ -275,12 +276,12 @@ def _run_raster_blit(command: Command, params: List[int], arena: Arena) -> None:
 def _run_layer_norm(command: Command, params: List[int], arena: Arena) -> None:
     """The scalar path of htp_ops_layer_norm.
 
-    gamma and beta are null here, so the affine step is skipped -- the emitter
-    leaves both absent because the scale is a separate multiply in the graph.
-    The last param selects RMS mode, and in RMS mode the mean is not merely
-    dropped but never accumulated, which is the whole difference between this op
-    doing an RMSNorm and doing a LayerNorm. Accumulation is fp32 throughout and
-    the result is written back as fp16.
+    beta is null here, so any bias is skipped; gamma carries the norm's weight
+    when the emitter folds one in, and is read as fp32 so the affine step runs in
+    fp32 like the kernel's. The last param selects RMS mode, and in RMS mode the
+    mean is not merely dropped but never accumulated, which is the whole
+    difference between this op doing an RMSNorm and doing a LayerNorm.
+    Accumulation is fp32 throughout and the result is written back as fp16.
 
     The vendored kernel reduces in a different order than numpy, so a result
     here is only expected to agree to about fp16's own precision.
@@ -291,8 +292,8 @@ def _run_layer_norm(command: Command, params: List[int], arena: Arena) -> None:
     dst = refs[3]
     gamma = refs[1]
     beta = refs[2]
-    if gamma.space != ABSENT or beta.space != ABSENT:
-        raise UnsupportedOp("blob: the affine step of layer_norm is not modelled")
+    if beta.space != ABSENT:
+        raise UnsupportedOp("blob: the bias of layer_norm is not modelled")
 
     source = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16).reshape(
         rows, inner
@@ -306,8 +307,13 @@ def _run_layer_norm(command: Command, params: List[int], arena: Arena) -> None:
     else:
         mean = np.zeros_like(variance)
     inv_std = (1.0 / np.sqrt(variance + eps)).astype(np.float32)
-    out = ((x - mean[:, None]) * inv_std[:, None]).astype(np.float16)
-    _store(arena, arena.address(dst), out.tobytes())
+    out = (x - mean[:, None]) * inv_std[:, None]
+    if gamma.space != ABSENT:
+        weight = np.frombuffer(bytes(arena.view(gamma)), dtype=np.float32).reshape(
+            inner
+        )
+        out = out * weight[None, :]
+    _store(arena, arena.address(dst), out.astype(np.float16).tobytes())
 
 
 def _as_float(bits: int) -> float:
@@ -359,6 +365,62 @@ def _run_add_fuse_layernorm(command: Command, params: List[int], arena: Arena) -
     )
 
 
+def _run_rope(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_rope's scalar path for one (q) tensor.
+
+    The command names q and k, but every emitter here hands it q as both and
+    passes kv_num_head = 0, so the k loop runs zero times. Tokens are the leading
+    axis and heads sit inside a token, which is the geometry the emitter builds
+    by folding a one-wide batch axis into the sequence. The table is the graph's
+    own [seq, head_dim] row: the first half is the even angles and the second the
+    odd ones, so element d of a head pairs with element d + head_dim/2:
+
+        out[d]          = in[d] * cos[d] - in[d + half] * sin[d]
+        out[d + half]   = in[d + half] * cos[d + half] + in[d] * sin[d + half]
+
+    The kernel multiplies and subtracts in fp16, so the products are rounded to
+    fp16 rather than accumulated in fp32.
+    """
+    batch_seq, num_head, kv_num_head, head_dim, rope_dim, input_c4 = params[:6]
+    if input_c4:
+        raise UnsupportedOp("blob: a c4-packed rope input is not modelled")
+    if rope_dim != head_dim:
+        raise UnsupportedOp("blob: a rope that rotates only part of a head")
+    del kv_num_head
+
+    half = head_dim // 2
+    refs = list(command.inputs) + list(command.outputs)
+    source = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)
+    cos = np.frombuffer(bytes(arena.view(refs[2])), dtype=np.float16)
+    sin = np.frombuffer(bytes(arena.view(refs[3])), dtype=np.float16)
+    out = np.array(source, dtype=np.float16)
+    token_elems = num_head * head_dim
+    for token in range(batch_seq):
+        at = token * token_elems
+        table = token * head_dim
+        x = source[at : at + token_elems].reshape(num_head, head_dim).astype(np.float32)
+        c = cos[table : table + head_dim].astype(np.float32)
+        s = sin[table : table + head_dim].astype(np.float32)
+        lo = (x[:, :half] * c[:half] - x[:, half:] * s[:half]).astype(np.float16)
+        hi = (x[:, half:] * c[half:] + x[:, :half] * s[half:]).astype(np.float16)
+        out[at : at + token_elems] = np.concatenate([lo, hi], axis=1).reshape(-1)
+    _store(arena, arena.address(refs[4]), out.tobytes())
+
+
+def _untile_hmx(flat: np.ndarray, k: int, n: int) -> np.ndarray:
+    """The inverse of `pack_hmx_weight`, back to a row-major (k, n) weight.
+
+    The command carries the packed bytes for the HMX route, which is the route
+    the emitter takes by default, so the interpreter has to undo the tile order
+    before it can walk the descriptor's row-major strides.
+    """
+    kp, nt = -(-k // 32), -(-n // 32)
+    tiles = flat.reshape(nt, kp, 16, 32, 2)
+    units = tiles.transpose(0, 1, 2, 4, 3).reshape(nt, kp, 32, 32)
+    padded = units.transpose(1, 2, 0, 3).reshape(kp * 32, nt * 32)
+    return np.ascontiguousarray(padded[:k, :n]).reshape(-1)
+
+
 def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None:
     """The general path of htp_ops_loop_matmul_region.
 
@@ -372,6 +434,9 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
     numbers each iteration itself and reaches that iteration's operands through
     the descriptor's steps, which are elements: with one iteration the steps are
     unreachable and mm is what comes out, and with one step per tile bmm is.
+
+    The plan word marks a weight the host stored in the unit's tile order; that
+    operand is un-tiled here, because every stride below is row-major.
     """
     # params[0] is the element size, then the descriptor: the loop count, the
     # three axes, three stride triples in bytes, three steps and three view
@@ -385,6 +450,7 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
     steps = params[14:17]
     views = params[17:20]
     out_elems, in0_elems, in1_elems = params[20], params[22], params[24]
+    hmx_prepacked = bool(params[26] & 1)
     if params[21] or params[23] or params[25]:
         raise UnsupportedOp("blob: a matmul operand of 2**31 elements or more")
 
@@ -395,7 +461,8 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
             raise UnsupportedOp("blob: a matmul with an iterator is not modelled")
 
     src0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)
-    src1 = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16)
+    src1_raw = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16)
+    src1 = _untile_hmx(src1_raw, inner, cols) if hmx_prepacked else src1_raw
     out = np.zeros(len(arena.view(dst)) // unit, dtype=np.float16)
     for loop in range(loops):
         # An iteration whose three bases do not all land inside their operand is
@@ -620,6 +687,7 @@ _EXECUTORS = {
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,
     ADD_FUSE_LAYERNORM: _run_add_fuse_layernorm,
+    ROPE: _run_rope,
     BATCH_MATMUL: _run_batch_matmul,
     FLASH_ATTN: _run_flash_attn,
 }

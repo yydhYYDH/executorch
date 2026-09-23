@@ -39,10 +39,32 @@ from executorch.backends.hexagon.kv_cache import (  # noqa: E402
     UPDATE_CACHE,
 )
 from executorch.backends.hexagon.rms_norm import RMS_NORM  # noqa: E402
+from executorch.backends.hexagon.rope import _rope, ROPE  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
+
+
+def _program(graph_module):
+    """Wrap a hand-built graph module the way preprocess expects a program.
+
+    These graphs own no parameters or buffers, but the backend reads the
+    signature to tell an owned constant from a caller-passed input, so the
+    wrapper carries an empty one.
+    """
+    signature = SimpleNamespace(
+        inputs_to_buffers={},
+        buffers_to_mutate={},
+        inputs_to_parameters={},
+        inputs_to_lifted_tensor_constants={},
+    )
+    return SimpleNamespace(
+        graph_module=graph_module,
+        graph_signature=signature,
+        range_constraints={},
+    )
+
 
 #: DSP_OP_RASTER_BLIT, the only op every shape here lowers to.
 _RASTER_BLIT = 3
@@ -135,7 +157,7 @@ def _cache_program(cache_shape, value_shape):
     fused = graph.call_function(UPDATE_CACHE, args=(cache, value, position))
     fused.meta["val"] = torch.empty(cache_shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _run_cache(cache_shape, value_shape, position):
@@ -205,30 +227,34 @@ def test_a_wrong_patch_scale_is_caught():
 
 
 def _norm_blob(shape, eps):
-    """A graph holding just the fused norm.
+    """A graph holding just the fused norm, with the weight as a constant.
 
     The node is built rather than reached by fusing an export: FuseRmsNormPass
     anchors on the weight multiply that RMSNorm.forward ends with, and a graph
     written to match it here would be testing the pattern rather than the
     emitter. The fusion itself is what the Qwen3 run measures.
     """
+    weight = ((torch.arange(shape[-1]) % 5) * 0.25 + 0.5).half()
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     x.meta["val"] = torch.empty(shape, dtype=torch.float16)
-    fused = graph.call_function(RMS_NORM, args=(x, eps))
+    gamma = graph.get_attr("weight")
+    gamma.meta["val"] = torch.empty(shape[-1], dtype=torch.float16)
+    fused = graph.call_function(RMS_NORM, args=(x, gamma, eps))
     fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(fused)
-    program = SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
-    return HexagonBackend.preprocess(program, []).processed_bytes
+    root = torch.nn.Module()
+    root.weight = torch.nn.Parameter(weight, requires_grad=False)
+    graph_module = torch.fx.GraphModule(root, graph)
+    blob = HexagonBackend.preprocess(_program(graph_module), []).processed_bytes
+    return blob, weight
 
 
 def _run_norm(shape, eps):
     x = torch.randn(*shape, dtype=torch.float16)
-    blob = _norm_blob(shape, eps)
+    blob, weight = _norm_blob(shape, eps)
     got = np.frombuffer(execute(blob, [x.numpy()])[0], dtype=np.float16).reshape(shape)
-    expected = torch.nn.functional.rms_norm(x, (shape[-1],), None, eps).numpy()
+    expected = torch.nn.functional.rms_norm(x, (shape[-1],), weight, eps).numpy()
     return blob, x, got, expected
 
 
@@ -273,6 +299,60 @@ def test_a_layernorm_flag_is_caught():
     assert not np.allclose(
         bad, expected, atol=2e-2
     ), "clearing the RMS flag changed nothing, so the flag is not being checked"
+
+
+def _rope_table_shape(shape):
+    """The table's shape: one row per token, broadcast over the head axis.
+
+    The kernel only reads the row, so the head axis is what makes the tables
+    broadcast against the activations in torch's own expression of the rotation.
+    """
+    if len(shape) == 3:
+        return (shape[0], 1, shape[-1])
+    return (shape[0], shape[1], 1, shape[-1])
+
+
+def _rope_blob(shape):
+    """A graph holding just the fused rope, on a hand-built node.
+
+    Like the fused norm, the op is reached by hand rather than by matching the
+    decomposition: FuseRopePass anchors on the add that ends the rotate-half
+    chain, and a graph written to match it would be testing the pattern.
+    """
+    table_shape = _rope_table_shape(shape)
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    cos = graph.placeholder("cos")
+    cos.meta["val"] = torch.empty(table_shape, dtype=torch.float16)
+    sin = graph.placeholder("sin")
+    sin.meta["val"] = torch.empty(table_shape, dtype=torch.float16)
+    fused = graph.call_function(ROPE, args=(x, cos, sin))
+    fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    graph.output(fused)
+    return HexagonBackend.preprocess(
+        _program(torch.fx.GraphModule(torch.nn.Module(), graph)), []
+    ).processed_bytes
+
+
+def test_rope_matches_torch():
+    # A one-wide batch axis folds into the sequence, and a three-dim shape has
+    # none at all, so both spellings the exporter produces are covered. The
+    # kernel multiplies in fp16, so this is a tolerance rather than equality.
+    for shape in ((2, 4, 8), (1, 3, 2, 16)):
+        x = torch.randn(*shape, dtype=torch.float16)
+        table_shape = _rope_table_shape(shape)
+        cos = torch.randn(*table_shape, dtype=torch.float16)
+        sin = torch.randn(*table_shape, dtype=torch.float16)
+        blob = _rope_blob(shape)
+        got = np.frombuffer(
+            execute(blob, [x.numpy(), cos.numpy(), sin.numpy()])[0], dtype=np.float16
+        ).reshape(shape)
+        expected = _rope(x, cos, sin).numpy()
+        worst = float(
+            np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
+        )
+        assert worst < 2e-2, f"rope differs by {worst} at {shape}"
 
 
 class _Mm(torch.nn.Module):
@@ -418,12 +498,9 @@ def _run_addmm(m, k, n):
     model = _Addmm(k, n)
     program = to_edge(export(model, (x,))).exported_program()
     blob = HexagonBackend.preprocess(program, []).processed_bytes
-    # to_edge lifts the parameters, so the blob takes them ahead of the input.
-    operands = [
-        model.weight.detach().numpy(),
-        model.bias.detach().numpy(),
-        x.numpy(),
-    ]
+    # The backend owns the lifted parameters, so they are stored in the blob's
+    # weight section and x is the only method input.
+    operands = [x.numpy()]
     got = np.frombuffer(execute(blob, operands)[0], dtype=np.float16)
     # The delegate rounds the product to fp16 in an activation before the bias is
     # added, so the reference does the same rather than adding in fp32.
@@ -698,7 +775,7 @@ def test_every_op_an_emitter_can_emit_is_modelled():
 def test_the_ops_actually_emitted_are_the_ones_we_think():
     """Pins the set, so a new emitter is a failure here rather than a silent
     hole in the interpreter's coverage."""
-    # 3 blit, 4 unary, 8 layer norm, 16 add+fused norm, 18 flash attention,
-    # 19 element-wise, 28 softmax, 29 reduction, 38 batch matmul. Tensor convert
-    # (7) is in the DSP's enum but no emitter here produces it.
-    assert _emitted_op_types() == {3, 4, 8, 16, 18, 19, 28, 29, 38}
+    # 3 blit, 4 unary, 8 layer norm, 14 rope, 16 add+fused norm, 18 flash
+    # attention, 19 element-wise, 28 softmax, 29 reduction, 38 batch matmul.
+    # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
+    assert _emitted_op_types() == {3, 4, 8, 14, 16, 18, 19, 28, 29, 38}

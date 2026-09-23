@@ -40,6 +40,27 @@ from executorch.exir import to_edge  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
+
+def _program(graph_module):
+    """Wrap a hand-built graph module the way preprocess expects a program.
+
+    These graphs own no parameters or buffers, but the backend reads the
+    signature to tell an owned constant from a caller-passed input, so the
+    wrapper carries an empty one.
+    """
+    signature = SimpleNamespace(
+        inputs_to_buffers={},
+        buffers_to_mutate={},
+        inputs_to_parameters={},
+        inputs_to_lifted_tensor_constants={},
+    )
+    return SimpleNamespace(
+        graph_module=graph_module,
+        graph_signature=signature,
+        range_constraints={},
+    )
+
+
 _RUNNER = pathlib.Path(__file__).resolve().parent / "sim/blob_runner.cpp"
 
 #: softmax_ops.cc includes this, and the backend's CMake generates it with QAIC
@@ -195,7 +216,7 @@ def _cast_chain_graph(shape):
     out = graph.call_function(exir_ops.edge.aten.neg.default, args=(down,))
     out.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(out)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _dynamic_slice_graph(source_shape, rows):
@@ -218,7 +239,7 @@ def _dynamic_slice_graph(source_shape, rows):
     out = graph.call_function(exir_ops.edge.aten.neg.default, args=(cut,))
     out.meta["val"] = torch.empty((rows, source_shape[1]), dtype=torch.float16)
     graph.output(out)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _small(shape):
@@ -229,16 +250,25 @@ def _small(shape):
     return (torch.arange(count) * 5 % 7 - 3).float().reshape(shape).half()
 
 
+def _norm_weight(size):
+    """A non-trivial gamma, so a norm that skipped the weight would show up."""
+    return ((torch.arange(size) % 5) * 0.25 + 0.5).half()
+
+
 def _norm_graph(shape, eps):
     from executorch.backends.hexagon.rms_norm import RMS_NORM
 
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     x.meta["val"] = torch.empty(shape, dtype=torch.float16)
-    fused = graph.call_function(RMS_NORM, args=(x, eps))
+    gamma = graph.get_attr("weight")
+    gamma.meta["val"] = torch.empty(shape[-1], dtype=torch.float16)
+    fused = graph.call_function(RMS_NORM, args=(x, gamma, eps))
     fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    root = torch.nn.Module()
+    root.weight = torch.nn.Parameter(_norm_weight(shape[-1]), requires_grad=False)
+    return _program(torch.fx.GraphModule(root, graph))
 
 
 def _cache_graph(cache_shape, value_shape):
@@ -254,7 +284,7 @@ def _cache_graph(cache_shape, value_shape):
     fused = graph.call_function(UPDATE_CACHE, args=(cache, value, position))
     fused.meta["val"] = torch.empty(cache_shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _mul_silu_graph(shape):
@@ -268,7 +298,7 @@ def _mul_silu_graph(shape):
     fused = graph.call_function(MUL_SILU, args=(a, b))
     fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim):
@@ -297,7 +327,7 @@ def _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim):
         (batch, qo_len, n_heads, head_dim), dtype=torch.float16
     )
     graph.output(out)
-    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _attention_reference(query, key, value):
@@ -382,7 +412,11 @@ def _cases():
         "C",
         _norm_graph(tuple(x.shape), 1e-5),
         (x,),
-        _bits(torch.nn.functional.rms_norm(x, (x.shape[-1],), None, 1e-5).reshape(-1)),
+        _bits(
+            torch.nn.functional.rms_norm(
+                x, (x.shape[-1],), _norm_weight(x.shape[-1]), 1e-5
+            ).reshape(-1)
+        ),
         kind="close",
         tolerance=_NORM_TOLERANCE,
     )

@@ -1789,7 +1789,7 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     runs, and the cache is written in place.
     """
     args = node.args
-    query, key, value = args[0], args[1], args[2]
+    query, key = args[0], args[1]
     # Unlike the other ops, attention accepts fp32: the runtime narrows those
     # operands to fp16 as they enter the arena, so the DSP still sees fp16.
     _dtype = node.meta["val"].dtype

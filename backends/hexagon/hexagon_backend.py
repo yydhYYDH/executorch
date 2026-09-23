@@ -8,11 +8,7 @@ import copy
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
-from executorch.backends.hexagon.hexagon_ops import (
-    _hmx_prepack_enabled,
-    EMITTERS,
-    pack_hmx_weight,
-)
+from executorch.backends.hexagon.hexagon_ops import EMITTERS, pack_hmx_weight
 from executorch.backends.hexagon.serialization.blob import BlobBuilder, TensorRef
 from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec

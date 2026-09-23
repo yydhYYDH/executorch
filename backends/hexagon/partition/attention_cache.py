@@ -19,7 +19,6 @@ visible. Run use_stored_caches() on the program before to_backend().
 
 from typing import Optional
 
-import torch
 from torch.fx import GraphModule, Node
 
 
