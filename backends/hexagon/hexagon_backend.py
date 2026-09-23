@@ -416,6 +416,29 @@ class BlobContext:
         self.packed_targets.add(getattr(node, "target", node))
         return ref
 
+    def packed_weights(self, node: torch.fx.Node, build, kind: str) -> TensorRef:
+        """Materializes a constant in whatever order a kernel reads its bytes.
+
+        Same arrangement as the HMX weight above, and for the same reason: a
+        convolution's weights arrive in torch's order and the kernels want the
+        DSP's, which is a pass over the weight once at export rather than a
+        rearrange on the DSP at every inference. `build` takes the fp16 array
+        and returns the file's bytes, so the layout rule lives next to the
+        emitter that depends on it.
+        """
+        key = (node, ("packed", kind))
+        cached = self._constants.get(key)
+        if cached is not None:
+            return cached
+        tensor = self.lifted_value(node)
+        if tensor is None:
+            raise RuntimeError(f"hexagon: no value for constant {node.name}")
+        tensor = tensor.detach().to(torch.float16)
+        ref = self.builder.add_weights(build(tensor.cpu().numpy()))
+        self._constants[key] = ref
+        self.packed_targets.add(getattr(node, "target", node))
+        return ref
+
     def gather_table(self, node: torch.fx.Node, tensor, oc: int, ic: int) -> TensorRef:
         """Materializes a table in the order SHARED_GATHER reads its rows.
 

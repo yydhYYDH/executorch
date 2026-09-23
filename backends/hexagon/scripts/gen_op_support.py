@@ -63,6 +63,12 @@ VISION_ATTENTION = "DSP_OP_VISION_ATTENTION_FP16"
 # The pool kernel. It carries no op type of its own beyond this one: max and the
 # average are selected by a param the emitter fills in.
 POOL = "DSP_OP_POOL2D_FP16"
+# The convolution family: the depthwise walk, the im2col convolution the HMX unit
+# runs, and the memset a channel count that is not a multiple of 64 needs before
+# the activation is packed into 64-lane blocks.
+DEPTHWISE = "DSP_OP_CONV_DEPTHWISE2D_FP16"
+IM2COL = "DSP_OP_IM2COL_CONVOLUTION_FP16"
+ZERO = "DSP_OP_ZERO"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -347,6 +353,26 @@ SUPPORTED: List[OpSupport] = [
         "divisor_override has no command form and keeps the node portable.",
     ),
     OpSupport(
+        "aten.convolution.default",
+        f"{DEPTHWISE} / {IM2COL}",
+        "fp16 (arena); fp32 narrowed on entry",
+        "A 4-D batched input, static extents, and a weight and bias that are "
+        "constants at export. Two forms, chosen by the group count. A group per "
+        "channel (weight `[C, 1, ky, kx]`, `groups == C_in == C_out`) runs the "
+        "depthwise walk: blit in, the walk, blit out. Every other supported "
+        "convolution has `groups == 1` and runs the im2col convolution the same way, "
+        "where the pack and the unpack convert between the row-major tensor and the "
+        f"64-channel blocked layout; a channel count that is not a multiple of 64 "
+        f"also emits {ZERO} ahead of the pack, because the fill reads whole 64-lane "
+        "vectors and the lanes past the last channel would otherwise hold whatever "
+        "the arena last held. A 1x1 spatial extent needs neither blit, since the two "
+        "layouts are then the same bytes. Left portable: transposed convolution, "
+        "non-zero output_padding, a group count between 1 and C_in, a fractional or "
+        "negative padding, a non-4-D or unbatched operand, symbolic extents, a weight "
+        "or bias that is not a constant, and any stride, padding or dilation that "
+        "does not reproduce the output extent the graph declares.",
+    ),
+    OpSupport(
         "et_hexagon.add_relu.default",
         BINARY,
         ARENA_FP16,
@@ -583,10 +609,10 @@ SUPPORTED: List[OpSupport] = [
 # Exclusions worth naming: each is something a reader might expect to work.
 NOT_SUPPORTED = [
     (
-        "aten.convolution.default",
-        "No generic convolution kernel. Only the exact patch-embed Conv3d pattern "
-        "(kernel == stride, no padding/dilation/groups, one output window) is "
-        "rewritten to a matmul by conv_patch_embed.py.",
+        "aten.convolution.default with transposed=True, or output_padding != 0",
+        "No transposed-convolution kernel. The im2col kernel walks its window "
+        "forward over the input, which is a scatter read for a transposed "
+        "convolution: a different kernel rather than another parameter set.",
     ),
     (
         "aten.gather.default",
@@ -781,6 +807,7 @@ PREDICATES = [
     "layer_norm_is_emittable",
     "add_rms_norm_is_emittable",
     "quantized_matmul_is_emittable",
+    "conv_spec",
     "vision_attention_is_emittable",
     "pool_spec",
     "reduction_dims",

@@ -26,6 +26,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     CAST_TARGETS,
     cat_region,
     CAT_TARGETS,
+    conv_spec,
+    CONV_TARGETS,
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
     DQ_PER_CHANNEL,
@@ -434,6 +436,15 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # rearranges; a dilation, a ceil_mode window, a divisor this kernel
             # cannot take, or a shape whose windows would fall outside the input
             # all have to stay on a portable kernel rather than reach it.
+            return False
+        if (
+            node.target in CONV_TARGETS
+            and conv_spec(node, self.is_data_placeholder) is None
+        ):
+            # The two convolution kernels take one weight order and one weight
+            # they can see at export, and neither of them walks a group count
+            # in between 1 and the channel count: anything else stays on a
+            # portable kernel rather than reach one that reads it wrong.
             return False
         if (
             node.target in GATHER_TARGETS

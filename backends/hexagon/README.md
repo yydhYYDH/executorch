@@ -438,6 +438,49 @@ Things that bite:
   which is what `hexagon_ops.pack_q4a16_gemv_weight` appends; the two layouts are
   not interchangeable.
 
+- **The two convolution kernels take the same blocked activation and different
+  weights.** `hvx_conv_depthwise2d_fp16` reads `[c4][ky][kx][64]` and walks the
+  window from `oy * stride - pad` with `+ky * dilate`, accumulating each product
+  in fp16 from a bias vector it always dereferences; `hmx_im2col_convolution_fp16`
+  reads `[ceil(oc/32)][ky*kx*ceil(ic/32)][1024]`, the 32x32 tiles the HMX unit
+  takes, and adds the bias after the product. Both were read out of the sources
+  and then run: `test/sim/conv_runner.cpp` builds their operands the way the
+  emitters do, prints a digest of the packed weight, and the host side reproduces
+  that digest through `pack_depthwise_weight` and `pack_conv_weight` before
+  comparing the output against torch bit for bit.
+- **The im2col kernel has to be given `mp = 1, np = 2`.** With the default
+  single-tile chunking a ragged position tile reaches `store_output_tile_fp16`,
+  whose leftover path rotates the accumulator *after* adding the bias, so the
+  tile's upper half is handed the neighbouring channel tile's bias: for a 3x3 s1
+  p1 convolution over 5x5 with 64 channels the simulator returns channels 32..63
+  of the last position off by `bias[l] - bias[32 + l]`, and nothing else moves.
+  The pair store (`store_output_tile_pair_fp16`) has no such path, and every
+  shape in `test/sim/conv_runner.cpp` is exact with it; `CV_ODD` is that failure
+  case and `test_the_single_tile_chunking_is_what_the_emitter_avoids` pins it.
+  This is a defect in the vendored kernel, worked around from the emitter rather
+  than fixed in place.
+- **The lanes past the input's last channel are part of the product.** The fill
+  reads whole 32-lane groups, so with three input channels the k lanes 3..31 of
+  the first group are multiplied by whatever the weight holds there. Setting the
+  weight's padding lanes to 1 and the activation's to 3 moves the simulator's
+  answer by exactly 29 lanes times 3 per in-range tap. The weight's padding lanes
+  are zero by construction, and the activation's are cleared by a `DSP_OP_ZERO`
+  command ahead of the pack when the channel count is not a multiple of 64; that
+  clear is defensive, since the simulated unit flushes `0 * inf` to zero and this
+  is not a property to rely on from a device.
+- **The im2col weight and activation fills reach VTCM by DMA, which copies a
+  misaligned operand wrong rather than failing.** Every tensor in a blob is laid
+  out on a 128-byte boundary, and `test/sim/blob_runner.cpp` had to place its
+  arena on one too: without it the whole-blob pointwise convolution came back with
+  5938 of 6144 elements wrong while the host model of the same commands was
+  exact. This is why the alignment is a property of the arena rather than of a
+  tensor in it.
+- **Bias is never a null operand.** The depthwise walk reads a 64-lane bias vector
+  unconditionally and the im2col store reads one starting at every 32-channel
+  group's first lane, so a convolution with no bias still gets a zero-filled
+  buffer, long enough for the last group to run a whole vector past the channel
+  count.
+
 ## Quantized matmuls
 
 Weight-only quantization lands on the two integer GEMV entries, for `M == 1`
@@ -719,6 +762,22 @@ Working and verified without a device:
   tensor rounded to fp16 was the same defect the sum gate was added for. See
   `test/test_overload_reductions.py`, `test/test_overload_clamp.py` and
   `test/test_overload_census.py`.
+- convolutions reach the DSP, and all three of the usual CNN shapes are among
+  the cases. A depthwise `groups == C_in == C_out` convolution lowers to a blit,
+  one `CONV_DEPTHWISE2D_FP16` (2) command and a blit back, and every other
+  supported convolution to the same three commands with
+  `IM2COL_CONVOLUTION_FP16` (12) between them, plus a `ZERO` (24) ahead of the
+  pack when the channel count is not a multiple of 64. Both kernels were run
+  under hexagon-sim against torch bit for bit: six depthwise geometries (origin,
+  stride, dilation, both activations, a second channel block over a batch) in
+  `test/sim/conv_runner.cpp`, and ten im2col geometries covering 3x3 with stride
+  and padding, 1x1, no padding, a dilated window, a batch of two, an input
+  narrower than a 32-channel group and an output that is not a whole number of
+  32-channel tiles, including MobileNetV2's `ic=3, oc=32, k=3, s=2, p=1` stem.
+  Two whole blobs also run the full three-way comparison -- emitter, host
+  interpreter, simulator, torch -- in `test/test_blob_on_sim.py`. See
+  "Op contracts, and the traps in them" for the kernel defect the same simulator
+  found in the im2col store.
 - the commands this branch added have run on hexagon-sim and answer torch
   bit-for-bit: the row gather on an `ic=33`/`oc=35` shape whose 32x32 tiles are
   neither square nor whole, with two indices past the vocabulary that the kernel
@@ -818,6 +877,17 @@ Not done yet:
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
   1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
   keeps that form off the delegate until the kernel is checked;
+- **Convolutions have run on the simulator and nowhere else.** The kernels agree
+  with torch bit for bit on every case above, but that says what the kernels
+  compute and not that the device path works: the FastRPC transport, the skel
+  deployment, the VTCM budget under a real arena and the `DSP_OP_ZERO` command's
+  behaviour on hardware are all unverified. The im2col kernel's other entry
+  points (`CONV1X1_DIRECT_FP16`, the weight-only quantized convolutions), its
+  scale-block parameters (`scaleBlockNum`, `scaleAsymmetric`) and the
+  `outputBytes` bound check, which this emitter turns off by passing 0, are
+  unread beyond the fields the fp16 path uses. The depthwise walk's `relu` and
+  `relu6` params are pinned off, because `to_edge` leaves a relu as its own node,
+  so the kernel's fused activations are untested here.
 - **pooling has now run on hexagon-sim** -- max pooling bit-for-bit against torch
   and average pooling within 1.95e-3, the fp16 `1/count` divisor, on both
   `countType` forms -- and `sum` has run through the run-time patch above. A
@@ -828,10 +898,16 @@ Not done yet:
   and not with the hardware. Unverified on device: that the two pool blits really
   take the DSP's pack-area fast path (`try_pack_area_blit` takes the geometry the
   emitter checks for, but the fallback's numbers were never compared against the
-  fast path, and this suite models the fallback deliberately); the pool's window
-  origin and out-of-range handling beyond the two cases above; `amax`'s signed
-  zero and NaN tie-break; and that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
-  zero-divisor guard agree with the host model;
+  fast path on hardware, and this suite models the fallback deliberately); that
+  `hvx_pool2d_fp16`'s window origin and its out-of-range handling beyond the two
+  cases above, and its `countType` divisor, are what the tests model, including
+  its rounding of the fp16 reciprocal and its fp16 accumulation; `amax`'s signed
+  zero and NaN tie-break; that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
+  zero-divisor guard agree with the host model, and which of the two paths
+  (`htp_ops_binary_elementwise`'s scalar `apply_fp16` or the fp16 vector tail) the
+  dispatcher takes for subtype 12; and that the reduction's accumulator really is
+  fp32 with an fp16 store, which the `bytes` param asserts and no test can
+  observe;
 - **the fused rectified sum (`add_relu`, subtype 8) has never run anywhere but on
   the host**, because no ATen op produces `max(a + b, 0)`: `relu(x + y)` reaches
   the graph as an add and a relu, and `FuseAddReluPass` in the caller's

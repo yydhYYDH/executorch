@@ -12,7 +12,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "dsp/hmx_mgr.h"
+#include "dsp/ops.h"
+#include "dsp/hmx_queue.h"
+#include "dsp/power.h"
+#include "dsp/vtcm_mgr.h"
+#include "dsp/worker_pool.h"
 #include "hexagon_schema.h"
+#include "region_ops.h"
 
 using namespace executorch::backends::hexagon;
 
@@ -63,6 +70,15 @@ extern "C" int htp_ops_unary_row_guard(uint8_t *dst, uint8_t *mask, uint8_t *src
                                        int32_t size, int32_t row_len, int32_t pad);
 extern "C" int htp_ops_unary_scale(uint8_t *dst, uint8_t *src, int32_t size,
                                    int32_t scale_bits);
+extern "C" int htp_ops_conv_depthwise2d_fp16(
+    uint8_t *dst, uint8_t *src, uint8_t *weight, uint8_t *bias, int32_t batch,
+    int32_t ih, int32_t iw, int32_t oh, int32_t ow, int32_t c4, int32_t kernelY,
+    int32_t kernelX, int32_t strideY, int32_t strideX, int32_t padY, int32_t padX,
+    int32_t dilateY, int32_t dilateX, int32_t relu, int32_t relu6);
+extern "C" int htp_ops_im2col_convolution_fp16(uint8_t *output, uint8_t *input,
+                                               uint8_t *weight, uint8_t *bias,
+                                               const HmxIm2ColConvParam *params);
+extern "C" int htp_ops_zero(uint8_t *dst, int32_t size);
 extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v,
                                   uint8_t *mask, uint8_t *workspace,
                                   uint8_t *pastK, uint8_t *pastV, int32_t qo_len,
@@ -85,11 +101,12 @@ extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation
                                             uint8_t *weight, uint8_t *bias, int32_t k,
                                             int32_t n, int32_t scale_block_num,
                                             int32_t scale_asymmetric);
-extern "C" int hmx_matmulw8a16block_gemv_i8(uint8_t *c, const uint8_t *a,
-                                            const uint8_t *b_wt,
-                                            const uint8_t *b_scale,
-                                            const uint8_t *bias, int32_t K, int32_t N,
-                                            int32_t scale_block_num);
+/* `hmx_matmulw8a16block_gemv_i8` below and `htp_ops_vision_attention_fp16` further
+ * down are the two the vendored `dsp/ops.h` declares itself, so they are the two
+ * this file must not: Hexagon's `int32_t` is `long`, and a second prototype that
+ * spells the same parameter `int32_t` where ops.h spells it `int` is a redeclaration
+ * with different types -- which the compiler rejects, but only once something here
+ * includes ops.h. The GEMV entry was written before this file included it. */
 /* The two GEMV entries stage their operands in VTCM and take the size-zero path
  * out of `matmul_q4block_gemv_i8.c:323-325` when they cannot: they return -1
  * before writing a byte, so the fixture's output is whatever the arena already
@@ -103,13 +120,6 @@ extern "C" unsigned int vtcm_manager_get_vtcm_size();
  * (attention_entry.cc:24-67), not the flash variant the existing suite excludes:
  * the flash kernel starts a worker pool, which the simulated QuRT cannot, while
  * this one never reaches the pool at all. */
-extern "C" int htp_ops_vision_attention_fp16(uint8_t *output, const uint8_t *query,
-                                             const uint8_t *key, const uint8_t *value,
-                                             const uint8_t *mask, uint8_t *workspace,
-                                             int32_t batch, int32_t tokens,
-                                             int32_t heads, int32_t headDim,
-                                             float scale, int32_t maskStride,
-                                             int32_t workspaceBytes);
 
 /* An HVX vector at `-mhvx-length=128b`, which is what every kernel here assumes
  * of the buffers it is handed. The static assertions below the buffers read this
@@ -118,12 +128,15 @@ enum { kVectorBytes = 128 };
 
 enum {
   kPool2d = 1,
+  kDepthwise = 2,
   kRasterBlit = 3,
   kUnary = 4,
   kLayerNorm = 8,
+  kIm2Col = 12,
   kFlashAttn = 18,
   kBinaryElementwise = 19,
   kSharedGather = 23,
+  kZero = 24,
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
@@ -273,6 +286,28 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
     params[op.patch_param] = value * (int32_t)op.patch_scale;
   }
 
+  if (op.type == kDepthwise) {
+    htp_ops_conv_depthwise2d_fp16(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]), address(header, op.inputs[2]), params[0],
+        params[1], params[2], params[3], params[4], params[5], params[6], params[7],
+        params[8], params[9], params[10], params[11], params[12], params[13],
+        params[14], params[15]);
+    return;
+  }
+  if (op.type == kIm2Col) {
+    /* The command's parameters are the kernel's own struct, in its field order. */
+    htp_ops_im2col_convolution_fp16(address(header, op.outputs[0]),
+                                    address(header, op.inputs[0]),
+                                    address(header, op.inputs[1]),
+                                    address(header, op.inputs[2]),
+                                    (const HmxIm2ColConvParam *)params);
+    return;
+  }
+  if (op.type == kZero) {
+    htp_ops_zero(address(header, op.outputs[0]), params[0]);
+    return;
+  }
   if (op.type == kUnary) {
     /* The dispatcher does not hand every unary to the same entry point
      * (execute_command.cc:380-398): clamp, the masked-row guard and the scale
@@ -477,11 +512,21 @@ static int run_blob(const unsigned char *blob, uint64_t blob_bytes, uint8_t *are
 }
 
 int main(void) {
+  /* The convolution kernels reach VTCM and the HMX unit, which the device build
+   * brings up when the backend is initialized. */
+  power_setup();
+  power_acquire();
+  hmx_manager_setup();
+  hmx_queue_setup();
+  worker_pool_global_init();
+
   /* One arena, reused: run_blob zeroes it. Sized for the largest fixture, and
    * aligned the way the kernels' vector accesses assume: an HVX load or store
    * wants its address aligned to the vector length, and a byte array gives the
    * linker no reason to -- which is a wrong answer rather than a crash, and one
-   * that a change to the fixture list can flip. Keep the attribute, and see
+   * that a change to the fixture list can flip. The section bases are derived
+   * from the arena's own address and the blob lays every tensor out on a 128-byte
+   * boundary, so the arena has to start on one. Keep the attribute, and see
    * backends/hexagon/test/README.md before changing either side.
    *
    * The assertion is what makes dropping the attribute a build failure rather
@@ -493,6 +538,11 @@ int main(void) {
   static_assert(
       __alignof__(arena) == kVectorBytes,
       "the kernels read this arena a vector at a time");
+  /* The blob's own rule for where a section starts has to be the alignment the
+   * kernels want, or the bases this file derives from the arena's address would
+   * put an operand off a vector boundary. */
+  static_assert(kHexagonAlignment == kVectorBytes,
+                "the section layout and the vector length have to agree");
   int status = 0;
   /* A device does not run these kernels without VTCM: the delegate's setup
    * acquires it and the dispatcher re-acquires it when it is missing

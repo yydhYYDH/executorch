@@ -104,6 +104,9 @@ _SOURCES = [
     "power.cc",
     "ops/matmul_q4fp16.c",
     "ops/matmul_q4fp16_mle32.c",
+    "conv_depthwise_ops.cc",
+    "im2col_convolution_fp16.cc",
+    "ops/depthwise_conv_fp16.c",
     "attention_entry.cc",
     "attention_sync_setup.cc",
     "attention_sync_process.cc",
@@ -392,6 +395,57 @@ def _attention_reference(query, key, value):
             weights = torch.softmax(scores * scale, dim=-1)
             out[0, row, head] = weights @ value[0, :valid, kv].float()
     return out
+
+
+class _Conv(torch.nn.Module):
+    """A convolution, which lowers to a blit pair around one of two kernels."""
+
+    def __init__(
+        self, in_channels, out_channels, kernel, padding, groups, stride=1
+    ) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel,
+            stride=stride,
+            padding=padding,
+            groups=groups,
+            bias=True,
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _whole_conv(in_channels, out_channels, kernel, padding, groups, stride=1, seed=0):
+    """A convolution over integers, so every sum through it is exact.
+
+    Both kernels narrow an accumulator at some point, so a comparison against
+    torch is only bit-exact when no partial sum rounds: small integers keep it
+    that way, which is what makes this a statement about the layout rather than
+    about the arithmetic.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    model = _Conv(in_channels, out_channels, kernel, padding, groups, stride).half()
+    model.conv.weight.data = torch.randint(
+        -1, 2, model.conv.weight.shape, generator=generator
+    ).to(torch.float16)
+    model.conv.bias.data = torch.randint(
+        -1, 2, model.conv.bias.shape, generator=generator
+    ).to(torch.float16)
+    return model
+
+
+def _whole(*shape, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(-2, 3, shape, generator=generator).half()
+
+
+def _conv_reference(model, x):
+    """The module's own answer, off the autograd graph its parameters carry."""
+    with torch.no_grad():
+        return model(x)
 
 
 def _case(
@@ -956,6 +1010,25 @@ def _cases():
         _bits((ax.float() @ aw.float()).half().float() + ab.float()),
     )
 
+    # The two convolution kernels, one case per form: a depthwise walk with a
+    # blit either side, and a pointwise layer through the HMX unit.
+    depth_model = _whole_conv(64, 64, 3, 1, 64, seed=11)
+    depth_x = _whole(1, 64, 8, 8, seed=12)
+    depthwise = _case(
+        "O", depth_model, (depth_x,), _bits(_conv_reference(depth_model, depth_x))
+    )
+
+    # "P" would have been the next letter in this pair and is taken: the sdpa case
+    # further down has held it since before this branch, and it is only absent
+    # here because `llama.custom_sdpa` is not registered -- so the collision would
+    # be invisible until someone ran this on a checkout that registers it, where
+    # two fixtures would share a tag and one DSP answer would be read twice.
+    point_model = _whole_conv(64, 96, 1, 0, 1, seed=13)
+    point_x = _whole(1, 64, 8, 8, seed=14)
+    pointwise = _case(
+        "M", point_model, (point_x,), _bits(_conv_reference(point_model, point_x))
+    )
+
     x = _small((2, 3, 8))
     norm = _case(
         "C",
@@ -1092,6 +1165,8 @@ def _cases():
         gated,
         absorbed,
         pinned,
+        depthwise,
+        pointwise,
         *([attention] if attention is not None else []),
         *_branch_cases(),
     ]
@@ -1525,12 +1600,24 @@ def simulated(cases):
 
 def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     """A subgraph that lowered to something else would silently test nothing."""
+    # A tag names a fixture twice over -- it is the name the runner prints and the
+    # key the answers come back under -- so two cases sharing one would have the
+    # second DSP answer read as the first's, and the second case would never be
+    # checked at all. Four batches of cases were added to this file in parallel,
+    # each picking its own letters, which is how "P" came to be taken twice.
+    tags = [case.tag for case in cases]
+    assert len(set(tags)) == len(tags), (
+        "two fixtures share a tag: "
+        f"{sorted({tag for tag in tags if tags.count(tag) > 1})}"
+    )
     kinds = {case.tag: [command.type for command in case.commands] for case in cases}
     assert kinds["A"] == [3, 3, 3], "the concatenate, slice and transpose are not blits"
     assert kinds["B"] == [38], "the product is not a batch matmul"
     assert kinds["Q"] == [38], "the batched product is not a batch matmul"
     assert kinds["R"] == [38, 19], "addmm is not a product followed by an add"
     assert kinds["C"] == [8], "the fused norm is not a layer norm"
+    assert kinds["O"] == [3, 2, 3], "the depthwise walk is not between two blits"
+    assert kinds["M"] == [3, 12, 3], "the pointwise layer is not the im2col kernel"
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
     assert kinds["E"] == [19], "the scale is not an element-wise op"

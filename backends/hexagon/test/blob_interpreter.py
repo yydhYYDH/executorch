@@ -39,6 +39,9 @@ from executorch.backends.hexagon.serialization import blob as B
 
 #: DSPOpType values this can execute.
 POOL2D_FP16 = 1
+CONV_DEPTHWISE2D_FP16 = 2
+IM2COL_CONVOLUTION_FP16 = 12
+ZERO = 24
 RASTER_BLIT = 3
 LAYER_NORM = 8
 ADD_FUSE_LAYERNORM = 16
@@ -77,6 +80,11 @@ POOL_MAX = 0
 POOL_COUNT_VALID = 0
 POOL_COUNT_KERNEL = 1
 POOL_PACK = 64
+
+#: The HMX unit's tile geometry: a 32x32 tile of fp16, and the 64 lanes the
+#: blocked activation carries.
+HMX_TILE = 32
+HMX_TILE_ELMS = HMX_TILE * HMX_TILE
 
 #: Operands the DSP reads as a null pointer.
 ABSENT = B.TensorSpace.ABSENT
@@ -840,6 +848,220 @@ def _run_softmax(command: Command, params: List[int], arena: Arena) -> None:
     _store(arena, arena.address(command.outputs[0]), out.tobytes())
 
 
+def _run_zero(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_zero (blit_ops.cc:1724): a memset over the output operand."""
+    at = arena.address(command.outputs[0])
+    _store(arena, at, bytes(params[0]))
+
+
+def _run_conv_depthwise2d(command: Command, params: List[int], arena: Arena) -> None:
+    """hvx_conv_depthwise2d_fp16 (depthwise_conv_fp16.c:9), one lane at a time.
+
+    Both sides are the DSP's 64-channel blocked activation, so a lane of the
+    accumulator is one channel and the whole walk is that channel's own filter.
+    The weight is one HMX vector per tap with the channel block outside the taps
+    (``wBase = weight + cb * kernelY * kernelX * pack``, :27, and
+    ``(ky * kernelX + kx) * pack``, :49). The bias is read as a whole vector per
+    block and is never checked for absence, it lands on the narrowed accumulator,
+    and relu/relu6 follow it (:64-71).
+    """
+    (
+        batch,
+        ih,
+        iw,
+        oh,
+        ow,
+        c4,
+        kernel_y,
+        kernel_x,
+        stride_y,
+        stride_x,
+        pad_y,
+        pad_x,
+        dilate_y,
+        dilate_x,
+        relu,
+        relu6,
+    ) = params[:16]
+    source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    weight = np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16)
+    bias = np.frombuffer(bytes(arena.view(command.inputs[2])), dtype=np.float16)
+    if source.size != c4 * batch * ih * iw * POOL_PACK:
+        raise UnsupportedOp(
+            f"blob: {source.size} activation values do not fill {c4} blocks of "
+            f"{batch}x{ih}x{iw}"
+        )
+    if weight.size != c4 * kernel_y * kernel_x * POOL_PACK:
+        raise UnsupportedOp(
+            f"blob: {weight.size} weight values are not {c4}x{kernel_y}x{kernel_x} taps"
+        )
+    if bias.size < c4 * POOL_PACK:
+        raise UnsupportedOp(
+            f"blob: {bias.size} bias values are under one vector per block"
+        )
+
+    src = source.reshape(c4, batch, ih * iw, POOL_PACK)
+    wgt = weight.reshape(c4, kernel_y, kernel_x, POOL_PACK)
+    out = np.zeros((c4, batch, oh * ow, POOL_PACK), dtype=np.float16)
+    for n in range(batch):
+        for cb in range(c4):
+            for oy in range(oh):
+                for ox in range(ow):
+                    acc = bias[cb * POOL_PACK : (cb + 1) * POOL_PACK].astype(np.float32)
+                    for ky in range(kernel_y):
+                        iy = oy * stride_y - pad_y + ky * dilate_y
+                        if not 0 <= iy < ih:
+                            continue
+                        for kx in range(kernel_x):
+                            ix = ox * stride_x - pad_x + kx * dilate_x
+                            if not 0 <= ix < iw:
+                                continue
+                            # The kernel accumulates with an fp16
+                            # multiply-accumulate, so every tap narrows.
+                            product = src[cb, n, iy * iw + ix].astype(np.float32) * wgt[
+                                cb, ky, kx
+                            ].astype(np.float32)
+                            acc = (acc + product).astype(np.float16).astype(np.float32)
+                    value = acc.astype(np.float16)
+                    if relu or relu6:
+                        value = np.maximum(value, np.float16(0))
+                        if relu6:
+                            value = np.minimum(value, np.float16(6))
+                    out[cb, n, oy * ow + ox] = value
+    _store(arena, arena.address(command.outputs[0]), out.tobytes())
+
+
+#: Where element (k, c) of a 32x32 weight tile sits in the tile's bytes, which
+#: is how the HMX unit reads a column of it (`pack_hmx_weight` writes the same
+#: order, and `hmx_load_tiles_fp16` reads it back).
+_HMX_TILE_INDEX = (
+    (np.arange(HMX_TILE)[:, None] // 2) * 64
+    + np.arange(HMX_TILE)[None, :] * 2
+    + (np.arange(HMX_TILE)[:, None] % 2)
+)
+
+
+def _run_im2col_convolution(command: Command, params: List[int], arena: Arena) -> None:
+    """hmx_im2col_convolution_fp16 (im2col_convolution_fp16.cc:1761), as a product.
+
+    The command is a matrix product over an im2col patch: tile ``i`` of the
+    weight is ``(ky * kernelX + kx) * ic_blocks + ic_block`` with
+    ``ic_blocks = ceil(ic / 32)`` (fill_im2col_activation_kk_range, :248), the k
+    inside a tile is the channel inside that 32-channel group, and the tile's
+    bytes are the blob's verbatim (fill_weight_tiles_fp16, :1673). The unit
+    accumulates in fp32 and narrows once; the store then adds the bias to that
+    narrowed value in fp16 (store_output_tile_pair_fp16, :163-181). This model
+    sums the same products in a different order, which only shows on values that
+    round differently.
+    """
+    (
+        pad_x,
+        pad_y,
+        dilate_x,
+        dilate_y,
+        stride_x,
+        stride_y,
+        kernel_x,
+        kernel_y,
+        _ic_div4,
+        kernel_units,
+        iw,
+        ih,
+        ow,
+        oh,
+        _src_z_step,
+        _src_y_step,
+        _pack_c_unit,
+        _dest_ic_stride,
+        ic,
+        _icup4,
+    ) = params[:20]
+    (
+        oc,
+        _mp,
+        _np,
+        relu,
+        relu6,
+        batch,
+        _output_bytes,
+        _scale_block_num,
+        _scale_asymmetric,
+    ) = params[20:29]
+    if relu or relu6:
+        # The emitters leave the fused activations off and let to_edge's own
+        # relu node reach the unary kernel, so a nonzero one here is a command
+        # this model has never been asked to reproduce.
+        raise UnsupportedOp("blob: the im2col convolution's fused relu is not modelled")
+
+    source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    weight = np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16)
+    bias = np.frombuffer(bytes(arena.view(command.inputs[2])), dtype=np.float16)
+    k_units = -(-ic // 32)
+    if kernel_units != kernel_y * kernel_x * k_units:
+        raise UnsupportedOp(
+            f"blob: {kernel_units} kernel units are not {kernel_y}x{kernel_x} of "
+            f"{k_units} channel groups"
+        )
+    in_blocks = -(-ic // 64)
+    if source.size != in_blocks * batch * ih * iw * POOL_PACK:
+        raise UnsupportedOp(
+            f"blob: {source.size} activation values do not fill the input blocks"
+        )
+    if weight.size != -(-oc // 32) * kernel_units * HMX_TILE_ELMS:
+        raise UnsupportedOp(
+            f"blob: {weight.size} weight values are not the {oc}-channel tiling"
+        )
+    if bias.size < oc:
+        raise UnsupportedOp(f"blob: {bias.size} bias values are under {oc} channels")
+
+    src = source.reshape(in_blocks, batch, ih * iw, POOL_PACK)
+    area = oh * ow
+    positions = np.arange(batch * area)
+    n = positions // area
+    oy = (positions % area) // ow
+    ox = positions % ow
+    patches = np.zeros((batch * area, kernel_units * HMX_TILE), dtype=np.float16)
+    for kernel_index in range(kernel_y * kernel_x):
+        ky, kx = divmod(kernel_index, kernel_x)
+        iy = oy * stride_y - pad_y + ky * dilate_y
+        ix = ox * stride_x - pad_x + kx * dilate_x
+        inside = (iy >= 0) & (iy < ih) & (ix >= 0) & (ix < iw)
+        flat = (np.clip(iy, 0, ih - 1) * iw + np.clip(ix, 0, iw - 1))[inside]
+        for ic_block in range(k_units):
+            first = ic_block * HMX_TILE
+            width = min(HMX_TILE, ic - first)
+            column = (kernel_index * k_units + ic_block) * HMX_TILE
+            lanes = np.arange(first, first + width) % POOL_PACK
+            patches[inside, column : column + width] = src[first // 64][
+                n[inside], flat
+            ][:, lanes]
+
+    tiles = weight.reshape(-1, HMX_TILE_ELMS)
+    tap = np.zeros((kernel_units * HMX_TILE, oc), dtype=np.float16)
+    for channel_block in range(-(-oc // 32)):
+        width = min(HMX_TILE, oc - channel_block * HMX_TILE)
+        for unit in range(kernel_units):
+            tile = tiles[channel_block * kernel_units + unit]
+            tap[unit * HMX_TILE : (unit + 1) * HMX_TILE, :][
+                :, channel_block * HMX_TILE : channel_block * HMX_TILE + width
+            ] = tile[_HMX_TILE_INDEX][:, :width]
+
+    accumulated = patches.astype(np.float32) @ tap.astype(np.float32)
+    narrowed = accumulated.astype(np.float16).astype(np.float32) + bias[:oc].astype(
+        np.float32
+    )
+    values = narrowed.astype(np.float16)
+
+    out_blocks = -(-oc // 64)
+    blocked = np.zeros((out_blocks, batch, area, POOL_PACK), dtype=np.float16)
+    for channel_block in range(out_blocks):
+        width = min(POOL_PACK, oc - channel_block * POOL_PACK)
+        blocked[channel_block, :, :, :width] = values[
+            :, channel_block * POOL_PACK : channel_block * POOL_PACK + width
+        ].reshape(batch, area, width)
+    _store(arena, arena.address(command.outputs[0]), blocked.tobytes())
+
+
 def _run_pool2d(command: Command, params: List[int], arena: Arena) -> None:
     """hvx_pool2d_fp16, one vector lane at a time.
 
@@ -1325,6 +1547,9 @@ def _run_shared_gather(command: Command, params: List[int], arena: Arena) -> Non
 
 _EXECUTORS = {
     POOL2D_FP16: _run_pool2d,
+    CONV_DEPTHWISE2D_FP16: _run_conv_depthwise2d,
+    IM2COL_CONVOLUTION_FP16: _run_im2col_convolution,
+    ZERO: _run_zero,
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,

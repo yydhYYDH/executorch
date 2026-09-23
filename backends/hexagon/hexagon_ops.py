@@ -33,8 +33,16 @@ from executorch.exir.sym_util import eval_upper_bound
 
 # DSPOpType, from third-party/mnn-htp-ops/include/htp_command.h.
 DSP_OP_POOL2D_FP16 = 1
+DSP_OP_CONV_DEPTHWISE2D_FP16 = 2
 DSP_OP_RASTER_BLIT = 3
+# The im2col convolution, which is also what 17 (CONV1X1_DIRECT_FP16) resolves
+# to: htp_ops_conv1x1_direct_fp16 is a second name for the same function
+# (im2col_convolution_fp16.cc:1840), so nothing here selects between them.
+DSP_OP_IM2COL_CONVOLUTION_FP16 = 12
 DSP_OP_UNARY = 4
+# A memset over one operand, which is the only way to clear the padding lanes a
+# ragged channel count leaves in a blocked activation (blit_ops.cc:1724).
+DSP_OP_ZERO = 24
 DSP_OP_LAYER_NORM = 8
 DSP_OP_ROPE = 14
 DSP_OP_ADD_FUSE_LAYERNORM = 16
@@ -2203,6 +2211,505 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+# The convolution family. One ATen op carries all of it -- conv2d is the form
+# torch.export writes for nn.Conv2d, and convolution is the one its own rewrites
+# produce, with transposed/output_padding/benchmark arguments it adds -- and the
+# two kernels behind it split on groups: groups == in_channels == out_channels
+# is the per-channel walk MobileNet's depthwise layers are, groups == 1 is every
+# other convolution.
+#
+# Both read and write their activation in the same 64-channel blocking pooling
+# uses, so both are wrapped in the same pair of blits, and the general path
+# wants its weight in the HMX unit's 32x32 tiles, which is an export-time
+# rearrange of the same kind pack_hmx_weight does for a matmul.
+CONV2D = exir_ops.edge.aten.conv2d.default
+CONVOLUTION = exir_ops.edge.aten.convolution.default
+CONV_TARGETS = frozenset({CONV2D, CONVOLUTION})
+
+
+class ConvSpec(NamedTuple):
+    """Everything a convolution command carries, once the node is known to fit."""
+
+    batch: int
+    in_channels: int
+    in_h: int
+    in_w: int
+    out_channels: int
+    out_h: int
+    out_w: int
+    kernel_y: int
+    kernel_x: int
+    stride_y: int
+    stride_x: int
+    pad_y: int
+    pad_x: int
+    dilate_y: int
+    dilate_x: int
+    depthwise: bool
+
+
+def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
+    """The convolution's geometry, or None when neither kernel here can run it.
+
+    The support check and the emitter both call this, so they cannot disagree
+    about which convolutions are delegated; `is_constant` is the caller's own
+    test for "a value whose bytes I can read now", since both kernels take a
+    weight this layer has to rearrange before the DSP ever sees it.
+    """
+    if node.target not in CONV_TARGETS:
+        return None
+    args = node.args
+    # conv2d is the form torch.export produces for nn.Conv2d and convolution is
+    # the one every rewrite of it lands on; the two differ only in the arguments
+    # the emitter refuses anyway.
+    convolve = node.target is CONVOLUTION
+    if len(args) < (9 if convolve else 7):
+        return None
+    source, weight = args[0], args[1]
+    if not (isinstance(source, torch.fx.Node) and isinstance(weight, torch.fx.Node)):
+        return None
+    if not is_constant(weight):
+        return None
+    bias = args[2] if len(args) > 2 else None
+    if bias is not None and not (isinstance(bias, torch.fx.Node) and is_constant(bias)):
+        return None
+    group = args[8] if convolve else args[6]
+    stride = _int_pair(args[3], None)
+    padding = _int_pair(args[4], None)
+    dilation = _int_pair(args[5], (1, 1))
+    if convolve:
+        if args[6] is not False:
+            # A transposed convolution is a scatter, not a window walk.
+            return None
+        output_padding = args[7]
+        if output_padding is not None and any(output_padding):
+            return None
+    if isinstance(group, bool) or not isinstance(group, int) or group <= 0:
+        return None
+    if stride is None or padding is None or dilation is None:
+        return None
+    if any(step <= 0 for step in stride) or any(step <= 0 for step in dilation):
+        return None
+    if any(pad < 0 for pad in padding):
+        return None
+
+    value = source.meta.get("val")
+    kernel = weight.meta.get("val")
+    result = node.meta.get("val")
+    if not all(isinstance(item, torch.Tensor) for item in (value, kernel, result)):
+        return None
+    if value.dtype not in (torch.float16, torch.float32):
+        return None
+    if value.dim() != 4 or kernel.dim() != 4 or result.dim() != 4:
+        return None
+    if any(
+        isinstance(dim, torch.SymInt)
+        for dim in list(value.shape) + list(kernel.shape) + list(result.shape)
+    ):
+        return None
+    batch, in_channels, in_h, in_w = value.shape
+    out_channels, per_group, kernel_y, kernel_x = kernel.shape
+    if per_group * group != in_channels:
+        return None
+    extents = (batch, in_channels, in_h, in_w, out_channels, kernel_y, kernel_x)
+    if any(extent <= 0 for extent in extents):
+        return None
+    # The region stride of a channel block is the plane's element count, and the
+    # DSP holds it in an int32.
+    if in_channels * in_h * in_w >= 1 << 31:
+        return None
+
+    out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_y - 1) - 1) // stride[0] + 1
+    out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_x - 1) - 1) // stride[1] + 1
+    if out_h <= 0 or out_w <= 0:
+        return None
+    if list(result.shape) != [batch, out_channels, out_h, out_w]:
+        return None
+
+    depthwise = group == in_channels == out_channels and per_group == 1
+    if not depthwise and group != 1:
+        # A group count in between is a third kernel: neither walk carries the
+        # channel mapping for it, and faking it with blits is not worth the
+        # commands.
+        return None
+    return ConvSpec(
+        batch=batch,
+        in_channels=in_channels,
+        in_h=in_h,
+        in_w=in_w,
+        out_channels=out_channels,
+        out_h=out_h,
+        out_w=out_w,
+        kernel_y=kernel_y,
+        kernel_x=kernel_x,
+        stride_y=stride[0],
+        stride_x=stride[1],
+        pad_y=padding[0],
+        pad_x=padding[1],
+        dilate_y=dilation[0],
+        dilate_x=dilation[1],
+        depthwise=depthwise,
+    )
+
+
+def _channel_blocks(channels: int) -> int:
+    return -(-channels // POOL_CHANNEL_BLOCK)
+
+
+def pack_depthwise_weight(weight, channels: int, kernel_y: int, kernel_x: int) -> bytes:
+    """A depthwise ``(channels, 1, ky, kx)`` weight in the order the kernel reads it.
+
+    The walk starts each block's weights at ``weight + cb * ky * kx * 64``
+    (depthwise_conv_fp16.c:27) and each tap at ``w + (ky * kernelX + kx) * 64``
+    (:49), so the flat index is ``((cb * kernelY + ky) * kernelX + kx) * 64 +
+    lane``: one 64-lane vector per tap, with the channel block outermost. Lanes
+    past the channel count are zero -- the kernel multiplies them like any
+    other lane, and only the lanes below the count are read back.
+    """
+    import numpy as np
+
+    values = weight.astype(np.float16, copy=False)
+    if values.shape != (channels, 1, kernel_y, kernel_x):
+        raise RuntimeError(f"hexagon: depthwise weight has shape {values.shape}")
+    padded = np.zeros(
+        (_channel_blocks(channels), POOL_CHANNEL_BLOCK, kernel_y, kernel_x),
+        dtype=np.float16,
+    )
+    for index in range(_channel_blocks(channels)):
+        first = index * POOL_CHANNEL_BLOCK
+        width = min(POOL_CHANNEL_BLOCK, channels - first)
+        padded[index, :width] = values[first : first + width, 0]
+    return np.ascontiguousarray(padded.transpose(0, 2, 3, 1)).tobytes()
+
+
+def pack_conv_weight(weight, spec: ConvSpec) -> bytes:
+    """A general ``(oc, ic, ky, kx)`` weight as the HMX unit's 32x32 tiles.
+
+    ``fill_weight_tiles_fp16`` copies each tile out of the blob verbatim
+    (im2col_convolution_fp16.cc:1673-1690), so the tile the unit reads *is* the
+    blob's bytes and the column order has to be built here: element (k, c) sits
+    at ``(k // 2) * 64 + c * 2 + (k & 1)``, the same rule pack_hmx_weight
+    writes for a matmul. The tile index decomposes as ``(ky * kernelX + kx) *
+    ic_blocks + ic_block`` with ``ic_blocks = ceil(ic / 32)``
+    (fill_im2col_activation_kk_range, :248), and the k inside a tile is the
+    channel inside that 32-channel group. Channels past ``ic`` inside the last
+    group are zero: the fill reads them from the padding lanes of the blocked
+    activation, so a non-zero weight there would add whatever those lanes hold.
+    """
+    import numpy as np
+
+    values = weight.astype(np.float16, copy=False)
+    expected = (spec.out_channels, spec.in_channels, spec.kernel_y, spec.kernel_x)
+    if values.shape != expected:
+        raise RuntimeError(f"hexagon: convolution weight has shape {values.shape}")
+    k_blocks = -(-spec.in_channels // 32)
+    tiles = -(-spec.out_channels // 32) * spec.kernel_y * spec.kernel_x * k_blocks
+    out = np.zeros(tiles * 1024, dtype=np.float16)
+    for tile_out in range(-(-spec.out_channels // 32)):
+        for ky in range(spec.kernel_y):
+            for kx in range(spec.kernel_x):
+                for k_block in range(k_blocks):
+                    index = (
+                        tile_out * spec.kernel_y * spec.kernel_x
+                        + ky * spec.kernel_x
+                        + kx
+                    ) * k_blocks + k_block
+                    base = index * 1024
+                    for kin in range(32):
+                        channel = k_block * 32 + kin
+                        if channel >= spec.in_channels:
+                            break
+                        for c in range(32):
+                            out_channel = tile_out * 32 + c
+                            if out_channel >= spec.out_channels:
+                                break
+                            out[base + (kin // 2) * 64 + c * 2 + kin % 2] = values[
+                                out_channel, channel, ky, kx
+                            ]
+    return out.tobytes()
+
+
+def pack_conv_bias(bias, channels: int, lanes: int) -> bytes:
+    """A bias as the flat fp16 array both kernels read a vector at a time from.
+
+    The depthwise walk reads 64 lanes from ``bias + cb * 64`` and the im2col
+    walk 64 lanes from ``bias + tile * 32`` (output_conv_fp16.cc:66), so the
+    buffer has to be as long as the widest read rather than as long as the
+    channel count -- and it can never be absent: the depthwise kernel
+    dereferences it unconditionally, so a convolution with no bias needs a zero
+    buffer here rather than a null operand.
+    """
+    import numpy as np
+
+    values = bias.astype(np.float16, copy=False).reshape(-1)
+    out = np.zeros(lanes, dtype=np.float16)
+    out[: min(channels, lanes)] = values[: min(channels, lanes)]
+    return out.tobytes()
+
+
+def _conv_layouts_agree(area: int, channels: int) -> bool:
+    """Whether a row-major ``[batch][channels][area]`` buffer is the blocked one.
+
+    The blocked index ``((c // 64) * batch + n) * area * 64 + (m * 64) + c % 64``
+    collapses to the row-major ``(n * channels + c) * area + m`` only when a plane
+    is a single element and every block is full: with a ragged channel count the
+    blocked form is wider than the tensor it would be read from, so the kernel
+    would walk past the buffer rather than inside it.
+    """
+    return area == 1 and channels % POOL_CHANNEL_BLOCK == 0
+
+
+def _channel_block_regions(
+    batch: int, area: int, channels: int, packing: bool
+) -> List[int]:
+    """The blits that move every 64-channel block between the two layouts.
+
+    This is `_channel_block_region`'s geometry once per block, with the offsets
+    that move block ``i`` from ``[batch][channels][area]`` (packing) or back to
+    it (unpacking). The blocked layout puts the channel block outside the batch
+    (``[c4][batch][area][64]``), which is why the source offset is the block
+    start times the plane and the destination offset counts whole blocks.
+    """
+    regions: List[int] = []
+    for index in range(_channel_blocks(channels)):
+        first = index * POOL_CHANNEL_BLOCK
+        width = min(POOL_CHANNEL_BLOCK, channels - first)
+        blocked_offset = index * batch * area * POOL_CHANNEL_BLOCK
+        row_major = [channels * area, area, 1]
+        blocked = [area * POOL_CHANNEL_BLOCK, 1, POOL_CHANNEL_BLOCK]
+        if packing:
+            source, dest = row_major, blocked
+            source_offset, dest_offset = first * area, blocked_offset
+        else:
+            source, dest = blocked, row_major
+            source_offset, dest_offset = blocked_offset, first * area
+        regions += [0, source_offset, dest_offset, batch, width, area]
+        regions += source + dest
+    return regions
+
+
+def _emit_channel_block_blit(
+    ctx,
+    node: torch.fx.Node,
+    source: TensorRef,
+    dest: TensorRef,
+    batch: int,
+    area: int,
+    channels: int,
+    packing: bool,
+) -> None:
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[source],
+            outputs=[dest],
+            params=[_channel_blocks(channels), FP16_BYTES, 1]
+            + _channel_block_regions(batch, area, channels, packing),
+        ),
+    )
+
+
+def _emit_zero(ctx, node: torch.fx.Node, dest: TensorRef) -> None:
+    """Clears a whole activation buffer with the DSP's own memset.
+
+    `htp_ops_zero` takes one operand and a byte count (`blit_ops.cc:1724`), and
+    the command carries no inputs: the output is the buffer it clears.
+    """
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_ZERO,
+            inputs=[],
+            outputs=[dest],
+            params=[dest.size],
+        ),
+    )
+
+
+def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
+    """A convolution as the DSP's depthwise walk or its im2col convolution.
+
+    Both take the same blocked activation, so both are three commands: the blit
+    in, the convolution, and the blit out of its result.
+    """
+    spec = conv_spec(node, lambda operand: ctx.constant_value(operand) is not None)
+    if spec is None:
+        raise RuntimeError(
+            "hexagon: this convolution is not one the DSP kernels can run (see conv_spec)"
+        )
+    _require_arena_dtype(node, "convolution")
+    source = ctx.operand(node.args[0])
+    weight_node = node.args[1]
+    bias_node = node.args[2] if len(node.args) > 2 else None
+    out = ctx.result_for(node, _numel(node))
+
+    in_area = spec.in_h * spec.in_w
+    out_area = spec.out_h * spec.out_w
+    packed_in = source
+    if not _conv_layouts_agree(in_area, spec.in_channels):
+        packed_in = ctx.builder.add_activation(
+            spec.batch
+            * in_area
+            * _channel_blocks(spec.in_channels)
+            * POOL_CHANNEL_BLOCK
+            * FP16_BYTES
+        )
+        if not spec.depthwise and spec.in_channels % POOL_CHANNEL_BLOCK:
+            # The im2col fill copies whole 64-lane groups out of the blocked
+            # activation, so the lanes past the last channel are read -- and
+            # multiplied by the zero weights the tiles carry for them, which a
+            # NaN there would turn into another NaN rather than a zero. The pack
+            # blit below writes only the channels the tensor has, so those lanes
+            # have to be zeroed first.
+            _emit_zero(ctx, node, packed_in)
+        _emit_channel_block_blit(
+            ctx, node, source, packed_in, spec.batch, in_area, spec.in_channels, True
+        )
+    packed_out = out
+    if not _conv_layouts_agree(out_area, spec.out_channels):
+        packed_out = ctx.builder.add_activation(
+            spec.batch
+            * out_area
+            * _channel_blocks(spec.out_channels)
+            * POOL_CHANNEL_BLOCK
+            * FP16_BYTES
+        )
+
+    if spec.depthwise:
+        weight = ctx.packed_weights(
+            weight_node,
+            lambda array: pack_depthwise_weight(
+                array, spec.in_channels, spec.kernel_y, spec.kernel_x
+            ),
+            "depthwise",
+        )
+        bias = _conv_bias_ref(
+            ctx,
+            bias_node,
+            spec.out_channels,
+            _channel_blocks(spec.out_channels) * POOL_CHANNEL_BLOCK,
+            "depthwise",
+        )
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_CONV_DEPTHWISE2D_FP16,
+                inputs=[packed_in, weight, bias],
+                outputs=[packed_out],
+                params=[
+                    spec.batch,
+                    spec.in_h,
+                    spec.in_w,
+                    spec.out_h,
+                    spec.out_w,
+                    _channel_blocks(spec.in_channels),
+                    spec.kernel_y,
+                    spec.kernel_x,
+                    spec.stride_y,
+                    spec.stride_x,
+                    spec.pad_y,
+                    spec.pad_x,
+                    spec.dilate_y,
+                    spec.dilate_x,
+                    # The kernel fuses relu and relu6 after the bias, and to_edge
+                    # leaves a relu as its own node rather than folding it in, so
+                    # both are always off here.
+                    0,
+                    0,
+                ],
+            ),
+        )
+    else:
+        k_units = -(-spec.in_channels // 32)
+        weight = ctx.packed_weights(
+            weight_node, lambda array: pack_conv_weight(array, spec), "im2col"
+        )
+        bias = _conv_bias_ref(
+            ctx,
+            bias_node,
+            spec.out_channels,
+            -(-spec.out_channels // 32) * 32 + 32,
+            "im2col",
+        )
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_IM2COL_CONVOLUTION_FP16,
+                inputs=[packed_in, weight, bias],
+                outputs=[packed_out],
+                params=[
+                    spec.pad_x,
+                    spec.pad_y,
+                    spec.dilate_x,
+                    spec.dilate_y,
+                    spec.stride_x,
+                    spec.stride_y,
+                    spec.kernel_x,
+                    spec.kernel_y,
+                    # icDiv4 and icup4 belong to the int4 entry points; the fp16
+                    # path reads neither.
+                    spec.in_channels // 4,
+                    spec.kernel_y * spec.kernel_x * k_units,
+                    spec.in_w,
+                    spec.in_h,
+                    spec.out_w,
+                    spec.out_h,
+                    # srcZStep steps between 64-channel blocks, srcYStep between
+                    # rows of one, and destICStride is what a batch advances by:
+                    # all three in the blocked layout the blit above produced
+                    # (input_block_offset_fp16, :213).
+                    spec.batch * in_area * POOL_CHANNEL_BLOCK,
+                    spec.in_w * POOL_CHANNEL_BLOCK,
+                    POOL_CHANNEL_BLOCK,
+                    in_area * POOL_CHANNEL_BLOCK,
+                    spec.in_channels,
+                    (spec.in_channels + 3) // 4 * 4,
+                    spec.out_channels,
+                    # One position tile and two channel tiles per pass. The pair
+                    # is not a tuning choice: the single-tile store rotates an
+                    # odd tile's accumulator *after* adding its bias, so an odd
+                    # tile that reaches it is handed the neighbouring tile's bias
+                    # on the last position of a ragged position tile.
+                    # test/sim/conv_runner.cpp runs that case as CV_ODD and
+                    # test_conv_sim.py pins the wrong channels and the size of
+                    # the error on the simulator.
+                    1,
+                    2,
+                    # relu and relu6 are fused into the store, and to_edge
+                    # leaves a relu as its own node, so both are off here.
+                    0,
+                    0,
+                    spec.batch,
+                    # outputBytes turns the store's own bounds check off.
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+        )
+    if packed_out is not out:
+        _emit_channel_block_blit(
+            ctx, node, packed_out, out, spec.batch, out_area, spec.out_channels, False
+        )
+    return ctx.record(node, out)
+
+
+def _conv_bias_ref(ctx, bias_node, channels: int, lanes: int, kind: str) -> TensorRef:
+    """The bias operand, padded to the widest vector read either kernel makes.
+
+    A convolution without a bias still needs a buffer here rather than a null
+    operand, and the buffer has to be longer than the channel count: every read
+    starts at a 32- or 64-channel group's first lane and runs a whole HVX vector
+    past it.
+    """
+    if bias_node is not None:
+        return ctx.packed_weights(
+            bias_node, lambda array: pack_conv_bias(array, channels, lanes), kind
+        )
+    return ctx.builder.add_weights(bytes(lanes * FP16_BYTES))
+
+
 # REDUCTION collapses one contiguous span, so the reduced dims have to be
 # adjacent; the callers' support checks enforce that before an emitter runs.
 SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
@@ -3247,6 +3754,9 @@ EMITTERS = {
     # x ** 2 and torch.square both arrive as pow.Tensor_Scalar.
     POW_TENSOR_SCALAR: _emit_square_pow,
     ROW_GUARD: _emit_row_guard,
+    # One ATen op, two kernels: the depthwise walk and the im2col convolution
+    # (see conv_spec for which geometry each takes).
+    CONVOLUTION: _emit_convolution,
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),
     exir_ops.edge.aten.rsqrt.default: _unary("rsqrt"),
