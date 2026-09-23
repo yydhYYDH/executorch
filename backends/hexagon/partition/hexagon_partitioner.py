@@ -36,15 +36,15 @@ from executorch.backends.hexagon.hexagon_ops import (
     layer_norm_getitem,
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
+    MAX_POOL2D_WITH_INDICES,
+    max_pool_getitem,
+    max_pool_is_emittable,
     MEAN_TARGETS,
     MM_TARGETS,
     NATIVE_LAYER_NORM,
     operand_dtypes_are_readable,
     permute_region,
     PERMUTE_TARGETS,
-    max_pool_getitem,
-    max_pool_is_emittable,
-    MAX_POOL2D_WITH_INDICES,
     pool_spec,
     POOL_TARGETS,
     quantized_matmul_is_refused,
@@ -60,8 +60,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     sum_dim_is_emittable,
     SUM_TARGETS,
     update_cache_layout,
-    VISION_ATTENTION_TARGETS,
     vision_attention_is_emittable,
+    VISION_ATTENTION_TARGETS,
 )
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
@@ -401,10 +401,7 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 return False
             if node.target in SUM_TARGETS and not sum_dim_is_emittable(node):
                 return False
-        if (
-            node.target is MAX_POOL2D_WITH_INDICES
-            and not max_pool_is_emittable(node)
-        ):
+        if node.target is MAX_POOL2D_WITH_INDICES and not max_pool_is_emittable(node):
             # The indices come out of the same node and no kernel here produces
             # them, so a graph that reads them keeps the pool portable.
             return False

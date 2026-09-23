@@ -91,13 +91,16 @@ def _commands(program):
 
 
 def _run(blob, inputs):
-    return np.frombuffer(execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16)
+    return np.frombuffer(
+        execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16
+    )
 
 
 def _edge(model, inputs):
     """The edge graph on its own, which is where a transform pass runs."""
     return to_edge(
-        export(model, inputs), compile_config=EdgeCompileConfig(_check_ir_validity=False)
+        export(model, inputs),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
 
 
@@ -125,7 +128,9 @@ def test_a_rectified_sum_becomes_one_element_wise_command():
     """The subtype, the operands, and torch's own numbers."""
     x = torch.randn(4, 8, dtype=torch.float16)
     y = torch.randn(4, 8, dtype=torch.float16)
-    blob, commands = _commands(_program(_RectifiedSum(), (x, y), passes=[FuseAddReluPass()]))
+    blob, commands = _commands(
+        _program(_RectifiedSum(), (x, y), passes=[FuseAddReluPass()])
+    )
     assert [command.type for command in commands] == [_BINARY]
     assert list(commands[0].params[:8]) == [32, 32, 32, _ADD_RELU, 2, 2, 0, 0]
     got = _run(blob, (x, y))

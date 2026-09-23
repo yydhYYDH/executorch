@@ -17,11 +17,11 @@ import struct
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
-from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
-from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 
 # After rms_norm, which opens the et_hexagon namespace these fragments join.
 from executorch.backends.hexagon.add_relu import ADD_RELU
+from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
+from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.backends.hexagon.mul_silu import MUL_SILU
 from executorch.backends.hexagon.rms_norm import RMS_NORM
 from executorch.backends.hexagon.rope import ROPE
@@ -2028,9 +2028,7 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
             # The divisor is what the kernel's countType selects; an arbitrary
             # one has no command form.
             return None
-        count_type = (
-            POOL_COUNT_KERNEL if count_include_pad else POOL_COUNT_VALID
-        )
+        count_type = POOL_COUNT_KERNEL if count_include_pad else POOL_COUNT_VALID
         pool_type = POOL_AVERAGE
     if ceil_mode:
         # ceil_mode adds windows past the input that this kernel's geometry (one
@@ -2078,7 +2076,10 @@ def _channel_block_region(batch: int, area: int, channels: int, packing: bool) -
     ``dst[b * area * 64 + x * 64 + c] = src[b * 64 * area + c * area + x]``,
     which is the same mapping this region describes.
     """
-    inner = ([channels * area, area, 1], [area * POOL_CHANNEL_BLOCK, 1, POOL_CHANNEL_BLOCK])
+    inner = (
+        [channels * area, area, 1],
+        [area * POOL_CHANNEL_BLOCK, 1, POOL_CHANNEL_BLOCK],
+    )
     if not packing:
         inner = (inner[1], inner[0])
     return [0, 0, 0, batch, POOL_CHANNEL_BLOCK, area] + list(inner[0]) + list(inner[1])

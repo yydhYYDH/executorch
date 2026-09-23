@@ -108,9 +108,11 @@ def test_a_sum_is_one_span_of_the_buffer(shape, dim, span):
     x = torch.randn(*shape, dtype=torch.float16)
     blob, commands = _delegated(_Reduce("sum", dim=dim), x)
     assert [command.type for command in commands] == [_REDUCTION]
-    assert list(commands[0].params) == [*span, _SUM, _FP16_BYTES], (
-        f"sum over {dim} of {shape} emitted {list(commands[0].params)}"
-    )
+    assert list(commands[0].params) == [
+        *span,
+        _SUM,
+        _FP16_BYTES,
+    ], f"sum over {dim} of {shape} emitted {list(commands[0].params)}"
     np.testing.assert_allclose(
         _run(blob, x),
         torch.sum(x, dim=dim).numpy().reshape(-1),
@@ -172,7 +174,9 @@ def test_a_reduction_over_two_separate_spans_stays_on_the_host():
         assert _delegates(program) == [], f"{kind} over (0, 2) reached the delegate"
         # The portable kernel still answers, with the value the delegate cannot
         # express in one command.
-        expected = torch.sum(x, dim=(0, 2)) if kind == "sum" else torch.amax(x, dim=(0, 2))
+        expected = (
+            torch.sum(x, dim=(0, 2)) if kind == "sum" else torch.amax(x, dim=(0, 2))
+        )
         assert expected.shape == (3,)
 
 

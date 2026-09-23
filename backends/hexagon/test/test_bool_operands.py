@@ -88,12 +88,16 @@ def test_the_comparison_and_its_conversion_stay_outside_the_delegate():
     for model in (_Comparison(), _ComparisonWithCast()):
         program = _program(model, (x, y))
         outer = {
-            str(node.target) for node in program.graph_module.graph.nodes if node.op == "call_function"
+            str(node.target)
+            for node in program.graph_module.graph.nodes
+            if node.op == "call_function"
         }
         assert any("gt" in target for target in outer), outer
         assert any("dim_order_copy" in target for target in outer), outer
         calls = _delegates(program)
-        assert len(calls) == 1, f"the element-wise op did not reach the delegate: {calls}"
+        assert (
+            len(calls) == 1
+        ), f"the element-wise op did not reach the delegate: {calls}"
         lowered = program.graph_module.get_submodule(calls[0].args[0].target)
         blob = bytes(lowered._processed_bytes)
         _, commands = read_blob(blob)
@@ -126,5 +130,7 @@ def test_a_bool_operand_is_refused_at_the_gate():
     numbers. The control is the same node with a fp16 operand, which is taken.
     """
     assert not operand_dtypes_are_readable(_node_with_operand(torch.bool))
-    assert not HexagonOperatorSupport().is_node_supported({}, _node_with_operand(torch.bool))
+    assert not HexagonOperatorSupport().is_node_supported(
+        {}, _node_with_operand(torch.bool)
+    )
     assert operand_dtypes_are_readable(_node_with_operand(torch.float16))

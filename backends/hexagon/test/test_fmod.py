@@ -82,7 +82,9 @@ def _delegated(model, inputs):
 
 
 def _run(blob, inputs):
-    return np.frombuffer(execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16)
+    return np.frombuffer(
+        execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16
+    )
 
 
 def test_fmod_is_the_truncated_remainder_the_kernel_computes():
@@ -205,9 +207,7 @@ def test_the_host_interpreter_computes_the_kernel_s_remainder(kind):
     y = (torch.randn(64, dtype=torch.float16) + 0.5).abs() * 4 + 0.25
     blob, _ = _delegated(_Fmod(), (x, y))
     got = _run(blob, (x, y))
-    expected = (
-        torch.fmod(x, y) if kind == "fmod" else torch.remainder(x, y)
-    ).numpy()
+    expected = (torch.fmod(x, y) if kind == "fmod" else torch.remainder(x, y)).numpy()
     if kind == "fmod":
         assert got.tobytes() == expected.tobytes()
     else:

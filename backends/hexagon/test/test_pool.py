@@ -232,9 +232,7 @@ def test_average_selects_the_divisor_the_kernel_takes(count_include_pad):
     ]
     got = _run(blob, x)
     expected = model(x)
-    np.testing.assert_allclose(
-        got, expected.numpy().reshape(-1), rtol=2e-3, atol=2e-3
-    )
+    np.testing.assert_allclose(got, expected.numpy().reshape(-1), rtol=2e-3, atol=2e-3)
 
 
 def test_a_pool_with_a_one_position_input_needs_no_blits():
@@ -473,12 +471,17 @@ def test_the_host_interpreter_pools_the_way_the_kernel_does():
                 np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
 
 
-def _pool_node(args, source_shape=(1, 64, 8, 8), result_shape=(1, 64, 4, 4), target=None):
+def _pool_node(
+    args, source_shape=(1, 64, 8, 8), result_shape=(1, 64, 4, 4), target=None
+):
     """A pool node with the values its predicate reads, built by hand."""
     graph = torch.fx.Graph()
     source = graph.placeholder("x")
     source.meta["val"] = torch.empty(source_shape, dtype=torch.float16)
-    node = graph.call_function(target or exir_ops.edge.aten.max_pool2d_with_indices.default, args=(source, *args))
+    node = graph.call_function(
+        target or exir_ops.edge.aten.max_pool2d_with_indices.default,
+        args=(source, *args),
+    )
     node.meta["val"] = (
         torch.empty(result_shape, dtype=torch.float16),
         torch.empty(result_shape, dtype=torch.int64),
@@ -526,4 +529,3 @@ def test_pool_spec_refuses_what_the_command_cannot_describe(
 ):
     """Every refusal the partitioner depends on, on the node it reads."""
     assert pool_spec(_pool_node(args, source_shape, result_shape)) is None
-
