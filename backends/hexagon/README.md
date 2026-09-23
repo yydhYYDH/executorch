@@ -712,6 +712,17 @@ Working and verified without a device:
   same file carries three controls that assert the opposite -- a row-major tile
   table, a blanked dynamic trailer and an exchanged pool layout each have to move
   the answer, and they do. See `test/test_blob_on_sim.py`.
+- **one command cannot be covered by the simulator at all, and its refusals are
+  therefore host-only evidence.** `DSP_OP_FLASH_ATTN` (18), the entry point behind
+  `llama.custom_sdpa`, submits work to a worker pool, and the simulated QuRT
+  refuses to start one -- `qurt_cb_fwk_worker_init` returns -4 and the runtime
+  aborts, taking the whole run with it, so the fixture cannot even be built. The
+  defensive rejections that protect that emitter (a mask, a causal bias, the
+  non-square case, the all-`-inf` row) are checked by the host tests and by
+  reading, never by a simulator run, and no simulator result in this README
+  should be read as covering them. Every other attention path here -- the vision
+  kernel and the decomposed `scaled_dot_product_attention` -- is a plain loop and
+  does run.
 
 Not done yet:
 

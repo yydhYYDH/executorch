@@ -15,6 +15,10 @@ out by hand.
 These are the same subgraphs test_blob_interpreter.py checks: the concatenate,
 slice and transpose behind one blit chain, the fused norm, the cache advance
 with its patch and scale, a matmul and a broadcast.
+
+Adding a fixture changes the arena size the runner is given, and an unaligned
+arena answers garbage rather than failing: read `test/README.md` before touching
+the fixtures or the runner.
 """
 
 import os

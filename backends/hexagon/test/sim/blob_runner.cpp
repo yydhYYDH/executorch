@@ -463,7 +463,9 @@ int main(void) {
   /* One arena, reused: run_blob zeroes it. Sized for the largest fixture, and
    * aligned the way the kernels' vector accesses assume: an HVX load or store
    * wants its address aligned to the vector length, and a byte array gives the
-   * linker no reason to. */
+   * linker no reason to -- which is a wrong answer rather than a crash, and one
+   * that a change to the fixture list can flip. Keep the attribute, and see
+   * backends/hexagon/test/README.md before changing either side. */
   static uint8_t arena[kMaxArenaBytes] __attribute__((aligned(128)));
   int status = 0;
   for (unsigned i = 0; i < kFixtureCount; ++i) {

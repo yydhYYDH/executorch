@@ -40,7 +40,9 @@ static void print_bits(const char *tag, const _Float16 *v, int n) {
 /* The buffers below are declared 128-byte aligned because the kernels read and
  * write them a vector at a time, and an HVX access wants that alignment. Without
  * it the array lands wherever the linker puts it and the result depends on the
- * size of the whole shared object rather than on the kernel. */
+ * size of the whole shared object rather than on the kernel -- a wrong answer
+ * rather than a crash, from an edit that says nothing about memory. See
+ * backends/hexagon/test/README.md. */
 
 /* The fused norm. gamma and beta are fp32 even though src and dst are fp16,
  * which is only visible in layer_norm_ops.cc and reads garbage if missed. */
