@@ -1,10 +1,10 @@
 import struct
 
 import torch
-from torch.export import Dim, export
 
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend
 from executorch.exir import to_edge
+from torch.export import Dim, export
 
 
 def test_dynamic_mm_emits_sequence_patches():

@@ -20,10 +20,10 @@ from typing import Dict, List, NamedTuple, Optional
 import torch
 from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
-from executorch.backends.hexagon.rms_norm import RMS_NORM
 
 # After rms_norm, which opens the et_hexagon namespace this fragment joins.
 from executorch.backends.hexagon.mul_silu import MUL_SILU
+from executorch.backends.hexagon.rms_norm import RMS_NORM
 from executorch.backends.hexagon.rope import ROPE
 from executorch.backends.hexagon.row_guard import ROW_GUARD
 from executorch.backends.hexagon.serialization.blob import ABSENT, Op, TensorRef
@@ -132,8 +132,14 @@ def _numel(node: torch.fx.Node) -> int:
 def _upper_product(values, ctx=None) -> int:
     result = 1
     for value in values:
-        result *= ctx.upper_dim(value) if ctx is not None else (
-            eval_upper_bound(value) if isinstance(value, torch.SymInt) else int(value)
+        result *= (
+            ctx.upper_dim(value)
+            if ctx is not None
+            else (
+                eval_upper_bound(value)
+                if isinstance(value, torch.SymInt)
+                else int(value)
+            )
         )
     return result
 
@@ -156,7 +162,9 @@ def _dynamic_scale(ctx, value) -> int:
     return 1
 
 
-def _patch_dynamic_rows(ctx, op_index: int, param_index: int, rows: int, factors) -> None:
+def _patch_dynamic_rows(
+    ctx, op_index: int, param_index: int, rows: int, factors
+) -> None:
     """Patch a row count that is the exported length times static factors.
 
     A blit region's row count is the product of the shape the copy runs over.
@@ -175,7 +183,9 @@ def _patch_dynamic_rows(ctx, op_index: int, param_index: int, rows: int, factors
     ctx.add_dynamic_patch(op_index, param_index, rows // example, 0)
 
 
-def _patch_dynamic_numel(ctx, op_index: int, node: torch.fx.Node, param_index: int = 0) -> None:
+def _patch_dynamic_numel(
+    ctx, op_index: int, node: torch.fx.Node, param_index: int = 0
+) -> None:
     _patch_dynamic_product(ctx, op_index, tuple(_value_of(node).shape), param_index)
 
 
@@ -664,7 +674,11 @@ def _unary(op_name: str):
                 inputs=[ctx.operand(src)],
                 outputs=[out],
                 # size is in elements, not bytes.
-                params=[_upper_product(tuple(_value_of(node).shape), ctx), UNARY_OP_TYPES[op_name], FP16_BYTES],
+                params=[
+                    _upper_product(tuple(_value_of(node).shape), ctx),
+                    UNARY_OP_TYPES[op_name],
+                    FP16_BYTES,
+                ],
             )
         )
         _patch_dynamic_numel(ctx, op_index, node)
@@ -1164,8 +1178,16 @@ def _weight_operand(ctx, rhs, m: int, k: int, n: int):
 
 
 def _matmul_command(
-    ctx, lhs, rhs, out, batches: int, m: int, k: int, n: int,
-    hmx_prepacked: bool = False, hmx_tile_budget: int = 0,
+    ctx,
+    lhs,
+    rhs,
+    out,
+    batches: int,
+    m: int,
+    k: int,
+    n: int,
+    hmx_prepacked: bool = False,
+    hmx_tile_budget: int = 0,
 ) -> None:
     """One BATCH_MATMUL over contiguous (m, k) @ (k, n) tiles.
 
@@ -1179,7 +1201,11 @@ def _matmul_command(
     m_plan = ctx.upper_bound(m)
     k_plan = ctx.upper_bound(k)
     n_plan = ctx.upper_bound(n)
-    steps = (m_plan * n_plan, m_plan * k_plan, k_plan * n_plan) if batches > 1 else (0, 0, 0)
+    steps = (
+        (m_plan * n_plan, m_plan * k_plan, k_plan * n_plan)
+        if batches > 1
+        else (0, 0, 0)
+    )
     op_index = ctx.builder.add_op(
         Op(
             type=DSP_OP_BATCH_MATMUL,
@@ -1214,16 +1240,30 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "mm")
     lhs_val, rhs_val = lhs.meta["val"], rhs.meta["val"]
     if not (lhs_val.is_contiguous() and rhs_val.is_contiguous()):
-        raise RuntimeError("hexagon: mm operands must be contiguous; strides come from shape")
+        raise RuntimeError(
+            "hexagon: mm operands must be contiguous; strides come from shape"
+        )
     m, k = lhs_val.shape
     contracted, n = rhs_val.shape
     if k != contracted:
         raise RuntimeError(f"hexagon: mm contracts {k} against {contracted}")
 
-    weight, prepacked = _weight_operand(ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n))
+    weight, prepacked = _weight_operand(
+        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+    )
     out = ctx.result_for(node, m * n)
-    _matmul_command(ctx, ctx.operand(lhs), weight, out, 1, m, k, n, hmx_prepacked=prepacked,
-                    hmx_tile_budget=_hmx_tile_budget())
+    _matmul_command(
+        ctx,
+        ctx.operand(lhs),
+        weight,
+        out,
+        1,
+        m,
+        k,
+        n,
+        hmx_prepacked=prepacked,
+        hmx_tile_budget=_hmx_tile_budget(),
+    )
     return ctx.record(node, out)
 
 
@@ -1237,7 +1277,9 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "bmm")
     lhs_val, rhs_val = lhs.meta["val"], rhs.meta["val"]
     if not (lhs_val.is_contiguous() and rhs_val.is_contiguous()):
-        raise RuntimeError("hexagon: bmm operands must be contiguous; strides come from shape")
+        raise RuntimeError(
+            "hexagon: bmm operands must be contiguous; strides come from shape"
+        )
     batches, m, k = lhs_val.shape
     rhs_batches, contracted, n = rhs_val.shape
     if batches != rhs_batches or k != contracted:
@@ -1245,10 +1287,22 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
             f"hexagon: bmm contracts {batches}x{k} against {rhs_batches}x{contracted}"
         )
 
-    weight, prepacked = _weight_operand(ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n))
+    weight, prepacked = _weight_operand(
+        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+    )
     out = ctx.result_for(node, batches * m * n)
-    _matmul_command(ctx, ctx.operand(lhs), weight, out, batches, m, k, n, hmx_prepacked=prepacked,
-                    hmx_tile_budget=_hmx_tile_budget())
+    _matmul_command(
+        ctx,
+        ctx.operand(lhs),
+        weight,
+        out,
+        batches,
+        m,
+        k,
+        n,
+        hmx_prepacked=prepacked,
+        hmx_tile_budget=_hmx_tile_budget(),
+    )
     return ctx.record(node, out)
 
 
@@ -1273,9 +1327,21 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     out = ctx.result_for(node, m * n)
     # beta == 0 folds the bias away and leaves mm, so there is nothing to add.
     target = out if beta == 0.0 else ctx.activation_for_shape((m, n))
-    weight, prepacked = _weight_operand(ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n))
-    _matmul_command(ctx, ctx.operand(lhs), weight, target, 1, m, k, n, hmx_prepacked=prepacked,
-                    hmx_tile_budget=_hmx_tile_budget())
+    weight, prepacked = _weight_operand(
+        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+    )
+    _matmul_command(
+        ctx,
+        ctx.operand(lhs),
+        weight,
+        target,
+        1,
+        m,
+        k,
+        n,
+        hmx_prepacked=prepacked,
+        hmx_tile_budget=_hmx_tile_budget(),
+    )
     if beta == 0.0:
         return ctx.record(node, out)
 
@@ -1568,7 +1634,7 @@ def layer_norm_normalizes_the_trailing_dims(node: torch.fx.Node) -> bool:
     normalized = list(node.args[1])
     if len(normalized) > len(shape):
         return False
-    return [int(size) for size in normalized] == shape[len(shape) - len(normalized):]
+    return [int(size) for size in normalized] == shape[len(shape) - len(normalized) :]
 
 
 def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
@@ -1602,7 +1668,9 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
     # affine is the same pair of elementwise commands rms_norm uses for its
     # scale. The cost is one rounding to fp16 before the multiply and one after
     # the add; the kernels are fp16 in and out regardless.
-    affine = [(arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None]
+    affine = [
+        (arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None
+    ]
     normalized = ctx.activation_for_shape(shape) if affine else out
     norm_op_index = ctx.builder.add_op(
         Op(
@@ -1634,7 +1702,12 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
                     FP16_BYTES,
                     0,  # inputs are not 4-byte floats
                     0,  # output is not a 4-byte float
-                    *_broadcast_tail((outer, inner), tuple(arg.meta["val"].shape), (outer, inner), ctx),
+                    *_broadcast_tail(
+                        (outer, inner),
+                        tuple(arg.meta["val"].shape),
+                        (outer, inner),
+                        ctx,
+                    ),
                 ],
             )
         )
@@ -1739,7 +1812,9 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     # pays for whole blocks, the same span attention_entry.cc sizes its own
     # packed K/V to.
     if len(kv_shape) != 4 or kv_shape[3] != q_shape[3]:
-        raise RuntimeError(f"hexagon: sdpa cache {tuple(kv_shape)} does not match head_dim {q_shape[3]}")
+        raise RuntimeError(
+            f"hexagon: sdpa cache {tuple(kv_shape)} does not match head_dim {q_shape[3]}"
+        )
     # Slots one and two reach the kernel as [batch, seq, heads, dim]: the
     # partitioner hands them the stored cache, and a caller that keeps its cache
     # head-major transposes it into that layout before the op.

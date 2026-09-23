@@ -16,13 +16,9 @@ from executorch.backends.hexagon.hexagon_ops import (
 from executorch.backends.hexagon.serialization.blob import BlobBuilder, TensorRef
 from executorch.exir.backend.backend_details import BackendDetails, PreprocessResult
 from executorch.exir.backend.compile_spec_schema import CompileSpec
-from torch._export.utils import (
-    get_buffer,
-    get_lifted_tensor_constant,
-    get_param,
-)
-from torch.export import ExportedProgram
 from executorch.exir.sym_util import eval_upper_bound
+from torch._export.utils import get_buffer, get_lifted_tensor_constant, get_param
+from torch.export import ExportedProgram
 
 # node.target -> emitter. The partitioner delegates exactly these, so what the
 # DSP is asked to run and what the AOT step can encode cannot drift apart.
@@ -149,7 +145,9 @@ class BlobContext:
     def upper_shape(self, shape, allow_static_fallback: bool = True) -> tuple:
         return tuple(self.upper_dim(value) for value in shape)
 
-    def dynamic_bytes_for_shape(self, shape, dtype: torch.dtype, allow_static_fallback: bool = True) -> tuple[int, int, int]:
+    def dynamic_bytes_for_shape(
+        self, shape, dtype: torch.dtype, allow_static_fallback: bool = True
+    ) -> tuple[int, int, int]:
         """Return bytes as c0 + c1*L + c2*L^2 for one tensor shape."""
         coeffs = [1, 0, 0]
         for dim in shape:
@@ -163,7 +161,9 @@ class BlobContext:
         itemsize = torch.empty((), dtype=dtype).element_size()
         return tuple(value * itemsize for value in coeffs)
 
-    def activation_for_shape(self, shape, dtype: torch.dtype = torch.float16) -> TensorRef:
+    def activation_for_shape(
+        self, shape, dtype: torch.dtype = torch.float16
+    ) -> TensorRef:
         upper_numel = 1
         for dim in shape:
             upper_numel *= self.upper_dim(dim)
@@ -172,7 +172,9 @@ class BlobContext:
             dynamic_layout=self.dynamic_bytes_for_shape(shape, dtype),
         )
 
-    def dynamic_bytes_for_function(self, max_bytes: int, function) -> tuple[int, int, int]:
+    def dynamic_bytes_for_function(
+        self, max_bytes: int, function
+    ) -> tuple[int, int, int]:
         """Fit a non-negative quadratic byte formula over the sequence length."""
         if (
             self.dynamic_sequence is None
@@ -188,9 +190,11 @@ class BlobContext:
                     eval_upper_bound(dim)
                     for node in self.graph_module.graph.nodes
                     for value in (
-                        node.meta.get("val")
-                        if node.meta.get("val") is not None
-                        else (),
+                        (
+                            node.meta.get("val")
+                            if node.meta.get("val") is not None
+                            else ()
+                        ),
                     )
                     for tensor in (value if isinstance(value, tuple) else (value,))
                     for dim in getattr(tensor, "shape", ())
@@ -217,10 +221,14 @@ class BlobContext:
         c1_numerator = slope_middle - c2 * middle * middle
         c1 = max(0, (c1_numerator + middle - 1) // middle)
         if at_zero + c1 * upper + c2 * upper * upper < at_upper:
-            c1 += (at_upper - (at_zero + c1 * upper + c2 * upper * upper) + upper - 1) // upper
+            c1 += (
+                at_upper - (at_zero + c1 * upper + c2 * upper * upper) + upper - 1
+            ) // upper
         return (at_zero, c1, c2)
 
-    def add_dynamic_patch(self, op_index: int, param_index: int, scale: int = 1, add: int = 0) -> None:
+    def add_dynamic_patch(
+        self, op_index: int, param_index: int, scale: int = 1, add: int = 0
+    ) -> None:
         if self.dynamic_sequence is not None:
             from executorch.backends.hexagon.serialization.blob import DynamicPatch
 
@@ -228,9 +236,7 @@ class BlobContext:
                 DynamicPatch(op_index, param_index, scale, add)
             )
 
-    def constant(
-        self, node: torch.fx.Node, dtype: torch.dtype = None
-    ) -> TensorRef:
+    def constant(self, node: torch.fx.Node, dtype: torch.dtype = None) -> TensorRef:
         """Materializes a get_attr node into the weight section, once.
 
         dtype converts the stored tensor, which some ops need: layer norm takes
@@ -420,7 +426,9 @@ class HexagonBackend(BackendDetails):
             placeholder: owned_weight(program, placeholder)
             for placeholder in placeholders
         }
-        weights = {node: tensor for node, tensor in weights.items() if tensor is not None}
+        weights = {
+            node: tensor for node, tensor in weights.items() if tensor is not None
+        }
         inputs = [node for node in placeholders if node not in weights]
 
         dynamic_sequence = None
@@ -432,13 +440,19 @@ class HexagonBackend(BackendDetails):
             if not hasattr(constraint, "upper"):
                 continue
             try:
-                finite_constraint_max = max(finite_constraint_max, int(constraint.upper))
+                finite_constraint_max = max(
+                    finite_constraint_max, int(constraint.upper)
+                )
             except Exception:
                 pass
 
         def symbol_upper(symbol) -> int:
             constraint = next(
-                (value for key, value in program.range_constraints.items() if str(key) == str(symbol)),
+                (
+                    value
+                    for key, value in program.range_constraints.items()
+                    if str(key) == str(symbol)
+                ),
                 None,
             )
             if constraint is not None and hasattr(constraint, "upper"):
@@ -453,7 +467,9 @@ class HexagonBackend(BackendDetails):
             if not isinstance(value, torch.Tensor):
                 continue
             dynamic_axes = [
-                axis for axis, dim in enumerate(value.shape) if isinstance(dim, torch.SymInt)
+                axis
+                for axis, dim in enumerate(value.shape)
+                if isinstance(dim, torch.SymInt)
             ]
             if dynamic_axes:
                 axis = dynamic_axes[0]
@@ -482,10 +498,13 @@ class HexagonBackend(BackendDetails):
             for placeholder in inputs
             for dim in getattr(_val_of(placeholder), "shape", ())
         )
-        if dynamic_sequence is None and has_symbolic_input and program.range_constraints:
+        if (
+            dynamic_sequence is None
+            and has_symbolic_input
+            and program.range_constraints
+        ):
             max_length = max(
-                eval_upper_bound(upper)
-                for upper in program.range_constraints.values()
+                eval_upper_bound(upper) for upper in program.range_constraints.values()
             )
             candidates = []
             for index, placeholder in enumerate(inputs):
@@ -497,7 +516,11 @@ class HexagonBackend(BackendDetails):
                         candidates.append((int(dim), index, axis))
             if candidates:
                 example, index, axis = max(
-                    candidates, key=lambda item: (sum(item[0] == c[0] for c in candidates), item[0])
+                    candidates,
+                    key=lambda item: (
+                        sum(item[0] == c[0] for c in candidates),
+                        item[0],
+                    ),
                 )
                 dynamic_example = example
                 dynamic_sequence = (index, axis, max_length)
@@ -538,9 +561,7 @@ class HexagonBackend(BackendDetails):
                     value.shape, allow_static_fallback=is_dynamic_input
                 ):
                     max_numel *= dim
-                size = bytes_for(
-                    max_numel, torch.float16 if narrowed else value.dtype
-                )
+                size = bytes_for(max_numel, torch.float16 if narrowed else value.dtype)
                 dynamic_layout = context.dynamic_bytes_for_shape(
                     value.shape,
                     torch.float16 if narrowed else value.dtype,

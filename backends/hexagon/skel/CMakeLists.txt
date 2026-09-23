@@ -51,17 +51,18 @@ if(NOT DEFINED HEXAGON_FLATBUFFERS_ROOT)
 endif()
 
 include_directories(
-    ${MNN_OPS_ROOT}
-    ${MNN_OPS_ROOT}/include
-    ${MNN_OPS_ROOT}/include/dsp
-    ${HEXAGON_FLATBUFFERS_ROOT}/include
-    ${HEXAGON_SDK_ROOT}/incs
-    ${HEXAGON_SDK_ROOT}/incs/stddef
-    ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include
-    ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/qurt
-    ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/posix
-    ${IDL_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR})
+  ${MNN_OPS_ROOT}
+  ${MNN_OPS_ROOT}/include
+  ${MNN_OPS_ROOT}/include/dsp
+  ${HEXAGON_FLATBUFFERS_ROOT}/include
+  ${HEXAGON_SDK_ROOT}/incs
+  ${HEXAGON_SDK_ROOT}/incs/stddef
+  ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include
+  ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/qurt
+  ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/posix
+  ${IDL_DIR}
+  ${CMAKE_CURRENT_BINARY_DIR}
+)
 
 set(_dsp ${MNN_OPS_ROOT}/src/dsp)
 
@@ -103,7 +104,8 @@ set(_skel_cxx
     ${_dsp}/hmx_queue.cc
     ${_dsp}/worker_pool.cc
     ${_dsp}/mmap_mgr.cc
-    ${_dsp}/vtcm_mgr.cc)
+    ${_dsp}/vtcm_mgr.cc
+)
 
 # C: the HVX/HMX kernels themselves.
 set(_skel_c
@@ -114,41 +116,46 @@ set(_skel_c
     ${_dsp}/ops/matmul_w8a16_gemv_i8.c
     ${_dsp}/ops/tmac_a16w1_fp16.c
     ${_dsp}/ops/pool_fp16.c
-    ${_dsp}/ops/depthwise_conv_fp16.c)
+    ${_dsp}/ops/depthwise_conv_fp16.c
+)
 
 set(HEX_SKEL_LIB hex-htp-${SKEL_ARCH})
 
-add_library(${HEX_SKEL_LIB} SHARED
-    ${_skel_cxx}
-    ${_skel_c}
-    ${IDL_DIR}/htp_ops_skel.c)
+add_library(
+  ${HEX_SKEL_LIB} SHARED ${_skel_cxx} ${_skel_c} ${IDL_DIR}/htp_ops_skel.c
+)
 
 # Upstream's kernels gate on the arch and on the PWL variant. learned8 is the
 # upstream default: it specialises SiLU/MulSiLU, the others keep the companded
 # implementation.
-target_compile_definitions(${HEX_SKEL_LIB} PRIVATE
-    HTP_OPS_SKEL_ARCH=0x${SKEL_ARCH_NUM}
-    HTP_OPS_PWL_COMPANDED16=1
-    HTP_OPS_PWL_LEARNED8=1)
+target_compile_definitions(
+  ${HEX_SKEL_LIB} PRIVATE HTP_OPS_SKEL_ARCH=0x${SKEL_ARCH_NUM}
+                          HTP_OPS_PWL_COMPANDED16=1 HTP_OPS_PWL_LEARNED8=1
+)
 
 # Upstream silences the vendored sources; keep their warnings out of our build
 # output without hiding ours.
-set_source_files_properties(${_skel_cxx} ${_skel_c} PROPERTIES COMPILE_OPTIONS "-w")
+set_source_files_properties(
+  ${_skel_cxx} ${_skel_c} PROPERTIES COMPILE_OPTIONS "-w"
+)
 
 # The dispatch layer is C++, so the skel needs the DSP C++ runtime. The SDK's
 # toolchain file defines HEXAGON_LIB_DIR as <tools>/Tools/target/hexagon/lib.
 # Link the static archives: the DSP only ships libc.so and libgcc.so, so a
 # NEEDED entry for libc++.so.1 makes FastRPC fail the load with AEE_EFAILED.
-target_link_libraries(${HEX_SKEL_LIB}
-    ${HEXAGON_LIB_DIR}/${SKEL_ARCH}/G0/pic/libc++.a
-    ${HEXAGON_LIB_DIR}/${SKEL_ARCH}/G0/pic/libc++abi.a)
+target_link_libraries(
+  ${HEX_SKEL_LIB} ${HEXAGON_LIB_DIR}/${SKEL_ARCH}/G0/pic/libc++.a
+  ${HEXAGON_LIB_DIR}/${SKEL_ARCH}/G0/pic/libc++abi.a
+)
 
 # The host loads this by name; keep it in step with hexagon_driver.cpp's
 # SelectSkel().
-set_target_properties(${HEX_SKEL_LIB} PROPERTIES
-    PREFIX "lib"
-    OUTPUT_NAME "hex-htp-skel-${SKEL_ARCH}"
-    SUFFIX ".so"
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/ship)
+set_target_properties(
+  ${HEX_SKEL_LIB}
+  PROPERTIES PREFIX "lib"
+             OUTPUT_NAME "hex-htp-skel-${SKEL_ARCH}"
+             SUFFIX ".so"
+             LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/ship
+)
 
 install(TARGETS ${HEX_SKEL_LIB} LIBRARY DESTINATION lib)

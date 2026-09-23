@@ -7,7 +7,10 @@
 from typing import Dict, final, Set
 
 import torch
-from executorch.backends.hexagon.hexagon_backend import HexagonBackend, SUPPORTED_TARGETS
+from executorch.backends.hexagon.hexagon_backend import (
+    HexagonBackend,
+    SUPPORTED_TARGETS,
+)
 from executorch.backends.hexagon.hexagon_ops import (
     _scalar_arg,
     _scalar_source,
@@ -16,30 +19,30 @@ from executorch.backends.hexagon.hexagon_ops import (
     add_rms_norm_is_emittable,
     ADDMM_TARGETS,
     ALIAS_TARGETS,
+    BINARY_TARGETS,
     BMM_TARGETS,
     CAST_TARGETS,
-    BINARY_TARGETS,
+    cat_region,
+    CAT_TARGETS,
+    dim_order_keeps_the_bytes,
+    DIM_ORDER_TARGETS,
     GETITEM,
     LAYER_NORM,
     layer_norm_getitem,
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
     MEAN_TARGETS,
-    NATIVE_LAYER_NORM,
-    softmax_reduces_the_inner_axis,
-    SOFTMAX_TARGETS,
-    cat_region,
-    CAT_TARGETS,
-    DIM_ORDER_TARGETS,
-    dim_order_keeps_the_bytes,
     MM_TARGETS,
+    NATIVE_LAYER_NORM,
     permute_region,
     PERMUTE_TARGETS,
+    sdpa_targets,
     select_region,
     SELECT_TARGETS,
     slice_region,
     SLICE_TARGETS,
-    sdpa_targets,
+    softmax_reduces_the_inner_axis,
+    SOFTMAX_TARGETS,
     update_cache_layout,
 )
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
@@ -51,9 +54,9 @@ from executorch.exir.backend.partitioner import (
     Partitioner,
     PartitionResult,
 )
+from executorch.exir.sym_util import eval_shape_upper_bound
 from torch.export import ExportedProgram
 from torch.fx.passes.operator_support import OperatorSupportBase
-from executorch.exir.sym_util import eval_shape_upper_bound
 
 
 # Emitters that store a constant at the width their kernel reads rather than the
@@ -165,6 +168,7 @@ def _fits_int32_offsets(node: torch.fx.Node, *operands) -> bool:
     result = node.meta.get("val")
     if result is None:
         return False
+
     def upper_numel(value) -> int:
         numel = 1
         for dim in eval_shape_upper_bound(value.shape):
@@ -218,7 +222,9 @@ def _addmm_fits_flat_path(node: torch.fx.Node) -> bool:
     # Whatever torch broadcasts the bias to is what the DSP repeats, so the only
     # question left is whether the strides it walks can reach it.
     try:
-        torch.broadcast_shapes(tuple(bias_val.shape), tuple(mat1_val.shape[:1] + mat2_val.shape[1:]))
+        torch.broadcast_shapes(
+            tuple(bias_val.shape), tuple(mat1_val.shape[:1] + mat2_val.shape[1:])
+        )
     except RuntimeError:
         return False
     return _fits_int32_offsets(node, mat1_val, mat2_val, bias_val)
@@ -415,8 +421,6 @@ def _data_placeholders(exported_program: ExportedProgram) -> Set[str]:
 
 
 @final
-
-
 class HexagonPartitioner(Partitioner):
     """Delegates every supported op, merging connected ones into one subgraph.
 

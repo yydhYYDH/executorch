@@ -34,7 +34,10 @@ import blob_interpreter  # noqa: E402
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
-from executorch.backends.hexagon.kv_cache import UPDATE_CACHE, _update_cache  # noqa: E402
+from executorch.backends.hexagon.kv_cache import (  # noqa: E402
+    _update_cache,
+    UPDATE_CACHE,
+)
 from executorch.backends.hexagon.rms_norm import RMS_NORM  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
@@ -143,7 +146,9 @@ def _run_cache(cache_shape, value_shape, position):
     blob = HexagonBackend.preprocess(_cache_program(cache_shape, value_shape), [])
     blob = blob.processed_bytes
     got = np.frombuffer(
-        execute(blob, [cache.numpy(), value.numpy(), np.array([position], dtype=np.int64)])[0],
+        execute(
+            blob, [cache.numpy(), value.numpy(), np.array([position], dtype=np.int64)]
+        )[0],
         dtype=np.float16,
     ).reshape(cache_shape)
     return blob, got, _update_cache(cache, value, torch.tensor([position])).numpy()
@@ -194,9 +199,9 @@ def test_a_wrong_patch_scale_is_caught():
         )[0],
         dtype=np.float16,
     ).reshape(cache_shape)
-    assert not np.array_equal(bad, expected), (
-        "unscaling the patch changed nothing, so the scale is not being checked"
-    )
+    assert not np.array_equal(
+        bad, expected
+    ), "unscaling the patch changed nothing, so the scale is not being checked"
 
 
 def _norm_blob(shape, eps):
@@ -265,9 +270,9 @@ def test_a_layernorm_flag_is_caught():
     bad = np.frombuffer(execute(bytes(data), [x.numpy()])[0], dtype=np.float16).reshape(
         shape
     )
-    assert not np.allclose(bad, expected, atol=2e-2), (
-        "clearing the RMS flag changed nothing, so the flag is not being checked"
-    )
+    assert not np.allclose(
+        bad, expected, atol=2e-2
+    ), "clearing the RMS flag changed nothing, so the flag is not being checked"
 
 
 class _Mm(torch.nn.Module):
@@ -297,7 +302,9 @@ def _run_mm(m, k, n):
 def test_matmul_matches_torch():
     for m, k, n in ((1, 1, 1), (4, 8, 3), (16, 32, 16)):
         _, _, _, got, expected = _run_mm(m, k, n)
-        assert got.shape == expected.shape, f"{got.shape} != {expected.shape} at {m}x{k}x{n}"
+        assert (
+            got.shape == expected.shape
+        ), f"{got.shape} != {expected.shape} at {m}x{k}x{n}"
         worst = float(
             np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
         )
@@ -322,7 +329,9 @@ def test_a_broken_contraction_is_caught():
     # params[1] starts the descriptor; src1StrideXYZ[1] is its int 11.
     struct.pack_into("<i", data, B.HEADER_SIZE + _PARAMS_AT + 4 * 12, 0)
 
-    bad = np.frombuffer(execute(bytes(data), [a.numpy(), b.numpy()])[0], dtype=np.float16)
+    bad = np.frombuffer(
+        execute(bytes(data), [a.numpy(), b.numpy()])[0], dtype=np.float16
+    )
     assert not np.array_equal(bad, got), (
         "zeroing the contraction stride changed nothing, so the descriptor is "
         "not being checked"
@@ -384,10 +393,12 @@ def test_a_batch_step_of_zero_is_caught():
     # cmdSteps[0], the first int of the step triple.
     struct.pack_into("<i", data, B.HEADER_SIZE + _PARAMS_AT + 4 * 14, 0)
 
-    bad = np.frombuffer(execute(bytes(data), [a.numpy(), b.numpy()])[0], dtype=np.float16)
-    assert not np.array_equal(bad, got), (
-        "zeroing the output step changed nothing, so the batch is not being walked"
+    bad = np.frombuffer(
+        execute(bytes(data), [a.numpy(), b.numpy()])[0], dtype=np.float16
     )
+    assert not np.array_equal(
+        bad, got
+    ), "zeroing the output step changed nothing, so the batch is not being walked"
 
 
 class _Addmm(torch.nn.Module):
@@ -417,9 +428,14 @@ def _run_addmm(m, k, n):
     # The delegate rounds the product to fp16 in an activation before the bias is
     # added, so the reference does the same rather than adding in fp32.
     expected = (
-        (x.float() @ model.weight.detach().float()).half().float()
-        + model.bias.detach().float()
-    ).half().numpy().reshape(-1)
+        (
+            (x.float() @ model.weight.detach().float()).half().float()
+            + model.bias.detach().float()
+        )
+        .half()
+        .numpy()
+        .reshape(-1)
+    )
     return blob, operands, got, expected
 
 
@@ -428,12 +444,15 @@ def test_addmm_matches_torch():
     for m, k, n in ((8, 64, 128), (4, 8, 3)):
         blob, _, got, expected = _run_addmm(m, k, n)
         _, commands = read_blob(blob)
-        assert [c.type for c in commands] == [_BATCH_MATMUL, _BINARY_ELEMENTWISE], (
-            f"addmm emitted {[c.type for c in commands]}"
-        )
+        assert [c.type for c in commands] == [
+            _BATCH_MATMUL,
+            _BINARY_ELEMENTWISE,
+        ], f"addmm emitted {[c.type for c in commands]}"
         # params[2] of the binary op is the bias length, which the broadcast walks.
         assert commands[1].params[2] == n, commands[1].params[:8]
-        worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
+        worst = float(
+            np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
+        )
         assert worst < 1e-2, f"addmm differs by {worst} at {m}x{k}x{n}"
 
 
@@ -462,9 +481,9 @@ def test_the_bias_broadcast_strides_are_the_ones_read():
     bad = np.frombuffer(execute(bytes(data), operands)[0], dtype=np.float16).reshape(
         got.shape
     )
-    assert not np.array_equal(bad, got), (
-        "changing the bias stride changed nothing, so it is not being read"
-    )
+    assert not np.array_equal(
+        bad, got
+    ), "changing the bias stride changed nothing, so it is not being read"
 
 
 class _Eltwise(torch.nn.Module):
@@ -484,9 +503,7 @@ class _Scaled(torch.nn.Module):
 def _run_eltwise(model, args, expected):
     program = to_edge(export(model, args)).exported_program()
     blob = HexagonBackend.preprocess(program, []).processed_bytes
-    got = np.frombuffer(
-        execute(blob, [t.numpy() for t in args])[0], dtype=np.float16
-    )
+    got = np.frombuffer(execute(blob, [t.numpy() for t in args])[0], dtype=np.float16)
     return blob, got.reshape(expected.shape), expected.numpy()
 
 
@@ -636,8 +653,14 @@ def test_a_permutation_needing_a_fourth_run_is_refused():
     the refusal lives in the predicate the support check reads.
     """
     assert hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 3, 2))) is None
-    assert hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 2, 3))) is not None
-    assert hexagon_ops.permute_region(_permute_copy((2, 3, 4, 5, 6), (4, 3, 2, 1, 0))) is None
+    assert (
+        hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 2, 3)))
+        is not None
+    )
+    assert (
+        hexagon_ops.permute_region(_permute_copy((2, 3, 4, 5, 6), (4, 3, 2, 1, 0)))
+        is None
+    )
 
 
 #: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed

@@ -40,10 +40,7 @@ from typing import List, NamedTuple, Optional
 
 import torch
 from executorch.exir.dialects._ops import ops as exir_ops
-from executorch.exir.pass_base import (
-    ExportedProgramPassBase,
-    ExportedProgramPassResult,
-)
+from executorch.exir.pass_base import ExportedProgramPassBase, ExportedProgramPassResult
 from executorch.exir.passes.remove_unused_parameters_pass import (
     remove_unused_parameters_pass,
 )
@@ -220,7 +217,8 @@ def _rewrite(ep: ExportedProgram, node: torch.fx.Node, match: PatchEmbed) -> Non
         # The convolution's own shape is what its consumers were traced
         # against, so the last window is folded back into it.
         widened = graph.call_function(
-            _VIEW, (shifted, [-1, match.channels] + [1] * (len(out_shape) - 2)))
+            _VIEW, (shifted, [-1, match.channels] + [1] * (len(out_shape) - 2))
+        )
         widened.meta["val"] = result
 
     node.replace_all_uses_with(widened)
@@ -235,9 +233,7 @@ class DecomposePatchEmbed(ExportedProgramPassBase):
     manager reach the same code through `DecomposePatchEmbed()(ep)`.
     """
 
-    def call(
-        self, exported_program: ExportedProgram
-    ) -> ExportedProgramPassResult:
+    def call(self, exported_program: ExportedProgram) -> ExportedProgramPassResult:
         """Rewrites the matches in place, and says whether it found any."""
         graph = exported_program.graph_module.graph
         if any(node.target in _ATEN_CONVOLUTIONS for node in graph.nodes):

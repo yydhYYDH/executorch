@@ -166,7 +166,9 @@ def _read_back(tmp_path, blob_bytes):
             hexed = field[3] if len(field) > 3 else ""
             sections[field[1]] = (int(field[2]), hexed)
         elif field[0] == "op":
-            op = ops.setdefault(int(field[1]), {"params": {}, "input": {}, "output": {}})
+            op = ops.setdefault(
+                int(field[1]), {"params": {}, "input": {}, "output": {}}
+            )
             if field[2] == "param":
                 op["params"][int(field[3])] = int(field[4])
             elif field[2] in ("input", "output"):
@@ -275,7 +277,15 @@ def test_dynamic_trailer_roundtrip():
         n_patches,
         example_length,
     ) = B._DYNAMIC_HEADER_V3.unpack_from(blob, trailer_at)
-    assert (magic, version, input_index, axis, max_length, n_patches, example_length) == (
+    assert (
+        magic,
+        version,
+        input_index,
+        axis,
+        max_length,
+        n_patches,
+        example_length,
+    ) == (
         B.DYNAMIC_TRAILER_MAGIC,
         3,
         0,

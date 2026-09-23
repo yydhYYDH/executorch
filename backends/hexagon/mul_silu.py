@@ -20,10 +20,10 @@ is: a fused op built before that pass does not survive the decomposition table.
 from typing import NamedTuple, Optional
 
 import torch
-from executorch.exir.dialects._ops import ops as exir_ops
-from executorch.exir.pass_base import ExportPass, PassResult
 
 from executorch.backends.hexagon.rms_norm import _pick, _source_of
+from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.pass_base import ExportPass, PassResult
 
 NAMESPACE = "et_hexagon"
 
@@ -117,7 +117,9 @@ def match_mul_silu(node: torch.fx.Node) -> Optional[MulSiluMatch]:
             held = value.meta.get("val") if hasattr(value, "meta") else None
             if not isinstance(held, torch.Tensor):
                 return None
-            if held.dtype is not torch.float16 or tuple(held.shape) != tuple(result.shape):
+            if held.dtype is not torch.float16 or tuple(held.shape) != tuple(
+                result.shape
+            ):
                 return None
         return MulSiluMatch(node, up, gate)
     return None
@@ -133,8 +135,7 @@ def fuse_mul_silu(graph_module: torch.fx.GraphModule) -> int:
     found = [
         (node, match)
         for node in graph.nodes
-        if node.op == "call_function"
-        and (match := match_mul_silu(node)) is not None
+        if node.op == "call_function" and (match := match_mul_silu(node)) is not None
     ]
 
     for _anchor, match in found:

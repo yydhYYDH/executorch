@@ -33,10 +33,7 @@ from typing import Optional, Tuple
 
 import torch
 from executorch.exir.dialects._ops import ops as exir_ops
-from executorch.exir.pass_base import (
-    ExportedProgramPassBase,
-    ExportedProgramPassResult,
-)
+from executorch.exir.pass_base import ExportedProgramPassBase, ExportedProgramPassResult
 
 NAMESPACE = "et_hexagon"
 
@@ -94,10 +91,14 @@ def masked_row_guard(
     if tuple(reduced_value.shape) != tuple(values_value.shape[:-1]) + (1,):
         return None
     inner = any_row.args[0]
-    if not isinstance(inner, torch.fx.Node) or "aten.logical_not" not in str(inner.target):
+    if not isinstance(inner, torch.fx.Node) or "aten.logical_not" not in str(
+        inner.target
+    ):
         return None
     comparison = inner.args[0]
-    if not isinstance(comparison, torch.fx.Node) or "aten.eq" not in str(comparison.target):
+    if not isinstance(comparison, torch.fx.Node) or "aten.eq" not in str(
+        comparison.target
+    ):
         return None
     if len(comparison.args) < 2:
         return None

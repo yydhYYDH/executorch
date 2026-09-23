@@ -55,7 +55,9 @@ def _graph_module(program) -> GraphModule:
         return program
     graph_module = getattr(program, "graph_module", None)
     if graph_module is None:
-        raise TypeError(f"use_stored_caches: no graph module on {type(program).__name__}")
+        raise TypeError(
+            f"use_stored_caches: no graph module on {type(program).__name__}"
+        )
     return graph_module
 
 
@@ -67,7 +69,9 @@ def use_stored_caches(program):
     """
     programs = getattr(program, "_edge_programs", None)
     graph_modules = (
-        [_graph_module(p) for p in programs.values()] if programs else [_graph_module(program)]
+        [_graph_module(p) for p in programs.values()]
+        if programs
+        else [_graph_module(program)]
     )
     for graph_module in graph_modules:
         for node in graph_module.graph.nodes:

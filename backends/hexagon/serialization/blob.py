@@ -125,20 +125,17 @@ class Op:
 
         patch_param, patch_input = self.patch if self.patch else (NO_PATCH, 0)
 
-        return (
-            _OP_PREFIX.pack(
-                self.type,
-                len(self.inputs),
-                len(self.outputs),
-                len(self.params),
-                *params,
-                patch_param,
-                patch_input,
-                self.patch_scale,
-                self.in_place,
-            )
-            + b"".join(ref.pack() for ref in refs)
-        )
+        return _OP_PREFIX.pack(
+            self.type,
+            len(self.inputs),
+            len(self.outputs),
+            len(self.params),
+            *params,
+            patch_param,
+            patch_input,
+            self.patch_scale,
+            self.in_place,
+        ) + b"".join(ref.pack() for ref in refs)
 
 
 @dataclass(frozen=True)
@@ -203,7 +200,9 @@ class BlobBuilder:
         self._dynamic_patches: List[DynamicPatch] = []
         self._dynamic_layouts: Dict[Tuple[TensorSpace, int], DynamicLayout] = {}
 
-    def set_dynamic_sequence(self, input_index: int, axis: int, max_length: int, example_length: int = 0) -> None:
+    def set_dynamic_sequence(
+        self, input_index: int, axis: int, max_length: int, example_length: int = 0
+    ) -> None:
         if input_index < 0 or input_index >= self._n_inputs:
             raise ValueError(f"dynamic input index {input_index} out of range")
         if axis < 0 or max_length <= 0:
@@ -218,7 +217,9 @@ class BlobBuilder:
 
     def add_dynamic_layout(self, layout: DynamicLayout) -> None:
         if layout.c0 < 0 or layout.c1 < 0 or layout.c2 < 0:
-            raise ValueError(f"dynamic layout coefficients must be non-negative: {layout}")
+            raise ValueError(
+                f"dynamic layout coefficients must be non-negative: {layout}"
+            )
         key = (layout.space, layout.index)
         previous = self._dynamic_layouts.get(key)
         if previous is not None and previous != layout:
@@ -302,7 +303,9 @@ class BlobBuilder:
         active: List[Tuple[int, int, int]] = []  # (last use, offset, size)
         free: List[Tuple[int, int]] = []  # (offset, size)
         arena_end = 0
-        for index, (first, last) in sorted(lifetimes.items(), key=lambda item: (item[1][0], item[0])):
+        for index, (first, last) in sorted(
+            lifetimes.items(), key=lambda item: (item[1][0], item[0])
+        ):
             still_active: List[Tuple[int, int, int]] = []
             for active_last, offset, size in active:
                 if active_last < first:
@@ -319,11 +322,7 @@ class BlobBuilder:
             )
             if candidate is None:
                 tail = next(
-                    (
-                        block
-                        for block in free
-                        if block[0] + block[1] == arena_end
-                    ),
+                    (block for block in free if block[0] + block[1] == arena_end),
                     None,
                 )
                 if tail is not None:
@@ -412,7 +411,12 @@ class BlobBuilder:
         if ref.space == TensorSpace.OUTPUT:
             return self._output_slots[ref.index]
         if ref.space == TensorSpace.WEIGHTS:
-            return TensorRef(TensorSpace.WEIGHTS, self._weight_offsets[ref.index], ref.size, ref.index)
+            return TensorRef(
+                TensorSpace.WEIGHTS,
+                self._weight_offsets[ref.index],
+                ref.size,
+                ref.index,
+            )
         if ref.space == TensorSpace.ACTIVATION:
             return TensorRef(
                 TensorSpace.ACTIVATION,
@@ -443,7 +447,9 @@ class BlobBuilder:
     def build(self) -> bytes:
         self._pack_activations()
         inputs_bytes = self._pack_section(self._input_slots, self._n_inputs, "input")
-        outputs_bytes = self._pack_section(self._output_slots, self._n_outputs, "output")
+        outputs_bytes = self._pack_section(
+            self._output_slots, self._n_outputs, "output"
+        )
         weights, self._weight_offsets = self._pack_weights()
 
         # rebuild via replace() so every other field survives automatically:

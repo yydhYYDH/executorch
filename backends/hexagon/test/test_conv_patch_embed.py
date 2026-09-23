@@ -192,10 +192,18 @@ def test_the_unused_convolution_weight_is_dropped():
         # condition, so a match would be a rewrite over different arithmetic.
         (torch.nn.Conv3d(1, 4, 3, stride=2, bias=True), 4, True),  # kernel != stride
         (torch.nn.Conv3d(1, 4, 2, stride=2, padding=1, bias=True), 1, True),  # padding
-        (torch.nn.Conv3d(1, 4, 2, stride=2, dilation=2, bias=True), 3, True),  # dilation
+        (
+            torch.nn.Conv3d(1, 4, 2, stride=2, dilation=2, bias=True),
+            3,
+            True,
+        ),  # dilation
         (torch.nn.Conv3d(4, 4, 2, stride=2, groups=2, bias=True), 2, True),  # groups
         (torch.nn.ConvTranspose3d(1, 4, 1, stride=1, bias=True), 1, True),  # transposed
-        (torch.nn.Conv2d(1, 4, 2, stride=2, bias=True), 2, True),  # not five-dimensional
+        (
+            torch.nn.Conv2d(1, 4, 2, stride=2, bias=True),
+            2,
+            True,
+        ),  # not five-dimensional
         # Disjoint windows, kernel equal to stride -- but four of them, not one,
         # so the batch is not the row count this rewrite would matmul over.
         (torch.nn.Conv3d(1, 4, 2, stride=2, bias=True), 4, False),
@@ -205,9 +213,7 @@ def test_a_convolution_the_pattern_does_not_describe_is_left_alone(
     model, spatial, one_window
 ):
     """One condition short of the pattern: nothing may be rewritten."""
-    x = torch.randn(
-        1, model.in_channels, *([spatial] * (model.weight.dim() - 2))
-    )
+    x = torch.randn(1, model.in_channels, *([spatial] * (model.weight.dim() - 2)))
     program = to_edge(export(model.eval(), (x,))).exported_program()
     # The setup, before the pass: an edge convolution whose output window is one
     # patch wide is on the graph, so a match is only withheld by the arithmetic.
@@ -315,8 +321,11 @@ def test_the_emitted_commands_are_the_matmul_and_the_bias():
     # The DSP rounds the product to fp16 in an activation before the bias is
     # added, so the reference does the same rather than adding in fp32.
     expected = (
-        (x.float() @ weight).half().float() + model.proj.bias.detach().float()
-    ).half().numpy().reshape(-1)
+        ((x.float() @ weight).half().float() + model.proj.bias.detach().float())
+        .half()
+        .numpy()
+        .reshape(-1)
+    )
     assert np.array_equal(got, expected), (
         "the DSP model differs by "
         f"{np.abs(got.astype(np.float32) - expected.astype(np.float32)).max()}"
@@ -333,6 +342,7 @@ def test_the_pass_refuses_a_program_that_still_holds_the_aten_convolution():
 
 def test_a_graph_with_no_patch_embed_is_returned_untouched():
     """Nothing to match means nothing changes, not a rewritten graph."""
+
     class _Other(torch.nn.Module):
         def forward(self, a, b):
             return torch.mm(a, b)

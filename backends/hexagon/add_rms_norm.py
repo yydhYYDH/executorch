@@ -25,10 +25,10 @@ import operator
 from typing import NamedTuple, Optional
 
 import torch
+
+from executorch.backends.hexagon.rms_norm import _as_float, RMS_NORM
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.pass_base import ExportPass, PassResult
-
-from executorch.backends.hexagon.rms_norm import RMS_NORM, _as_float
 
 NAMESPACE = "et_hexagon"
 
@@ -125,9 +125,8 @@ def match_add_rms_norm(norm_node: torch.fx.Node) -> Optional[AddRmsNormMatch]:
         held = operand.meta.get("val")
         if not isinstance(held, torch.Tensor):
             return None
-        if (
-            held.dtype is not torch.float16
-            or tuple(held.shape) != tuple(add_value.shape)
+        if held.dtype is not torch.float16 or tuple(held.shape) != tuple(
+            add_value.shape
         ):
             return None
     return AddRmsNormMatch(

@@ -7,17 +7,14 @@
 """Folds the weight transposes the DSP would otherwise run every inference."""
 
 import torch
-from executorch.exir.pass_base import (
-    ExportedProgramPassBase,
-    ExportedProgramPassResult,
-)
+
+from executorch.backends.hexagon.conv_patch_embed import _val_of_shape
+from executorch.exir.pass_base import ExportedProgramPassBase, ExportedProgramPassResult
 from executorch.exir.passes.remove_unused_parameters_pass import (
     remove_unused_parameters_pass,
 )
 from executorch.exir.program._program import lift_constant_tensor_pass
 from torch.export import ExportedProgram
-
-from executorch.backends.hexagon.conv_patch_embed import _val_of_shape
 
 _PERMUTE_COPY = {torch.ops.aten.permute_copy.default, torch.ops.aten.permute_copy.out}
 
@@ -33,7 +30,9 @@ def _constant_of(program: ExportedProgram, node):
         return program.state_dict.get(str(node.target))
     if node.op != "placeholder":
         return None
-    matches = [k for k in program.state_dict if "p_" + k.replace(".", "_") == str(node.target)]
+    matches = [
+        k for k in program.state_dict if "p_" + k.replace(".", "_") == str(node.target)
+    ]
     if len(matches) != 1:
         return None
     return program.state_dict[matches[0]]

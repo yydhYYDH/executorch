@@ -148,7 +148,9 @@ class Arena:
         # are zero here exactly as they would be if the file carried them.
         host_at = B.HEADER_SIZE + header.n_ops * B.OP_SIZE
         self.bytes[
-            self.base[int(B.TensorSpace.WEIGHTS)] : self.base[int(B.TensorSpace.WEIGHTS)]
+            self.base[int(B.TensorSpace.WEIGHTS)] : self.base[
+                int(B.TensorSpace.WEIGHTS)
+            ]
             + header.weights_bytes
         ] = data[host_at : host_at + header.weights_bytes]
 
@@ -325,13 +327,19 @@ def _run_add_fuse_layernorm(command: Command, params: List[int], arena: Arena) -
     rows, inner, eps_bits, rms = params[0], params[1], params[2], params[3]
     eps = _as_float(eps_bits)
     if not rms:
-        raise UnsupportedOp("blob: the layer-norm mode of add_fuse_layernorm is not modelled")
+        raise UnsupportedOp(
+            "blob: the layer-norm mode of add_fuse_layernorm is not modelled"
+        )
     refs = list(command.inputs) + list(command.outputs)
     if refs[3].space != ABSENT:
         raise UnsupportedOp("blob: the bias of add_fuse_layernorm is not modelled")
 
-    src0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16).reshape(rows, inner)
-    src1 = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16).reshape(rows, inner)
+    src0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16).reshape(
+        rows, inner
+    )
+    src1 = np.frombuffer(bytes(arena.view(refs[1])), dtype=np.float16).reshape(
+        rows, inner
+    )
     added = (src0 + src1).astype(np.float16)
     _store(arena, arena.address(refs[len(command.inputs) + 1]), added.tobytes())
 
@@ -340,9 +348,15 @@ def _run_add_fuse_layernorm(command: Command, params: List[int], arena: Arena) -
     inv_std = (1.0 / np.sqrt(sqsum / inner + eps)).astype(np.float32)
     out = x * inv_std[:, None]
     if refs[2].space != ABSENT:
-        gamma = np.frombuffer(bytes(arena.view(refs[2])), dtype=np.float32).reshape(inner)
+        gamma = np.frombuffer(bytes(arena.view(refs[2])), dtype=np.float32).reshape(
+            inner
+        )
         out = out * gamma[None, :]
-    _store(arena, arena.address(refs[len(command.inputs)]), out.astype(np.float16).tobytes())
+    _store(
+        arena,
+        arena.address(refs[len(command.inputs)]),
+        out.astype(np.float16).tobytes(),
+    )
 
 
 def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None:
@@ -399,7 +413,9 @@ def _run_batch_matmul(command: Command, params: List[int], arena: Arena) -> None
                 for k in range(inner):
                     a = in0_at + (row * src0_stride[0] + k * src0_stride[1]) // unit
                     b = in1_at + (k * src1_stride[1] + col * src1_stride[2]) // unit
-                    total = np.float32(total) + np.float32(src0[a]) * np.float32(src1[b])
+                    total = np.float32(total) + np.float32(src0[a]) * np.float32(
+                        src1[b]
+                    )
                 at = out_at + (row * dst_stride[0] + col * dst_stride[2]) // unit
                 out[at] = total
     _store(arena, arena.address(dst), out.tobytes())
@@ -479,9 +495,7 @@ def _run_binary(command: Command, params: List[int], arena: Arena) -> None:
     # The kernel refuses the descriptor unless the extents multiply out to the
     # declared output size, so a mismatch here is a mismatch there.
     if int(np.prod(out_dims)) != out_size:
-        raise UnsupportedOp(
-            f"blob: extents {out_dims} do not multiply to {out_size}"
-        )
+        raise UnsupportedOp(f"blob: extents {out_dims} do not multiply to {out_size}")
 
     refs = list(command.inputs) + list(command.outputs)
     in0 = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)
@@ -531,7 +545,9 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
     outside, reduce, inside = params[0], params[1], params[2]
     op_type, unit = params[3], params[4]
     if unit != FP16_BYTES:
-        raise UnsupportedOp(f"blob: a reduction over {unit}-byte values is not modelled")
+        raise UnsupportedOp(
+            f"blob: a reduction over {unit}-byte values is not modelled"
+        )
     src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
     if src.size != outside * reduce * inside:
         raise UnsupportedOp(
@@ -593,9 +609,7 @@ def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
             weights = np.exp(scores - scores.max())
             weights /= weights.sum()
             out[row, head] = weights @ value[:valid, kv_head]
-    _store(
-        arena, arena.address(command.outputs[0]), out.astype(np.float16).tobytes()
-    )
+    _store(arena, arena.address(command.outputs[0]), out.astype(np.float16).tobytes())
 
 
 _EXECUTORS = {

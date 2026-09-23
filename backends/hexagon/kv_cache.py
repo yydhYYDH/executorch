@@ -56,6 +56,7 @@ def _update_cache_fake(cache, value, position):
     """
     return torch.empty_like(cache)
 
+
 UPDATE_CACHE = exir_ops.edge.et_hexagon.update_cache.default
 
 
@@ -114,8 +115,7 @@ def fuse_kv_cache(graph_module: torch.fx.GraphModule) -> int:
     found = [
         (node, match)
         for node in graph.nodes
-        if node.op == "call_function"
-        and (match := match_kv_cache(node)) is not None
+        if node.op == "call_function" and (match := match_kv_cache(node)) is not None
     ]
 
     for node, match in found:

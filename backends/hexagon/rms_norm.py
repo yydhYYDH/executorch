@@ -82,8 +82,14 @@ def _pick(node: torch.fx.Node, target) -> Optional[tuple]:
     """
     if len(node.args) < 2:
         return None
-    for candidate, other in ((node.args[0], node.args[1]), (node.args[1], node.args[0])):
-        if isinstance(candidate, torch.fx.Node) and _source_of(candidate).target is target:
+    for candidate, other in (
+        (node.args[0], node.args[1]),
+        (node.args[1], node.args[0]),
+    ):
+        if (
+            isinstance(candidate, torch.fx.Node)
+            and _source_of(candidate).target is target
+        ):
             return candidate, _source_of(candidate), other
     return None
 
@@ -177,8 +183,7 @@ def fuse_rms_norm(graph_module: torch.fx.GraphModule) -> int:
     found = [
         (node, match)
         for node in graph.nodes
-        if node.op == "call_function"
-        and (match := match_rms_norm(node)) is not None
+        if node.op == "call_function" and (match := match_rms_norm(node)) is not None
     ]
 
     for _anchor, match in found:

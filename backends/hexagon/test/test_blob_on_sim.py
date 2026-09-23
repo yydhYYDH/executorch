@@ -36,8 +36,8 @@ import hexagon_sim  # noqa: E402
 from blob_interpreter import Arena, execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
 _RUNNER = pathlib.Path(__file__).resolve().parent / "sim/blob_runner.cpp"
@@ -195,9 +195,7 @@ def _cast_chain_graph(shape):
     out = graph.call_function(exir_ops.edge.aten.neg.default, args=(down,))
     out.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(out)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _dynamic_slice_graph(source_shape, rows):
@@ -220,9 +218,7 @@ def _dynamic_slice_graph(source_shape, rows):
     out = graph.call_function(exir_ops.edge.aten.neg.default, args=(cut,))
     out.meta["val"] = torch.empty((rows, source_shape[1]), dtype=torch.float16)
     graph.output(out)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _small(shape):
@@ -242,9 +238,7 @@ def _norm_graph(shape, eps):
     fused = graph.call_function(RMS_NORM, args=(x, eps))
     fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _cache_graph(cache_shape, value_shape):
@@ -260,9 +254,7 @@ def _cache_graph(cache_shape, value_shape):
     fused = graph.call_function(UPDATE_CACHE, args=(cache, value, position))
     fused.meta["val"] = torch.empty(cache_shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _mul_silu_graph(shape):
@@ -276,9 +268,7 @@ def _mul_silu_graph(shape):
     fused = graph.call_function(MUL_SILU, args=(a, b))
     fused.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(fused)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim):
@@ -307,9 +297,7 @@ def _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim):
         (batch, qo_len, n_heads, head_dim), dtype=torch.float16
     )
     graph.output(out)
-    return SimpleNamespace(
-        graph_module=torch.fx.GraphModule(torch.nn.Module(), graph)
-    )
+    return SimpleNamespace(graph_module=torch.fx.GraphModule(torch.nn.Module(), graph))
 
 
 def _attention_reference(query, key, value):
@@ -394,16 +382,14 @@ def _cases():
         "C",
         _norm_graph(tuple(x.shape), 1e-5),
         (x,),
-        _bits(
-            torch.nn.functional.rms_norm(x, (x.shape[-1],), None, 1e-5).reshape(-1)
-        ),
+        _bits(torch.nn.functional.rms_norm(x, (x.shape[-1],), None, 1e-5).reshape(-1)),
         kind="close",
         tolerance=_NORM_TOLERANCE,
     )
 
     cache_shape = (1, 16, 2, 8)
-    cache = (torch.arange(int(np.prod(cache_shape))) % 11 - 5).half().reshape(
-        cache_shape
+    cache = (
+        (torch.arange(int(np.prod(cache_shape))) % 11 - 5).half().reshape(cache_shape)
     )
     advances = []
     for tag, value_shape, position in (
@@ -417,11 +403,18 @@ def _cases():
                 tag,
                 _cache_graph(cache_shape, value_shape),
                 (cache, value, torch.tensor([position], dtype=torch.int64)),
-                _bits(_update_cache(cache, value, torch.tensor([position])).reshape(-1)),
+                _bits(
+                    _update_cache(cache, value, torch.tensor([position])).reshape(-1)
+                ),
             )
         )
 
-    scale = _case("E", _Scale(), (x, _small((1, 1, 8))), _bits(x.float() * _small((1, 1, 8)).float()))
+    scale = _case(
+        "E",
+        _Scale(),
+        (x, _small((1, 1, 8))),
+        _bits(x.float() * _small((1, 1, 8)).float()),
+    )
 
     wide = _small((2, 6, 4))
     softmax = _case(
@@ -495,9 +488,7 @@ def _cases():
     if sdpa_targets():
         attention = _case(
             "P",
-            _attention_graph(
-                batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim
-            ),
+            _attention_graph(batch, qo_len, n_heads, n_kv_heads, max_kv_len, head_dim),
             (query, cache_k, cache_v),
             _attention_reference(query, cache_k, cache_v).half(),
         )
@@ -597,12 +588,12 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["L"] == [4], "the fp32 round trip left a command behind"
     assert kinds["N"] == [3, 4], "the dynamic slice is not a blit"
     assert any(
-        command.patch_param != 0xFFFFFFFF
-        for command in _tagged(cases, "N").commands
+        command.patch_param != 0xFFFFFFFF for command in _tagged(cases, "N").commands
     ), "the dynamic slice has no patched parameter"
     for tag in ("D", "F", "G"):
         assert any(
-            command.patch_param != 0xFFFFFFFF for command in _tagged(cases, tag).commands
+            command.patch_param != 0xFFFFFFFF
+            for command in _tagged(cases, tag).commands
         ), f"{tag}: the cache advance has no patched parameter"
 
 
@@ -612,9 +603,9 @@ def test_every_blob_agrees_three_ways(cases, simulated):
         host = _from_bits([int(value) for value in _host_bits(case.host[0])])
         if case.kind == "bits":
             expected = case.expected.view("uint16").tolist()
-            assert _host_bits(case.host[0]) == expected, (
-                f"{case.tag}: the host model disagrees with torch"
-            )
+            assert (
+                _host_bits(case.host[0]) == expected
+            ), f"{case.tag}: the host model disagrees with torch"
             assert dsp == expected, f"{case.tag}: the DSP disagrees with torch"
         else:
             expected = case.expected
@@ -638,7 +629,9 @@ def test_the_dsp_result_would_move_if_the_blob_did(cases):
     at = 36 + 16 + 4 * (3 + 8)
     stride = int.from_bytes(data[at : at + 4], "little", signed=True)
     data[at : at + 4] = (stride + 1).to_bytes(4, "little", signed=True)
-    changed = execute(bytes(data), [_small((2, 3, 4)).numpy(), _small((2, 3, 4)).numpy()])
-    assert _host_bits(changed[0]) != _host_bits(case.host[0]), (
-        "changing the region changed nothing, so the comparison is vacuous"
+    changed = execute(
+        bytes(data), [_small((2, 3, 4)).numpy(), _small((2, 3, 4)).numpy()]
     )
+    assert _host_bits(changed[0]) != _host_bits(
+        case.host[0]
+    ), "changing the region changed nothing, so the comparison is vacuous"

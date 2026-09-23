@@ -80,8 +80,12 @@ _DEFINES = [
 ]
 
 
-def build(runner: pathlib.Path, sources: List[str], work: pathlib.Path,
-          includes_more: List[str] = ()) -> pathlib.Path:
+def build(
+    runner: pathlib.Path,
+    sources: List[str],
+    work: pathlib.Path,
+    includes_more: List[str] = (),
+) -> pathlib.Path:
     """Compile one DSP runner plus the vendored sources into a shared object.
 
     includes_more holds extra -I directories, and the work directory is always
@@ -101,6 +105,7 @@ def build(runner: pathlib.Path, sources: List[str], work: pathlib.Path,
         f"-I{sdk}/rtos/qurt/compute{arch}/include/qurt",
         f"-I{sdk}/rtos/qurt/compute{arch}/include/posix",
     ]
+
     def compile_one(source: str, obj: pathlib.Path) -> None:
         # The vendored library is mixed C and C++, and the ++ driver treats a
         # .c input as C++ regardless of its name, so pick the driver to match.
@@ -112,7 +117,8 @@ def build(runner: pathlib.Path, sources: List[str], work: pathlib.Path,
         flags = [flag for flag in _FLAGS if not flag.startswith("-std=")] + [std]
         done = subprocess.run(
             [cc, *flags, *_DEFINES, *includes, "-c", source, "-o", str(obj)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if done.returncode != 0:
             raise Unavailable(f"compiling {source}:\n{done.stderr[-3000:]}")
@@ -136,10 +142,22 @@ def build(runner: pathlib.Path, sources: List[str], work: pathlib.Path,
     # libc++.so.1 makes the loader fail with AEE_EFAILED, the same trap the
     # skel's own build documents.
     subprocess.run(
-        [str(tools / "bin/hexagon-clang++"), f"-m{arch}", "-shared", "-O2",
-         "-nostdlib++", str(main), *objects,
-         "-o", str(out), f"-L{lib}", str(lib / "libc++.a"), str(lib / "libc++abi.a")],
-        check=True, capture_output=True,
+        [
+            str(tools / "bin/hexagon-clang++"),
+            f"-m{arch}",
+            "-shared",
+            "-O2",
+            "-nostdlib++",
+            str(main),
+            *objects,
+            "-o",
+            str(out),
+            f"-L{lib}",
+            str(lib / "libc++.a"),
+            str(lib / "libc++abi.a"),
+        ],
+        check=True,
+        capture_output=True,
     )
     return out
 
@@ -155,8 +173,12 @@ def _configs(sdk: pathlib.Path, tools: pathlib.Path, work: pathlib.Path) -> None
     )
 
 
-def run(runner: pathlib.Path, sources: List[str], headers: Dict[str, str] = None,
-        includes_more: List[str] = ()) -> Dict[str, List[int]]:
+def run(
+    runner: pathlib.Path,
+    sources: List[str],
+    headers: Dict[str, str] = None,
+    includes_more: List[str] = (),
+) -> Dict[str, List[int]]:
     """Run a DSP runner and return its tagged fp16 bit patterns.
 
     headers are written into the build directory before compiling, which is how
@@ -176,22 +198,42 @@ def run(runner: pathlib.Path, sources: List[str], headers: Dict[str, str] = None
                 filter(None, [libs, env.get("LD_LIBRARY_PATH", "")])
             )
         command = [
-            str(tools / "bin/hexagon-sim"), "-mv79na_1", "--simulated_returnval",
-            "--usefs", str(work), "--mhmx=3",
-            "--cosim_file", str(work / "q6ss.cfg"),
-            "--l2tcm_base", "0xd800", "--subsystem_base", "0xFC90",
-            "--rtos", str(work / "osam.cfg"),
-            str(sdk / "rtos/qurt/computev79/sdksim_bin/runelf.pbn"), "--",
-            str(sdk / "libs/run_main_on_hexagon/ship/hexagon_toolv19_v79/run_main_on_hexagon_sim"),
-            "--", str(shared),
+            str(tools / "bin/hexagon-sim"),
+            "-mv79na_1",
+            "--simulated_returnval",
+            "--usefs",
+            str(work),
+            "--mhmx=3",
+            "--cosim_file",
+            str(work / "q6ss.cfg"),
+            "--l2tcm_base",
+            "0xd800",
+            "--subsystem_base",
+            "0xFC90",
+            "--rtos",
+            str(work / "osam.cfg"),
+            str(sdk / "rtos/qurt/computev79/sdksim_bin/runelf.pbn"),
+            "--",
+            str(
+                sdk
+                / "libs/run_main_on_hexagon/ship/hexagon_toolv19_v79/run_main_on_hexagon_sim"
+            ),
+            "--",
+            str(shared),
         ]
-        done = subprocess.run(command, capture_output=True, text=True, timeout=900, env=env)
+        done = subprocess.run(
+            command, capture_output=True, text=True, timeout=900, env=env
+        )
         global LAST_STDOUT
         LAST_STDOUT = done.stdout
         if "Main() returned 0" not in done.stdout:
             interesting = [
-                line for line in done.stdout.splitlines()
-                if any(word in line for word in ("Error", "error", "symbol", "dlopen", "returned"))
+                line
+                for line in done.stdout.splitlines()
+                if any(
+                    word in line
+                    for word in ("Error", "error", "symbol", "dlopen", "returned")
+                )
             ]
             raise Unavailable(
                 "hexagon-sim did not run the runner:\n" + "\n".join(interesting)[-3000:]
