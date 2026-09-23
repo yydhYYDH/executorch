@@ -90,6 +90,15 @@ extern "C" int hmx_matmulw8a16block_gemv_i8(uint8_t *c, const uint8_t *a,
                                             const uint8_t *b_scale,
                                             const uint8_t *bias, int32_t K, int32_t N,
                                             int32_t scale_block_num);
+/* The two GEMV entries stage their operands in VTCM and take the size-zero path
+ * out of `matmul_q4block_gemv_i8.c:323-325` when they cannot: they return -1
+ * before writing a byte, so the fixture's output is whatever the arena already
+ * held. On the device the delegate's own setup acquires it, and the dispatcher
+ * re-acquires when it has not (`execute_command.cc:995`); a runner that drives
+ * the kernels itself has to say so, which is what main() does below. */
+extern "C" void vtcm_manager_setup();
+extern "C" int vtcm_manager_acquire();
+extern "C" unsigned int vtcm_manager_get_vtcm_size();
 /* The vision tower's attention. It is a scalar walk over the score matrix
  * (attention_entry.cc:24-67), not the flash variant the existing suite excludes:
  * the flash kernel starts a worker pool, which the simulated QuRT cannot, while
@@ -159,6 +168,9 @@ static bool absent(const HexagonTensorRef &ref) {
 
 static uint8_t *g_arena = nullptr;
 static Bases g_bases;
+/* The fixture's tag, for the diagnostics below: a kernel that refuses says so
+ * on stdout, where nothing else distinguishes it from an empty answer. */
+static const char *g_tag = "";
 
 static uint8_t *address(const HexagonBlobHeader *header, const HexagonTensorRef &ref) {
   (void)header;
@@ -305,22 +317,21 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
     return;
   }
   if (op.type == kQ4A16Gemv) {
-    htp_ops_matmul_q4a16_gemv_i8(
+    int ret = htp_ops_matmul_q4a16_gemv_i8(
         address(header, op.outputs[0]), address(header, op.inputs[0]),
         address(header, op.inputs[1]),
         absent(op.inputs[2]) ? nullptr : address(header, op.inputs[2]), params[1],
         params[2], params[8], params[9]);
+    if (ret != 0) printf("%s q4a16 gemv returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kW8A16Gemv) {
-    hmx_matmulw8a16block_gemv_i8(address(header, op.outputs[0]),
-                                 address(header, op.inputs[0]),
-                                 address(header, op.inputs[1]),
-                                 address(header, op.inputs[2]),
-                                 absent(op.inputs[3])
-                                     ? nullptr
-                                     : address(header, op.inputs[3]),
-                                 params[1], params[2], params[8]);
+    int ret = hmx_matmulw8a16block_gemv_i8(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]), address(header, op.inputs[2]),
+        absent(op.inputs[3]) ? nullptr : address(header, op.inputs[3]), params[1],
+        params[2], params[8]);
+    if (ret != 0) printf("%s w8a16 gemv returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kVisionAttention) {
@@ -418,6 +429,7 @@ static int run_blob(const unsigned char *blob, uint64_t blob_bytes, uint8_t *are
   }
   g_arena = arena;
   g_bases = bases_of(header);
+  g_tag = tag;
   memset(arena, 0, arena_bytes);
   g_runtime_length = runtime_length;
   load_patches(blob, header, blob_bytes);
@@ -482,6 +494,15 @@ int main(void) {
       __alignof__(arena) == kVectorBytes,
       "the kernels read this arena a vector at a time");
   int status = 0;
+  /* A device does not run these kernels without VTCM: the delegate's setup
+   * acquires it and the dispatcher re-acquires it when it is missing
+   * (`execute_command.cc:995`), but this main() is neither of those. Without the
+   * call both GEMV entries return -1 before writing anything -- an empty answer
+   * that is indistinguishable, in the output slot, from a wrong one. The
+   * simulator hands out the same 8 MiB a device has. */
+  vtcm_manager_setup();
+  printf("vtcm acquired=%d size=%u\n", vtcm_manager_acquire(),
+         vtcm_manager_get_vtcm_size());
   for (unsigned i = 0; i < kFixtureCount; ++i) {
     const BlobFixture &fixture = kFixtures[i];
     status |= run_blob(fixture.blob, fixture.blob_bytes, arena, sizeof(arena),

@@ -39,12 +39,23 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 import blob_interpreter  # noqa: E402
 import hexagon_sim  # noqa: E402
-from blob_interpreter import Arena, execute, read_blob, UnsupportedOp  # noqa: E402
+from blob_interpreter import (  # noqa: E402
+    ABSENT,
+    Arena,
+    execute,
+    read_blob,
+    UnsupportedOp,
+)
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
+from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import Dim, export  # noqa: E402
+from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
+    convert_pt2e,
+    prepare_pt2e,
+)
 
 
 def _program(graph_module):
@@ -582,6 +593,167 @@ def _with_row_major_table(table):
         return blob[:at] + packed + blob[at + ref.size :]
 
     return mutate
+
+
+# --- The quantized GEMV entries, whose layout was never run -------------------
+
+
+def _gemv_scale_rule(scheme):
+    """(qmin, qmax, full): the stored range and the value that fixes the scale."""
+    return (-8, 7, 15) if scheme == "q4a16" else (-128, 127, 255)
+
+
+def _gemv_weight(scheme, k, n):
+    """A (k, n) weight whose every column peaks at `full`, in even steps.
+
+    torch's per-channel symmetric scale is `max|w| / ((qmax - qmin) / 2)` --
+    7.5 for the int4 range [-8, 7] -- so a column peaking at 15 gets a scale of
+    exactly 2.0, and the stored value is a whole number (`q = w / 2`). `full` is
+    forced into every column for that reason: with the scale a power of two the
+    dequantized weight is `2 * q`, which fp32 holds exactly, and the sums below
+    are integers fp16 holds exactly. Forcing it into a *different* row of each
+    column is what keeps the columns distinct.
+    """
+    qmin, qmax, full = _gemv_scale_rule(scheme)
+    limit = 7 if scheme == "q4a16" else 16
+    generator = torch.Generator().manual_seed(20240924)
+    weight = torch.randint(-limit, limit + 1, (k, n), generator=generator) * 2
+    for column in range(n):
+        weight[column % k, column] = full
+        weight[(column + 1) % k, column] = -full
+    return weight.to(torch.float32)
+
+
+def _gemv_stored(weight, scheme):
+    """The integer weight and the per-channel scale the quantizer stores.
+
+    Computed here from torch's rule rather than read back out of the blob: the
+    blob is what is under test, and the assertion on its scale bytes (in
+    `test_the_blobs_contain_the_ops_we_mean_to_run`) is what keeps this rule
+    honest instead of the other way round.
+    """
+    qmin, qmax, _ = _gemv_scale_rule(scheme)
+    values = np.asarray(weight, dtype=np.float64)
+    scale = (np.abs(values).max(axis=0) / ((qmax - qmin) / 2)).astype(np.float32)
+    stored = np.clip(np.rint(values / scale), qmin, qmax).astype(np.int64)
+    return stored, scale
+
+
+def _gemv_all_ones_answer(weight, scheme):
+    """`scale[n] * sum_k q[k, n]`: what the DSP must answer for ones."""
+    stored, scale = _gemv_stored(weight, scheme)
+    return (stored.sum(axis=0) * scale).astype(np.float16)
+
+
+def _gemv_row_answer(weight, scheme, row):
+    """`scale[n] * q[row, n]`: what it must answer for a one at `row` alone."""
+    stored, scale = _gemv_stored(weight, scheme)
+    return (stored[row] * scale).astype(np.float16)
+
+
+class _QuantizedMm(torch.nn.Module):
+    """The graph the quantizer annotates: a weight-only mm, optionally biased."""
+
+    def __init__(self, weight, bias=None):
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+        self.register_parameter(
+            "bias",
+            (
+                None
+                if bias is None
+                else torch.nn.Parameter(bias.clone(), requires_grad=False)
+            ),
+        )
+
+    def forward(self, x):
+        if self.bias is None:
+            return torch.mm(x, self.weight)
+        return torch.addmm(self.bias, x, self.weight)
+
+
+def _quantized_gemv(scheme, k, n, bias=None):
+    """One quantized matmul, through the real PT2E pipeline, as a blob.
+
+    This is the same chain a caller runs -- `prepare_pt2e`/`convert_pt2e` on an
+    exported model, then the backend's own `preprocess` -- so the command, its
+    weight bytes, its parameter slots and its scale block count are the
+    emitter's, not a fixture's. Where the emitter and the kernel disagree about
+    the layout, the answer disagrees with the arithmetic below and this fails.
+    """
+    weight = _gemv_weight(scheme, k, n)
+    model = _QuantizedMm(weight, bias).eval()
+    x = torch.ones(1, k, dtype=torch.float32)
+    exported = torch.export.export(model, (x,))
+    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
+    with torch.no_grad():
+        prepared(x)
+    converted = convert_pt2e(prepared)
+    program = to_edge(torch.export.export(converted, (x,))).exported_program()
+    return HexagonBackend.preprocess(program, []).processed_bytes, weight
+
+
+def _gemv_operand(blob, index):
+    """One operand of the blob's single GEMV command, as bytes."""
+    header, commands = read_blob(blob)
+    ref = commands[0].inputs[index]
+    return bytes(Arena(header, blob, "gemv").view(ref))
+
+
+def _stored_gemv_scales(blob, scheme, n):
+    """The per-output-channel scales the blob carries, as fp32.
+
+    For q4a16 they follow the tiles inside the weight operand; w8a16 keeps them
+    in an operand of their own. Both are flat and one per output channel, which
+    is what the emitter's `scale_block_num == 1` means.
+    """
+    index = 2 if scheme == "w8a16" else 1
+    raw = np.frombuffer(_gemv_operand(blob, index), dtype=np.float32)
+    return raw[-n:]
+
+
+def _transpose_the_tiles(blob, k, n):
+    """The same blob with the 512-byte tile table written column-major.
+
+    The tiles are `icP * ocP` units addressed `(y*icP + x)*512`, so this is the
+    layout a packer that looped the two strides the other way round would have
+    written: the same bytes, every tile still present once, and the weight each
+    output channel reads taken from another tile. Unlike the nibble pair, this
+    one moves a sum over k.
+    """
+    header, commands = read_blob(blob)
+    ref = commands[0].inputs[1]
+    at = _weights_base(blob) + ref.offset
+    kp, np_ = k // 32, n // 32
+    body = bytearray(blob)
+    tiles = bytes(body[at : at + 512 * kp * np_])
+    for y in range(np_):
+        for x in range(kp):
+            source = (y * kp + x) * 512
+            target = at + (x * np_ + y) * 512
+            body[target : target + 512] = tiles[source : source + 512]
+    return bytes(body)
+
+
+def _swap_the_nibble_pair(blob, k, n):
+    """The same blob with every weight byte's two nibbles exchanged.
+
+    Each byte of a tile packs one *pair* of k in its two nibbles, so this is
+    what a packer that believed the odd k of the pair came first would have
+    written: same length, every element still present exactly once, and the only
+    difference is which half of the byte carries which k. The host model and the
+    DSP read those bytes the same way, so they must still agree with each other
+    -- and must no longer agree with the matrix.
+    """
+    header, commands = read_blob(blob)
+    ref = commands[0].inputs[1]
+    at = _weights_base(blob) + ref.offset
+    tiles = 512 * (k // 32) * (n // 32)
+    body = bytearray(blob)
+    for index in range(at, at + tiles):
+        value = body[index]
+        body[index] = ((value & 0x0F) << 4) | (value >> 4)
+    return bytes(body)
 
 
 class _Pool(torch.nn.Module):
@@ -1147,6 +1319,150 @@ def _branch_cases():
                     mutate=_set_param(6, struct.pack("<i", 1)),
                 )
             )
+
+    # 6. The two quantized GEMV entries. Their packers' byte orders were
+    #    transcribed from the kernel's own header and never run, and the first
+    #    attempt to run them (a probe, not a test) reported the design weight
+    #    answering 611.5 where the arithmetic says -7.375. That number was the
+    #    probe's own: it byte-swapped a bit pattern the runner had already
+    #    printed in order. What is asserted here is the arithmetic instead.
+    #
+    #    The construction is the probe's and it is deliberately blind to the
+    #    layout: an activation of one everywhere makes the answer
+    #    `scale[n] * sum_k q[k, n]`, and the weights are built so that scale is a
+    #    power of two and that sum is an integer fp16 holds exactly (`_gemv_
+    #    weight`). Two shapes each: with one tile pair, a wrong k-tile or oc-tile
+    #    stride has nothing to be wrong about. Its limit is the other way round
+    #    too -- a permutation of k cannot move a sum over k -- which is what the
+    #    one-hot cases below are for.
+    q4_blob, q4_weight = _quantized_gemv("q4a16", 64, 32)
+    cases.append(
+        _case(
+            "AJ",
+            None,
+            (torch.ones(1, 64, dtype=torch.float16),),
+            _gemv_all_ones_answer(q4_weight, "q4a16"),
+            blob=q4_blob,
+        )
+    )
+    wide_blob, wide_weight, narrow_blob, narrow_weight = None, None, None, None
+    for tag, scheme, k, n in (
+        ("AK", "w8a16", 64, 32),
+        ("AL", "q4a16", 128, 64),
+        ("AM", "w8a16", 128, 64),
+    ):
+        blob, weight = _quantized_gemv(scheme, k, n)
+        if tag == "AL":
+            wide_blob, wide_weight = blob, weight
+        if tag == "AK":
+            narrow_blob, narrow_weight = blob, weight
+        cases.append(
+            _case(
+                tag,
+                None,
+                (torch.ones(1, k, dtype=torch.float16),),
+                _gemv_all_ones_answer(weight, scheme),
+                blob=blob,
+            )
+        )
+    #    One activation of one at k0 alone: the answer is row k0 of the stored
+    #    weight, so a k this packer and that kernel disagree about moves it. The
+    #    positions cover both nibbles of a byte (0, 2), both halves of a 4-k group
+    #    (0, 1, 2, 3), the second group (8) and the last k of the first k-tile
+    #    (31).
+    for tag, position in (
+        ("AN", 0),
+        ("AO", 1),
+        ("AP", 2),
+        ("AQ", 3),
+        ("AR", 8),
+        ("AS", 31),
+    ):
+        one_hot = torch.zeros(1, 64, dtype=torch.float16)
+        one_hot[0, position] = 1.0
+        cases.append(
+            _case(
+                tag,
+                None,
+                (one_hot,),
+                _gemv_row_answer(q4_weight, "q4a16", position),
+                blob=q4_blob,
+            )
+        )
+    #    The int8 layout has an order of its own inside each group of four
+    #    (`perm = (0, 2, 1, 3)`, the pair-interleave), and a sum over k is blind
+    #    to it exactly as it is blind to the nibble pair: the activation is
+    #    splatted in the same permuted order, so every mismatch still multiplies
+    #    the right weight by *some* activation. One at a time is what tells.
+    for tag, position in (("AT", 1), ("AU", 2), ("AV", 9)):
+        one_hot = torch.zeros(1, 64, dtype=torch.float16)
+        one_hot[0, position] = 1.0
+        cases.append(
+            _case(
+                tag,
+                None,
+                (one_hot,),
+                _gemv_row_answer(narrow_weight, "w8a16", position),
+                blob=narrow_blob,
+            )
+        )
+    last = torch.zeros(1, 64, dtype=torch.float16)
+    last[0, 63] = 1.0
+    cases.append(
+        _case(
+            "AW",
+            None,
+            (last,),
+            _gemv_row_answer(q4_weight, "q4a16", 63),
+            blob=q4_blob,
+        )
+    )
+    #    Two controls, because the two readings worth falsifying are not the
+    #    same shape of mistake. Exchanging the two nibbles of every byte moves k
+    #    within the pair, which a sum over k cannot see: its control is a one-hot
+    #    case, where the answer moves from row k to row k ^ 1. Writing the tile
+    #    table column-major moves the k of one tile onto another's output
+    #    channels, which a sum over k *can* see: its control is the closed form.
+    first = torch.zeros(1, 64, dtype=torch.float16)
+    first[0, 0] = 1.0
+    cases.append(
+        _case(
+            "AX",
+            None,
+            (first,),
+            _gemv_row_answer(q4_weight, "q4a16", 0),
+            blob=q4_blob,
+            kind="teeth",
+            mutate=lambda blob: _swap_the_nibble_pair(blob, 64, 32),
+        )
+    )
+    cases.append(
+        _case(
+            "AY",
+            None,
+            (torch.ones(1, 128, dtype=torch.float16),),
+            _gemv_all_ones_answer(wide_weight, "q4a16"),
+            blob=wide_blob,
+            kind="teeth",
+            mutate=lambda blob: _transpose_the_tiles(blob, 128, 64),
+        )
+    )
+    #    The bias is one fp16 per output channel and arrives in the kernel
+    #    rather than as a second command, so the closed form gains it rather than
+    #    a separate add.
+    bias = (torch.arange(32) % 3).to(torch.float32) - 1.0
+    blob, weight = _quantized_gemv("q4a16", 64, 32, bias=bias)
+    cases.append(
+        _case(
+            "AZ",
+            None,
+            (torch.ones(1, 64, dtype=torch.float16),),
+            (_gemv_all_ones_answer(weight, "q4a16") + bias.half().numpy()).astype(
+                np.float16
+            ),
+            blob=blob,
+        )
+    )
     return cases
 
 
@@ -1253,6 +1569,61 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     for tag in ("AD", "AE"):
         assert kinds[tag] == [_VISION_ATTENTION], f"{tag}: not a vision attention"
 
+    # The quantized matmuls, on the op type they claim. Every one of them is a
+    # GEMV: a prefill-shaped matmul on the same weight has no kernel here and
+    # has to stay portable, so a case that lowered to something else would be
+    # checking the wrong command entirely.
+    for tag in ("AJ", "AL", "AN", "AO", "AP", "AQ", "AR", "AS", "AX", "AZ", "AY", "AW"):
+        assert kinds[tag] == [_Q4A16_GEMV], f"{tag}: not the q4a16 gemv"
+    for tag in ("AK", "AM", "AT", "AU", "AV"):
+        assert kinds[tag] == [_W8A16_GEMV], f"{tag}: not the w8a16 gemv"
+    assert kinds["AK"] == kinds["AU"], "the int8 one-hot cases are not AK's blob"
+    assert kinds["AJ"] == kinds["AN"], "the one-hot cases are not AJ's blob"
+    assert kinds["AL"] == kinds["AY"], "the tile control is not the 128x64 case"
+    for tag, k, n in (("AJ", 64, 32), ("AL", 128, 64)):
+        command = next(iter(_tagged(cases, tag).commands))
+        assert (command.params[1], command.params[2]) == (
+            k,
+            n,
+        ), f"{tag}: {command.params}"
+        # One scale block per output channel is what the emitter writes and what
+        # the kernel reads as a per-channel scale; the weights are symmetric, so
+        # there is no qbias operand for the asymmetric entry to find.
+        assert command.params[8] == 1, f"{tag}: scale_block_num is {command.params[8]}"
+        assert command.params[9] == 0, f"{tag}: scale_asymmetric is {command.params[9]}"
+        assert len(command.inputs) == 3, f"{tag}: unexpected operands {command.inputs}"
+        assert (
+            _tagged(cases, tag).commands[0].inputs[2].space == ABSENT
+        ), f"{tag}: a bias operand the graph does not have"
+    for tag, n in (("AK", 32), ("AM", 64)):
+        command = next(iter(_tagged(cases, tag).commands))
+        # The int8 weight and its scales are two operands, unlike the int4
+        # entry's single one, and the scales are one fp32 per output channel.
+        assert len(command.inputs) == 4, f"{tag}: {command.inputs}"
+        assert (
+            len(_gemv_operand(_tagged(cases, tag).blob, 2)) == 4 * n
+        ), f"{tag}: the scale operand is not {n} fp32"
+    assert (
+        next(iter(_tagged(cases, "AZ").commands)).inputs[2].space != ABSENT
+    ), "the biased case lost its bias operand"
+
+    # The closed form the GEMV cases are checked against is only exact because
+    # the scale those weights produce is a power of two. That comes from torch's
+    # own rule (`_gemv_stored`), so it is asserted against the bytes the blob
+    # actually carries: if the rule moves, this fails here rather than letting
+    # the expectations above drift into being approximate.
+    for tag, scheme, k, n in (
+        ("AJ", "q4a16", 64, 32),
+        ("AK", "w8a16", 64, 32),
+        ("AL", "q4a16", 128, 64),
+    ):
+        scales = _stored_gemv_scales(_tagged(cases, tag).blob, scheme, n)
+        _, want = _gemv_stored(_gemv_weight(scheme, k, n), scheme)
+        assert np.array_equal(scales, want), (
+            f"{tag}: the stored scales are {sorted(set(scales.tolist()))}, the rule "
+            f"says {sorted(set(want.tolist()))}"
+        )
+
     # The dynamic cases carry the record the run-time length arrives by, and the
     # static ones carry none: a patch on a command that never mentions the length
     # is as wrong as leaving one off. Both halves are asserted, because the
@@ -1340,6 +1711,35 @@ def test_every_blob_agrees_three_ways(cases, simulated):
                     np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
                 )
                 assert worst < case.tolerance, f"{case.tag}: {name} differs by {worst}"
+
+
+def test_the_gemv_control_can_tell_the_two_nibble_orders_apart(cases):
+    """The quantized cases are only as good as what they can tell apart.
+
+    Two things have to hold for them to decide anything, and neither needs the
+    simulator: the pair-swapped control has to *move* the answer (otherwise the
+    control would pass on the real bytes too), and the one-hot expectations have
+    to be able to see a permutation of k (a sum over k cannot).
+    """
+    weight, _ = _gemv_stored(_gemv_weight("q4a16", 64, 32), "q4a16")
+    assert len({tuple(row) for row in weight.tolist()}) == 64, (
+        "two rows of the weight are equal, so a one-hot case could not tell a "
+        "k from the k it was swapped with"
+    )
+    # One byte holds the pair {4g + 2p, 4g + 2p + 1}, so exchanging its nibbles
+    # exchanges an even k with the odd k that follows it -- and a sum over k is
+    # blind to that, which is why this control is one of the one-hot cases and
+    # not the closed form.
+    swapped = weight[np.arange(64) ^ 1]
+    assert not np.array_equal(swapped[0], weight[0]), (
+        "rows 0 and 1 are equal, so the swapped control answers what the honest "
+        "case expects and the comparison would be vacuous"
+    )
+    for tag in ("AX", "AY"):
+        assert (
+            _tagged(cases, tag).blob
+            != _tagged(cases, "AJ" if tag == "AX" else "AL").blob
+        ), f"{tag}: the control is the case it was meant to control"
 
 
 def test_the_dsp_result_would_move_if_the_blob_did(cases):

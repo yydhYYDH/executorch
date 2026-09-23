@@ -464,6 +464,14 @@ worth reading twice:
   `absmax/127`, round, clamp to `[-127, 127]`. There is no calibration for it
   and no static activation scale anywhere. The scheme names (`q4a16`, `w8a16`)
   describe the operand widths at the command boundary, not the multiply.
+- **Both GEMV entries stage their operands in VTCM and refuse with `-1` when
+  there is none.** `matmul_q4block_gemv_i8.c:323-325` takes the size-zero path
+  out of the kernel before it has written a byte, so the output is left as it
+  was: an empty answer that reads as a wrong one, with only the return code to
+  say so. On the device the delegate's setup acquires VTCM and the dispatcher
+  re-acquires it when it is missing (`execute_command.cc:995`); a caller that
+  brings its own arena has to do the same, which is what the simulator's runners
+  had to learn (`test/sim/blob_runner.cpp`).
 - **True static-scale w8a8 is not reachable from here.** No vendored kernel
   takes an int8 activation tensor, and the runtime reads every non-`Float` arena
   entry as two bytes per element. A w8a8 graph would need both of those to
@@ -652,14 +660,25 @@ Working and verified without a device:
   `MATMUL_Q4A16_GEMV_I8` (41) or `MATMUL_W8A16_GEMV_I8` (45) command, and the
   host interpreter reads the blob back and reproduces the kernels' arithmetic
   within a few percent of the dequantized reference. See "Quantized matmuls" for
-  what that arithmetic is and what is still unverified. **Neither GEMV entry has
-  been run on hexagon-sim or on a device**: the host leg above is a transcription
-  of the kernels' read paths, so the packer's byte order and the `K % 64` / `N %
-  32` guards are still checked only against each other, and a wrong byte order
-  there would decode to plausible-looking numbers rather than to an error. These
-  two are the largest thing in this batch that the simulator has not seen, and
-  closing them needs a quantized case in `test_blob_on_sim.py` rather than a
-  device;
+  what that arithmetic is and what is still unverified. **Both GEMV entries have
+  now run on hexagon-sim** and answer the closed form bit-for-bit: an activation
+  of one everywhere on weights whose every column reaches full scale, so the
+  answer is `sum_k q[k, n] * scale[n]` with no tile order, nibble order or scale
+  position anywhere in the expectation; and an activation of one at a single k,
+  which answers row k of the stored weight and so moves if the packer and the
+  kernel disagree about which weight belongs to which contraction index -- the
+  closed form is blind to a permutation of k, that one is not. Both shapes a
+  stride could be wrong about (64x32 and 128x64), both entries, and the biased
+  form; two controls assert the opposite, a pair-exchanged nibble order and a
+  column-major tile table each have to move the answer, and they do. The
+  exhaustive half is `test/test_gemv_on_sim.py`, which walks every k of both
+  layouts and measures what `unpack_vrmpy_weight_128` does to a byte instead of
+  reading the comment that says what it should do. Two things about these entries
+  are **not verified**, which is not the same as verified absent: the chunked
+  weight path (`matmul_q4block_gemv_i8.c:320+`, the split it takes when the
+  weights do not fit the VTCM budget) has **never been reached** by any case
+  here -- every shape used fits one chunk -- so it is unexercised rather than
+  correct; and no case measures the timing, on the simulator or anywhere else;
 - a vision attention block goes all the way through once `FuseVisionAttention` is
   in the caller's `transform_passes`: a three-projection ViT attention over a
   dynamic patch count partitions into one delegate whose blob carries one
@@ -701,13 +720,14 @@ Working and verified without a device:
   `test/test_overload_reductions.py`, `test/test_overload_clamp.py` and
   `test/test_overload_census.py`.
 - the commands this branch added have run on hexagon-sim and answer torch
-  bit-for-bit, with the two quantized GEMV entries as the exception noted below:
-  the row gather on an `ic=33`/`oc=35` shape whose 32x32 tiles are
+  bit-for-bit: the row gather on an `ic=33`/`oc=35` shape whose 32x32 tiles are
   neither square nor whole, with two indices past the vocabulary that the kernel
   clears and torch refuses; a reduction whose span arrives as a run-time patch,
   run at a length shorter than its export with the arena past that length filled
   with a value no correct answer can contain; max pooling; the clamp family on a
-  NaN; and the vision attention on `[1,4,2,64]` and `[2,3,4,64]`. Average
+  NaN; the vision attention on `[1,4,2,64]` and `[2,3,4,64]`; and both quantized
+  GEMV entries, whose expectation mentions neither a tile, a group, a nibble nor
+  a scale position. Average
   pooling comes back within 1.95e-3, which is its fp16 `1/count` divisor, and the
   same file carries three controls that assert the opposite -- a row-major tile
   table, a blanked dynamic trailer and an exchanged pool layout each have to move
