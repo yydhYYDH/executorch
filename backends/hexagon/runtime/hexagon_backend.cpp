@@ -34,6 +34,7 @@
 #include <executorch/backends/hexagon/runtime/HexagonBackendOptions.h>
 #include <executorch/backends/hexagon/runtime/hexagon_compat.h>
 #include <executorch/runtime/backend/interface.h>
+#include <executorch/runtime/core/event_tracer_hooks_delegate.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
 #include <executorch/runtime/core/exec_aten/util/tensor_util.h>
 #include <executorch/runtime/core/named_data_map.h>
@@ -90,6 +91,18 @@ constexpr int kProbeStages = 80;
 constexpr int kProbeBytes =
     (kProbeBaseInts + kProbeHeaderInts + kProbeRecords * kProbeRecordInts + kProbeStages * 4) * 4;
 constexpr int32_t kProbeMagic = 0x48455850; // "HEXP"
+
+// Which int of a command record holds the kernel microseconds for that command,
+// and which header int tells this host that the skel writes them. A skel built
+// before the two agree leaves the header int at zero, so the field is read as
+// "no per-command timing" rather than as a duration.
+constexpr int kProbeRecordTimeInt = kProbeRecordInts - 1;
+constexpr int kProbeHeaderVersionInt = 2;
+constexpr int32_t kProbeVersionCommandTime = 2;
+
+// DSP_OP_MAX from htp_command.h. Slots below it are op types; the accumulation
+// table execute_command.cc fills is indexed by the DSPOpType itself.
+constexpr int kDspOpTypes = 100;
 
 // DSP_OP_FLASH_ATTN, the one command whose empty cache slots are fatal. Its
 // type number and its page_size param come from hexagon_compat.h, which reads
@@ -344,23 +357,39 @@ void PrintProbe(const HexagonDelegate& delegate) {
     return;
   }
   std::fprintf(stderr, "[hexagon] probe d%d: sent count=%d last=%d\n", delegate.index, header[1], header[3]);
+  const bool timed = header[kProbeHeaderVersionInt] == kProbeVersionCommandTime;
   for (int i = 0; i < header[1] && i < kProbeRecords; i++) {
     const int32_t* rec = probe + kProbeBaseInts + kProbeHeaderInts + i * kProbeRecordInts;
     if (rec[0] != i + 1) {
       continue;
     }
     const char* phase = rec[1] == 0 ? "ENTER (no return)" : (rec[1] == 1 ? "done" : "failed");
-    std::fprintf(
-        stderr,
-        "[hexagon] probe d%d cmd %d: op=%d fd=%d off=%d size=%d %s ret=%d\n",
-        delegate.index,
-        i,
-        rec[5],
-        rec[2],
-        rec[3],
-        rec[4],
-        phase,
-        rec[6]);
+    if (timed) {
+      std::fprintf(
+          stderr,
+          "[hexagon] probe d%d cmd %d: op=%d fd=%d off=%d size=%d %s ret=%d us=%d\n",
+          delegate.index,
+          i,
+          rec[5],
+          rec[2],
+          rec[3],
+          rec[4],
+          phase,
+          rec[6],
+          rec[kProbeRecordTimeInt]);
+    } else {
+      std::fprintf(
+          stderr,
+          "[hexagon] probe d%d cmd %d: op=%d fd=%d off=%d size=%d %s ret=%d\n",
+          delegate.index,
+          i,
+          rec[5],
+          rec[2],
+          rec[3],
+          rec[4],
+          phase,
+          rec[6]);
+    }
   }
 }
 
@@ -376,6 +405,195 @@ void PrintOpTimes(const HexagonDelegate& delegate) {
     if (slots[slot] != 0) {
       std::fprintf(stderr, "[hexagon] optime d%d slot=%d: %d us\n", delegate.index, slot, slots[slot]);
     }
+  }
+}
+
+// What one command of the group cost, as the DSP recorded it. The time is the
+// kernel's, measured around htp_execute_command, so it excludes the RPC and the
+// command loop.
+struct CommandProfile {
+  int32_t op_type = -1;
+  int32_t microseconds = 0;
+  int32_t ret = 0;
+};
+
+// The DSP's account of one command group, decoded from the probe buffer. Kept
+// separate from the event tracer on purpose: this is the only part of the
+// profiling path that reads DSP bytes, so it is the part worth reasoning about
+// (and testing) on its own, and the events are a thin layer above it.
+struct CommandProfiles {
+  std::vector<CommandProfile> commands;
+  // True when the skel put a duration in each record. A skel built before
+  // that field existed says so with a zero in the header's version int.
+  bool timed = false;
+};
+
+CommandProfiles ReadCommandProfiles(const HexagonDelegate& delegate) {
+  CommandProfiles profiles;
+  if (delegate.probe.ptr == nullptr) {
+    return profiles;
+  }
+  const int32_t* probe = static_cast<const int32_t*>(delegate.probe.ptr);
+  const int32_t* header = probe + kProbeBaseInts;
+  if (header[0] != kProbeMagic) {
+    return profiles;
+  }
+  profiles.timed = header[kProbeHeaderVersionInt] == kProbeVersionCommandTime;
+  const int32_t sent = header[1];
+  const int32_t count =
+      std::max(0, std::min(sent, (int32_t)kProbeRecords));
+  profiles.commands.reserve(count);
+  for (int i = 0; i < count; i++) {
+    const int32_t* rec =
+        probe + kProbeBaseInts + kProbeHeaderInts + i * kProbeRecordInts;
+    CommandProfile profile;
+    // index + 1 is filled in as the command is reached, so a zero means the
+    // loop never got there and the rest of the group did not run.
+    if (rec[0] != i + 1) {
+      break;
+    }
+    profile.op_type = rec[5];
+    profile.microseconds = profiles.timed ? rec[kProbeRecordTimeInt] : 0;
+    profile.ret = rec[6];
+    profiles.commands.push_back(profile);
+  }
+  return profiles;
+}
+
+// What an event carries about the DSP work it describes. Opaque to the event
+// tracer, so the layout is this file's to define; little-endian and packed, and
+// written down again in the backend README for whoever reads a dump.
+#pragma pack(push, 1)
+// One command, on the event whose delegate debug identifier is that command's
+// index in the blob.
+struct OpProfileMetadata {
+  int32_t op_type; // DSPOpType
+  int32_t microseconds; // the command's kernel time
+  int32_t ret; // 0 when the command returned
+};
+// One entry of the array on HEXAGON_DSP_CALL. That event needs no skel support:
+// the accumulation table in the profile buffer holds it whether or not the skel
+// times individual commands.
+struct OpTypeProfileMetadata {
+  int32_t op_type;
+  int32_t microseconds;
+};
+#pragma pack(pop)
+static_assert(sizeof(OpProfileMetadata) == 12);
+static_assert(sizeof(OpTypeProfileMetadata) == 8);
+
+std::vector<OpTypeProfileMetadata> ReadOpTypeTotals(
+    const HexagonDelegate& delegate) {
+  std::vector<OpTypeProfileMetadata> totals;
+  if (delegate.probe.ptr == nullptr) {
+    return totals;
+  }
+  const int32_t* slots = static_cast<const int32_t*>(delegate.probe.ptr);
+  for (int type = 0; type < kDspOpTypes; type++) {
+    if (slots[type] != 0) {
+      totals.push_back({type, slots[type]});
+    }
+  }
+  return totals;
+}
+
+// The tracer to profile through, or nullptr when there is none. Without
+// ET_EVENT_TRACER_ENABLED the hooks below are no-ops and this is never
+// non-null.
+runtime::EventTracer* ProfilingTracer(BackendExecutionContext& context) {
+#ifdef ET_EVENT_TRACER_ENABLED
+  return context.event_tracer();
+#else
+  (void)context;
+  return nullptr;
+#endif
+}
+
+// Arms the DSP's per-command trace. It is what makes the DSP report what each
+// command cost, so it is the one thing a profile cannot be produced without,
+// and it is allocated here -- at the execute that needs it -- rather than at
+// init, which cannot see whether a tracer is attached.
+bool ArmProbe(HexagonDelegate& delegate) {
+  auto probe = delegate.driver.Alloc(kProbeBytes);
+  if (!probe.ok()) {
+    return false;
+  }
+  delegate.probe = probe.get();
+  std::memset(delegate.probe.ptr, 0, kProbeBytes);
+  return true;
+}
+
+// A delegate-level phase, opened where it starts and closed where it ends.
+//
+// The name is the event's identity: with no delegate debug identifier the
+// tracer files it under that string, which is what makes the phases readable in
+// a dump next to the per-op events.
+class PhaseEvent {
+ public:
+  PhaseEvent(runtime::EventTracer* tracer, const char* name) : tracer_(tracer) {
+    entry_ = event_tracer_start_profiling_delegate(tracer_, name, -1);
+  }
+  ~PhaseEvent() {
+    if (open_) {
+      event_tracer_end_profiling_delegate(tracer_, entry_);
+    }
+  }
+  PhaseEvent(const PhaseEvent&) = delete;
+  PhaseEvent& operator=(const PhaseEvent&) = delete;
+
+  // Data that only exists once the phase is done, such as the DSP's own
+  // accounting of the call it just ran.
+  void End(const void* metadata = nullptr, size_t metadata_len = 0) {
+    if (!open_) {
+      return;
+    }
+    open_ = false;
+    event_tracer_end_profiling_delegate(tracer_, entry_, metadata, metadata_len);
+  }
+
+ private:
+  runtime::EventTracer* tracer_;
+  runtime::EventTracerEntry entry_;
+  bool open_ = true;
+};
+
+// One profiling event per DSP command, numbered by the command's index in the
+// blob. That number is the delegate debug identifier the AOT step put in
+// PreprocessResult::debug_handle_map, which is what turns the event back into
+// the graph node that asked for the command.
+//
+// The DSP's clock is its own, and it reports durations in microseconds, so the
+// events are laid out along the host's span for the call: the first command
+// starts when the call did and each next one starts where the previous ended.
+// Durations are then exact and the RPC and sync time around them shows up as
+// the gap before the end of HEXAGON_DSP_CALL. Commands the DSP did not time --
+// an older skel -- produce no events at all rather than a row of zeroes.
+void PublishCommandProfiles(
+    runtime::EventTracer* tracer,
+    const CommandProfiles& profiles,
+    uint32_t first,
+    et_timestamp_t call_start_ticks) {
+  if (!profiles.timed) {
+    return;
+  }
+  int64_t offset_us = 0;
+  for (size_t i = 0; i < profiles.commands.size(); i++) {
+    const CommandProfile& command = profiles.commands[i];
+    const et_timestamp_t start =
+        call_start_ticks + static_cast<et_timestamp_t>(offset_us * 1000);
+    offset_us += std::max<int32_t>(command.microseconds, 0);
+    const et_timestamp_t end =
+        call_start_ticks + static_cast<et_timestamp_t>(offset_us * 1000);
+    const OpProfileMetadata metadata{
+        command.op_type, command.microseconds, command.ret};
+    event_tracer_log_profiling_delegate(
+        tracer,
+        nullptr,
+        static_cast<runtime::DelegateDebugIntId>(first + i),
+        start,
+        end,
+        &metadata,
+        sizeof(metadata));
   }
 }
 
@@ -1184,14 +1402,12 @@ Result<DelegateHandle*> HexagonBackend::init(
   delegate->scratch = pooled.get();
   stamp("scratch_alloc");
 
+  // Nothing here arms the DSP-side trace buffer: a tracer attached to an
+  // execute is the other reason to want one and init cannot see it, so execute()
+  // arms it on first need (see ArmProbe). The knobs below come from the options
+  // this delegate was loaded with, which is also what init() checks the blob
+  // against.
   const HexagonRuntimeOptions& config = delegate->options;
-  if (config.trace || config.delegate >= 0) {
-    auto probe = delegate->driver.Alloc(kProbeBytes);
-    if (probe.ok()) {
-      delegate->probe = probe.get();
-      std::memset(delegate->probe.ptr, 0, kProbeBytes);
-    }
-  }
 
   const auto* ops = reinterpret_cast<const HexagonOp*>(
       reinterpret_cast<const uint8_t*>(processed->data()) +
@@ -1753,8 +1969,6 @@ Error HexagonBackend::execute(
     BackendExecutionContext& context,
     DelegateHandle* handle,
     Span<EValue*> args) const {
-  (void)context;
-
   auto* delegate = static_cast<HexagonDelegate*>(handle);
   if (delegate == nullptr) {
     return Error::InvalidArgument;
@@ -1767,6 +1981,15 @@ Error HexagonBackend::execute(
         args.size());
     return Error::InvalidArgument;
   }
+
+  // Profiling. A whole subgraph is one delegate call, so without these the dump
+  // has a single row for the delegate and nothing inside it; the phases below
+  // split the call, and the per-command events published after it say what each
+  // DSP op cost. All of it is inert without ET_EVENT_TRACER_ENABLED, where the
+  // hooks are no-ops and ProfilingTracer returns nullptr.
+  runtime::EventTracer* const tracer = ProfilingTracer(context);
+  const bool profiled = tracer != nullptr;
+  PhaseEvent execute_event(tracer, "HEXAGON_EXECUTE");
 
   auto* const resident = static_cast<uint8_t*>(delegate->resident.ptr);
   uint8_t* scratch = static_cast<uint8_t*>(delegate->scratch.ptr);
@@ -1796,6 +2019,7 @@ Error HexagonBackend::execute(
     }
     dynamic_length = sequence.sizes()[delegate->dynamic_axis];
     if (!delegate->dynamic_layouts.empty()) {
+      PhaseEvent resize_event(tracer, "HEXAGON_RESIZE");
       Error resize_status = ResizeDynamicDelegate(delegate, dynamic_length);
       if (resize_status != Error::Ok) {
         return resize_status;
@@ -1852,6 +2076,7 @@ Error HexagonBackend::execute(
     }
   }
 
+  PhaseEvent copy_in_event(tracer, "HEXAGON_COPY_IN");
   for (size_t i = 0; i < delegate->inputs.size(); i++) {
     // A non-tensor input still has an arena slot: a graph hands the attention
     // its start position as a plain int, and the command reads it back out of
@@ -1961,14 +2186,18 @@ Error HexagonBackend::execute(
         resident + delegate->commands.offset, delegate->commands.size));
   }
   const double t_flush = acct ? AcctNowMs() : 0.0;
+  copy_in_event.End();
 
   const HexagonRuntimeOptions& config = delegate->options;
   static int next_execute = 0;
   const int exec_index = next_execute++;
-  const bool traced = config.trace && (config.delegate < 0 || config.delegate == exec_index);
+  // Which execute this delegate's diagnostics apply to. HEXAGON_DELEGATE picks
+  // one; everything else speaks about every one.
+  const bool watch = config.delegate < 0 || config.delegate == exec_index;
+  const bool traced = config.trace && watch;
   uint32_t first = 0;
   uint32_t count = delegate->n_ops;
-  if (config.delegate < 0 || config.delegate == exec_index) {
+  if (watch) {
     first = (uint32_t)std::min<int>(std::max(config.cmd_start, 0), (int)delegate->n_ops);
     count = delegate->n_ops - first;
     if (config.cmd_limit > 0) {
@@ -1977,6 +2206,22 @@ Error HexagonBackend::execute(
   }
   const int32_t group_offset = (int32_t)(
       delegate->group.offset + delegate->resident.bias + first * 3 * (int)sizeof(int32_t));
+
+  // The DSP reports what each command cost only through the traced call, so a
+  // profile needs the probe buffer whether or not the diagnostic environment
+  // asked for one. A tracer takes every delegate it runs; HEXAGON_DELEGATE
+  // takes the one it names. That is the one thing the two paths share: the
+  // stderr dumping stays on HEXAGON_TRACE. The trade is a 21 KB rpcmem block
+  // per profiled delegate and a cache clean per command on the DSP, against a
+  // profile that is otherwise a single row per subgraph.
+  const bool want_probe =
+      profiled || (watch && (config.trace || config.delegate >= 0));
+  if (want_probe && delegate->probe.ptr == nullptr && !ArmProbe(*delegate)) {
+    ET_LOG(
+        Error,
+        "hexagon: probe buffer allocation failed; per-op times are not available");
+  }
+  const bool probed = want_probe && delegate->probe.ptr != nullptr;
 
   std::fprintf(
       stderr,
@@ -1992,10 +2237,12 @@ Error HexagonBackend::execute(
     std::fprintf(
         stderr, "[phase] t=%.1f exec d%d pre_call\n", PhaseNowMs(), delegate->index);
   }
+  PhaseEvent call_event(tracer, "HEXAGON_DSP_CALL");
+  const et_timestamp_t call_start_ticks = runtime::pal_current_ticks();
   Error group_error = Error::Ok;
   {
     ProbeWatchdog watchdog(delegate, traced);
-    if (traced && delegate->probe.ptr != nullptr) {
+    if (probed) {
       group_error = delegate->driver.ExecuteCommandGroupTraced(
           delegate->resident.fd,
           group_offset,
@@ -2015,6 +2262,19 @@ Error HexagonBackend::execute(
           (int)(delegate->sync.offset + delegate->resident.bias),
           (int)delegate->sync.size);
     }
+  }
+
+  if (profiled) {
+    // The op-type totals are in the buffer whether or not the skel times
+    // individual commands, so they go on the phase event that just ended: they
+    // are the whole of what can be said about a group run on an older skel.
+    const std::vector<OpTypeProfileMetadata> totals = ReadOpTypeTotals(*delegate);
+    call_event.End(
+        totals.empty() ? nullptr : totals.data(),
+        totals.size() * sizeof(OpTypeProfileMetadata));
+    PublishCommandProfiles(tracer, ReadCommandProfiles(*delegate), first, call_start_ticks);
+  } else {
+    call_event.End();
   }
 
   std::fprintf(
@@ -2059,6 +2319,7 @@ Error HexagonBackend::execute(
   }
   ET_CHECK_OK_OR_RETURN_ERROR(group_error);
 
+  PhaseEvent copy_out_event(tracer, "HEXAGON_COPY_OUT");
   // A subgraph that advances a KV cache in place has to hand the updated buffer
   // back, or the next execute() copies the old one in and every step after the
   // first attends over stale keys.
@@ -2129,6 +2390,10 @@ Error HexagonBackend::execute(
     std::memcpy(
         tensor.mutable_data_ptr(), scratch + out.offset, tensor.nbytes());
   }
+  copy_out_event.End();
+  // Ended here rather than by the destructor so the accounting prints below
+  // stay outside the delegate's span.
+  execute_event.End();
 
   if (acct) {
     const double t_end = AcctNowMs();

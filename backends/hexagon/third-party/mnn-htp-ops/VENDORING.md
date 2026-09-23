@@ -56,7 +56,8 @@ Each command is a FlatBuffers `DSPCOMMAND::Command` at `(cmd_fd, cmd_offset)`:
 
 ## Local modifications
 
-Two, both forced by the build environment rather than by logic:
+Three. The first two are forced by the build environment; the third is
+instrumentation that only runs when the host asks for it:
 
 1. `src/dsp/vtcm_mgr.cc` — one `#include "flatbuffers/flatbuffers.h"` removed.
    The file never references the `flatbuffers::` namespace, and adding the
@@ -66,6 +67,15 @@ Two, both forced by the build environment rather than by logic:
    header is byte-identical to upstream's, and `flatc` is not part of the
    Hexagon SDK. `schema/current/Command.fbs` is kept as the source of truth, so
    the header can be regenerated whenever flatc is available.
+3. The profile buffer (`htp_ops_execute_command_group_profile`, and the probe
+   records and stage writes in `src/dsp/execute_command.cc` plus the `htp_probe_stage`
+   calls in the attention kernels) is ExecuTorch's, not upstream's. It exists
+   because a DSP fault takes the RPC session down with it and the probe survives
+   it. Nothing in it does anything unless the host passes a profile buffer, and
+   the op-selection paths are untouched, so a call without one behaves as
+   upstream. It now also records each command's kernel microseconds in the last
+   int of its probe record and marks the header with a version, which is what
+   the host-side profiler reads to attribute time to individual ops.
 
 ## Build
 

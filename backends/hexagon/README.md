@@ -18,8 +18,8 @@ are generated from those files by `qaic`, so handle numbers and struct layouts
 cannot drift.
 
 The DSP side is the MNN op library vendored under `third-party/mnn-htp-ops`
-(provenance and the two local build fixes are in its `VENDORING.md`). It is
-consumed unmodified: the only contract is
+(provenance, the two local build fixes and the profiling instrumentation are in
+its `VENDORING.md`). It is consumed unmodified: the only contract is
 
     execute_command_group(groupFd, groupOffset, count, syncFd, syncOffset, syncSize)
 
@@ -173,6 +173,57 @@ externalizes everything moves the same bytes at load time that it did before.
 Removing that copy needs a runner that can hand the delegate a file-backed
 mapping the DSP mappings itself, which is a new contract with the runner rather
 than a change here.
+## Profiling
+
+A whole subgraph is one delegate call, so an ETDump of a hexagon model would
+otherwise say only that `HexagonBackend` took X ms. The backend closes that gap
+from both ends:
+
+- **AOT.** `preprocess` returns `PreprocessResult.debug_handle_map`, keyed by the
+  index of each DSP command in the blob, which is what names the graph node a
+  command came from. The blob format is untouched: the mapping travels in the
+  ETRecord, not in the `.pte`.
+- **Runtime.** `execute()` logs a span per phase -- `HEXAGON_EXECUTE`,
+  `HEXAGON_COPY_IN`, `HEXAGON_RESIZE`, `HEXAGON_DSP_CALL`, `HEXAGON_COPY_OUT` --
+  and then one event per DSP command, with that command's index as its delegate
+  debug identifier. The times are the DSP's own `HAP_perf_get_time_us` deltas,
+  measured around each kernel.
+
+The events land in whatever ETDump the runner already produces, so a profiling
+run is an ordinary run:
+
+```sh
+python3 -m devtools.inspector.inspector_cli \
+    --etdump_path model.etdump --etrecord_path model.etrecord
+```
+
+With the ETRecord the per-op rows resolve to node names; without one they are
+numbered by command index. `delegate_debug_metadata` carries the fields the
+event has no room for, little-endian:
+
+| event | bytes | fields |
+|---|---|---|
+| one per command | 12 | `op_type` (DSPOpType), `microseconds`, `ret` |
+| `HEXAGON_DSP_CALL` | 8 x n | `{op_type, microseconds}` per op type the call ran |
+
+The second layout is the per-op-type accumulation `execute_command.cc` already
+keeps, which needs nothing of the skel, so a group run on an older skel still
+reports where its time went. That skel also cannot report individual commands:
+it says so by leaving the probe header's version int at zero, and the per-op
+rows are then simply absent rather than zero.
+
+Worth knowing:
+
+- the DSP's clock is its own, so per-op events are laid out along the host's span
+  for the call, in the order the commands ran. Durations are the DSP's; the
+  absolute times place them inside `HEXAGON_DSP_CALL`.
+- the probe buffer that carries the per-command data costs 21 KB of rpcmem per
+  delegate and a cache clean per command on the DSP, so it is armed only when a
+  tracer is attached or `HEXAGON_TRACE` asks for it. Nothing else pays.
+- the records cover the first 508 commands of a delegate; past that the phase
+  events and the op-type totals are all there is.
+- `HEXAGON_TRACE=1` keeps its stderr trace, now with each command's time when
+  the skel reports one.
 
 ## Building
 

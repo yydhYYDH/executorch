@@ -833,13 +833,22 @@ static constexpr int kProbeMaxRecords = 508;
 static constexpr int kProbeEnter = 0;
 static constexpr int kProbeDone = 1;
 static constexpr int kProbeFailed = 2;
+// The last int of a record holds the command's kernel microseconds, and header
+// int 2 says so. That per-command time is the only one there is: the totals in
+// the slots below 100 cannot tell one matmul from the next. The header int was
+// unused before, so a host that reads a zero there is talking to an older skel
+// and must read the field as not-a-time.
+static constexpr int kProbeRecordTimeInt = kProbeRecordInts - 1;
+static constexpr int kProbeHeaderVersionInt = 2;
+static constexpr int kProbeVersionCommandTime = 2;
 
 static void probe_flush(int* probe, int address, int words) {
     qurt_mem_cache_clean(
         (qurt_addr_t)probe, (address + words) * (int)sizeof(int), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 }
 
-static void probe_record(int* probe, int index, int count, int phase, int fd, int offset, int size, int opType, int ret) {
+static void probe_record(
+    int* probe, int index, int count, int phase, int fd, int offset, int size, int opType, int ret, int elapsedUs) {
     if (probe == nullptr || index < 0 || index >= kProbeMaxRecords) {
         return;
     }
@@ -855,7 +864,7 @@ static void probe_record(int* probe, int index, int count, int phase, int fd, in
     rec[4] = size;
     rec[5] = opType;
     rec[6] = ret;
-    rec[7] = count;
+    rec[7] = elapsedUs;
     probe_flush(probe, kProbeBase, kProbeHeaderInts + (index + 1) * kProbeRecordInts);
 }
 
@@ -881,7 +890,7 @@ extern "C" void htp_probe_stage(int stage, int a, int b, int c) {
     probe_flush(g_stage_probe, kProbeStageOffset + (stage - 1) * 4, 4);
 }
 
-static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr) {
+static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 cmdOffset, int32 cmdSize, int32 dirty, int* profile = nullptr, int* elapsedUs = nullptr) {
     void* cmd_base = NULL;
     if ((cmd_base = mmap_manager_get_map_local(mmap_manager, cmdFd)) == NULL) {
         FARF(ERROR, "execute_single_command: mmap failed for cmdFd %d", cmdFd);
@@ -909,7 +918,11 @@ static int execute_single_command(MmapManager* mmap_manager, int32 cmdFd, int32 
     if (profile) {
         unsigned long long end_time = HAP_perf_get_time_us();
         int opType = command->type();
-        profile[opType] += (int)(end_time - start_time);
+        const int elapsed = (int)(end_time - start_time);
+        profile[opType] += elapsed;
+        if (elapsedUs != nullptr) {
+            *elapsedUs = elapsed;
+        }
 #if HTP_MM_PHASE_PROFILE
         // HMX prefill phase breakdown (us) into spare slots 200..207.
         extern unsigned long long g_mm_phase_us[13];
@@ -1086,6 +1099,7 @@ AEEResult htp_ops_execute_command_group_profile(remote_handle64 handle, int32 gr
             qurt_mem_cache_clean((qurt_addr_t)profile, profileSize, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
             probe = (profileSize >= (kProbeBase + kProbeHeaderInts) * (int)sizeof(int)) ? profile + kProbeBase : NULL;
             if (probe) {
+                probe[kProbeHeaderVersionInt] = kProbeVersionCommandTime;
                 probe[1] = count;
                 probe[3] = -1;
                 probe[0] = kProbeMagic;
@@ -1122,11 +1136,14 @@ AEEResult htp_ops_execute_command_group_profile(remote_handle64 handle, int32 gr
                     opType = command->type();
                 }
             }
-            probe_record(probe, i, count, kProbeEnter, cmdFd, cmdOffset, cmdSize, opType, 0);
+            probe_record(probe, i, count, kProbeEnter, cmdFd, cmdOffset, cmdSize, opType, 0, 0);
         }
-        ret = execute_single_command(mmap_manager, cmdFd, cmdOffset, cmdSize, command_is_dirty(commands, i), profile);
+        int elapsedUs = 0;
+        ret = execute_single_command(
+            mmap_manager, cmdFd, cmdOffset, cmdSize, command_is_dirty(commands, i), profile, &elapsedUs);
         if (probe) {
-            probe_record(probe, i, count, ret == 0 ? kProbeDone : kProbeFailed, cmdFd, cmdOffset, cmdSize, opType, ret);
+            probe_record(
+                probe, i, count, ret == 0 ? kProbeDone : kProbeFailed, cmdFd, cmdOffset, cmdSize, opType, ret, elapsedUs);
         }
         if (ret != 0) break;
     }

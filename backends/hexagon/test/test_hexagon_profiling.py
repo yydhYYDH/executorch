@@ -15,6 +15,7 @@ per-command times to arrive at all.
 
 import os
 import pathlib
+import re
 import struct
 import sys
 
@@ -33,6 +34,11 @@ from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa:
 from executorch.exir import to_edge, to_edge_transform_and_lower  # noqa: E402
 from executorch.exir.backend.backend_api import LoweredBackendModule  # noqa: E402
 from torch.export import export  # noqa: E402
+
+_HEXAGON = pathlib.Path(__file__).resolve().parents[1]
+_RUNTIME_SOURCE = _HEXAGON / "runtime" / "hexagon_backend.cpp"
+_DSP_SOURCE = _HEXAGON / "third-party" / "mnn-htp-ops" / "src" / "dsp" / "execute_command.cc"
+
 
 class _Mm(torch.nn.Module):
     """One command per node: a matmul then a bias add."""
@@ -143,3 +149,62 @@ def test_a_partitioned_subgraph_is_profiled_by_the_map_it_records():
     mapping = modules[0].meta["debug_handle_map"]
     assert sorted(mapping) == list(range(_command_count(modules[0].processed_bytes)))
     assert all(isinstance(handle, int) for (handle,) in mapping.values())
+
+
+def _constants(source: pathlib.Path) -> dict:
+    """Every `constexpr int NAME = EXPR;` in a C++ file, evaluated.
+
+    The expressions are plain arithmetic over ints and earlier names, which is
+    all this needs: the point is to compare two files, not to parse C++.
+    """
+    values: dict = {}
+    text = re.sub(r"//[^\n]*", "", source.read_text())
+    for name, expression in re.findall(
+        r"constexpr\s+(?:int|uint32_t|int32_t|int64_t|size_t)\s+(\w+)\s*=\s*([^;]+);",
+        text,
+    ):
+        try:
+            values[name] = int(eval(expression, {}, values))
+        except (NameError, TypeError, ValueError):
+            # An initializer over something this cannot see, such as a sizeof or
+            # another file's constant. Nothing under test needs it.
+            continue
+    return values
+
+
+def test_the_host_and_the_dsp_agree_on_the_probe_layout():
+    """The two sides write and read the same buffer with no shared header.
+
+    Nothing but these numbers ties them together, so a change to one that is not
+    made to the other is either a record read at the wrong offset or, worse, a
+    duration read out of the wrong record.
+    """
+    host = _constants(_RUNTIME_SOURCE)
+    dsp = _constants(_DSP_SOURCE)
+
+    # The host calls the base offset kProbeBaseInts; execute_command.cc calls it
+    # kProbeBase. Everything else shares a name.
+    assert host["kProbeBaseInts"] == dsp["kProbeBase"]
+    assert host["kProbeMagic"] == dsp["kProbeMagic"]
+    for name in (
+        "kProbeHeaderInts",
+        "kProbeRecordInts",
+        "kProbeStages",
+        "kProbeRecordTimeInt",
+        "kProbeHeaderVersionInt",
+        "kProbeVersionCommandTime",
+    ):
+        assert host[name] == dsp[name], name
+
+    # The host's buffer has to be big enough for every region the DSP writes
+    # into, or the DSP silently drops the ones that do not fit: records are
+    # capped at kProbeMaxRecords and the stage region starts after them.
+    stage_offset = (
+        dsp["kProbeHeaderInts"] + dsp["kProbeMaxRecords"] * dsp["kProbeRecordInts"]
+    )
+    dsp_words = dsp["kProbeBase"] + stage_offset + dsp["kProbeStages"] * 4
+    assert host["kProbeRecords"] >= dsp["kProbeMaxRecords"]
+    assert dsp_words * 4 <= host["kProbeBytes"]
+
+    # The written record has to be one the host reads whole.
+    assert dsp["kProbeRecordTimeInt"] < host["kProbeRecordInts"]
