@@ -222,11 +222,11 @@ Worth knowing:
   tracer is attached or `HEXAGON_TRACE` asks for it. Nothing else pays.
 - the records cover the first 508 commands of a delegate; past that the phase
   events and the op-type totals are all there is.
-- the Inspector reports a delegated row in the units the delegate logged it in,
-  which for these is nanoseconds, while it scales non-delegated rows to the unit
-  asked for. A run that wants one unit across the table passes a
-  `delegate_time_scale_converter`, which is handed the row's name and so can
-  tell a phase from a command.
+- the Inspector scales a delegated row by the same factor as any other, taking
+  the delegate's timestamps to be on the source time scale. These are on it
+  (`pal_current_ticks`, nanoseconds), so a proxy run needs nothing extra; a
+  delegate that logged in some other unit would need a
+  `delegate_time_scale_converter`.
 - `HEXAGON_TRACE=1` keeps its stderr trace, now with each command's time when
   the skel reports one.
 
