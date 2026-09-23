@@ -652,7 +652,14 @@ Working and verified without a device:
   `MATMUL_Q4A16_GEMV_I8` (41) or `MATMUL_W8A16_GEMV_I8` (45) command, and the
   host interpreter reads the blob back and reproduces the kernels' arithmetic
   within a few percent of the dequantized reference. See "Quantized matmuls" for
-  what that arithmetic is and what is still unverified;
+  what that arithmetic is and what is still unverified. **Neither GEMV entry has
+  been run on hexagon-sim or on a device**: the host leg above is a transcription
+  of the kernels' read paths, so the packer's byte order and the `K % 64` / `N %
+  32` guards are still checked only against each other, and a wrong byte order
+  there would decode to plausible-looking numbers rather than to an error. These
+  two are the largest thing in this batch that the simulator has not seen, and
+  closing them needs a quantized case in `test_blob_on_sim.py` rather than a
+  device;
 - a vision attention block goes all the way through once `FuseVisionAttention` is
   in the caller's `transform_passes`: a three-projection ViT attention over a
   dynamic patch count partitions into one delegate whose blob carries one
@@ -693,6 +700,18 @@ Working and verified without a device:
   tensor rounded to fp16 was the same defect the sum gate was added for. See
   `test/test_overload_reductions.py`, `test/test_overload_clamp.py` and
   `test/test_overload_census.py`.
+- the commands this branch added have run on hexagon-sim and answer torch
+  bit-for-bit, with the two quantized GEMV entries as the exception noted below:
+  the row gather on an `ic=33`/`oc=35` shape whose 32x32 tiles are
+  neither square nor whole, with two indices past the vocabulary that the kernel
+  clears and torch refuses; a reduction whose span arrives as a run-time patch,
+  run at a length shorter than its export with the arena past that length filled
+  with a value no correct answer can contain; max pooling; the clamp family on a
+  NaN; and the vision attention on `[1,4,2,64]` and `[2,3,4,64]`. Average
+  pooling comes back within 1.95e-3, which is its fp16 `1/count` divisor, and the
+  same file carries three controls that assert the opposite -- a row-major tile
+  table, a blanked dynamic trailer and an exchanged pool layout each have to move
+  the answer, and they do. See `test/test_blob_on_sim.py`.
 
 Not done yet:
 
@@ -716,13 +735,16 @@ Not done yet:
   `embedding`/`index_select`/`index.Tensor`, `vision_attention` and the
   narrowing and transpose blits. The view, cast, getitem and dequantize emitters
   have run as well but emit nothing by design;
-- **the row gather has never run anywhere but on the host.** Its tiling is a
-  second implementation of the same source, so the tests agree with the reading
-  and not with the hardware. Unverified on device: that the fp16 path's tile
-  order is what `pack_shared_gather_table` writes; the `bytes = 4` (fp32 output)
-  path, which no emitter here reaches; the int4 and int8 table paths; the
-  out-of-range index clearing a row; and what a 311 MB tiled table costs to read
-  against a row-major one;
+- **the row gather has now run on hexagon-sim** and agrees with torch
+  bit-for-bit on the shape that makes its tiling visible: `ic=33`, `oc=35`, so no
+  32x32 tile is whole. The tile order is checked by a control rather than by
+  agreement alone -- the same blob with its weight bytes reordered row-major
+  answers differently, so the case does depend on the order
+  `pack_shared_gather_table` writes. The out-of-range index clearing is
+  exercised too: two of the six indices are past the table. Still unverified on
+  device: the `bytes = 4` (fp32 output) path, which no emitter here reaches; the
+  int4 and int8 table paths; and what a 311 MB tiled table costs to read against
+  a row-major one;
 - attention delegates on fp32 operands that the runtime narrows to fp16 on the
   way into the arena, so the DSP runs fp16 attention. That trade is deliberate
   but unmeasured, and it means a working delegation is not yet a correct one;
@@ -734,17 +756,17 @@ Not done yet:
   pack64 activation and the output repack, and neither is built: the GEMV
   entries wired up here read a single row linearly, which is why they needed no
   repack at all;
-- **the vision attention has never run anywhere but on the host.** Its layout is
-  a second reading of `attention_entry.cc`, and the interpreter agrees with that
-  reading rather than with the hardware. Unverified on device: the layout itself
-  (`[batch, tokens, heads, headDim]` against the kernel's own stride arithmetic,
-  which is the single highest-risk claim in the emitter); the param order
-  (`batch, tokens, heads, headDim, scale, maskStride, workspaceBytes`);
-  `floatParams[4]` reading the scale's bit pattern; the workspace operand being
-  the second output and being large enough after the kernel's own 128-byte
-  alignment; and the scale's fp32 precision, which the kernel applies per score
-  while this backend's `bmm` and `softmax` are separate commands. Nothing here
-  has been through hexagon-sim, and no build was run for it;
+- **the vision attention has now run on hexagon-sim**, bit-for-bit against torch
+  on `[1,4,2,64]` and `[2,3,4,64]` at `headDim` 64, with the scale passed as the
+  fp32 bit pattern in the param slot it is read from, the mask absent and the
+  workspace operand the second output the kernel requires. The layout is checked
+  by separation rather than by agreement: the head-major reading (`[batch,
+  heads, tokens, headDim]`) answers 1.2 away on these operands, so a case that
+  could not tell the two apart would fail its own control. Still unverified on
+  device: the masked path, which no emitter reaches here; whether the workspace
+  size the emitter reserves holds for every `tokens` the kernel's own 128-byte
+  alignment asks for, since the simulator does not enforce the allocation; and
+  the timing of a real tower;
 - **no multimodal model runs end to end.** The vision attention is one block of a
   vision tower, and a tower still needs the patch embedding, the layer norms, the
   MLP and the projection into the text embedding space; on this backend the
@@ -755,20 +777,20 @@ Not done yet:
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
   1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
   keeps that form off the delegate until the kernel is checked;
-- **pooling, `sum`, `amax` and `fmod` have never run anywhere but on the host.**
-  Their layouts and arithmetic are second implementations of the same sources, so
-  the tests agree with the reading and not with the hardware. Unverified on
-  device: that the two pool blits really take the DSP's pack-area fast path
-  (`try_pack_area_blit` takes the geometry the emitter checks for, but the
-  fallback's numbers were never compared against the fast path on hardware); that
-  `hvx_pool2d_fp16`'s window origin, its out-of-range handling and its `countType`
-  divisor are what the tests model, including its rounding of the fp16 reciprocal
-  and its fp16 accumulation; that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
-  zero-divisor guard agree with the host model, and which of the two paths
-  (`htp_ops_binary_elementwise`'s scalar `apply_fp16` or the fp16 vector tail) the
-  dispatcher takes for subtype 12; and that the reduction's accumulator really is
-  fp32 with an fp16 store, which the `bytes` param asserts and no test can
-  observe;
+- **pooling has now run on hexagon-sim** -- max pooling bit-for-bit against torch
+  and average pooling within 1.95e-3, the fp16 `1/count` divisor, on both
+  `countType` forms -- and `sum` has run through the run-time patch above. A
+  control asserts that the packed layout matters: exchanging the two inner axes
+  of the same buffer answers differently on these operands. `amax` and `fmod`
+  have never run anywhere but on the host. Their layouts and arithmetic are
+  second implementations of the same sources, so the tests agree with the reading
+  and not with the hardware. Unverified on device: that the two pool blits really
+  take the DSP's pack-area fast path (`try_pack_area_blit` takes the geometry the
+  emitter checks for, but the fallback's numbers were never compared against the
+  fast path, and this suite models the fallback deliberately); the pool's window
+  origin and out-of-range handling beyond the two cases above; `amax`'s signed
+  zero and NaN tie-break; and that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
+  zero-divisor guard agree with the host model;
 - **the fused rectified sum (`add_relu`, subtype 8) has never run anywhere but on
   the host**, because no ATen op produces `max(a + b, 0)`: `relu(x + y)` reaches
   the graph as an add and a relu, and `FuseAddReluPass` in the caller's
@@ -781,21 +803,21 @@ Not done yet:
   propagates a NaN where torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour
   is not documented here; and that an add whose sum has another reader still gets
   the command, which is a partition question rather than a kernel one.
-- **the clamp entry point has never run anywhere but on the host.** Four edge
-  ops now reach it -- `clamp`, `hardtanh`, `relu` and `relu6` -- and the
-  arithmetic the tests model is a transcription of `htp_ops_clamp_fp16_chunk`
-  (`unary_ops.cc:498-541`), not the kernel. Unverified on device: that the two
-  bounds really are read as fp16 bit patterns out of params[3] and params[4] and
-  in that order; that the NaN restore's bit test (`|x| > 0x7c00`) is the test the
-  kernel performs, since it is the only thing standing between a NaN input and
-  the upper bound; that the vector loop's unordered compares agree with the
-  scalar tail the tests also model (`Q6_Q_vcmp_gt_VhfVhf` on a NaN is not
-  documented here); that an upper bound of `+inf`, which is what makes relu a
-  `max(x, 0)`, really is a compare that never fires on the DSP; and that the
-  fp16 literal `6.0` narrows to the same word `F.relu6` compares against. This
-  is the one place in this batch where a delegated op's correctness rests on a
-  NaN path no host test can exercise, and it is worth a device run before
-  trusting `relu` on data that can be NaN.
+- **the clamp entry point has run on hexagon-sim, and the NaN path it was feared
+  for is not one path but two.** On a tensor of 64 fp16 elements or more the
+  kernel takes its vector loop and restores a NaN by the `(|x| & 0x7fff) > 0x7c00`
+  bit test: `relu`, `relu6` and `hardtanh(-1, 1)` all come back bit-for-bit
+  against torch, NaN included, and the two bounds are read as fp16 bit patterns
+  out of params[3] and params[4] in that order. Below one vector there is no
+  vector loop and no bit test -- `unary_ops.cc:536-539` is `x < lo ? lo : x > hi ?
+  hi : x` -- and on the simulator that answers a NaN with the *upper bound*:
+  `relu(NaN)` comes back as `+inf` where torch and the host model return the NaN.
+  No exception, no shape change, one wrong number. `test_blob_on_sim.py` reports
+  this as `xfail(strict=True)` on a 32-element case rather than asserting it
+  away, and the same file's 128-element cases are the ones that pass. Whether
+  silicon's scalar fp16 compare is ordered the way IEEE says, and so agrees with
+  torch instead, needs a device run before `relu` is trusted on data that can be
+  NaN; either way the kernel has no bit test on that path;
 - **`torch.mean(x)` / `torch.max(x)` / `x ** 2` have never run anywhere but on
   the host either**, in the same sense as the other reductions: the span
   `[1][numel][1]` and the unary square are transcriptions. The mean's span is

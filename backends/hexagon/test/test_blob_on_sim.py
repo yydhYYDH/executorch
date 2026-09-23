@@ -32,13 +32,14 @@ import torch
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
+import blob_interpreter  # noqa: E402
 import hexagon_sim  # noqa: E402
 from blob_interpreter import Arena, execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from torch.export import Dim, export  # noqa: E402
 
 
 def _program(graph_module):
@@ -95,6 +96,17 @@ _SOURCES = [
     "attention_hmx.cc",
     "attention_hmx_queue.cc",
     "hmx_queue.cc",
+    # The commands this branch added. Each is the translation unit the skel
+    # builds for that op and nothing else: the pool wrapper and its HVX walk,
+    # the row gather's fp16 read path, and the two GEMV entries with their
+    # packers' read side.
+    "pool_ops.cc",
+    "ops/pool_fp16.c",
+    "shared_gather_ops.cc",
+    "matmul_q4block_ops.cc",
+    "ops/matmul_q4block_gemv_i8.c",
+    "ops/matmul_q4block_fp16_mle32.c",
+    "ops/matmul_w8a16_gemv_i8.c",
     # The kernels above call htp_probe_stage, which the device build defines in
     # execute_command.cc -- a translation unit with the whole op table behind it,
     # so the probe is linked on its own here. It is a trace hook and every kernel
@@ -130,6 +142,22 @@ _MEAN_TOLERANCE = 1e-6
 # kept above that because the approximation is what it is; how it behaves outside
 # this range is unverified.
 _SILU_TOLERANCE = 1e-6
+
+#: The pool's average divides by `1/count` narrowed to fp16 before the multiply
+#: (pool_fp16.c:74-86), so the divisor is not exact and neither is the answer.
+#: The worst the two cases showed on the simulator is 1.95e-3, and the ceiling
+#: sits just above it rather than at a rounder number that would hide a wrong
+#: window: a kernel reading the wrong neighbourhood is off by far more.
+_POOL_TOLERANCE = 5e-3
+
+#: The vision attention exponentiates in fp32 with the same approximate exp2 the
+#: softmax kernel uses, but its result is a convex combination of at most
+#: `tokens` values, so the approximation's error reaches the output damped rather
+#: than at full size. On the simulator the DSP is bit-exact on both cases and the
+#: host model is within 3.9e-6; the ceiling is set for the host leg, whose fp32
+#: accumulation order is its own. The two layouts this case has to separate are
+#: 1.2 apart, so the margin is four orders of magnitude.
+_VISION_TOLERANCE = 1e-4
 
 
 class _Shapes(torch.nn.Module):
@@ -350,14 +378,47 @@ def _attention_reference(query, key, value):
     return out
 
 
-def _case(tag, program, args, expected, kind="bits", tolerance=None):
-    if isinstance(program, torch.nn.Module):
-        program = to_edge(export(program, tuple(args))).exported_program()
-    blob = HexagonBackend.preprocess(program, []).processed_bytes
+def _case(
+    tag,
+    program,
+    args,
+    expected,
+    kind="bits",
+    tolerance=None,
+    length=0,
+    blob=None,
+    mutate=None,
+    dynamic_shapes=None,
+):
+    """One fixture: a blob, the bytes its inputs are handed as, and its answer.
+
+    `length` is the run-time sequence length a dynamic blob's caller would hand
+    it. The simulator applies the blob's own trailer patches with it, which is
+    what the runtime does before it issues anything; zero says the blob carries
+    no trailer and there is nothing to apply.
+
+    `mutate` rewrites the blob, which is how a case says what the DSP must *not*
+    answer: a control whose comparison would still pass on the wrong bytes says
+    nothing about the real ones.
+    """
+    if blob is None:
+        if dynamic_shapes is None:
+            dynamic_shapes = {}
+        if isinstance(program, torch.nn.Module):
+            program = to_edge(
+                export(program, tuple(args), dynamic_shapes=dynamic_shapes or None)
+            ).exported_program()
+        blob = HexagonBackend.preprocess(program, []).processed_bytes
+    blob = bytes(blob)
+    if mutate is not None:
+        blob = bytes(mutate(blob))
     header, commands = read_blob(blob)
     # execute() checks each input's byte size against the slot the emitters
-    # claimed, so a blob whose inputs are in another order fails here.
-    host = execute(blob, [t.numpy() for t in args])
+    # claimed, so a blob whose inputs are in another order fails here. The length
+    # is stated because a dynamic case hands over the whole bound-sized slot
+    # rather than the run-time tensor; it is the same number the simulator is
+    # given, and the trailer's own longest length is asserted against both.
+    host = execute(blob, [t.numpy() for t in args], length=length or None)
     arena = Arena(header, blob, "fixture")
     return SimpleNamespace(
         tag=tag,
@@ -369,12 +430,273 @@ def _case(tag, program, args, expected, kind="bits", tolerance=None):
         kind=kind,
         tolerance=tolerance,
         arena_bytes=len(arena.bytes),
+        length=length,
+        args=tuple(args),
     )
 
 
 def _tagged(cases, tag):
     """One case by tag. Indexing the list would break when a case is added."""
     return next(case for case in cases if case.tag == tag)
+
+
+# --- The commands this branch put on the DSP for the first time ---------------
+#
+# Everything above runs a command the backend already had. Below is each of the
+# six the branch added, chosen so that the thing the branch assumed is the thing
+# the run decides:
+#
+#   * the row gather's 32x32 tile order, on an `ic`/`oc` that is neither a
+#     multiple of 32 nor square -- the shape where a wrong reading of the inner
+#     order cannot coincidentally agree;
+#   * a reduction whose span holds the run-time length, run at a length shorter
+#     than the one it was exported for, with the arena past that length carrying
+#     values no correct answer can contain;
+#   * both quantized GEMV entries, whose packers' byte orders were written from
+#     the kernels' read paths and never run;
+#   * the clamp family's NaN path, which the branch itself calls its largest
+#     on-device risk;
+#   * the pool's packed window walk, which the host model deliberately does not
+#     model as the fast path the emitter asserts;
+#   * the vision tower's attention layout, which is positional and unchecked.
+
+_SHARED_GATHER = 23
+_POOL2D = 1
+_UNARY = 4
+_REDUCTION = 29
+_VISION_ATTENTION = 43
+_Q4A16_GEMV = 41
+_W8A16_GEMV = 45
+
+
+def _table_ints(oc, ic):
+    """A table whose every element is a distinct small integer.
+
+    Half-integers would do, but integers keep every sum and product in the
+    references below exact, so a disagreement is a disagreement about the
+    arrangement and not about rounding.
+    """
+    rows = torch.arange(oc).reshape(oc, 1)
+    columns = torch.arange(ic).reshape(1, ic)
+    return ((rows * 3 + columns * 5) % 37 - 18).half()
+
+
+def _fake(tensor):
+    """A metadata value that is a tensor and still not one the export step can read.
+
+    `constant_value` refuses a FakeTensor by name, which is how the emitters tell
+    a weight they can see from an operand only the caller has; a real tensor in a
+    placeholder's metadata would look like a weight. A hand-built graph has to
+    make that distinction itself, and this is how it does.
+    """
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    return FakeTensorMode().from_tensor(tensor)
+
+
+def _gather_graph(oc, ic, rows):
+    """`embedding` as one SHARED_GATHER.
+
+    The table is an attribute, which is the only kind the emitter can read -- it
+    rearranges the bytes into the order the kernel walks, so a table that only
+    exists at run time has nothing to rearrange. The indices are the caller's own
+    int32 placeholder: the kernel reads `const int32_t[]`, and an int64 tensor
+    would be read as alternating low and high words.
+    """
+    graph = torch.fx.Graph()
+    index = graph.placeholder("index")
+    index.meta["val"] = _fake(torch.empty((rows,), dtype=torch.int32))
+    weight = graph.get_attr("weight")
+    weight.meta["val"] = torch.empty((oc, ic), dtype=torch.float16)
+    out = graph.call_function(
+        exir_ops.edge.aten.embedding.default, args=(weight, index)
+    )
+    out.meta["val"] = torch.empty((rows, ic), dtype=torch.float16)
+    graph.output(out)
+    root = torch.nn.Module()
+    root.weight = torch.nn.Parameter(_table_ints(oc, ic), requires_grad=False)
+    return _program(torch.fx.GraphModule(root, graph))
+
+
+def _gather_reference(table, indices):
+    """The rows the command reads, with an out-of-range index clearing its row.
+
+    `shared_gather_ops.cc:292-295` clears a row whose index is outside
+    `[0, oc)`; `torch.embedding` raises instead. The divergence is the kernel's,
+    so this reference takes it and a test below pins the other side of it.
+    """
+    out = torch.zeros((len(indices), table.shape[1]), dtype=torch.float16)
+    for row, index in enumerate(indices):
+        if 0 <= int(index) < table.shape[0]:
+            out[row] = table[int(index)]
+    return out
+
+
+def _weights_base(blob):
+    """Where the file's weights section starts, from the header and the op count."""
+    header, _ = read_blob(blob)
+    return blob_interpreter.B.HEADER_SIZE + header.n_ops * blob_interpreter.B.OP_SIZE
+
+
+def _row_major_tiles(table):
+    """The same table with each 32x32 tile written plain row-major.
+
+    This is the reading of `shared_gather_ops.cc:296-311` this batch considered
+    first and rejected: the tile's *base* address is right either way, so the
+    blob stays well formed and every table element is still present once. Only
+    the order inside a tile changes, which is exactly the claim under test.
+    """
+    oc, ic = table.shape
+    rows, columns = -(-oc // 32), -(-ic // 32)
+    padded = np.zeros((rows * 32, columns * 32), dtype=np.float16)
+    padded[:oc, :ic] = table.numpy()
+    tiles = padded.reshape(rows, 32, columns, 32)
+    return np.ascontiguousarray(tiles).tobytes()
+
+
+def _with_row_major_table(table):
+    """A rewrite of a gather blob whose stored table is in the order above."""
+
+    def mutate(blob):
+        header, commands = read_blob(blob)
+        gather = next(command for command in commands if command.type == _SHARED_GATHER)
+        ref = gather.inputs[1]
+        at = _weights_base(blob) + ref.offset
+        packed = _row_major_tiles(table)
+        assert ref.size == len(
+            packed
+        ), f"{ref.size} bytes of table, {len(packed)} packed"
+        return blob[:at] + packed + blob[at + ref.size :]
+
+    return mutate
+
+
+class _Pool(torch.nn.Module):
+    def __init__(self, kind, kernel, stride, padding, count_include_pad=True):
+        super().__init__()
+        self.kind = kind
+        if kind == "max":
+            self.pool = torch.nn.MaxPool2d(kernel, stride, padding)
+        else:
+            self.pool = torch.nn.AvgPool2d(
+                kernel, stride, padding, count_include_pad=count_include_pad
+            )
+
+    def forward(self, x):
+        return self.pool(x)
+
+
+class _Clamp(torch.nn.Module):
+    """One of the clamp family: relu, hardtanh and relu6 all lower to the one
+    command, and the NaN path is the branch's own largest risk."""
+
+    def __init__(self, kind, lower=None, upper=None):
+        super().__init__()
+        self.kind = kind
+        self.lower = lower
+        self.upper = upper
+
+    def forward(self, x):
+        if self.kind == "relu":
+            return torch.relu(x)
+        if self.kind == "relu6":
+            return torch.nn.functional.relu6(x)
+        return torch.clamp(x, self.lower, self.upper)
+
+
+def _vision_graph(batch, tokens, heads, head_dim, scale):
+    """`et_hexagon.vision_attention` as one VISION_ATTENTION_FP16.
+
+    The operands go in as the fused op takes them -- `[batch, tokens, heads,
+    headDim]`, heads inside a token's row -- which is the layout the kernel
+    strides by `heads * headDim` (attention_entry.cc:36,41,57). The workspace is
+    the command's second output, sized for the longest run the emitter saw.
+    """
+    from executorch.backends.hexagon.vision_attention import VISION_ATTENTION
+
+    shape = (batch, tokens, heads, head_dim)
+    graph = torch.fx.Graph()
+    operands = []
+    for name in ("query", "key", "value"):
+        node = graph.placeholder(name)
+        node.meta["val"] = torch.empty(shape, dtype=torch.float16)
+        operands.append(node)
+    out = graph.call_function(VISION_ATTENTION, args=(*operands, scale))
+    out.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    graph.output(out)
+    return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
+
+
+def _vision_reference(query, key, value, scale):
+    """The contract in torch ops, sharing no code with the kernel.
+
+    The kernel's inner product is over `headDim` in fp32 and its weights come
+    from an fp32 exponential, so the reference stays in fp32 and the comparison
+    is a tolerance rather than bits.
+    """
+    q = query.float().transpose(1, 2)
+    k = key.float().transpose(1, 2)
+    v = value.float().transpose(1, 2)
+    scores = (q @ k.transpose(-1, -2)) * scale
+    return (scores.softmax(dim=-1) @ v).transpose(1, 2)
+
+
+def _vision_reference_swapped(query, key, value, scale):
+    """The same attention under the *other* reading of the layout.
+
+    `[batch, heads, tokens, headDim]`: the head axis where the kernel puts the
+    token axis, and the token axis where it puts the heads. Nothing about the
+    tensors changes -- this is what the kernel would have computed if its strides
+    were the ones a matmul wants.
+    """
+    q, k, v = (tensor.float() for tensor in (query, key, value))
+    scores = (q @ k.transpose(-1, -2)) * scale
+    return scores.softmax(dim=-1) @ v
+
+
+def _reduction_graph(dim):
+    """`sum(x, dim)` over a sequence whose length the caller picks."""
+
+    class _Sum(torch.nn.Module):
+        def forward(self, x):
+            return torch.sum(x, dim=dim)
+
+    return _Sum()
+
+
+def _lowered_blob(model, args, dynamic_shapes):
+    """The blob the real pipeline produces, and the operands its delegate takes."""
+    from executorch.backends.hexagon.partition.hexagon_partitioner import (
+        HexagonPartitioner,
+    )
+    from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+
+    program = to_edge_transform_and_lower(
+        export(model, tuple(args), dynamic_shapes=dynamic_shapes),
+        partitioner=[HexagonPartitioner()],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    calls = [
+        node
+        for node in program.graph_module.graph.nodes
+        if node.target is torch.ops.higher_order.executorch_call_delegate
+    ]
+    assert len(calls) == 1, f"the graph did not reach one delegate: {calls}"
+    submodule = program.graph_module.get_submodule(calls[0].args[0].target)
+    return bytes(submodule._processed_bytes)
+
+
+def _strip_trailer(blob):
+    """A blob whose dynamic trailer no longer parses: the patches are gone.
+
+    This is what the pre-`efe2a64` emitter produced, byte for byte: the command
+    still describes the exported bound and nothing recomputes it. The simulator
+    is handed the same fixture, so the only difference between this case and the
+    one above it is whether the run-time length reaches the param.
+    """
+    at = blob.find(blob_interpreter.B.DYNAMIC_TRAILER_MAGIC.to_bytes(4, "little"))
+    assert at >= 0, "a dynamic blob carries a trailer"
+    return blob[:at] + b"\0\0\0\0" + blob[at + 4 :]
 
 
 def _cases():
@@ -544,7 +866,193 @@ def _cases():
         absorbed,
         pinned,
         *([attention] if attention is not None else []),
+        *_branch_cases(),
     ]
+
+
+#: The length the dynamic cases are exported for, the run-time length they are
+#: actually run at, and the row width of the sequences below.
+_UPPER = 16
+_RUN = 3
+_ROW = 8
+
+#: What the arena holds past the run-time length. A command that still reads the
+#: exported bound folds this in, and no correct answer can contain it.
+_POISON = 256.0
+
+
+def _sequence(width):
+    """A bound-sized sequence whose first `_RUN` rows are live.
+
+    The operand a dynamic graph is handed is the run-time tensor; the arena slot
+    behind it is the exported bound, and what sits in that tail is whatever the
+    last call left there. A fixture has to state it, and stating it as poison is
+    what makes an unpatched command fail instead of passing on zeros.
+    """
+    live = ((torch.arange(_RUN * width).reshape(_RUN, width) * 3) % 29 - 14).half()
+    bound = torch.full((1, _UPPER, width), _POISON, dtype=torch.float16)
+    bound[:, :_RUN, :] = live
+    return bound
+
+
+def _branch_cases():
+    """The commands this branch added, on the DSP."""
+    cases = []
+
+    # 1. The row gather. `oc` and `ic` are neither multiples of 32 nor equal, so
+    #    every row of every tile is off by a different amount if the inner order
+    #    is read as plain row-major. Two of the indices are outside the
+    #    vocabulary, which is the one place the kernel and torch disagree.
+    table = _table_ints(35, 33)
+    indices = torch.tensor([3, 34, 35, 0, 17, -1], dtype=torch.int32)
+    gather = _case(
+        "S",
+        _gather_graph(35, 33, len(indices)),
+        (indices,),
+        _bits(_gather_reference(table, indices)),
+    )
+    cases.append(gather)
+    # The same blob with its table written row-major inside each tile: the
+    # reading this batch rejected. Both legs read those bytes, so they must still
+    # agree with each other and must no longer agree with torch.
+    cases.append(
+        _case(
+            "U",
+            _gather_graph(35, 33, len(indices)),
+            (indices,),
+            _bits(_gather_reference(table, indices)),
+            kind="teeth",
+            mutate=_with_row_major_table(table),
+        )
+    )
+
+    # 2. A reduction whose span holds the run-time length. `sum(x, dim=1)` is the
+    #    shape that answered *silently* wrong before efe2a64: the span straddles
+    #    the live rows and the poison together, so the patch is the only thing
+    #    standing between the DSP and a wrong number.
+    sequence = _sequence(_ROW)
+    blob = _lowered_blob(
+        _reduction_graph(1),
+        (torch.zeros(1, _RUN, _ROW, dtype=torch.float16),),
+        {"x": {1: Dim("tokens", min=1, max=_UPPER)}},
+    )
+    expected = _bits(torch.sum(sequence[:, :_RUN, :], dim=1))
+    cases.append(_case("V", None, (sequence,), expected, blob=blob, length=_RUN))
+    # The control: the same command with the trailer gone, which is what the
+    # emitter produced before the fix. Same fixture, same length, so the patch is
+    # the only difference between the two cases.
+    cases.append(
+        _case(
+            "W",
+            None,
+            (sequence,),
+            expected,
+            blob=blob,
+            length=_RUN,
+            kind="teeth",
+            mutate=_strip_trailer,
+        )
+    )
+
+    # 3. The clamp family's NaN path. A NaN has to come back as a NaN: if the
+    #    kernel's restore is not the bit test the branch read, the bound comes
+    #    back instead and nothing raises.
+    torch.manual_seed(11)
+    special = torch.tensor(
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            -0.0,
+            0.0,
+            2.5,
+            -2.5,
+            0.25,
+        ],
+        dtype=torch.float16,
+    )
+    filled = torch.cat([special, torch.randn(24, dtype=torch.float16)]).reshape(2, 16)
+    # The kernel walks the tensor in one-HVX-vector chunks and finishes with a
+    # scalar tail (unary_ops.cc:517-539); only the chunk restores a NaN by the
+    # bit test, so the two sizes are two different code paths and both are here.
+    # 128 elements is two whole vectors with the specials in the first.
+    wide = torch.cat([special, torch.randn(120, dtype=torch.float16)]).reshape(4, 32)
+    for tag, model, operand, kind in (
+        ("X", _Clamp("relu"), wide, "nan"),
+        ("Y", _Clamp("relu6"), wide, "nan"),
+        ("Z", _Clamp("hardtanh", -1.0, 1.0), wide, "nan"),
+        # 32 elements is the tail alone; the case is the branch's own claim run
+        # where the kernel does not keep it, and it is reported rather than
+        # asserted away. See test_the_clamp_tail_answers_a_nan_with_the_bound.
+        ("AF", _Clamp("relu"), filled, "tail"),
+    ):
+        cases.append(
+            _case(
+                tag,
+                model,
+                (operand,),
+                _bits(model(operand).half()),
+                kind=kind,
+            )
+        )
+
+    # 4. The pool: the packed window walk between two blits, with the geometry
+    #    the emitter asserts the fast path wants. C is 64, the one channel count
+    #    the support check admits.
+    pooled = (
+        torch.rand(1, 64, 8, 8, generator=torch.Generator().manual_seed(5)) * 8 - 4
+    ).half()
+    max_plain = _case(
+        "AA", _Pool("max", 2, 2, 0), (pooled,), _bits(_Pool("max", 2, 2, 0)(pooled))
+    )
+    cases.append(max_plain)
+    avg_padded = _Pool("avg", 3, 2, 1, count_include_pad=True)
+    cases.append(
+        _case(
+            "AB",
+            avg_padded,
+            (pooled,),
+            _bits(avg_padded(pooled)),
+            kind="close",
+            tolerance=_POOL_TOLERANCE,
+        )
+    )
+    avg_valid = _Pool("avg", 2, 2, 0, count_include_pad=False)
+    cases.append(
+        _case(
+            "AC",
+            avg_valid,
+            (pooled,),
+            _bits(avg_valid(pooled)),
+            kind="close",
+            tolerance=_POOL_TOLERANCE,
+        )
+    )
+
+    # 5. The vision tower's attention. The layout is the one assumption both
+    #    readings of attention_entry.cc share, and the batch loop is the kernel's
+    #    outermost, so it gets a case of its own. Random operands rather than the
+    #    periodic ones above: on the periodic data the two layouts happen to
+    #    answer the same thing, and a case that cannot tell them apart decides
+    #    nothing.
+    for tag, batch, tokens, heads in (("AD", 1, 4, 2), ("AE", 2, 3, 4)):
+        head_dim, scale = 64, 0.125
+        shape = (batch, tokens, heads, head_dim)
+        generator = torch.Generator().manual_seed(7)
+        operands = [
+            (torch.rand(shape, generator=generator) * 2 - 1).half() for _ in range(3)
+        ]
+        cases.append(
+            _case(
+                tag,
+                _vision_graph(batch, tokens, heads, head_dim, scale),
+                tuple(operands),
+                _bits(_vision_reference(*operands, scale=scale).half()),
+                kind="close",
+                tolerance=_VISION_TOLERANCE,
+            )
+        )
+    return cases
 
 
 def _bits(values):
@@ -569,8 +1077,8 @@ def _fixture_header(cases):
     lines.append("static const BlobFixture kFixtures[] = {")
     for index, case in enumerate(cases):
         lines.append(
-            f'  {{"{case.tag}", kBlob{index}, kInputData{index}, '
-            f"sizeof(kInputData{index})}},"
+            f'  {{"{case.tag}", kBlob{index}, sizeof(kBlob{index}), '
+            f"kInputData{index}, sizeof(kInputData{index}), {case.length}}},"
         )
     lines.append("};")
     lines.append(f"static const unsigned kFixtureCount = {len(cases)};")
@@ -629,20 +1137,99 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
             command.patch_param != 0xFFFFFFFF
             for command in _tagged(cases, tag).commands
         ), f"{tag}: the cache advance has no patched parameter"
+    # The commands this branch added, each on the op type it claims to be.
+    assert kinds["S"] == [_SHARED_GATHER], "the row gather is not a shared gather"
+    assert kinds["S"] == kinds["U"], "the control is not a copy of the gather case"
+    assert kinds["V"] == [_REDUCTION], "the dynamic sum is not a reduction"
+    assert kinds["V"] == kinds["W"], "the control is not a copy of the sum case"
+    for tag in ("X", "Y", "Z", "AF"):
+        assert kinds[tag] == [_UNARY], f"{tag}: the clamp family is not the unary one"
+    assert all(
+        next(iter(_tagged(cases, tag).commands)).params[0] >= 64
+        for tag in ("X", "Y", "Z")
+    ), "a clamp case is short enough to run the scalar tail"
+    assert (
+        next(iter(_tagged(cases, "AF").commands)).params[0] < 64
+    ), "AF is meant to be the scalar tail alone"
+    for tag in ("AA", "AB", "AC"):
+        # The emitter's two blits around the command are part of the command
+        # being what it claims: without them the kernel reads other channels.
+        assert kinds[tag] == [3, _POOL2D, 3], f"{tag}: the pool is not pack/pool/unpack"
+    for tag in ("AD", "AE"):
+        assert kinds[tag] == [_VISION_ATTENTION], f"{tag}: not a vision attention"
+
+    # The dynamic cases carry the record the run-time length arrives by, and the
+    # static ones carry none: a patch on a command that never mentions the length
+    # is as wrong as leaving one off. Both halves are asserted, because the
+    # simulator applies whatever is there.
+    dynamic = blob_interpreter.read_dynamic_trailer(_tagged(cases, "V").blob)
+    assert dynamic is not None, "the dynamic sum carries no trailer"
+    assert (dynamic.axis, dynamic.max_length) == (
+        1,
+        _UPPER,
+    ), f"the trailer names axis {dynamic.axis} up to {dynamic.max_length}"
+    assert dynamic.patches == [(0, 1, 1, 0)], f"the sum patched {dynamic.patches}"
+    # The blob on disk still describes the bound: the run-time length only ever
+    # reaches this command through the patch, which is what the case decides.
+    assert _tagged(cases, "V").commands[0].params[1] == _UPPER
+    assert (
+        blob_interpreter.read_dynamic_trailer(_tagged(cases, "W").blob) is None
+    ), "the control still carries its trailer"
+    for tag in ("S", "X", "Y", "Z", "AF", "AA", "AB", "AC", "AD", "AE"):
+        assert (
+            blob_interpreter.read_dynamic_trailer(_tagged(cases, tag).blob) is None
+        ), f"{tag}: a static blob carries a trailer"
 
 
 def test_every_blob_agrees_three_ways(cases, simulated):
     for case in cases:
         dsp = simulated[f"{case.tag}0"]
         host = _from_bits([int(value) for value in _host_bits(case.host[0])])
-        if case.kind == "bits":
-            expected = case.expected.view("uint16").tolist()
+        expected = case.expected
+        if case.kind == "teeth":
+            # A control case: its bytes are the ones a wrong assumption would
+            # have produced. The two models still have to agree with each other
+            # -- a disagreement here would be a finding of its own -- and the
+            # answer has to have moved, or the comparison on the real bytes is
+            # vacuous.
             assert (
-                _host_bits(case.host[0]) == expected
+                _host_bits(case.host[0]) == dsp
+            ), f"{case.tag}: the host and the DSP disagree on the control's bytes"
+            assert dsp != expected.view("uint16").tolist(), (
+                f"{case.tag}: the control produced the right answer, so the "
+                "assumption it was built to falsify is not being tested"
+            )
+            continue
+        if case.kind == "bits":
+            expected_bits = expected.view("uint16").tolist()
+            assert (
+                _host_bits(case.host[0]) == expected_bits
             ), f"{case.tag}: the host model disagrees with torch"
-            assert dsp == expected, f"{case.tag}: the DSP disagrees with torch"
+            assert dsp == expected_bits, f"{case.tag}: the DSP disagrees with torch"
+        elif case.kind == "tail":
+            # The one case the DSP does not agree on, and a real wrong answer
+            # rather than a tolerance: it is asserted on its own, below.
+            continue
+        elif case.kind == "nan":
+            # Bit-exact, except that one NaN is as good as another: the claim is
+            # that a NaN comes back as a NaN rather than as the bound.
+            want = expected.view("uint16").tolist()
+            for name, got in (("host model", _host_bits(case.host[0])), ("DSP", dsp)):
+                if np.array_equal(_from_bits(got), _from_bits(want), equal_nan=True):
+                    continue
+                moved = [
+                    (index, _from_bits(got)[index], _from_bits(want)[index])
+                    for index in range(len(want))
+                    if not (
+                        np.isnan(_from_bits(got)[index])
+                        and np.isnan(_from_bits(want)[index])
+                    )
+                    and _from_bits(got)[index] != _from_bits(want)[index]
+                ]
+                raise AssertionError(
+                    f"{case.tag}: {name} disagrees with torch at {moved[:8]}"
+                )
         else:
-            expected = case.expected
             for name, got in (("host model", host), ("DSP", _from_bits(dsp))):
                 worst = float(
                     np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
@@ -669,3 +1256,135 @@ def test_the_dsp_result_would_move_if_the_blob_did(cases):
     assert _host_bits(changed[0]) != _host_bits(
         case.host[0]
     ), "changing the region changed nothing, so the comparison is vacuous"
+
+
+def test_an_index_past_the_vocabulary_is_where_torch_and_the_kernel_part(cases):
+    """The other side of the gather case's out-of-range indices.
+
+    `shared_gather_ops.cc:292-295` clears the row; `torch.embedding` raises. The
+    case above takes the kernel's answer, so this is where the divergence itself
+    is stated rather than left implicit in a reference nobody reads.
+    """
+    table = _table_ints(35, 33)
+    for bad in (35, -1):
+        with pytest.raises(IndexError):
+            torch.nn.functional.embedding(torch.tensor([bad]), table)
+
+
+def test_a_nan_comes_back_as_a_nan_and_not_as_the_bound(cases, simulated):
+    """The clamp family's NaN path, which the branch called its largest risk.
+
+    If the kernel's restore is not the bit test it was read from, a NaN input
+    comes back as the upper bound: no exception, no wrong shape, one wrong
+    number. `nan` comparisons pass on either answer by construction, so this is
+    the assertion with teeth -- and it is on the DSP's own output.
+    """
+    for tag, bound in (("X", None), ("Y", 6.0), ("Z", 1.0)):
+        dsp = _from_bits(simulated[f"{tag}0"])
+        assert np.isnan(dsp[0]), f"{tag}: the DSP answered {dsp[0]} for a NaN"
+        if bound is not None:
+            assert dsp[0] != np.float16(
+                bound
+            ), f"{tag}: a NaN input came back as the upper bound {bound}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="the simulator answers a NaN with the upper bound when the clamp runs "
+    "its scalar tail: unary_ops.cc:536-539 has no NaN bit test, and `x > hi` is "
+    "true for a NaN there. Reported in SIM-report.md rather than asserted away.",
+)
+def test_the_clamp_tail_answers_a_nan_with_the_bound(cases, simulated):
+    """A wrong answer found on the simulator, on a tensor shorter than one vector.
+
+    `htp_ops_clamp_fp16_chunk` restores a NaN by the `(|x| & 0x7fff) > 0x7c00`
+    bit test inside its vector loop (unary_ops.cc:531-532). A tensor of fewer
+    than 64 fp16 elements never reaches that loop: `vec_end` is zero and every
+    element goes through `x < lo ? lo : x > hi ? hi : x`, which has no bit test
+    at all. On the simulator that answers a NaN with the upper bound -- `inf` for
+    relu -- where torch, and the host model, return the NaN.
+
+    The case is 32 elements, so it is the tail and nothing else; `X` above is the
+    same claim on 128 elements, which is the path that does keep it.
+    """
+    assert _tagged(cases, "AF").kind == "tail"
+    dsp = _from_bits(simulated["AF0"])
+    host = _from_bits(_host_bits(_tagged(cases, "AF").host[0]))
+    assert np.isnan(host[0]), f"the host model answered {host[0]}"
+    assert np.isnan(
+        dsp[0]
+    ), f"the DSP answered {dsp[0]} for a NaN in a 32-element tensor"
+
+
+def test_the_vision_case_can_tell_the_two_layouts_apart(cases):
+    """Both readings of attention_entry.cc are readings of the same C.
+
+    The other one is `[batch, heads, tokens, headDim]` -- the transposed tensor
+    a matmul would want, with the token axis where the heads are. If this case
+    cannot separate the two, running it decides nothing, so the separation is
+    asserted here rather than assumed from the fact that the layouts are spelled
+    differently.
+    """
+    case = _tagged(cases, "AD")
+    query, key, value = case.args
+    swapped = _vision_reference_swapped(query, key, value, 0.125)
+    worst = float(
+        np.max(
+            np.abs(
+                swapped.float().numpy().reshape(-1) - case.expected.astype(np.float32)
+            )
+        )
+    )
+    assert worst > _VISION_TOLERANCE, (
+        f"the two readings answer within {worst}, so the tolerance above cannot "
+        "tell them apart"
+    )
+
+
+def test_the_pool_case_can_tell_the_packed_layout_apart(cases):
+    """The blits around the pool command are load bearing.
+
+    The kernel reads its activation as 64-channel blocks, `(y*width + x)*64 + c`.
+    Over the row-major buffer that is the same read with the two axes' roles
+    exchanged, and on this input that is a different answer -- which is what
+    makes the case above a test of the whole chain and not just of the window
+    walk.
+    """
+    case = _tagged(cases, "AA")
+    pooled = case.args[0]
+    exchanged = (
+        pooled.reshape(1, 64, -1).transpose(1, 2).contiguous().reshape(pooled.shape)
+    )
+    window = _Pool("max", 2, 2, 0)
+    assert not torch.equal(
+        window(exchanged).half(), torch.from_numpy(case.expected.copy())
+    ), (
+        "reading the buffer as blocks gives the same answer, so this case does "
+        "not see the layout at all"
+    )
+
+
+def test_the_run_time_length_is_what_moves_the_reduction(cases, simulated):
+    """The patch is the difference between the two dynamic cases.
+
+    Both are the same blob and the same fixture; one carries the trailer the
+    runtime applies and the other has it blanked, which is what the emitter
+    produced before `efe2a64`. On the DSP the first has to match torch at the run
+    length and the second must answer the exported bound instead. If both
+    matched, the poison past the live rows would be invisible and the case would
+    not be testing the patch at all.
+    """
+    expected = _tagged(cases, "V").expected.view("uint16").tolist()
+    assert (
+        simulated["V0"] == expected
+    ), "the patched DSP answer is not torch at the run length"
+    # The unpatched command sums the whole bound, poison included, so its answer
+    # is the one number that says which span it read.
+    whole = float(torch.sum(_sequence(_ROW), dim=1)[0, 0].float())
+    assert abs(float(_from_bits(simulated["W0"])[0]) - whole) < 1.0, (
+        f"the unpatched answer is {float(_from_bits(simulated['W0'])[0])}, not the "
+        f"{whole} a whole-bound read gives"
+    )
+    assert float(_from_bits(simulated["W0"])[0]) != float(
+        _from_bits(simulated["V0"])[0]
+    ), "the two cases answered the same thing"

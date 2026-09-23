@@ -37,11 +37,18 @@ static void print_bits(const char *tag, const _Float16 *v, int n) {
   printf("\n");
 }
 
+/* The buffers below are declared 128-byte aligned because the kernels read and
+ * write them a vector at a time, and an HVX access wants that alignment. Without
+ * it the array lands wherever the linker puts it and the result depends on the
+ * size of the whole shared object rather than on the kernel. */
+
 /* The fused norm. gamma and beta are fp32 even though src and dst are fp16,
  * which is only visible in layer_norm_ops.cc and reads garbage if missed. */
 static void run_norm(void) {
-  static _Float16 src[ROWS * INNER], dst[ROWS * INNER];
-  static float gamma[INNER], beta[INNER];
+  static _Float16 src[ROWS * INNER] __attribute__((aligned(128)));
+  static _Float16 dst[ROWS * INNER] __attribute__((aligned(128)));
+  static float gamma[INNER] __attribute__((aligned(128)));
+  static float beta[INNER] __attribute__((aligned(128)));
   for (int i = 0; i < ROWS * INNER; ++i)
     src[i] = (_Float16)((float)((i * 7) % 13 - 6) * 0.5f);
   for (int i = 0; i < INNER; ++i) {
@@ -60,7 +67,9 @@ static void run_norm(void) {
 /* Operands are small integers, so products and sums are exact and agreement
  * does not depend on the order either side accumulates in. */
 static void run_mm(void) {
-  static _Float16 a[M * K], b[K * N], c[M * N];
+  static _Float16 a[M * K] __attribute__((aligned(128)));
+  static _Float16 b[K * N] __attribute__((aligned(128)));
+  static _Float16 c[M * N] __attribute__((aligned(128)));
   for (int i = 0; i < M * K; ++i) a[i] = (_Float16)((float)((i * 5) % 7 - 3));
   for (int i = 0; i < K * N; ++i) b[i] = (_Float16)((float)((i * 3) % 5 - 2));
   print_bits("A", a, M * K);
@@ -91,7 +100,8 @@ static void run_mm(void) {
 
 /* A 2x3 transpose, which is the region _emit_permute produces. */
 static void run_blit(void) {
-  static _Float16 src[6], dst[6];
+  static _Float16 src[6] __attribute__((aligned(128)));
+  static _Float16 dst[6] __attribute__((aligned(128)));
   for (int i = 0; i < 6; ++i) src[i] = (_Float16)((float)(i * 2 - 5));
   print_bits("SRC", src, 6);
 

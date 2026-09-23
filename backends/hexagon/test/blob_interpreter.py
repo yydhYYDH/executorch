@@ -336,6 +336,90 @@ def _patched(command: Command, arena: Arena) -> List[int]:
     return params
 
 
+@dataclass(frozen=True)
+class DynamicTrailer:
+    """The dynamic metadata a blob carries after its weights.
+
+    `input_index` and `axis` name the operand the run-time length is read off;
+    `max_length` is the longest the export declared. Each patch names one
+    command's parameter slot and the scale a length reaches it by.
+    """
+
+    input_index: int
+    axis: int
+    max_length: int
+    example_length: int
+    patches: List[Tuple[int, int, int, int]]
+
+
+def read_dynamic_trailer(data: bytes) -> Optional[DynamicTrailer]:
+    """The trailer, or None for a blob whose lengths are all static.
+
+    Mirrors the runtime: it starts where the weights section ends, which is
+    `read_external_weights`' own answer for where the next section begins.
+    """
+    at = read_external_weights(data).trailer_at
+    if at + B._DYNAMIC_HEADER_V3.size > len(data):
+        return None
+    magic, _version, input_index, axis, max_length, n_patches, example = (
+        B._DYNAMIC_HEADER_V3.unpack_from(data, at)
+    )
+    if magic != B.DYNAMIC_TRAILER_MAGIC:
+        return None
+    at += B._DYNAMIC_HEADER_V3.size
+    patches = [
+        B._DYNAMIC_PATCH.unpack_from(data, at + 16 * i) for i in range(n_patches)
+    ]
+    return DynamicTrailer(
+        input_index=input_index,
+        axis=axis,
+        max_length=max_length,
+        example_length=example,
+        patches=patches,
+    )
+
+
+def _length_patches(
+    data: bytes, inputs: Sequence[np.ndarray], length: Optional[int] = None
+) -> Dict[int, Dict[int, int]]:
+    """The params the run-time length rewrites, keyed by command then slot.
+
+    The runtime derives the length from the shape of the input the trailer names
+    and writes `length * scale + add` into the named slot of the named command
+    before it issues anything (hexagon_backend.cpp:2147-2156). Reading it back
+    off the operand the caller actually passed is the whole point: a command
+    whose span holds the exported bound instead of the run length answers a
+    question about the arena rather than about the caller's tensor.
+
+    `length` is that number stated outright, for a caller whose operand is the
+    whole bound-sized arena slot rather than the tensor the runtime would be
+    handed -- a fixture has to write the slot to say what is past the live rows.
+    """
+    trailer = read_dynamic_trailer(data)
+    if trailer is None:
+        return {}
+    if length is None:
+        if trailer.input_index >= len(inputs):
+            raise ValueError(
+                f"hexagon: the trailer names input {trailer.input_index}, "
+                f"and {len(inputs)} were passed"
+            )
+        shape = inputs[trailer.input_index].shape
+        if trailer.axis >= len(shape):
+            raise ValueError(
+                f"hexagon: the trailer's axis {trailer.axis} is past a rank "
+                f"{len(shape)} operand"
+            )
+        length = int(shape[trailer.axis])
+    rewritten: Dict[int, Dict[int, int]] = {}
+    for op_index, param_index, scale, add in trailer.patches:
+        value = length * scale + add
+        if not -(1 << 31) <= value < (1 << 31):
+            raise ValueError(f"hexagon: dynamic patch {value} does not fit int32")
+        rewritten.setdefault(op_index, {})[param_index] = value
+    return rewritten
+
+
 def _run_raster_blit(command: Command, params: List[int], arena: Arena) -> None:
     """The general fallback of the vendored blit_ops.cc.
 
@@ -846,11 +930,19 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
             f"blob: a reduction over {unit}-byte values is not modelled"
         )
     src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
-    if src.size != outside * reduce * inside:
+    # Fewer elements than the slot holds is the run-time case, not a mistake: the
+    # operand's ref is the exported bound, while a span the trailer patches
+    # describes the part of it this call filled. More than the slot holds is the
+    # direction that reads another tensor's bytes, and stays refused.
+    if src.size < outside * reduce * inside:
         raise UnsupportedOp(
             f"blob: {src.size} values do not fill [{outside}][{reduce}][{inside}]"
         )
-    rows = src.reshape(outside, reduce, inside).astype(np.float32)
+    rows = (
+        src[: outside * reduce * inside]
+        .reshape(outside, reduce, inside)
+        .astype(np.float32)
+    )
     if op_type == REDUCTION_SUM:
         out = rows.sum(axis=1)
     elif op_type == REDUCTION_MAXIMUM:
@@ -1254,12 +1346,19 @@ def execute(
     data: bytes,
     inputs: Sequence[np.ndarray],
     named_data: Optional[Dict[str, bytes]] = None,
+    length: Optional[int] = None,
 ) -> List[np.ndarray]:
     """Runs a blob over the host arena and returns its outputs by index.
 
     `inputs` is indexed by method input index, which is the order the emitters
     declared their placeholders in. `named_data` is the named data map a blob
     with external weights needs, keyed the way the trailer names its entries.
+
+    `length` is the run-time sequence length a dynamic blob's trailer patches are
+    computed from. Left out, it is read off the shape of the operand the trailer
+    names, which is what the runtime does; it is stated only when the operand
+    handed over is the whole bound-sized slot an arena holds rather than the
+    tensor a caller would pass.
     """
     header, commands = read_blob(data)
     if len(inputs) != header.n_inputs:
@@ -1276,13 +1375,22 @@ def execute(
         _copy(arena, arena.address(ref), arena.address(ref), 0)
         arena.bytes[arena.address(ref) : arena.address(ref) + ref.size] = raw
 
-    for command in commands:
+    rewritten = _length_patches(data, inputs, length)
+    for index, command in enumerate(commands):
         executor = _EXECUTORS.get(command.type)
         if executor is None:
             raise UnsupportedOp(
                 f"blob: op type {command.type} is not modelled on the host"
             )
-        executor(command, _patched(command, arena), arena)
+        params = _patched(command, arena)
+        for param_index, value in rewritten.get(index, {}).items():
+            if param_index >= len(params):
+                raise ValueError(
+                    f"hexagon: command {index} carries {len(params)} params and "
+                    f"the trailer patches slot {param_index}"
+                )
+            params[param_index] = value
+        executor(command, params, arena)
 
     outputs = []
     for index in range(header.n_outputs):

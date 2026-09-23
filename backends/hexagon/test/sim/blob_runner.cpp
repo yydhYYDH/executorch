@@ -21,8 +21,15 @@ using namespace executorch::backends::hexagon;
 struct BlobFixture {
   const char *tag;
   const unsigned char *blob;
+  unsigned long long blob_bytes;
   const unsigned char *inputs;
   unsigned int inputs_size;
+  /* The length the caller would hand this blob at run time, for the cases whose
+   * blob carries a dynamic trailer. The runtime reads it off the shape of the
+   * input the trailer names (hexagon_backend.cpp:2006-2021); a fixture has no
+   * shapes, so the test states the same number here and the patches below turn
+   * it into params exactly the way that code does. Zero for a static blob. */
+  long long runtime_length;
 };
 
 extern "C" int htp_ops_binary_elementwise(uint8_t *dst, uint8_t *src0, uint8_t *src1,
@@ -50,6 +57,12 @@ extern "C" int htp_ops_raster_blit(uint8_t *dst, uint8_t **src, int src_number,
                                    int32_t bytes);
 extern "C" int htp_ops_unary(uint8_t *dst, uint8_t *src, int32_t size,
                              int32_t opType, int32_t bytes);
+extern "C" int htp_ops_unary_clamp(uint8_t *dst, uint8_t *src, int32_t size,
+                                   int32_t min_bits, int32_t max_bits);
+extern "C" int htp_ops_unary_row_guard(uint8_t *dst, uint8_t *mask, uint8_t *src,
+                                       int32_t size, int32_t row_len, int32_t pad);
+extern "C" int htp_ops_unary_scale(uint8_t *dst, uint8_t *src, int32_t size,
+                                   int32_t scale_bits);
 extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v,
                                   uint8_t *mask, uint8_t *workspace,
                                   uint8_t *pastK, uint8_t *pastV, int32_t qo_len,
@@ -58,16 +71,59 @@ extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v
                                   int32_t head_dim, float scale,
                                   int32_t mask_stride, int32_t max_kv_len,
                                   int32_t value_c4);
+extern "C" int htp_ops_pool2d_fp16(uint8_t *output, uint8_t *input, int32_t batch,
+                                   int32_t ih, int32_t iw, int32_t oh, int32_t ow,
+                                   int32_t c4, int32_t kernelY, int32_t kernelX,
+                                   int32_t strideY, int32_t strideX, int32_t padY,
+                                   int32_t padX, int32_t padType, int32_t countType,
+                                   int32_t poolType);
+extern "C" int htp_ops_shared_gather(uint8_t *dst, uint8_t *indices, uint8_t *weight,
+                                     int32_t selectSize, int32_t ic, int32_t oc,
+                                     int32_t bytes, int32_t isInt4,
+                                     int32_t scaleBlockNum, int32_t scaleAsymmetric);
+extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation,
+                                            uint8_t *weight, uint8_t *bias, int32_t k,
+                                            int32_t n, int32_t scale_block_num,
+                                            int32_t scale_asymmetric);
+extern "C" int hmx_matmulw8a16block_gemv_i8(uint8_t *c, const uint8_t *a,
+                                            const uint8_t *b_wt,
+                                            const uint8_t *b_scale,
+                                            const uint8_t *bias, int32_t K, int32_t N,
+                                            int32_t scale_block_num);
+/* The vision tower's attention. It is a scalar walk over the score matrix
+ * (attention_entry.cc:24-67), not the flash variant the existing suite excludes:
+ * the flash kernel starts a worker pool, which the simulated QuRT cannot, while
+ * this one never reaches the pool at all. */
+extern "C" int htp_ops_vision_attention_fp16(uint8_t *output, const uint8_t *query,
+                                             const uint8_t *key, const uint8_t *value,
+                                             const uint8_t *mask, uint8_t *workspace,
+                                             int32_t batch, int32_t tokens,
+                                             int32_t heads, int32_t headDim,
+                                             float scale, int32_t maskStride,
+                                             int32_t workspaceBytes);
 
 enum {
+  kPool2d = 1,
   kRasterBlit = 3,
   kUnary = 4,
   kLayerNorm = 8,
   kFlashAttn = 18,
   kBinaryElementwise = 19,
+  kSharedGather = 23,
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
+  kQ4A16Gemv = 41,
+  kVisionAttention = 43,
+  kW8A16Gemv = 45,
+};
+
+/* The three unary types that arrive at an entry point of their own, from
+ * unary_ops.cc:15-33. */
+enum {
+  kUnaryClamp = 15,
+  kUnaryRowGuard = 16,
+  kUnaryScale = 17,
 };
 
 #include "blob_fixture.h"
@@ -134,9 +190,66 @@ static const HexagonTensorRef *slot(const HexagonOp *ops, uint32_t n_ops,
   return nullptr;
 }
 
-static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header) {
+/* The dynamic trailer's patches, and the run-time length they are computed
+ * from. The runtime applies these before it issues anything
+ * (hexagon_backend.cpp:2148-2156): every record names one command's parameter
+ * slot and overwrites it with `length * scale + add`. The host interpreter does
+ * not read the trailer, so until this existed nothing but the device could tell
+ * a patched command from one that describes the exported bound. */
+static const HexagonDynamicPatch *g_patches = nullptr;
+static uint32_t g_patch_count = 0;
+static int64_t g_runtime_length = 0;
+
+/* Where the trailer starts: past the ops, past the weights the file carries,
+ * and past the external-weight records when the blob left some behind. */
+static const uint8_t *trailer_of(const uint8_t *blob, const HexagonBlobHeader *header) {
+  const uint8_t *at = blob + sizeof(HexagonBlobHeader) +
+                      (size_t)header->n_ops * sizeof(HexagonOp) + header->weights_bytes;
+  if (header->version == kHexagonBlobVersionExternalWeights) {
+    HexagonExternalWeightsTrailer trailer;
+    memcpy(&trailer, at, sizeof(trailer));
+    at += sizeof(trailer) +
+          (size_t)trailer.n_ext * sizeof(HexagonExternalWeight);
+  }
+  return at;
+}
+
+/* Reads the trailer, if the blob has one. Returns false when it does not. */
+static bool load_patches(const uint8_t *blob, const HexagonBlobHeader *header,
+                         uint64_t blob_bytes) {
+  g_patches = nullptr;
+  g_patch_count = 0;
+  const uint8_t *at = trailer_of(blob, header);
+  if ((uint64_t)(at - blob) + sizeof(HexagonDynamicTrailerV3) > blob_bytes) return false;
+  HexagonDynamicTrailerV3 dynamic;
+  memcpy(&dynamic, at, sizeof(dynamic));
+  if (dynamic.base.magic != kHexagonDynamicTrailerMagic) return false;
+  (void)dynamic.example_length;
+  const size_t patches_at = sizeof(HexagonDynamicTrailerV3);
+  if ((uint64_t)(at - blob) + patches_at +
+          (size_t)dynamic.base.n_patches * sizeof(HexagonDynamicPatch) >
+      blob_bytes)
+    return false;
+  g_patches = (const HexagonDynamicPatch *)(at + patches_at);
+  g_patch_count = dynamic.base.n_patches;
+  return true;
+}
+
+static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
+                       uint32_t op_index) {
   int32_t params[kMaxOpParams];
   memcpy(params, op.params, sizeof(params));
+  /* The runtime's order: the length patches first, then the operands' own ones,
+   * which read back what the caller just handed in. */
+  for (uint32_t i = 0; i < g_patch_count; ++i) {
+    if ((uint32_t)g_patches[i].op_index != op_index) continue;
+    if (g_patches[i].param_index < 0 ||
+        (uint32_t)g_patches[i].param_index >= kMaxOpParams)
+      continue;
+    const int64_t patched =
+        g_runtime_length * g_patches[i].scale + g_patches[i].add;
+    params[g_patches[i].param_index] = (int32_t)patched;
+  }
   if (op.patch_param != kNoOpPatch) {
     int32_t value;
     memcpy(&value, address(header, op.inputs[op.patch_input]), 4);
@@ -144,10 +257,80 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header) {
   }
 
   if (op.type == kUnary) {
-    htp_ops_unary(address(header, op.outputs[0]), address(header, op.inputs[0]),
-                  params[0], params[1], params[2]);
+    /* The dispatcher does not hand every unary to the same entry point
+     * (execute_command.cc:380-398): clamp, the masked-row guard and the scale
+     * take their operands where the rest take an op type. Calling the generic
+     * one for all of them would leave clamp's bounds at the zero its task state
+     * starts at -- clamp(x, 0, 0) -- which is a wrong number rather than an
+     * error, so the split is mirrored here. */
+    if (params[1] == kUnaryClamp) {
+      htp_ops_unary_clamp(address(header, op.outputs[0]),
+                          address(header, op.inputs[0]), params[0], params[3],
+                          params[4]);
+    } else if (params[1] == kUnaryRowGuard) {
+      htp_ops_unary_row_guard(address(header, op.outputs[0]),
+                              address(header, op.inputs[0]),
+                              address(header, op.inputs[1]), params[0], params[3],
+                              params[4]);
+    } else if (params[1] == kUnaryScale) {
+      htp_ops_unary_scale(address(header, op.outputs[0]),
+                          address(header, op.inputs[0]), params[0], params[3]);
+    } else {
+      htp_ops_unary(address(header, op.outputs[0]), address(header, op.inputs[0]),
+                    params[0], params[1], params[2]);
+    }
     return;
   }
+  if (op.type == kPool2d) {
+    /* One operand: the packed activation the emitter's first blit produced,
+     * and the pooled one it writes for the second to read back. */
+    htp_ops_pool2d_fp16(address(header, op.outputs[0]), address(header, op.inputs[0]),
+                        params[0], params[1], params[2], params[3], params[4],
+                        params[5], params[6], params[7], params[8], params[9],
+                        params[10], params[11], params[12], params[13], params[14]);
+    return;
+  }
+  if (op.type == kSharedGather) {
+    /* Indices first, table second -- the order the emitter binds them in, which
+     * is the order execute_command.cc:807 hands mapped_ptrs[0] and [1] to. */
+    htp_ops_shared_gather(address(header, op.outputs[0]),
+                          address(header, op.inputs[0]),
+                          address(header, op.inputs[1]), params[0], params[1],
+                          params[2], params[3], params[4], 1, 0);
+    return;
+  }
+  if (op.type == kQ4A16Gemv) {
+    htp_ops_matmul_q4a16_gemv_i8(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]),
+        absent(op.inputs[2]) ? nullptr : address(header, op.inputs[2]), params[1],
+        params[2], params[8], params[9]);
+    return;
+  }
+  if (op.type == kW8A16Gemv) {
+    hmx_matmulw8a16block_gemv_i8(address(header, op.outputs[0]),
+                                 address(header, op.inputs[0]),
+                                 address(header, op.inputs[1]),
+                                 address(header, op.inputs[2]),
+                                 absent(op.inputs[3])
+                                     ? nullptr
+                                     : address(header, op.inputs[3]),
+                                 params[1], params[2], params[8]);
+    return;
+  }
+  if (op.type == kVisionAttention) {
+    float scale;
+    memcpy(&scale, &params[4], 4);
+    htp_ops_vision_attention_fp16(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]), address(header, op.inputs[2]),
+        op.n_inputs > 3 && !absent(op.inputs[3]) ? address(header, op.inputs[3])
+                                                 : nullptr,
+        address(header, op.outputs[1]), params[0], params[1], params[2], params[3],
+        scale, params[5], params[6]);
+    return;
+  }
+
   if (op.type == kBatchMatmul) {
     htp_ops_batch_matmul(address(header, op.outputs[0]),
                          address(header, op.inputs[0]),
@@ -220,9 +403,9 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header) {
 }
 
 /* Runs one blob against one arena and prints its method outputs. */
-static int run_blob(const unsigned char *blob, uint8_t *arena, uint64_t arena_bytes,
-                    const unsigned char *input_data, uint64_t input_bytes,
-                    const char *tag) {
+static int run_blob(const unsigned char *blob, uint64_t blob_bytes, uint8_t *arena,
+                    uint64_t arena_bytes, const unsigned char *input_data,
+                    uint64_t input_bytes, const char *tag, int64_t runtime_length) {
   const HexagonBlobHeader *header = (const HexagonBlobHeader *)blob;
   if (header->magic != kHexagonBlobMagic || header->version != kHexagonBlobVersion) {
     printf("BADBLOB\n");
@@ -231,6 +414,8 @@ static int run_blob(const unsigned char *blob, uint8_t *arena, uint64_t arena_by
   g_arena = arena;
   g_bases = bases_of(header);
   memset(arena, 0, arena_bytes);
+  g_runtime_length = runtime_length;
+  load_patches(blob, header, blob_bytes);
 
   const HexagonOp *ops = (const HexagonOp *)(blob + sizeof(HexagonBlobHeader));
   const uint8_t *sections =
@@ -255,7 +440,7 @@ static int run_blob(const unsigned char *blob, uint8_t *arena, uint64_t arena_by
     at += ref->size;
   }
 
-  for (uint32_t i = 0; i < header->n_ops; ++i) execute_op(ops[i], header);
+  for (uint32_t i = 0; i < header->n_ops; ++i) execute_op(ops[i], header, i);
 
   for (uint32_t index = 0; index < header->n_outputs; ++index) {
     const HexagonTensorRef *ref =
@@ -275,13 +460,17 @@ static int run_blob(const unsigned char *blob, uint8_t *arena, uint64_t arena_by
 }
 
 int main(void) {
-  /* One arena, reused: run_blob zeroes it. Sized for the largest fixture. */
-  static uint8_t arena[kMaxArenaBytes];
+  /* One arena, reused: run_blob zeroes it. Sized for the largest fixture, and
+   * aligned the way the kernels' vector accesses assume: an HVX load or store
+   * wants its address aligned to the vector length, and a byte array gives the
+   * linker no reason to. */
+  static uint8_t arena[kMaxArenaBytes] __attribute__((aligned(128)));
   int status = 0;
   for (unsigned i = 0; i < kFixtureCount; ++i) {
     const BlobFixture &fixture = kFixtures[i];
-    status |= run_blob(fixture.blob, arena, sizeof(arena), fixture.inputs,
-                       fixture.inputs_size, fixture.tag);
+    status |= run_blob(fixture.blob, fixture.blob_bytes, arena, sizeof(arena),
+                       fixture.inputs, fixture.inputs_size, fixture.tag,
+                       fixture.runtime_length);
   }
   return status;
 }
