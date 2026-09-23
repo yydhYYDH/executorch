@@ -31,8 +31,10 @@ from executorch.exir.pass_base import ExportPass, PassResult
 NAMESPACE = "et_hexagon"
 
 # rms_norm opens this namespace with a DEF block and only one of those is
-# allowed, so this one has to add a fragment to it instead. That makes the
-# import order in hexagon_ops.py load-bearing.
+# allowed, so this one has to add a fragment to it instead. A fragment may
+# define into the namespace before that DEF library exists, so the order in
+# hexagon_ops.py is not load-bearing -- which is what lets ufmt sort the list
+# and put this line first.
 _library = torch.library.Library(NAMESPACE, "FRAGMENT")
 
 

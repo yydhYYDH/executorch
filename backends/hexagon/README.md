@@ -618,12 +618,13 @@ Working and verified without a device:
   host interpreter reads the blob back and reproduces the kernels' arithmetic
   within a few percent of the dequantized reference. See "Quantized matmuls" for
   what that arithmetic is and what is still unverified;
-- a vision attention block goes all the way through: a three-projection ViT
-  attention over a dynamic patch count partitions into one delegate, whose blob
-  carries one `VISION_ATTENTION_FP16` (43) command with the geometry the graph
-  had, three token-major operands and the fp32 workspace the kernel requires. The
-  host interpreter runs that command and reproduces the module to 3.1e-4 in fp16.
-  See "Delegating a vision tower's attention";
+- a vision attention block goes all the way through once `FuseVisionAttention` is
+  in the caller's `transform_passes`: a three-projection ViT attention over a
+  dynamic patch count partitions into one delegate whose blob carries one
+  `VISION_ATTENTION_FP16` (43) command with the geometry the graph had, three
+  token-major operands and the fp32 workspace the kernel requires. The host
+  interpreter runs that command and reproduces the module to 3.1e-4 in fp16. See
+  "Delegating a vision tower's attention";
 - pooling, `sum`, `amax` and `fmod` reach the DSP, blob and numbers included. A
   `max_pool2d` or `avg_pool2d` over 64 channels lowers to one delegate whose blob
   carries a blit into the kernel's blocked layout, one POOL2D command and a blit
@@ -657,7 +658,8 @@ Not done yet:
 - of the registered emitters, the ones that have produced a command on a real
   graph are `mm` (including the quantized weight-only form), `bmm`, the binary
   and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache`,
-  `mean`, `embedding`/`index_select`/`index.Tensor`, `vision_attention` and the
+  `mean`/`sum`/`amax`, `max_pool2d`/`avg_pool2d`,
+  `embedding`/`index_select`/`index.Tensor`, `vision_attention` and the
   narrowing and transpose blits. The view, cast, getitem and dequantize emitters
   have run as well but emit nothing by design;
 - **the row gather has never run anywhere but on the host.** Its tiling is a
