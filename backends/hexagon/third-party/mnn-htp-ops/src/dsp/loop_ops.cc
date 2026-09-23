@@ -1,0 +1,1747 @@
+#include <AEEStdErr.h>
+#include <HAP_farf.h>
+#include <HAP_mem.h>
+#include <math.h>
+#include <qurt_memory.h>
+#include <remote.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "dsp/dma_utils.h"
+#include "dsp/hmx_mgr.h"
+#include "dsp/hmx_utils.h"
+#include "dsp/hvx_convert.h"
+#include "dsp/hvx_math.h"
+#include "dsp/hvx_utils.h"
+#include "dsp/mmap_mgr.h"
+#include "dsp/pwl.h"
+#include "dsp/vtcm_mgr.h"
+#include "dsp/worker_pool.h"
+#include "region_ops.h"
+
+// The matmul HVX fast paths round the accumulator to fp16 after every
+// multiply-add, so a 1024-wide reduction loses about 17x more accuracy than the
+// HMX route, whose accumulator stays in fp32. HMX is only preferred for shapes a
+// transformer does not have (a reduction or output width that is not a multiple
+// of 32), which leaves the shapes a transformer does use on the fp16 path.
+// Preferring HMX always measured 3.42e-02 -> 1.95e-03 max error on a 64x1024x1024
+// matmul, but it also aborts a vision tower delegate with 0x8000040d, so the
+// blanket rule stays off until the failing shape is known. Build with
+// -DMNN_MATMUL_PREFER_HMX=1 to turn it on.
+#ifndef MNN_MATMUL_PREFER_HMX
+#  define MNN_MATMUL_PREFER_HMX 1
+#endif
+
+// The h-contiguous fast path below accumulates in fp16, which rounds both the
+// product and the running sum on every step: a 2048-wide reduction drifts
+// visibly and, a few layers deep, overflows to inf. Its neighbouring paths
+// (fast_h_inner and fast_l_contiguous) widen to fp32 before accumulating, so
+// this keeps the fast path consistent with them. Build with
+// -DMNN_MATMUL_FP32_ACC=0 to get the old fp16 accumulator back for an A/B.
+#ifndef MNN_MATMUL_FP32_ACC
+#  define MNN_MATMUL_FP32_ACC 1
+#endif
+
+// With the accumulator in fp32 the remaining rounding sits in the product: the
+// half-precision multiply narrows to fp16 before the widening, which costs
+// ~1e-3 of a term. An fp16 pair always multiplies exactly into fp32, so taking
+// the products wide leaves the final narrowing to fp16 as the only rounding
+// step, which is what the HMX route does.
+#ifndef MNN_MATMUL_EXACT_PRODUCT
+#  define MNN_MATMUL_EXACT_PRODUCT 1
+#endif
+
+extern "C" {
+
+AEEResult htp_ops_binary_blit(uint8_t* dst, const uint8_t* src0, const uint8_t* src1,
+                              uint8_t* region, int32_t regionCount, int32_t bytes, int32_t opType);
+
+static inline int32_t loop_read_int32(const uint8_t* ptr) {
+  int32_t val;
+  memcpy(&val, ptr, sizeof(int32_t));
+  return val;
+}
+
+static inline _Float16 htp_ops_loop_binary_apply_fp16(_Float16 a, _Float16 b, int32_t opType) {
+    switch (opType) {
+        case 1: return a + b;
+        case 2: return a - b;
+        case 3: return a * b;
+        case 11: {
+            float v = (float)a - (float)b;
+            return (_Float16)(v * v);
+        }
+        case 4: return a / b;
+        case 5: return a > b ? a : b;
+        case 6: return a < b ? a : b;
+        case 7: {
+            float a_f = (float)a;
+            float b_f = (float)b;
+            float sig_b = 1.0f / (1.0f + expf(-b_f));
+            return (_Float16)(a_f * b_f * sig_b);
+        }
+        default: return a;
+    }
+}
+
+static inline int32_t htp_ops_loop_binary_apply_int32(int32_t a, int32_t b, int32_t opType) {
+    switch (opType) {
+        case 1: return a + b;
+        case 2: return a - b;
+        case 3: return a * b;
+        case 11: {
+            int32_t v = a - b;
+            return v * v;
+        }
+        default: return a;
+    }
+}
+
+static inline HVX_Vector htp_ops_loop_binary_mul_silu_fp16_vec(HVX_Vector v0, HVX_Vector v1) {
+  HVX_Vector silu_v1 = htp_ops_silu_pwl_fp16_vec(v1);
+  return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v0, silu_v1));
+}
+
+static inline HVX_Vector htp_ops_loop_binary_apply_vec(HVX_Vector a, HVX_Vector b, int32_t opType) {
+    switch (opType) {
+        case 1:
+            return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(a, b));
+        case 2:
+            return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(a, b));
+        case 3:
+            return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(a, b));
+        case 11: {
+            HVX_Vector sub = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vsub_VhfVhf(a, b));
+            return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(sub, sub));
+        }
+        case 4: {
+            HVX_Vector inv_b = hvx_my_inv_vhf(b);
+            return Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(a, inv_b));
+        }
+        case 5:
+            return Q6_Vhf_vmax_VhfVhf(a, b);
+        case 6:
+            return Q6_Vhf_vmin_VhfVhf(a, b);
+        case 7:
+            return htp_ops_loop_binary_mul_silu_fp16_vec(a, b);
+        default:
+            return a;
+    }
+}
+
+static inline bool htp_ops_loop_binary_row_fast_fp16(uint8_t* dstY, const uint8_t* src0Y,
+                                                    const uint8_t* src1Y, const HtpOpsLoopParam* lp,
+                                                    int32_t opType, int32_t bytes) {
+    if (bytes != 2 || lp->dstStrideXYZ[2] != 2 || lp->sizeXYZ[2] <= 0) {
+        return false;
+    }
+    const bool src0Contig = lp->src0StrideXYZ[2] == 2;
+    const bool src1Contig = lp->src1StrideXYZ[2] == 2;
+    const bool src0Scalar = lp->src0StrideXYZ[2] == 0;
+    const bool src1Scalar = lp->src1StrideXYZ[2] == 0;
+    if (!((src0Contig || src0Scalar) && (src1Contig || src1Scalar)) || (src0Scalar && src1Scalar)) {
+        return false;
+    }
+
+    const int size = lp->sizeXYZ[2];
+    const int vecElems = __HVX_LENGTH__ / (int)sizeof(__fp16);
+    const int vecEnd = size & -vecElems;
+    __fp16* dst = (__fp16*)dstY;
+    const __fp16* src0 = (const __fp16*)src0Y;
+    const __fp16* src1 = (const __fp16*)src1Y;
+    int x = 0;
+
+    if (src0Contig && src1Scalar) {
+        const uint16_t scalarBits = *(const uint16_t*)src1;
+        HVX_Vector v1 = Q6_Vh_vsplat_R(scalarBits);
+        if (opType == 4) {
+            v1 = hvx_my_inv_vhf(v1);
+            for (; x < vecEnd; x += vecElems) {
+                HVX_Vector v0 = vmemu((const HVX_Vector*)(src0 + x));
+                HVX_Vector vr = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v0, v1));
+                vmemu((HVX_Vector*)(dst + x)) = vr;
+            }
+        } else {
+            for (; x < vecEnd; x += vecElems) {
+                HVX_Vector v0 = vmemu((const HVX_Vector*)(src0 + x));
+                HVX_Vector vr = htp_ops_loop_binary_apply_vec(v0, v1, opType);
+                vmemu((HVX_Vector*)(dst + x)) = vr;
+            }
+        }
+        for (; x < size; ++x) {
+            dst[x] = htp_ops_loop_binary_apply_fp16(src0[x], src1[0], opType);
+        }
+        return true;
+    }
+
+    if (src0Scalar && src1Contig) {
+        const uint16_t scalarBits = *(const uint16_t*)src0;
+        HVX_Vector v0 = Q6_Vh_vsplat_R(scalarBits);
+        for (; x < vecEnd; x += vecElems) {
+            HVX_Vector v1 = vmemu((const HVX_Vector*)(src1 + x));
+            HVX_Vector vr = htp_ops_loop_binary_apply_vec(v0, v1, opType);
+            vmemu((HVX_Vector*)(dst + x)) = vr;
+        }
+        for (; x < size; ++x) {
+            dst[x] = htp_ops_loop_binary_apply_fp16(src0[0], src1[x], opType);
+        }
+        return true;
+    }
+
+    if (src0Contig && src1Contig) {
+        for (; x < vecEnd; x += vecElems) {
+            HVX_Vector v0 = vmemu((const HVX_Vector*)(src0 + x));
+            HVX_Vector v1 = vmemu((const HVX_Vector*)(src1 + x));
+            HVX_Vector vr = htp_ops_loop_binary_apply_vec(v0, v1, opType);
+            vmemu((HVX_Vector*)(dst + x)) = vr;
+        }
+        for (; x < size; ++x) {
+            dst[x] = htp_ops_loop_binary_apply_fp16(src0[x], src1[x], opType);
+        }
+        return true;
+    }
+
+    return false;
+}
+
+static inline void htp_ops_loop_binary_region(uint8_t* dstBase, const uint8_t* src0Base,
+                                              const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                              int32_t opType, int32_t bytes, bool continuous,
+                                              int optX, int optY, int optZ) {
+    const int optXBytes = optX * bytes;
+    if (continuous) {
+        for (int z = 0; z < optZ; ++z) {
+            const uint8_t* src0Z = src0Base + z * lp->src0StrideXYZ[0];
+            const uint8_t* src1Z = src1Base + z * lp->src1StrideXYZ[0];
+            uint8_t* dstZ = dstBase + z * lp->dstStrideXYZ[0];
+            for (int y = 0; y < optY; ++y) {
+                const uint8_t* src0Y = src0Z + y * lp->src0StrideXYZ[1];
+                const uint8_t* src1Y = src1Z + y * lp->src1StrideXYZ[1];
+                uint8_t* dstY = dstZ + y * lp->dstStrideXYZ[1];
+                int x = 0;
+                if (bytes == 2) {
+                    const int vecBytes = __HVX_LENGTH__;
+                    const int vecEndBytes = optXBytes & -vecBytes;
+                    for (; x < vecEndBytes; x += vecBytes) {
+                        HVX_Vector v0 = vmemu((const HVX_Vector*)(src0Y + x));
+                        HVX_Vector v1 = vmemu((const HVX_Vector*)(src1Y + x));
+                        vmemu((HVX_Vector*)(dstY + x)) = htp_ops_loop_binary_apply_vec(v0, v1, opType);
+                    }
+                }
+                if (bytes == 2) {
+                    __fp16* dstFp16 = (__fp16*)(dstY + x);
+                    const __fp16* src0Fp16 = (const __fp16*)(src0Y + x);
+                    const __fp16* src1Fp16 = (const __fp16*)(src1Y + x);
+                    for (int i = 0; x + i * bytes < optXBytes; ++i) {
+                        dstFp16[i] = htp_ops_loop_binary_apply_fp16(src0Fp16[i], src1Fp16[i], opType);
+                    }
+                } else if (bytes == 4) {
+                    int32_t* dstI32 = (int32_t*)dstY;
+                    const int32_t* src0I32 = (const int32_t*)src0Y;
+                    const int32_t* src1I32 = (const int32_t*)src1Y;
+                    for (int i = 0; i < optX; ++i) {
+                        dstI32[i] = htp_ops_loop_binary_apply_int32(src0I32[i], src1I32[i], opType);
+                    }
+                } else {
+                    for (; x < optXBytes; x += bytes) {
+                        memcpy(dstY + x, src0Y + x, bytes);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    for (int z = 0; z < lp->sizeXYZ[0]; ++z) {
+        const uint8_t* src0Z = src0Base + z * lp->src0StrideXYZ[0];
+        const uint8_t* src1Z = src1Base + z * lp->src1StrideXYZ[0];
+        uint8_t* dstZ = dstBase + z * lp->dstStrideXYZ[0];
+        for (int y = 0; y < lp->sizeXYZ[1]; ++y) {
+            const uint8_t* src0Y = src0Z + y * lp->src0StrideXYZ[1];
+            const uint8_t* src1Y = src1Z + y * lp->src1StrideXYZ[1];
+            uint8_t* dstY = dstZ + y * lp->dstStrideXYZ[1];
+            if (htp_ops_loop_binary_row_fast_fp16(dstY, src0Y, src1Y, lp, opType, bytes)) {
+                continue;
+            }
+            for (int x = 0; x < lp->sizeXYZ[2]; ++x) {
+                const uint8_t* s0 = src0Y + x * lp->src0StrideXYZ[2];
+                const uint8_t* s1 = src1Y + x * lp->src1StrideXYZ[2];
+                uint8_t* d = dstY + x * lp->dstStrideXYZ[2];
+                if (bytes == 2) {
+                    *(__fp16*)d = htp_ops_loop_binary_apply_fp16(*(const __fp16*)s0, *(const __fp16*)s1, opType);
+                } else if (bytes == 4) {
+                    *(int32_t*)d = htp_ops_loop_binary_apply_int32(*(const int32_t*)s0, *(const int32_t*)s1, opType);
+                } else {
+                    memcpy(d, s0, bytes);
+                }
+            }
+        }
+    }
+}
+
+typedef struct {
+    uint8_t* dst;
+    uint8_t* src0;
+    uint8_t* src1;
+    uint8_t* iter0;
+    uint8_t* iter1;
+    uint8_t* iter2;
+    const HtpOpsLoopParam* lp;
+    int32_t opType;
+    int32_t bytes;
+    bool continuous;
+    int optX;
+    int optY;
+    int optZ;
+    worker_synctoken_t sync_ctx;
+} HtpOpsLoopBinaryTaskState;
+
+typedef struct {
+    HtpOpsLoopBinaryTaskState* state;
+    int begin;
+    int end;
+} HtpOpsLoopBinaryFixedTask;
+
+static inline void htp_ops_loop_binary_run_iter(HtpOpsLoopBinaryTaskState* state, int iter) {
+    const HtpOpsLoopParam* lp = state->lp;
+    const uint8_t* srcIter0 = state->iter0;
+    const uint8_t* srcIter1 = state->iter1;
+    const uint8_t* srcIter2 = state->iter2;
+
+    int32_t it0 = srcIter0 ? loop_read_int32(srcIter0 + iter * sizeof(int32_t)) : iter;
+    int32_t it1 = srcIter1 ? loop_read_int32(srcIter1 + iter * sizeof(int32_t)) : iter;
+    int32_t it2 = srcIter2 ? loop_read_int32(srcIter2 + iter * sizeof(int32_t)) : iter;
+
+    int32_t outOff = (int32_t)it0 * lp->cmdSteps[0] + lp->cmdViewOffset[0];
+    if (outOff < 0 || outOff >= lp->outputElementSize) {
+        return;
+    }
+    int32_t in0Off = (int32_t)it1 * lp->cmdSteps[1] + lp->cmdViewOffset[1];
+    if (in0Off < 0 || in0Off >= lp->input0Size) {
+        return;
+    }
+    int32_t in1Off = (int32_t)it2 * lp->cmdSteps[2] + lp->cmdViewOffset[2];
+    if (in1Off < 0 || in1Off >= lp->input1Size) {
+        return;
+    }
+
+    uint8_t* dstBase = state->dst + (int64_t)outOff * state->bytes;
+    const uint8_t* src0Base = state->src0 + (int64_t)in0Off * state->bytes;
+    const uint8_t* src1Base = state->src1 + (int64_t)in1Off * state->bytes;
+    htp_ops_loop_binary_region(dstBase, src0Base, src1Base, lp, state->opType, state->bytes,
+                               state->continuous, state->optX, state->optY, state->optZ);
+}
+
+static void htp_ops_loop_binary_worker(void* data, int worker_index) {
+    (void)worker_index;
+    HtpOpsLoopBinaryFixedTask* task = (HtpOpsLoopBinaryFixedTask*)data;
+    for (int iter = task->begin; iter < task->end; ++iter) {
+        htp_ops_loop_binary_run_iter(task->state, iter);
+    }
+    worker_pool_synctoken_jobdone(&(task->state->sync_ctx));
+}
+
+static inline bool htp_ops_loop_binary_try_parallel(uint8_t* dst, uint8_t* src0, uint8_t* src1,
+                                                    uint8_t* iter0, uint8_t* iter1, uint8_t* iter2,
+                                                    const HtpOpsLoopParam* lp, int32_t opType,
+                                                    int32_t bytes, bool continuous,
+                                                    int optX, int optY, int optZ) {
+    if (g_max_num_workers <= 1 || lp->loopNumber < 2 || optX <= 0 || optY <= 0 || optZ <= 0) {
+        return false;
+    }
+    const int workPerIter = optX * optY * optZ;
+    if (workPerIter <= 0 || (int64_t)workPerIter * lp->loopNumber < 4096) {
+        return false;
+    }
+    int nTasks = (int)g_max_num_workers;
+    if (nTasks > lp->loopNumber) {
+        nTasks = lp->loopNumber;
+    }
+    if (nTasks <= 1) {
+        return false;
+    }
+
+    HtpOpsLoopBinaryTaskState state = {};
+    state.dst = dst;
+    state.src0 = src0;
+    state.src1 = src1;
+    state.iter0 = iter0;
+    state.iter1 = iter1;
+    state.iter2 = iter2;
+    state.lp = lp;
+    state.opType = opType;
+    state.bytes = bytes;
+    state.continuous = continuous;
+    state.optX = optX;
+    state.optY = optY;
+    state.optZ = optZ;
+
+    worker_pool_job_t job;
+    job.fptr = htp_ops_loop_binary_worker;
+    HtpOpsLoopBinaryFixedTask* tasks = WORKER_POOL_STACK_ALLOC(HtpOpsLoopBinaryFixedTask, nTasks);
+    worker_pool_synctoken_init(&(state.sync_ctx), nTasks);
+    const int loopsPerTask = (lp->loopNumber + nTasks - 1) / nTasks;
+    for (int i = 0; i < nTasks; ++i) {
+        const int begin = i * loopsPerTask;
+        int end = begin + loopsPerTask;
+        if (end > lp->loopNumber) {
+            end = lp->loopNumber;
+        }
+        tasks[i].state = &state;
+        tasks[i].begin = begin;
+        tasks[i].end = end;
+        job.dptr = tasks + i;
+        worker_pool_submit(NULL, job);
+    }
+    worker_pool_synctoken_wait(&(state.sync_ctx));
+    return true;
+}
+
+static inline bool htp_ops_loop_check_element(int64_t baseOffset, int64_t extraBytes,
+                                              int32_t bytes, int64_t elementSize) {
+    if (bytes <= 0 || elementSize <= 0 || extraBytes % bytes != 0) {
+        return false;
+    }
+    int64_t elementOffset = baseOffset + extraBytes / bytes;
+    return elementOffset >= 0 && elementOffset < elementSize;
+}
+
+static inline float htp_ops_loop_reduce_sum2_f32(HVX_Vector acc0, HVX_Vector acc1) {
+    HVX_Vector v = Q6_Vsf_vadd_VsfVsf(acc0, acc1);
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vror_VR(v, 64)));
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vror_VR(v, 32)));
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vror_VR(v, 16)));
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vror_VR(v, 8)));
+    v = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(v, Q6_V_vror_VR(v, 4)));
+    union { HVX_Vector v; float f[32]; } u = { .v = v };
+    return u.f[0];
+}
+
+static inline int htp_ops_loop_up_div(int v, int d) {
+    return (v + d - 1) / d;
+}
+
+static inline HVX_Vector htp_ops_loop_hmx_load_row32(const uint8_t* src, int elems, bool canRead64) {
+    if (canRead64) {
+        return vmemu((const HVX_Vector*)src);
+    }
+    __fp16 tmp[64] __attribute__((aligned(128)));
+    memset(tmp, 0, sizeof(tmp));
+    memcpy(tmp, src, (size_t)elems * sizeof(__fp16));
+    return vmem((const HVX_Vector*)tmp);
+}
+
+static inline void htp_ops_loop_hmx_pack_activation_k64(__fp16* dst, const uint8_t* src0Base,
+                                                       const HtpOpsLoopParam* lp, int eBase,
+                                                       int validRows) {
+    __fp16* tile0 = dst;
+    __fp16* tile1 = dst + 1024;
+    if (validRows < 32) {
+        memset(tile0, 0, 1024 * sizeof(__fp16));
+        memset(tile1, 0, 1024 * sizeof(__fp16));
+    }
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        const uint8_t* src1 = src0Base + (int64_t)(eBase + r + 1) * lp->src0StrideXYZ[0];
+        HVX_Vector v0 = vmemu((const HVX_Vector*)src0);
+        HVX_Vector v1 = vmemu((const HVX_Vector*)src1);
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, 64);
+        vmem((HVX_Vector*)((uint8_t*)tile0 + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        vmem((HVX_Vector*)((uint8_t*)tile1 + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+    }
+    if (r < validRows) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        HVX_Vector v0 = vmemu((const HVX_Vector*)src0);
+        HVX_Vector v1 = Q6_V_vzero();
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, 64);
+        vmem((HVX_Vector*)((uint8_t*)tile0 + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        vmem((HVX_Vector*)((uint8_t*)tile1 + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+    }
+}
+
+static inline void htp_ops_loop_hmx_pack_activation_tile(__fp16* dst, const uint8_t* src0Base,
+                                                        const HtpOpsLoopParam* lp, int K, int kt,
+                                                        int eBase, int validRows) {
+    __fp16* tile = dst + (size_t)kt * 1024;
+    const int kBegin = kt * 32;
+    int kRemain = K - kBegin;
+    if (kRemain > 32) {
+        kRemain = 32;
+    }
+    if (lp->src0StrideXYZ[1] == 2 && kRemain > 0) {
+        if (validRows < 32 || kRemain < 32) {
+            memset(tile, 0, 1024 * sizeof(__fp16));
+        }
+        const bool canRead64 = kBegin + 64 <= K;
+        int r = 0;
+        for (; r <= validRows - 2; r += 2) {
+            const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0] + kBegin * 2;
+            const uint8_t* src1 = src0Base + (int64_t)(eBase + r + 1) * lp->src0StrideXYZ[0] + kBegin * 2;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(htp_ops_loop_hmx_load_row32(src1, kRemain, canRead64),
+                                                htp_ops_loop_hmx_load_row32(src0, kRemain, canRead64), 64);
+            vmem((HVX_Vector*)((uint8_t*)tile + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+        if (r < validRows) {
+            const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0] + kBegin * 2;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), htp_ops_loop_hmx_load_row32(src0, kRemain, canRead64), 64);
+            vmem((HVX_Vector*)((uint8_t*)tile + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+        return;
+    }
+    memset(tile, 0, 1024 * sizeof(__fp16));
+    for (int r = 0; r < validRows; ++r) {
+        const uint8_t* srcRow = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        for (int k = 0; k < kRemain; ++k) {
+            const int dstIndex = (r / 2) * 64 + k * 2 + (r & 1);
+            tile[dstIndex] = *(const __fp16*)(srcRow + (int64_t)(kBegin + k) * lp->src0StrideXYZ[1]);
+        }
+    }
+}
+
+// Packs every kt tile of one 32-row activation block in a single pass. The
+// single-tile path loads 64 fp16 starting at each tile's columns, so loads of
+// consecutive kt overlap by half, and its kt-outer/row-inner order touches 32
+// rows 2 KB apart in turn. Here a row pair is the outer loop and two tiles are
+// packed per aligned 128-byte load, so each row is read straight through in
+// 128-byte steps, one stream per row pair instead of 32 interleaved streams.
+// The vdeal splits the loaded [kBegin, kBegin+64) columns into the two tiles.
+static inline void htp_ops_loop_hmx_pack_activation_block(__fp16* dst, const uint8_t* src0Base,
+                                                          const HtpOpsLoopParam* lp, int K, int eBase,
+                                                          int validRows) {
+    const int kp = htp_ops_loop_up_div(K, 32);
+    if (lp->src0StrideXYZ[1] != 2) {
+        for (int kt = 0; kt < kp; ++kt) {
+            htp_ops_loop_hmx_pack_activation_tile(dst, src0Base, lp, K, kt, eBase, validRows);
+        }
+        return;
+    }
+    if (validRows < 32) {
+        memset(dst, 0, (size_t)kp * 1024 * sizeof(__fp16));
+    }
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        const uint8_t* src1 = src0Base + (int64_t)(eBase + r + 1) * lp->src0StrideXYZ[0];
+        int kt = 0;
+        for (; kt + 1 < kp && K - kt * 32 >= 64; kt += 2) {
+            const size_t off = (size_t)kt * 64;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(vmemu((const HVX_Vector*)(src1 + off)),
+                                                vmemu((const HVX_Vector*)(src0 + off)), 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const int kBegin = kt * 32;
+            int kRemain = K - kBegin;
+            if (kRemain > 32) {
+                kRemain = 32;
+            }
+            const bool canRead64 = kBegin + 64 <= K;
+            HVX_Vector v0 = htp_ops_loop_hmx_load_row32(src0 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_Vector v1 = htp_ops_loop_hmx_load_row32(src1 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+    if (r < validRows) {
+        const uint8_t* src0 = src0Base + (int64_t)(eBase + r) * lp->src0StrideXYZ[0];
+        int kt = 0;
+        for (; kt + 1 < kp && K - kt * 32 >= 64; kt += 2) {
+            const size_t off = (size_t)kt * 64;
+            HVX_Vector a0 = vmemu((const HVX_Vector*)(src0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const int kBegin = kt * 32;
+            int kRemain = K - kBegin;
+            if (kRemain > 32) {
+                kRemain = 32;
+            }
+            const bool canRead64 = kBegin + 64 <= K;
+            HVX_Vector v0 = htp_ops_loop_hmx_load_row32(src0 + (size_t)kBegin * 2, kRemain, canRead64);
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), v0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+}
+
+// Raw activation rows (row-major, one 128-byte pair-pack per 64 columns) turned
+// into the HMX pair-interleaved tile layout. This is the second half of the DMA
+// staging: the source is now VTCM, so the loads never stall on DDR. Tile/row
+// layout and the vdeal+vshuff rearrange are identical to the DDR pack above.
+static inline void htp_ops_loop_hmx_transform_activation_block(__fp16* dst, const __fp16* srcRaw, int K,
+                                                               int validRows) {
+    const int kp = htp_ops_loop_up_div(K, 32);
+    const int pairPacks = htp_ops_loop_up_div(K, 64);
+    const size_t rawStride = (size_t)pairPacks * 64;
+    if (validRows < 32) {
+        memset(dst, 0, (size_t)kp * 1024 * sizeof(__fp16));
+    }
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        const __fp16* row0 = srcRaw + (size_t)r * rawStride;
+        const __fp16* row1 = srcRaw + (size_t)(r + 1) * rawStride;
+        int kt = 0;
+        for (; kt + 1 < kp; kt += 2) {
+            const size_t off = (size_t)(kt / 2) * 64;
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(vmem((const HVX_Vector*)(row1 + off)),
+                                                vmem((const HVX_Vector*)(row0 + off)), 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const size_t off = (size_t)kt * 32;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_Vector a1 = vmem((const HVX_Vector*)(row1 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(a1, a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+    if (r < validRows) {
+        const __fp16* row0 = srcRaw + (size_t)r * rawStride;
+        int kt = 0;
+        for (; kt + 1 < kp; kt += 2) {
+            const size_t off = (size_t)(kt / 2) * 64;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)(kt + 1) * 1024) + r * 64)) =
+                Q6_Vh_vshuff_Vh(Q6_V_hi_W(vp));
+        }
+        for (; kt < kp; ++kt) {
+            const size_t off = (size_t)kt * 32;
+            HVX_Vector a0 = vmem((const HVX_Vector*)(row0 + off));
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_V_vzero(), a0, 64);
+            vmem((HVX_Vector*)((uint8_t*)(dst + (size_t)kt * 1024) + r * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+    }
+}
+
+// A straight copy of a pre-packed weight block into VTCM. libc's memcpy walks
+// this byte wide, and the source is DDR, which made the copy 2.4x slower than
+// the element rearrange it replaces even though it reads less and in a better
+// order. 128 bytes at a time is what the vector unit moves.
+// The DMA engine moves a whole prepacked group in one descriptor at a rate the
+// HVX loop below cannot reach: that loop has ~2 KB in flight and measured
+// 8.4 GB/s, which is the entire decode cost (122 of 130 ms of matmul time on
+// Qwen3-0.6B, HMX compute being 0.35 ms of it). Whole groups are 128-byte
+// aligned on both ends, which is all the 1D descriptor needs.
+static inline bool htp_ops_loop_hmx_dma_copy(void* dst, const void* src, size_t bytes) {
+    const uint32_t kMaxChunk = 4u << 20;  // the descriptor's length field is 24 bits
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    for (size_t x = 0; x < bytes; x += kMaxChunk) {
+        size_t chunk = bytes - x < kMaxChunk ? bytes - x : kMaxChunk;
+        if ((chunk & 127) != 0) {
+            return false;
+        }
+        _Alignas(64) dma_desc_1d_t desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.length = (uint32_t)chunk;
+        desc.type = DMA_DESC_TYPE_1D;
+        desc.ordered = 1;
+        desc.dstate = DMA_DESC_DSTATE_PENDING;
+        desc.src = (uint32_t)(uintptr_t)(s + x);
+        desc.dst = (uint32_t)(uintptr_t)(d + x);
+        dma_wait_for_idle();
+        dmstart(&desc);
+        dma_wait_for_idle();
+        if (desc.dstate != DMA_DESC_DSTATE_DONE) {
+            FARF(ERROR, "hmx: weight DMA incomplete dstate=%u bytes=%u src=%x dst=%x",
+                 desc.dstate, (unsigned)chunk, desc.src, desc.dst);
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline void htp_ops_loop_hmx_copy_block(__fp16* dst, const __fp16* src, size_t bytes) {
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+    size_t x = 0;
+#ifndef HTP_OPS_DISABLE_WEIGHT_DMA
+    if ((((uintptr_t)d | (uintptr_t)s) & 127) == 0 && bytes >= 2048 && htp_ops_loop_hmx_dma_copy(d, s, bytes)) {
+        return;
+    }
+#endif
+    // Both ends are 128-byte aligned in practice: VTCM allocations are, and the
+    // group offset inside a weight is a multiple of 2048. The unaligned load
+    // costs extra byte rotates, so use the plain one where the alignment allows
+    // and keep the unaligned one for the odd case. Four loads are issued before
+    // the first store so the uncached reads can overlap instead of being
+    // serialized by the store that follows each one.
+    if ((((uintptr_t)d | (uintptr_t)s) & 127) == 0) {
+        for (; x + 512 <= bytes; x += 512) {
+            // The source is DDR and this loop is latency bound without it: one
+            // 128-byte load in flight per iteration. Ask for the next kilobyte
+            // while the current one is still being stored.
+            if (x + 1024 + 2048 <= bytes) {
+                l2fetch(s + x + 1024, 128, 128, 8, 0);
+                l2fetch(s + x + 2048, 128, 128, 8, 0);
+            }
+            HVX_Vector v0 = vmem((const HVX_Vector*)(s + x));
+            HVX_Vector v1 = vmem((const HVX_Vector*)(s + x + 128));
+            HVX_Vector v2 = vmem((const HVX_Vector*)(s + x + 256));
+            HVX_Vector v3 = vmem((const HVX_Vector*)(s + x + 384));
+            vmem((HVX_Vector*)(d + x)) = v0;
+            vmem((HVX_Vector*)(d + x + 128)) = v1;
+            vmem((HVX_Vector*)(d + x + 256)) = v2;
+            vmem((HVX_Vector*)(d + x + 384)) = v3;
+        }
+        for (; x + 128 <= bytes; x += 128) {
+            vmem((HVX_Vector*)(d + x)) = vmem((const HVX_Vector*)(s + x));
+        }
+    } else {
+        for (; x + 128 <= bytes; x += 128) {
+            vmemu((HVX_Vector*)(d + x)) = vmemu((const HVX_Vector*)(s + x));
+        }
+    }
+    for (; x < bytes; ++x) {
+        d[x] = s[x];
+    }
+}
+
+static inline void htp_ops_loop_hmx_pack_weight_tile(__fp16* tile, const uint8_t* src1Base,
+                                                    const HtpOpsLoopParam* lp, int K, int N, int nt, int kt) {
+    memset(tile, 0, 1024 * sizeof(__fp16));
+    int kBegin = kt * 32;
+    int kRemain = K - kBegin;
+    if (kRemain > 32) {
+        kRemain = 32;
+    }
+    int nBegin = nt * 32;
+    int nRemain = N - nBegin;
+    if (nRemain > 32) {
+        nRemain = 32;
+    }
+    if (lp->src1StrideXYZ[2] == 2 && kRemain > 0 && nRemain > 0) {
+        if (kRemain < 32 || nRemain < 32) {
+            memset(tile, 0, 1024 * sizeof(__fp16));
+        }
+        const bool canRead64 = nBegin + 64 <= N;
+        for (int k = 0; k < kRemain; k += 2) {
+            const uint8_t* src0 = src1Base + (int64_t)(kBegin + k) * lp->src1StrideXYZ[1] + nBegin * 2;
+            HVX_Vector v0 = htp_ops_loop_hmx_load_row32(src0, nRemain, canRead64);
+            HVX_Vector v1 = Q6_V_vzero();
+            if (k + 1 < kRemain) {
+                const uint8_t* src1 = src1Base + (int64_t)(kBegin + k + 1) * lp->src1StrideXYZ[1] + nBegin * 2;
+                v1 = htp_ops_loop_hmx_load_row32(src1, nRemain, canRead64);
+            }
+            HVX_VectorPair vp = Q6_W_vdeal_VVR(v1, v0, 64);
+            vmem((HVX_Vector*)((uint8_t*)tile + k * 64)) = Q6_Vh_vshuff_Vh(Q6_V_lo_W(vp));
+        }
+        return;
+    }
+    for (int k = 0; k < kRemain; ++k) {
+        const uint8_t* srcRow = src1Base + (int64_t)(kBegin + k) * lp->src1StrideXYZ[1];
+        for (int c = 0; c < nRemain; ++c) {
+            int dstIndex = (k / 2) * 64 + c * 2 + (k & 1);
+            tile[dstIndex] = *(const __fp16*)(srcRow + (int64_t)(nBegin + c) * lp->src1StrideXYZ[2]);
+        }
+    }
+}
+
+// One deinterleaved output row leaves as a 64-byte fragment inside a 2 KB
+// destination row, so the writeback is a long run of short stores. vstu_variable
+// takes the length as a runtime value, which makes the compiler emit a memcpy
+// call per fragment; at ~50-100 cycles each that call is the whole cost of the
+// phase (527 ms for the 587 MB of L=1024 output, about 1.1 GB/s against the
+// weight fill's 33 GB/s). A row is always a whole number of 32-column tiles, so
+// the common width is a constant 64 bytes and can be an inline store with no
+// length dispatch at all.
+static inline void htp_ops_loop_hmx_store_row(uint8_t* dst, uint32_t rowBytes, HVX_Vector v) {
+    if (rowBytes == 64) {
+        _Alignas(128) uint64_t tmp[16];
+        vmem((HVX_Vector*)tmp) = v;
+        uint64_t* d = (uint64_t*)dst;
+        d[0] = tmp[0];
+        d[1] = tmp[1];
+        d[2] = tmp[2];
+        d[3] = tmp[3];
+        d[4] = tmp[4];
+        d[5] = tmp[5];
+        d[6] = tmp[6];
+        d[7] = tmp[7];
+        return;
+    }
+    vstu_variable(dst, rowBytes, v);
+}
+
+static inline void htp_ops_loop_hmx_store_output_tile(uint8_t* dstBase, const __fp16* vtcmOutput,
+                                                     const HtpOpsLoopParam* lp, int eBase,
+                                                     int validRows, int N, int nt) {
+    int nBegin = nt * 32;
+    int nRemain = N - nBegin;
+    if (nRemain > 32) {
+        nRemain = 32;
+    }
+    // Columns are contiguous even when the destination has padding or a larger
+    // token stride.  The pair-store below only assumes contiguous columns; the
+    // row stride is already applied independently for each destination row.
+    if (lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0) {
+        const uint32_t rowBytes = (uint32_t)(nRemain * (int)sizeof(__fp16));
+        const HVX_Vector* src = (const HVX_Vector*)vtcmOutput;
+        int r = 0;
+        for (; r <= validRows - 2; r += 2) {
+            HVX_Vector v = Q6_Vh_vdeal_Vh(*src++);
+            uint8_t* dst0 = dstBase + (int64_t)(eBase + r) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
+            uint8_t* dst1 = dstBase + (int64_t)(eBase + r + 1) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
+            htp_ops_loop_hmx_store_row(dst0, rowBytes, v);
+            htp_ops_loop_hmx_store_row(dst1, rowBytes, Q6_V_valign_VVR(v, v, 64));
+        }
+        if (r < validRows) {
+            HVX_Vector v = Q6_Vh_vdeal_Vh(*src++);
+            uint8_t* dst0 = dstBase + (int64_t)(eBase + r) * lp->dstStrideXYZ[0] + (int64_t)nBegin * lp->dstStrideXYZ[2];
+            htp_ops_loop_hmx_store_row(dst0, rowBytes, v);
+        }
+        return;
+    }
+    for (int r = 0; r < validRows; ++r) {
+        uint8_t* dstRow = dstBase + (int64_t)(eBase + r) * lp->dstStrideXYZ[0];
+        for (int c = 0; c < nRemain; ++c) {
+            int srcIndex = (r / 2) * 64 + c * 2 + (r & 1);
+            *(__fp16*)(dstRow + (int64_t)(nBegin + c) * lp->dstStrideXYZ[2]) = vtcmOutput[srcIndex];
+        }
+    }
+}
+
+// Two adjacent 32-column tiles land in consecutive columns of the same output
+// row, so storing them one at a time writes half of a 128-byte line twice. The
+// unit can only retire one 32x32 accumulator at a time, so both tiles are
+// buffered in VTCM and each row's two 64-byte halves are rebuilt into a single
+// 128-byte vector, then written with one store per row. This halves the store
+// instructions and gives every store a full cache line.
+// Caller guarantees the pair is contiguous and N - nBegin >= 64.
+static inline void htp_ops_loop_hmx_store_output_pair(uint8_t* dstBase, const __fp16* vtcmOutput,
+                                                      const HtpOpsLoopParam* lp, int eBase,
+                                                      int validRows, int N, int nt) {
+    const int nBegin = nt * 32;
+    const int64_t rowStride = lp->dstStrideXYZ[0];
+    uint8_t* base = dstBase + (int64_t)nBegin * lp->dstStrideXYZ[2];
+    const HVX_Vector* src0 = (const HVX_Vector*)vtcmOutput;
+    const HVX_Vector* src1 = (const HVX_Vector*)(vtcmOutput + 1024);
+    int r = 0;
+    for (; r <= validRows - 2; r += 2) {
+        // vdealh separates each tile's two interleaved rows; the 64-byte vdeal
+        // then pairs the two tiles' matching halves: lo=[row_r(t0)|row_r(t1)],
+        // hi=[row_{r+1}(t0)|row_{r+1}(t1)]. One instruction does what the
+        // vmux+vror shape needs four for.
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_Vh_vdeal_Vh(*src1++), Q6_Vh_vdeal_Vh(*src0++), 64);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r) * rowStride)) = Q6_V_lo_W(vp);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r + 1) * rowStride)) = Q6_V_hi_W(vp);
+    }
+    if (r < validRows) {
+        HVX_VectorPair vp = Q6_W_vdeal_VVR(Q6_Vh_vdeal_Vh(*src1++), Q6_Vh_vdeal_Vh(*src0++), 64);
+        vmemu((HVX_Vector*)(base + (int64_t)(eBase + r) * rowStride)) = Q6_V_lo_W(vp);
+    }
+}
+
+static inline bool htp_ops_loop_matmul_hmx_general_eligible(const HtpOpsLoopParam* lp) {
+    const int E = lp->sizeXYZ[0];
+    const int K = lp->sizeXYZ[1];
+    const int N = lp->sizeXYZ[2];
+    if (E <= 0 || K <= 0 || N <= 0) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[2] != 2 || lp->src0StrideXYZ[1] != 2 || lp->src1StrideXYZ[2] != 2) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[0] < 0 || lp->src0StrideXYZ[0] < 0 || lp->src1StrideXYZ[1] < 0) {
+        return false;
+    }
+    return (int64_t)E * K * N >= 32768;
+}
+
+static inline bool htp_ops_loop_matmul_hmx_small_eligible(const HtpOpsLoopParam* lp) {
+    const int E = lp->sizeXYZ[0];
+    const int K = lp->sizeXYZ[1];
+    const int N = lp->sizeXYZ[2];
+    if (E <= 0 || K != 64 || N <= 0 || N > 16) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[2] != 2 || lp->src0StrideXYZ[1] != 2 || lp->src0StrideXYZ[0] != K * 2 ||
+        lp->src1StrideXYZ[2] != 2) {
+        return false;
+    }
+    return lp->dstStrideXYZ[0] >= 0 && lp->src0StrideXYZ[0] >= 0 && lp->src1StrideXYZ[1] >= 0;
+}
+
+static inline bool htp_ops_loop_matmul_prefer_hmx_general(int K, int N) {
+#if MNN_MATMUL_PREFER_HMX
+    (void)K;
+    (void)N;
+    return true;
+#else
+    return ((K | N) & 31) != 0 || K == 32 || N == 32;
+#endif
+}
+
+// hmxFlags of a host that planned the tile budget: bit 0 marks weights already
+// stored in the order the unit reads them.
+static constexpr int32_t kHmxPlanMagic = 0x484D58;
+static constexpr int32_t kHmxPlanPrepackedWeights = 1;
+
+static inline bool htp_ops_loop_hmx_planned(const HtpOpsLoopParam* lp, bool* prepacked,
+                                            int* tileBudget) {
+    *prepacked = false;
+    *tileBudget = 0;
+    if (lp->hmxFlags != (kHmxPlanMagic | (lp->hmxFlags & kHmxPlanPrepackedWeights))) {
+        return false;
+    }
+    *prepacked = (lp->hmxFlags & kHmxPlanPrepackedWeights) != 0;
+    *tileBudget = lp->hmxTileBudget;
+    return true;
+}
+
+static inline bool htp_ops_loop_matmul_batch_hmx_prepare(const HtpOpsLoopParam* lp) {
+    const int K = lp->sizeXYZ[1];
+    const int N = lp->sizeXYZ[2];
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    if (htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles) && prepackedWeights) {
+        // Committed to the unit: the weights are already in its tile order, so
+        // there is no other kernel to fall back to. The unit itself is still
+        // acquired by the kernel, once its buffers are allocated, because the
+        // lock is taken against a VTCM context that does not exist yet here --
+        // and a unit left unlocked never retires an instruction, which hangs the
+        // command rather than slowing it down.
+        return false;
+    }
+    const bool preferHmxGeneral = htp_ops_loop_matmul_prefer_hmx_general(K, N);
+    return htp_ops_loop_matmul_hmx_small_eligible(lp) ||
+           (preferHmxGeneral && htp_ops_loop_matmul_hmx_general_eligible(lp));
+}
+
+// Phase timing for the HMX matmul path, off by default. The FARF lines below
+// are the measurement: how a command's time splits between the weight copy, the
+// activation pack, the unit's tile loads and the output store.
+#ifndef HTP_MM_PHASE_PROFILE
+#  define HTP_MM_PHASE_PROFILE 0
+#endif
+#if HTP_MM_PHASE_PROFILE
+#  include <HAP_perf.h>
+#  define MM_T0() ((unsigned long long) HAP_perf_get_time_us())
+// [0] weight fill, [1] activation pack, [2] unit tile loads, [3] output store,
+// [4] whole kernel, [5] calls, [6] weight bytes, [7] path (0 general, 1 small).
+// Surfaced by execute_command.cc into profile[200..212].
+unsigned long long g_mm_phase_us[13] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+#else
+#  define MM_T0() (0ULL)
+#endif
+
+static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8_t* src0Base,
+                                                   const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                   int64_t outOff, int64_t in0Off, int64_t in1Off,
+                                                   bool hmxPrepared) {
+    const int E = lp->sizeXYZ[0];
+    const int K = lp->sizeXYZ[1];
+    const int N = lp->sizeXYZ[2];
+    if (!htp_ops_loop_matmul_hmx_general_eligible(lp)) {
+       return false;
+    }
+    const int64_t dstLast = (int64_t)(E - 1) * lp->dstStrideXYZ[0] + (int64_t)(N - 1) * lp->dstStrideXYZ[2];
+    const int64_t src0Last = (int64_t)(E - 1) * lp->src0StrideXYZ[0] + (int64_t)(K - 1) * lp->src0StrideXYZ[1];
+    const int64_t src1Last = (int64_t)(K - 1) * lp->src1StrideXYZ[1] + (int64_t)(N - 1) * lp->src1StrideXYZ[2];
+    if (!htp_ops_loop_check_element(outOff, dstLast, 2, lp->outputElementSize) ||
+        !htp_ops_loop_check_element(in0Off, src0Last, 2, lp->input0Size) ||
+        !htp_ops_loop_check_element(in1Off, src1Last, 2, lp->input1Size)) {
+        return false;
+    }
+
+    const int kp = htp_ops_loop_up_div(K, 32);
+    const int np = htp_ops_loop_up_div(N, 32);
+    const int pairPacks = htp_ops_loop_up_div(K, 64);
+    const size_t blockBytes = (size_t)kp * 1024 * sizeof(__fp16);
+    // Raw activation staging: the 32-row block is copied in as one contiguous
+    // run (a single 1D DMA out of DDR), then rearranged in VTCM.
+    const size_t rawBytes = (size_t)pairPacks * 32 * 64 * sizeof(__fp16);
+    // Two 32x32 accumulator tiles are buffered so a pair of adjacent column
+    // groups can be written as one full 128-byte store per row.
+    const size_t outputBytes = 2048 * sizeof(__fp16);
+    // Keep as many 32-column weight blocks in VTCM as it takes and no more: the
+    // whole matrix is K*N*2 bytes, past the unit's capacity for every transformer
+    // shape, and the allocator cannot tell when it has run off the end.
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles);
+    uint8_t* vtcmPtr = (uint8_t*)vtcm_manager_get_vtcm_base();
+    uint8_t* vtcmEnd = (uint8_t*)vtcm_manager_get_vtcm_alloc_end();
+    int ntPerPass = 1;
+    if (vtcmPtr != NULL && vtcmEnd != NULL) {
+        const uint8_t* fixedEnd = vtcmPtr + blockBytes + rawBytes + outputBytes + 256;
+        if (vtcmEnd > fixedEnd) {
+            ntPerPass = (int)((size_t)(vtcmEnd - fixedEnd) / blockBytes);
+        }
+    }
+    if (plannedTiles > 0 && plannedTiles < ntPerPass) {
+        ntPerPass = plannedTiles;
+    }
+    if (ntPerPass < 1 || ntPerPass > np) {
+        ntPerPass = (np > 0) ? np : 1;
+    }
+    __fp16* vtcmActivationRaw = (__fp16*)vtcm_seq_alloc(&vtcmPtr, rawBytes);
+    __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, blockBytes);
+    // Every operand the unit loads has to be in VTCM: its loads address VTCM and
+    // a weights-section pointer hangs the command instead of reading it, so the
+    // pre-packed weight is still copied in, just without the rearrange.
+    __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)ntPerPass * blockBytes);
+    __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, outputBytes);
+    __fp16* vtcmScales = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 256);
+    if (vtcmActivationRaw == nullptr || vtcmActivation == nullptr || vtcmWeight == nullptr ||
+        vtcmOutput == nullptr || vtcmScales == nullptr) {
+        return false;
+    }
+
+    if (!hmxPrepared) {
+        hmx_manager_enable_execution();
+        hmx_unit_acquire();
+    }
+    hmx_init_column_scales(vtcmScales, Q6_V_vsplat_R(0x3c00));
+    hmx_set_output_scales(vtcmScales);
+
+#if HTP_MM_PHASE_PROFILE
+    unsigned long long mm_t0 = MM_T0(), mm_t = 0, mm_wfill = 0, mm_act = 0, mm_hmx = 0, mm_store = 0;
+#endif
+
+    for (int nt0 = 0; nt0 < np; nt0 += ntPerPass) {
+        const int ntEnd = (np - nt0 < ntPerPass) ? np : nt0 + ntPerPass;
+#if HTP_MM_PHASE_PROFILE
+        mm_t = MM_T0();
+#endif
+        if (prepackedWeights) {
+            // Already in the unit's tile order and contiguous per 32-column group,
+            // so the whole group is one straight copy out of the weights section
+            // instead of kp tiles rearranged an element at a time.
+            htp_ops_loop_hmx_copy_block(vtcmWeight,
+                                        (const __fp16*)(src1Base + (size_t)nt0 * kp * 1024 * sizeof(__fp16)),
+                                        (size_t)(ntEnd - nt0) * blockBytes);
+        } else {
+            for (int nt = nt0; nt < ntEnd; ++nt) {
+                for (int kt = 0; kt < kp; ++kt) {
+                    htp_ops_loop_hmx_pack_weight_tile(vtcmWeight + ((size_t)(nt - nt0) * kp + kt) * 1024,
+                                                      src1Base, lp, K, N, nt, kt);
+                }
+            }
+        }
+#if HTP_MM_PHASE_PROFILE
+        mm_wfill += MM_T0() - mm_t;
+#endif
+        for (int eBase = 0; eBase < E; eBase += 32) {
+            int validRows = E - eBase;
+            if (validRows > 32) {
+                validRows = 32;
+            }
+#if HTP_MM_PHASE_PROFILE
+            mm_t = MM_T0();
+#endif
+            const bool contiguousCols = lp->src0StrideXYZ[1] == 2;
+            if (contiguousCols && lp->src0StrideXYZ[0] == K * 2) {
+                if (K % 64 != 0 || validRows < 32) {
+                    memset(vtcmActivationRaw, 0, rawBytes);
+                }
+                htp_ops_loop_hmx_copy_block(vtcmActivationRaw,
+                                            (const __fp16*)(src0Base + (int64_t)eBase * lp->src0StrideXYZ[0]),
+                                            (size_t)validRows * K * 2);
+                htp_ops_loop_hmx_transform_activation_block(vtcmActivation, vtcmActivationRaw, K, validRows);
+            } else {
+                htp_ops_loop_hmx_pack_activation_block(vtcmActivation, src0Base, lp, K, eBase, validRows);
+            }
+            int nt = nt0;
+            const bool contiguous = lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0;
+            for (; contiguous && nt + 1 < ntEnd && N - nt * 32 >= 64; nt += 2) {
+#if HTP_MM_PHASE_PROFILE
+                mm_act += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                for (int which = 0; which < 2; ++which) {
+                    // One 32-column group of a pre-packed weight is contiguous, so
+                    // the unit's own loads run straight down the weights section.
+                    const __fp16* weightBlock = vtcmWeight + (size_t)(nt + which - nt0) * kp * 1024;
+                    for (int k = 0; k < kp; k += HMX_FP16_MAX_TILES_PER_LOAD) {
+                        int tiles = kp - k;
+                        if (tiles > HMX_FP16_MAX_TILES_PER_LOAD) {
+                            tiles = HMX_FP16_MAX_TILES_PER_LOAD;
+                        }
+                        hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
+                    }
+                    hmx_consume_accumulator_fp16(vtcmOutput + (size_t)which * 1024);
+                }
+#if HTP_MM_PHASE_PROFILE
+                mm_hmx += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                htp_ops_loop_hmx_store_output_pair(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+                mm_store += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+            }
+            for (; nt < ntEnd; ++nt) {
+                // One 32-column group of a pre-packed weight is contiguous, so
+                // the unit's own loads run straight down the weights section.
+                const __fp16* weightBlock = vtcmWeight + (size_t)(nt - nt0) * kp * 1024;
+#if HTP_MM_PHASE_PROFILE
+                mm_act += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                for (int k = 0; k < kp; k += HMX_FP16_MAX_TILES_PER_LOAD) {
+                    int tiles = kp - k;
+                    if (tiles > HMX_FP16_MAX_TILES_PER_LOAD) {
+                        tiles = HMX_FP16_MAX_TILES_PER_LOAD;
+                    }
+                    hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
+                }
+                hmx_consume_accumulator_fp16(vtcmOutput);
+#if HTP_MM_PHASE_PROFILE
+                mm_hmx += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+                htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+                mm_store += MM_T0() - mm_t;
+                mm_t = MM_T0();
+#endif
+            }
+        }
+    }
+
+#if HTP_MM_PHASE_PROFILE
+    {
+        const unsigned long long mm_tot = MM_T0() - mm_t0;
+        const unsigned long long mm_wb = (unsigned long long) ((size_t) kp * np * 1024 * sizeof(__fp16));
+        g_mm_phase_us[0] += mm_wfill;
+        g_mm_phase_us[1] += mm_act;
+        g_mm_phase_us[2] += mm_hmx;
+        g_mm_phase_us[3] += mm_store;
+        g_mm_phase_us[4] += mm_tot;
+        g_mm_phase_us[5] += 1;
+        g_mm_phase_us[6] += mm_wb;
+        g_mm_phase_us[7] = 0;
+    }
+#endif
+
+    if (!hmxPrepared) {
+        hmx_unit_release();
+        hmx_manager_disable_execution();
+    }
+    return true;
+}
+
+static inline bool htp_ops_loop_matmul_hmx_small(uint8_t* dstBase, const uint8_t* src0Base,
+                                                 const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                 int64_t outOff, int64_t in0Off, int64_t in1Off,
+                                                 bool hmxPrepared) {
+    const int E = lp->sizeXYZ[0];
+    const int K = lp->sizeXYZ[1];
+    const int N = lp->sizeXYZ[2];
+    if (!htp_ops_loop_matmul_hmx_small_eligible(lp)) {
+        return false;
+    }
+    const int64_t dstLast = (int64_t)(E - 1) * lp->dstStrideXYZ[0] + (int64_t)(N - 1) * lp->dstStrideXYZ[2];
+    const int64_t src0Last = (int64_t)(E - 1) * lp->src0StrideXYZ[0] + (int64_t)(K - 1) * lp->src0StrideXYZ[1];
+    const int64_t src1Last = (int64_t)(K - 1) * lp->src1StrideXYZ[1] + (int64_t)(N - 1) * lp->src1StrideXYZ[2];
+    if (!htp_ops_loop_check_element(outOff, dstLast, 2, lp->outputElementSize) ||
+        !htp_ops_loop_check_element(in0Off, src0Last, 2, lp->input0Size) ||
+        !htp_ops_loop_check_element(in1Off, src1Last, 2, lp->input1Size)) {
+        return false;
+    }
+
+    const int kp = htp_ops_loop_up_div(K, 32);
+    const int np = htp_ops_loop_up_div(N, 32);
+    uint8_t* vtcmPtr = (uint8_t*)vtcm_manager_get_vtcm_base();
+    __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)kp * 1024 * sizeof(__fp16));
+    __fp16* vtcmWeight = (__fp16*)vtcm_seq_alloc(&vtcmPtr, (size_t)np * kp * 1024 * sizeof(__fp16));
+    __fp16* vtcmOutput = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 1024 * sizeof(__fp16));
+    __fp16* vtcmScales = (__fp16*)vtcm_seq_alloc(&vtcmPtr, 256);
+    if (vtcmActivation == nullptr || vtcmWeight == nullptr || vtcmOutput == nullptr || vtcmScales == nullptr) {
+        return false;
+    }
+
+    if (!hmxPrepared) {
+        hmx_manager_enable_execution();
+        hmx_unit_acquire();
+    }
+    hmx_init_column_scales(vtcmScales, Q6_V_vsplat_R(0x3c00));
+    hmx_set_output_scales(vtcmScales);
+
+#if HTP_MM_PHASE_PROFILE
+    unsigned long long mm_t0 = MM_T0(), mm_t = MM_T0(), mm_wfill = 0, mm_act = 0, mm_hmx = 0, mm_store = 0;
+#endif
+    for (int nt = 0; nt < np; ++nt) {
+        for (int kt = 0; kt < kp; ++kt) {
+            htp_ops_loop_hmx_pack_weight_tile(vtcmWeight + ((size_t)nt * kp + kt) * 1024, src1Base, lp, K, N, nt, kt);
+        }
+    }
+#if HTP_MM_PHASE_PROFILE
+    mm_wfill += MM_T0() - mm_t;
+#endif
+
+    for (int eBase = 0; eBase < E; eBase += 32) {
+        int validRows = E - eBase;
+        if (validRows > 32) {
+            validRows = 32;
+        }
+#if HTP_MM_PHASE_PROFILE
+        mm_t = MM_T0();
+#endif
+        htp_ops_loop_hmx_pack_activation_k64(vtcmActivation, src0Base, lp, eBase, validRows);
+        for (int nt = 0; nt < np; ++nt) {
+#if HTP_MM_PHASE_PROFILE
+            mm_act += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
+            for (int kt = 0; kt < kp; ++kt) {
+                hmx_load_tiles_fp16(vtcmActivation + (size_t)kt * 1024,
+                                    vtcmWeight + ((size_t)nt * kp + kt) * 1024, 1);
+            }
+            hmx_consume_accumulator_fp16(vtcmOutput);
+#if HTP_MM_PHASE_PROFILE
+            mm_hmx += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
+            htp_ops_loop_hmx_store_output_tile(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+#if HTP_MM_PHASE_PROFILE
+            mm_store += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
+        }
+    }
+#if HTP_MM_PHASE_PROFILE
+    {
+        g_mm_phase_us[0] += mm_wfill;
+        g_mm_phase_us[1] += mm_act;
+        g_mm_phase_us[2] += mm_hmx;
+        g_mm_phase_us[3] += mm_store;
+        g_mm_phase_us[4] += MM_T0() - mm_t0;
+        g_mm_phase_us[5] += 1;
+        g_mm_phase_us[6] += (unsigned long long) ((size_t) np * kp * 1024 * sizeof(__fp16));
+        g_mm_phase_us[7] = 1;
+    }
+#endif
+
+    if (!hmxPrepared) {
+        hmx_unit_release();
+        hmx_manager_disable_execution();
+    }
+    return true;
+}
+
+typedef struct {
+    uint8_t* dstBase;
+    const uint8_t* src0Base;
+    const uint8_t* src1Base;
+    const HtpOpsLoopParam* lp;
+    int L;
+    int H;
+    int eStart;
+    int eEnd;
+    worker_synctoken_t* sync_ctx;
+} HtpOpsLoopMatmulHContigTask;
+
+static inline void htp_ops_loop_matmul_fast_h_contiguous_range(uint8_t* dstBase, const uint8_t* src0Base,
+                                                               const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                               int L, int H, int eStart, int eEnd) {
+    const int vecElems = __HVX_LENGTH__ / (int)sizeof(__fp16);
+    for (int e = eStart; e < eEnd; ++e) {
+        uint8_t* dstRow = dstBase + (int64_t)e * lp->dstStrideXYZ[0];
+        const uint8_t* src0Row = src0Base + (int64_t)e * lp->src0StrideXYZ[0];
+        int h = 0;
+        for (; h + vecElems <= H; h += vecElems) {
+#if MNN_MATMUL_FP32_ACC && MNN_MATMUL_EXACT_PRODUCT
+            HVX_VectorPair accW = Q6_W_vzero();
+            for (int l = 0; l < L; ++l) {
+                const __fp16* aPtr = (const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]);
+                uint16_t aBits = *(const uint16_t*)aPtr;
+                HVX_Vector aVec = Q6_Vh_vsplat_R(aBits);
+                const uint8_t* bPtr = src1Base + (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
+                HVX_Vector bVec = vmemu((const HVX_Vector*)bPtr);
+                accW = Q6_Wsf_vmpyacc_WsfVhfVhf(accW, aVec, bVec);
+            }
+            vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) =
+                Q6_Vhf_vcvt_VsfVsf(Q6_V_lo_W(accW), Q6_V_hi_W(accW));
+#else
+#if MNN_MATMUL_FP32_ACC
+            HVX_Vector acc0 = Q6_V_vzero();
+            HVX_Vector acc1 = Q6_V_vzero();
+#else
+            HVX_Vector acc = Q6_V_vzero();
+#endif
+            for (int l = 0; l < L; ++l) {
+                const __fp16* aPtr = (const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]);
+                uint16_t aBits = *(const uint16_t*)aPtr;
+                HVX_Vector aVec = Q6_Vh_vsplat_R(aBits);
+                const uint8_t* bPtr = src1Base + (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
+                HVX_Vector bVec = vmemu((const HVX_Vector*)bPtr);
+#if MNN_MATMUL_FP32_ACC && MNN_MATMUL_EXACT_PRODUCT
+                HVX_VectorPair prodF = Q6_Vqf32_vmpy_VhfVhf(aVec, bVec);
+                acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+                acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+#elif MNN_MATMUL_FP32_ACC
+                HVX_VectorPair prodF = hvx_my_vqf16_to_wsf(Q6_Vqf16_vmpy_VhfVhf(aVec, bVec));
+                acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+                acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+#else
+                HVX_Vector prod = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(aVec, bVec));
+                acc = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(acc, prod));
+#endif
+            }
+#if MNN_MATMUL_FP32_ACC
+            vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) = Q6_Vhf_vcvt_VsfVsf(acc0, acc1);
+#else
+            vmemu((HVX_Vector*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2])) = acc;
+#endif
+#endif
+        }
+        for (; h < H; ++h) {
+            float sum = 0.0f;
+            for (int l = 0; l < L; ++l) {
+                const int64_t src0Extra = (int64_t)e * lp->src0StrideXYZ[0] + (int64_t)l * lp->src0StrideXYZ[1];
+                const int64_t src1Extra = (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
+                sum += (float)(*(const __fp16*)(src0Base + src0Extra)) *
+                       (float)(*(const __fp16*)(src1Base + src1Extra));
+            }
+            *(__fp16*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2]) = (__fp16)sum;
+        }
+    }
+}
+
+static void htp_ops_loop_matmul_fast_h_contiguous_worker(void* data, int worker_index) {
+    (void)worker_index;
+    HtpOpsLoopMatmulHContigTask* task = (HtpOpsLoopMatmulHContigTask*)data;
+    htp_ops_loop_matmul_fast_h_contiguous_range(task->dstBase, task->src0Base, task->src1Base,
+                                                task->lp, task->L, task->H, task->eStart, task->eEnd);
+    worker_pool_synctoken_jobdone(task->sync_ctx);
+}
+
+static inline bool htp_ops_loop_matmul_fast_h_contiguous(uint8_t* dstBase, const uint8_t* src0Base,
+                                                         const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                         int64_t outOff, int64_t in0Off, int64_t in1Off) {
+    const int E = lp->sizeXYZ[0];
+    const int L = lp->sizeXYZ[1];
+    const int H = lp->sizeXYZ[2];
+    if (E <= 0 || L <= 0 || H <= 0 || lp->dstStrideXYZ[2] != 2 || lp->src1StrideXYZ[2] != 2) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[0] < 0 || lp->src0StrideXYZ[0] < 0 || lp->src0StrideXYZ[1] < 0 ||
+        lp->src1StrideXYZ[1] < 0) {
+        return false;
+    }
+    const int64_t dstLast = (int64_t)(E - 1) * lp->dstStrideXYZ[0] + (int64_t)(H - 1) * lp->dstStrideXYZ[2];
+    const int64_t src0Last = (int64_t)(E - 1) * lp->src0StrideXYZ[0] + (int64_t)(L - 1) * lp->src0StrideXYZ[1];
+    const int64_t src1Last = (int64_t)(L - 1) * lp->src1StrideXYZ[1] + (int64_t)(H - 1) * lp->src1StrideXYZ[2];
+    if (!htp_ops_loop_check_element(outOff, dstLast, 2, lp->outputElementSize) ||
+        !htp_ops_loop_check_element(in0Off, src0Last, 2, lp->input0Size) ||
+        !htp_ops_loop_check_element(in1Off, src1Last, 2, lp->input1Size)) {
+        return false;
+    }
+
+    const int64_t work = (int64_t)E * L * H;
+    if (g_max_num_workers > 1 && E >= 8 && work >= 32768) {
+        int nTasks = (int)g_max_num_workers;
+        if (nTasks > E) {
+            nTasks = E;
+        }
+        HtpOpsLoopMatmulHContigTask* tasks = WORKER_POOL_STACK_ALLOC(HtpOpsLoopMatmulHContigTask, nTasks);
+        worker_synctoken_t sync_ctx;
+        worker_pool_synctoken_init(&sync_ctx, nTasks);
+        worker_pool_job_t job;
+        job.fptr = htp_ops_loop_matmul_fast_h_contiguous_worker;
+        const int rowsPerTask = (E + nTasks - 1) / nTasks;
+        for (int i = 0; i < nTasks; ++i) {
+            const int eStart = i * rowsPerTask;
+            int eEnd = eStart + rowsPerTask;
+            if (eEnd > E) {
+                eEnd = E;
+            }
+            tasks[i].dstBase = dstBase;
+            tasks[i].src0Base = src0Base;
+            tasks[i].src1Base = src1Base;
+            tasks[i].lp = lp;
+            tasks[i].L = L;
+            tasks[i].H = H;
+            tasks[i].eStart = eStart;
+            tasks[i].eEnd = eEnd;
+            tasks[i].sync_ctx = &sync_ctx;
+            job.dptr = tasks + i;
+            worker_pool_submit(NULL, job);
+        }
+        worker_pool_synctoken_wait(&sync_ctx);
+        return true;
+    }
+    htp_ops_loop_matmul_fast_h_contiguous_range(dstBase, src0Base, src1Base, lp, L, H, 0, E);
+    return true;
+}
+
+static inline bool htp_ops_loop_matmul_fast_small_h(uint8_t* dstBase, const uint8_t* src0Base,
+                                                    const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                    int64_t outOff, int64_t in0Off, int64_t in1Off) {
+    const int E = lp->sizeXYZ[0];
+    const int L = lp->sizeXYZ[1];
+    const int H = lp->sizeXYZ[2];
+    const int vecElems = __HVX_LENGTH__ / (int)sizeof(__fp16);
+    if (E <= 0 || L <= 0 || H <= 0 || H > 16 || lp->dstStrideXYZ[2] != 2 ||
+        lp->src0StrideXYZ[1] != 2 || lp->src1StrideXYZ[2] != 2) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[0] < 0 || lp->src0StrideXYZ[0] < 0 || lp->src1StrideXYZ[1] < 0) {
+        return false;
+    }
+    const int64_t dstLast = (int64_t)(E - 1) * lp->dstStrideXYZ[0] + (int64_t)(H - 1) * lp->dstStrideXYZ[2];
+    const int64_t src0Last = (int64_t)(E - 1) * lp->src0StrideXYZ[0] + (int64_t)(L - 1) * lp->src0StrideXYZ[1];
+    const int64_t src1Last = (int64_t)(L - 1) * lp->src1StrideXYZ[1] + (int64_t)(H - 1) * lp->src1StrideXYZ[2];
+    if (!htp_ops_loop_check_element(outOff, dstLast, 2, lp->outputElementSize) ||
+        !htp_ops_loop_check_element(in0Off, src0Last, 2, lp->input0Size) ||
+        !htp_ops_loop_check_element(in1Off, src1Last, 2, lp->input1Size)) {
+        return false;
+    }
+
+    const HVX_Vector zero = Q6_V_vzero();
+    const HVX_VectorPred qH = Q6_Q_vsetq_R(H * (int)sizeof(__fp16));
+    const int safeRows = (vecElems + H - 1) / H;
+    const bool src1RowsTightlyPacked = lp->src1StrideXYZ[1] == H * (int)sizeof(__fp16);
+    const int vectorLimit = src1RowsTightlyPacked && L >= safeRows ? L - safeRows + 1 : 0;
+    for (int e = 0; e < E; ++e) {
+        const uint8_t* src0Row = src0Base + (int64_t)e * lp->src0StrideXYZ[0];
+        uint8_t* dstRow = dstBase + (int64_t)e * lp->dstStrideXYZ[0];
+        HVX_Vector acc0 = Q6_V_vzero();
+        HVX_Vector acc1 = Q6_V_vzero();
+        int l = 0;
+        for (; l < vectorLimit; ++l) {
+            const __fp16* aPtr = (const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]);
+            uint16_t aBits = *(const uint16_t*)aPtr;
+            HVX_Vector aVec = Q6_Vh_vsplat_R(aBits);
+            const uint8_t* bPtr = src1Base + (int64_t)l * lp->src1StrideXYZ[1];
+            HVX_Vector bVec = Q6_V_vmux_QVV(qH, vmemu((const HVX_Vector*)bPtr), zero);
+            HVX_Vector prod = Q6_Vqf16_vmpy_VhfVhf(aVec, bVec);
+            HVX_VectorPair prodF = hvx_my_vqf16_to_wsf(prod);
+            acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+            acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+        }
+        float tail[16] = {0.0f};
+        for (; l < L; ++l) {
+            const float a = (float)(*(const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]));
+            const __fp16* b = (const __fp16*)(src1Base + (int64_t)l * lp->src1StrideXYZ[1]);
+            for (int h = 0; h < H; ++h) {
+                tail[h] += a * (float)b[h];
+            }
+        }
+        HVX_Vector out = Q6_Vhf_vcvt_VsfVsf(acc0, acc1);
+        __fp16 tmp[64] __attribute__((aligned(128)));
+        vmem(tmp) = out;
+        for (int h = 0; h < H; ++h) {
+            tmp[h] = (__fp16)((float)tmp[h] + tail[h]);
+        }
+        memcpy(dstRow, tmp, (size_t)H * sizeof(__fp16));
+    }
+    return true;
+}
+
+static inline bool htp_ops_loop_matmul_fast_l_contiguous(uint8_t* dstBase, const uint8_t* src0Base,
+                                                         const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                                         int64_t outOff, int64_t in0Off, int64_t in1Off) {
+    const int E = lp->sizeXYZ[0];
+    const int L = lp->sizeXYZ[1];
+    const int H = lp->sizeXYZ[2];
+    const int vecElems = __HVX_LENGTH__ / (int)sizeof(__fp16);
+    if (E <= 0 || L < vecElems || H <= 0 || lp->dstStrideXYZ[2] != 2 ||
+        lp->src0StrideXYZ[1] != 2 || lp->src1StrideXYZ[1] != 2) {
+        return false;
+    }
+    if (lp->dstStrideXYZ[0] < 0 || lp->src0StrideXYZ[0] < 0 || lp->src1StrideXYZ[2] < 0) {
+        return false;
+    }
+    const int64_t dstLast = (int64_t)(E - 1) * lp->dstStrideXYZ[0] + (int64_t)(H - 1) * lp->dstStrideXYZ[2];
+    const int64_t src0Last = (int64_t)(E - 1) * lp->src0StrideXYZ[0] + (int64_t)(L - 1) * lp->src0StrideXYZ[1];
+    const int64_t src1Last = (int64_t)(H - 1) * lp->src1StrideXYZ[2] + (int64_t)(L - 1) * lp->src1StrideXYZ[1];
+    if (!htp_ops_loop_check_element(outOff, dstLast, 2, lp->outputElementSize) ||
+        !htp_ops_loop_check_element(in0Off, src0Last, 2, lp->input0Size) ||
+        !htp_ops_loop_check_element(in1Off, src1Last, 2, lp->input1Size)) {
+        return false;
+    }
+
+    for (int e = 0; e < E; ++e) {
+        const uint8_t* src0Row = src0Base + (int64_t)e * lp->src0StrideXYZ[0];
+        uint8_t* dstRow = dstBase + (int64_t)e * lp->dstStrideXYZ[0];
+        for (int h = 0; h < H; ++h) {
+            const uint8_t* src1Row = src1Base + (int64_t)h * lp->src1StrideXYZ[2];
+            HVX_Vector acc0 = Q6_V_vzero();
+            HVX_Vector acc1 = Q6_V_vzero();
+            int l = 0;
+            for (; l + vecElems <= L; l += vecElems) {
+                HVX_Vector aVec = vmemu((const HVX_Vector*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1]));
+                HVX_Vector bVec = vmemu((const HVX_Vector*)(src1Row + (int64_t)l * lp->src1StrideXYZ[1]));
+                HVX_Vector prod = Q6_Vqf16_vmpy_VhfVhf(aVec, bVec);
+                HVX_VectorPair prodF = hvx_my_vqf16_to_wsf(prod);
+                acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(prodF)));
+                acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(prodF)));
+            }
+            float sum = htp_ops_loop_reduce_sum2_f32(acc0, acc1);
+            for (; l < L; ++l) {
+                sum += (float)(*(const __fp16*)(src0Row + (int64_t)l * lp->src0StrideXYZ[1])) *
+                       (float)(*(const __fp16*)(src1Row + (int64_t)l * lp->src1StrideXYZ[1]));
+            }
+            *(__fp16*)(dstRow + (int64_t)h * lp->dstStrideXYZ[2]) = (__fp16)sum;
+        }
+    }
+    return true;
+}
+
+static inline void htp_ops_loop_matmul_region(uint8_t* dstBase, const uint8_t* src0Base,
+                                              const uint8_t* src1Base, const HtpOpsLoopParam* lp,
+                                              int64_t outOff, int64_t in0Off, int64_t in1Off,
+                                              bool hmxPrepared) {
+    bool prepackedWeights = false;
+    int plannedTiles = 0;
+    if (htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles) && prepackedWeights) {
+        // No other kernel here can read this operand: the weights are in the
+        // unit's tile order rather than the (K, N) one the HVX paths walk.
+        htp_ops_loop_matmul_hmx_general(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared);
+        return;
+    }
+    if (htp_ops_loop_matmul_hmx_small(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
+        return;
+    }
+    const bool preferHmxGeneral =
+        htp_ops_loop_matmul_prefer_hmx_general(lp->sizeXYZ[1], lp->sizeXYZ[2]);
+    if (preferHmxGeneral &&
+        htp_ops_loop_matmul_hmx_general(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
+        return;
+    }
+    if (htp_ops_loop_matmul_fast_small_h(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off)) {
+        return;
+    }
+    if (htp_ops_loop_matmul_fast_h_contiguous(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off)) {
+        return;
+    }
+    if (htp_ops_loop_matmul_fast_l_contiguous(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off)) {
+        return;
+    }
+    if (!preferHmxGeneral &&
+        htp_ops_loop_matmul_hmx_general(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared)) {
+        return;
+    }
+    const int E = lp->sizeXYZ[0];
+    const int L = lp->sizeXYZ[1];
+    const int H = lp->sizeXYZ[2];
+    for (int e = 0; e < E; ++e) {
+        const int64_t dstEOff = (int64_t)e * lp->dstStrideXYZ[0];
+        const int64_t src0EOff = (int64_t)e * lp->src0StrideXYZ[0];
+        for (int h = 0; h < H; ++h) {
+            const int64_t dstExtra = dstEOff + (int64_t)h * lp->dstStrideXYZ[2];
+            if (!htp_ops_loop_check_element(outOff, dstExtra, 2, lp->outputElementSize)) {
+                continue;
+            }
+            float sum = 0.0f;
+            for (int l = 0; l < L; ++l) {
+                const int64_t src0Extra = src0EOff + (int64_t)l * lp->src0StrideXYZ[1];
+                const int64_t src1Extra = (int64_t)l * lp->src1StrideXYZ[1] + (int64_t)h * lp->src1StrideXYZ[2];
+                if (!htp_ops_loop_check_element(in0Off, src0Extra, 2, lp->input0Size) ||
+                    !htp_ops_loop_check_element(in1Off, src1Extra, 2, lp->input1Size)) {
+                    continue;
+                }
+                sum += (float)(*(const __fp16*)(src0Base + src0Extra)) *
+                       (float)(*(const __fp16*)(src1Base + src1Extra));
+            }
+            *(__fp16*)(dstBase + dstExtra) = (__fp16)sum;
+        }
+    }
+}
+
+AEEResult htp_ops_loop_blit(uint8_t* dst, uint8_t* src0, uint8_t* src1,
+                            uint8_t* iter0, uint8_t* iter1, uint8_t* iter2,
+                            int32_t cmdKind, int32_t opType,
+                            int32_t bytes,
+                            uint8_t* param) {
+    uint8_t* pParam = param;
+
+    const HtpOpsLoopParam* lp = (HtpOpsLoopParam*)pParam;
+
+    int32_t loopNumber = lp->loopNumber;
+    if (loopNumber <= 0) {
+        return 0;
+    }
+
+    uint8_t* pDst = dst;
+    uint8_t* pSrc0 = src0;
+    uint8_t* pIter0 = iter0;
+    uint8_t* pIter1 = iter1;
+
+    const uint8_t* srcIter0 = pIter0;
+    const uint8_t* srcIter1 = pIter1;
+    if (cmdKind != 0 && cmdKind != 1 && cmdKind != 2) {
+        return AEE_EUNSUPPORTED;
+    }
+    if (cmdKind == 2 && bytes != 2) {
+        return AEE_EUNSUPPORTED;
+    }
+
+    int optZ = lp->sizeXYZ[0];
+    int optY = lp->sizeXYZ[1];
+    int optX = lp->sizeXYZ[2];
+    bool continuous = (lp->src0StrideXYZ[2] == bytes && lp->dstStrideXYZ[2] == bytes &&
+                       (cmdKind == 0 || lp->src1StrideXYZ[2] == bytes));
+    if (continuous) {
+        if (lp->src0StrideXYZ[1] == optX * bytes && lp->dstStrideXYZ[1] == optX * bytes &&
+            (cmdKind == 0 || lp->src1StrideXYZ[1] == optX * bytes)) {
+            optX *= optY;
+            optY = 1;
+            if (lp->src0StrideXYZ[0] == optX * bytes && lp->dstStrideXYZ[0] == optX * bytes &&
+                (cmdKind == 0 || lp->src1StrideXYZ[0] == optX * bytes)) {
+                optX *= optZ;
+                optZ = 1;
+            }
+        }
+    }
+    int optXBytes = optX * bytes;
+
+    if (cmdKind == 1 &&
+        htp_ops_loop_binary_try_parallel(pDst, pSrc0, src1, iter0, iter1, iter2, lp, opType, bytes,
+                                         continuous, optX, optY, optZ)) {
+        return 0;
+    }
+
+    for (int iter = 0; iter < loopNumber; ++iter) {
+        int32_t it0 = srcIter0 ? loop_read_int32(srcIter0 + iter * sizeof(int32_t)) : iter;
+        int32_t it1 = srcIter1 ? loop_read_int32(srcIter1 + iter * sizeof(int32_t)) : iter;
+
+        int32_t outOff = (int32_t)it0 * lp->cmdSteps[0] + lp->cmdViewOffset[0];
+        if (outOff < 0 || outOff >= lp->outputElementSize) continue;
+        int32_t outByteOffset = (int32_t)outOff * bytes;
+        uint8_t* dstBase = pDst + outByteOffset;
+
+        int32_t in0Off = (int32_t)it1 * lp->cmdSteps[1] + lp->cmdViewOffset[1];
+        if (in0Off < 0 || in0Off >= lp->input0Size) continue;
+        const uint8_t* src0Base = pSrc0 + in0Off * bytes;
+
+        if (cmdKind == 1 || cmdKind == 2) {
+            uint8_t* pSrc1 = src1;
+            uint8_t* pIter2 = iter2;
+            const uint8_t* srcIter2 = pIter2;
+            int32_t it2 = srcIter2 ? loop_read_int32(srcIter2 + iter * sizeof(int32_t)) : iter;
+            int32_t in1Off = (int32_t)it2 * lp->cmdSteps[2] + lp->cmdViewOffset[2];
+            if (in1Off < 0 || in1Off >= lp->input1Size) continue;
+            const uint8_t* src1Base = pSrc1 + in1Off * bytes;
+            if (cmdKind == 2) {
+                htp_ops_loop_matmul_region(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, false);
+            } else {
+                if (loopNumber == 1) {
+                    HtpOpsBinaryRegion region;
+                    region.src0Offset = 0;
+                    region.src1Offset = 0;
+                    region.dstOffset = 0;
+                    for (int d = 0; d < 3; ++d) {
+                        region.size[d] = lp->sizeXYZ[d];
+                        region.src0Stride[d] = lp->src0StrideXYZ[d];
+                        region.src1Stride[d] = lp->src1StrideXYZ[d];
+                        region.dstStride[d] = lp->dstStrideXYZ[d];
+                    }
+                    htp_ops_binary_blit(dstBase, src0Base, src1Base, (uint8_t*)&region, 1, bytes, opType);
+                    continue;
+                }
+                htp_ops_loop_binary_region(dstBase, src0Base, src1Base, lp, opType, bytes,
+                                           continuous, optX, optY, optZ);
+            }
+        } else if (continuous) {
+            for (int z = 0; z < optZ; ++z) {
+                const uint8_t* src0Z = src0Base + z * lp->src0StrideXYZ[0];
+                uint8_t* dstZ = dstBase + z * lp->dstStrideXYZ[0];
+                for (int y = 0; y < optY; ++y) {
+                    const uint8_t* src0Y = src0Z + y * lp->src0StrideXYZ[1];
+                    uint8_t* dstY = dstZ + y * lp->dstStrideXYZ[1];
+
+                    size_t rowBytes = (size_t)optXBytes;
+                    if (rowBytes >= (size_t)__HVX_LENGTH__) {
+                        const int vecBytes = __HVX_LENGTH__;
+                        const size_t vecCount = rowBytes / (size_t)vecBytes;
+                        const size_t tailBytes = rowBytes - vecCount * (size_t)vecBytes;
+                        for (size_t iVec = 0; iVec < vecCount; ++iVec) {
+                            const uint8_t *sVec = src0Y + iVec * (size_t)vecBytes;
+                            uint8_t *dVec = dstY + iVec * (size_t)vecBytes;
+                            HVX_Vector v = vmemu((const HVX_Vector *)sVec);
+                            vmemu((HVX_Vector *)dVec) = v;
+                        }
+                        if (tailBytes > 0) {
+                            memcpy(dstY + vecCount * (size_t)vecBytes, src0Y + vecCount * (size_t)vecBytes, tailBytes);
+                        }
+                    } else {
+                        memcpy(dstY, src0Y, rowBytes);
+                    }
+                }
+            }
+        } else {
+            for (int z = 0; z < lp->sizeXYZ[0]; ++z) {
+                const uint8_t* src0Z = src0Base + z * lp->src0StrideXYZ[0];
+                uint8_t* dstZ = dstBase + z * lp->dstStrideXYZ[0];
+                for (int y = 0; y < lp->sizeXYZ[1]; ++y) {
+                    const uint8_t* src0Y = src0Z + y * lp->src0StrideXYZ[1];
+                    uint8_t* dstY = dstZ + y * lp->dstStrideXYZ[1];
+                    for (int x = 0; x < lp->sizeXYZ[2]; ++x) {
+                        const uint8_t* s0 = src0Y + x * lp->src0StrideXYZ[2];
+                        uint8_t* d = dstY + x * lp->dstStrideXYZ[2];
+                        memcpy(d, s0, bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+AEEResult htp_ops_batch_matmul(uint8_t* dst, uint8_t* src0, uint8_t* src1,
+                               uint8_t* iter0, uint8_t* iter1, uint8_t* iter2,
+                               int32_t bytes, uint8_t* param) {
+    const HtpOpsLoopParam* lp = (HtpOpsLoopParam*)param;
+    if (lp == nullptr || lp->loopNumber <= 0) {
+        return 0;
+    }
+    if (bytes != 2) {
+        return AEE_EUNSUPPORTED;
+    }
+    const uint8_t* srcIter0 = iter0;
+    const uint8_t* srcIter1 = iter1;
+    const uint8_t* srcIter2 = iter2;
+    const bool hmxPrepared = htp_ops_loop_matmul_batch_hmx_prepare(lp);
+    if (hmxPrepared) {
+        hmx_manager_enable_execution();
+        hmx_unit_acquire();
+    }
+    for (int iter = 0; iter < lp->loopNumber; ++iter) {
+        int32_t it0 = srcIter0 ? loop_read_int32(srcIter0 + iter * sizeof(int32_t)) : iter;
+        int32_t it1 = srcIter1 ? loop_read_int32(srcIter1 + iter * sizeof(int32_t)) : iter;
+        int32_t it2 = srcIter2 ? loop_read_int32(srcIter2 + iter * sizeof(int32_t)) : iter;
+
+        int32_t outOff = (int32_t)it0 * lp->cmdSteps[0] + lp->cmdViewOffset[0];
+        if (outOff < 0 || outOff >= lp->outputElementSize) {
+            continue;
+        }
+        int32_t in0Off = (int32_t)it1 * lp->cmdSteps[1] + lp->cmdViewOffset[1];
+        if (in0Off < 0 || in0Off >= lp->input0Size) {
+            continue;
+        }
+        int32_t in1Off = (int32_t)it2 * lp->cmdSteps[2] + lp->cmdViewOffset[2];
+        if (in1Off < 0 || in1Off >= lp->input1Size) {
+            continue;
+        }
+        uint8_t* dstBase = dst + (int64_t)outOff * bytes;
+        const uint8_t* src0Base = src0 + (int64_t)in0Off * bytes;
+        const uint8_t* src1Base = src1 + (int64_t)in1Off * bytes;
+        htp_ops_loop_matmul_region(dstBase, src0Base, src1Base, lp, outOff, in0Off, in1Off, hmxPrepared);
+    }
+
+    if (hmxPrepared) {
+        hmx_unit_release();
+        hmx_manager_disable_execution();
+    }
+    return 0;
+}
+
+}  // extern "C"
