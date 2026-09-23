@@ -261,24 +261,25 @@ cmake -S backends/hexagon/skel -B build-skel \
 
 ```sh
 pytest backends/hexagon/test                                          # this backend's own tests
-pytest backends/test/suite/operators -m flow_hexagon -q               # the shared operator suite
 PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py      # regenerate OP_SUPPORT.md
 ```
 
-The first directory is in `pytest.ini`'s `testpaths`, so the generic CI unittest
-job runs it. The cases that need the SDK's toolchain or its simulator skip when
-it is absent, so the run is meaningful on a machine without the SDK.
+The directory is in `pytest.ini`'s `testpaths`, so the generic CI unittest job
+runs it. The cases that need the SDK's toolchain or its simulator skip when it is
+absent, so the run is meaningful on a machine without the SDK.
 `test/test_op_support.py` is the guard that keeps `OP_SUPPORT.md` equal to what
 `gen_op_support.py` renders from `hexagon_ops.EMITTERS`; add an emitter and that
 test fails until the table is regenerated.
 
-The second command reaches the shared operator suite through
-`backends/test/suite/flows/hexagon.py`. The flow is registered unconditionally,
-so `-m flow_hexagon` collects the backend's cases wherever it runs; each case
-exports, partitions and emits its blob, and then the run stage skips, because a
-serialized program needs the DSP. Executing a collected case needs a runner built
-with `EXECUTORCH_BUILD_HEXAGON=ON`, the matching skel on the device, and a way to
-hand the `.pte` over; see the execution policy note in `test/tester/tester.py`.
+`test/tester/` is this backend's half of the shared operator suite: the suite
+collects a backend's cases through a flow object, and the tester is what that
+flow drives. It lowers through `HexagonPartitioner` and skips the run stage,
+because a serialized program needs the DSP. The flow that instantiates it is
+registered in the suite's own directory and is not part of this change, so no
+`-m flow_hexagon` selection collects anything from here yet. Running a case
+instead of skipping it needs a runner built with `EXECUTORCH_BUILD_HEXAGON=ON`,
+the matching skel on the device, and a way to hand the `.pte` over; see the
+execution policy note in `test/tester/tester.py`.
 
 ## The skel must be built with optimization
 

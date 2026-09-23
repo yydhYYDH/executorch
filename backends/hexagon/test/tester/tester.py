@@ -16,11 +16,15 @@ The suite's run stage loads the serialized program into the in-process portable
 pybindings, which is a path this backend does not have. A Hexagon program calls
 into the delegate, whose kernels are HVX/HMX code built for one Hexagon arch and
 whose host side opens a FastRPC session through ``libcdsprpc``; both live on the
-device. Neither the SDK nor a device is needed to *lower* a case, so the flow is
-registered and collected everywhere (see
-``backends/test/suite/flows/hexagon.py``) and the run stage skips with the reason
-below. Everything up to and including serialization still runs, which is what
-this backend can assert without a DSP.
+device. Neither the SDK nor a device is needed to *lower* a case, so a case
+reaches the run stage and skips there with the reason below: everything up to and
+including serialization still runs, which is what this backend can assert
+without a DSP.
+
+A backend is handed cases by a flow, which is registered in the suite's own
+directory rather than here, so nothing in ``backends/hexagon`` instantiates this
+class. It is the backend half: the stages below are the ones a flow has to lower
+through.
 
 Executing a case instead of skipping it needs a runner that can load the ``.pte``
 with the delegate registered and the matching skel on the device, which nothing
