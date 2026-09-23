@@ -60,6 +60,17 @@ class Unavailable(RuntimeError):
     """The toolchain or simulator is not usable here."""
 
 
+class BuildFailed(RuntimeError):
+    """A runner or a kernel handed to `run` did not compile.
+
+    Deliberately not an `Unavailable`: a machine without the SDK should skip
+    these tests, while a translation unit that does not build has to fail them.
+    The runners carry static assertions that the vector alignment their kernels
+    assume really is declared, and a guard whose misalignment only ever showed up
+    as "this machine has no simulator" would not be a guard.
+    """
+
+
 def _check() -> tuple:
     sdk = _sdk_root()
     if sdk is None:
@@ -121,7 +132,7 @@ def build(
             text=True,
         )
         if done.returncode != 0:
-            raise Unavailable(f"compiling {source}:\n{done.stderr[-3000:]}")
+            raise BuildFailed(f"compiling {source}:\n{done.stderr[-3000:]}")
 
     objects = []
     for index, source in enumerate(sources):

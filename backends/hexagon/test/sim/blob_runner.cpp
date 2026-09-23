@@ -102,6 +102,11 @@ extern "C" int htp_ops_vision_attention_fp16(uint8_t *output, const uint8_t *que
                                              float scale, int32_t maskStride,
                                              int32_t workspaceBytes);
 
+/* An HVX vector at `-mhvx-length=128b`, which is what every kernel here assumes
+ * of the buffers it is handed. The static assertions below the buffers read this
+ * back out of the declarations. */
+enum { kVectorBytes = 128 };
+
 enum {
   kPool2d = 1,
   kRasterBlit = 3,
@@ -465,8 +470,17 @@ int main(void) {
    * wants its address aligned to the vector length, and a byte array gives the
    * linker no reason to -- which is a wrong answer rather than a crash, and one
    * that a change to the fixture list can flip. Keep the attribute, and see
-   * backends/hexagon/test/README.md before changing either side. */
-  static uint8_t arena[kMaxArenaBytes] __attribute__((aligned(128)));
+   * backends/hexagon/test/README.md before changing either side.
+   *
+   * The assertion is what makes dropping the attribute a build failure rather
+   * than a hazard to remember. It cannot be written on the address (not a
+   * constant expression) or on the array's type (an array's type alignment is
+   * its element's), so it reads the attribute back through `__alignof__` on the
+   * object, which the Hexagon compiler answers with the attribute's value. */
+  static uint8_t arena[kMaxArenaBytes] __attribute__((aligned(kVectorBytes)));
+  static_assert(
+      __alignof__(arena) == kVectorBytes,
+      "the kernels read this arena a vector at a time");
   int status = 0;
   for (unsigned i = 0; i < kFixtureCount; ++i) {
     const BlobFixture &fixture = kFixtures[i];

@@ -37,15 +37,25 @@ add a fixture:
   about memory. That is the dangerous part: a case could pass today, fail
   tomorrow, and the change that moved it was a test someone added elsewhere in
   the file.
-- **So it is declared, not hoped for.** `blob_runner.cpp` and `ops_runner.cpp`
-  both write `__attribute__((aligned(128)))` on the arena and on every operand
-  buffer a kernel reads or writes. Do the same for anything new that a kernel
-  dereferences. The generated fixture arrays are the exception, and only because
-  the runner `memcpy`s them into the arena: a scratch runner that hands its own
-  array straight to a kernel -- the way `htp_ops_matmul_q4a16_gemv_i8` was driven
-  while investigating the quantized GEMV entries -- has to align that array
-  itself. The one thing that must not happen is a passing suite that depends on
-  the compiler happening to place an array where the HVX wants it.
+- **So it is declared, and enforced at compile time.** `blob_runner.cpp` and
+  `ops_runner.cpp` both write `__attribute__((aligned(128)))` on the arena and on
+  every operand buffer a kernel reads or writes, and each declaration is
+  followed by `static_assert(__alignof__(buffer) == 128, ...)` naming it. Delete
+  the attribute and the build stops -- the compiler reports `expression evaluates
+  to '1 == 128'` -- instead of a suite that quietly goes back to depending on
+  link layout. The assertion has to be written that way: a `static_assert` on the
+  address is not a constant expression, and `alignof` on the array's *type* is
+  its element's alignment, so neither of those forms compiles or reports. Such a
+  failure stays visible because `hexagon_sim.BuildFailed` is not
+  `hexagon_sim.Unavailable`: a machine without the SDK skips these tests, a
+  translation unit that does not compile fails them. Do the same for anything new
+  that a kernel dereferences. The generated fixture arrays are the exception, and
+  only because the runner `memcpy`s them into the arena: a scratch runner that
+  hands its own array straight to a kernel -- the way
+  `htp_ops_matmul_q4a16_gemv_i8` was driven while investigating the quantized GEMV
+  entries -- has to align that array itself. The one thing that must not happen
+  is a passing suite that depends on the compiler happening to place an array
+  where the HVX wants it.
 
 ## What the simulator cannot run
 

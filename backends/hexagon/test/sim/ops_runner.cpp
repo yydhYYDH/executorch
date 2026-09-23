@@ -42,15 +42,28 @@ static void print_bits(const char *tag, const _Float16 *v, int n) {
  * it the array lands wherever the linker puts it and the result depends on the
  * size of the whole shared object rather than on the kernel -- a wrong answer
  * rather than a crash, from an edit that says nothing about memory. See
- * backends/hexagon/test/README.md. */
+ * backends/hexagon/test/README.md.
+ *
+ * The assertion below each declaration is what keeps that from being a promise:
+ * it names the declaration, so dropping the attribute fails the build instead of
+ * quietly reintroducing the hazard. `alignof` on the array's type would not do
+ * it -- an array's type alignment is its element's -- and a `static_assert` on
+ * the address is not a constant expression, so this reads the attribute through
+ * `__alignof__` on the object, which is a constant expression and which the
+ * Hexagon compiler answers with the attribute's value. */
+#define VECTOR_BYTES 128
 
 /* The fused norm. gamma and beta are fp32 even though src and dst are fp16,
  * which is only visible in layer_norm_ops.cc and reads garbage if missed. */
 static void run_norm(void) {
-  static _Float16 src[ROWS * INNER] __attribute__((aligned(128)));
-  static _Float16 dst[ROWS * INNER] __attribute__((aligned(128)));
-  static float gamma[INNER] __attribute__((aligned(128)));
-  static float beta[INNER] __attribute__((aligned(128)));
+  static _Float16 src[ROWS * INNER] __attribute__((aligned(VECTOR_BYTES)));
+  static _Float16 dst[ROWS * INNER] __attribute__((aligned(VECTOR_BYTES)));
+  static float gamma[INNER] __attribute__((aligned(VECTOR_BYTES)));
+  static float beta[INNER] __attribute__((aligned(VECTOR_BYTES)));
+  static_assert(__alignof__(src) == VECTOR_BYTES, "src is read a vector at a time");
+  static_assert(__alignof__(dst) == VECTOR_BYTES, "dst is written a vector at a time");
+  static_assert(__alignof__(gamma) == VECTOR_BYTES, "gamma is read a vector at a time");
+  static_assert(__alignof__(beta) == VECTOR_BYTES, "beta is read a vector at a time");
   for (int i = 0; i < ROWS * INNER; ++i)
     src[i] = (_Float16)((float)((i * 7) % 13 - 6) * 0.5f);
   for (int i = 0; i < INNER; ++i) {
@@ -69,9 +82,12 @@ static void run_norm(void) {
 /* Operands are small integers, so products and sums are exact and agreement
  * does not depend on the order either side accumulates in. */
 static void run_mm(void) {
-  static _Float16 a[M * K] __attribute__((aligned(128)));
-  static _Float16 b[K * N] __attribute__((aligned(128)));
-  static _Float16 c[M * N] __attribute__((aligned(128)));
+  static _Float16 a[M * K] __attribute__((aligned(VECTOR_BYTES)));
+  static _Float16 b[K * N] __attribute__((aligned(VECTOR_BYTES)));
+  static _Float16 c[M * N] __attribute__((aligned(VECTOR_BYTES)));
+  static_assert(__alignof__(a) == VECTOR_BYTES, "a is read a vector at a time");
+  static_assert(__alignof__(b) == VECTOR_BYTES, "b is read a vector at a time");
+  static_assert(__alignof__(c) == VECTOR_BYTES, "c is written a vector at a time");
   for (int i = 0; i < M * K; ++i) a[i] = (_Float16)((float)((i * 5) % 7 - 3));
   for (int i = 0; i < K * N; ++i) b[i] = (_Float16)((float)((i * 3) % 5 - 2));
   print_bits("A", a, M * K);
@@ -102,8 +118,10 @@ static void run_mm(void) {
 
 /* A 2x3 transpose, which is the region _emit_permute produces. */
 static void run_blit(void) {
-  static _Float16 src[6] __attribute__((aligned(128)));
-  static _Float16 dst[6] __attribute__((aligned(128)));
+  static _Float16 src[6] __attribute__((aligned(VECTOR_BYTES)));
+  static _Float16 dst[6] __attribute__((aligned(VECTOR_BYTES)));
+  static_assert(__alignof__(src) == VECTOR_BYTES, "src is read a vector at a time");
+  static_assert(__alignof__(dst) == VECTOR_BYTES, "dst is written a vector at a time");
   for (int i = 0; i < 6; ++i) src[i] = (_Float16)((float)(i * 2 - 5));
   print_bits("SRC", src, 6);
 
