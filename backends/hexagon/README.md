@@ -310,7 +310,7 @@ produces wrong numbers, not an error. These are the facts the emitters in
 
 | op | params | tensors |
 |---|---|---|
-| UNARY (4) | size in **elements**, op kind, element bytes | 1 in, 1 out |
+| UNARY (4) | size in **elements**, op kind, element bytes, and two more when the kind carries operands: clamp's fp16 bounds and row_guard's row length and masked value (mul_scalar's fp32 scale is one) | 1 in, 1 out |
 | BINARY_ELEMENTWISE (19) | outSize, in0Size, in1Size, kind, bytes, inputBytes, inputIsFloat, outputIsFloat | 2 in, 1 out |
 | SOFTMAX (28) | outside, channel, inside, bytes (must be 2) | 1 in, 1 out |
 | REDUCTION (29) | outside, reduce, inside, kind (sum 1, maximum 2, mean 3), bytes | 1 in, 1 out |
@@ -344,13 +344,48 @@ Things that bite:
   only when the spatial extent is one, where the two layouts agree element for
   element. A channel count that is not exactly one block is refused rather than
   emitted with padded lanes.
+- **A target with no emitter is not a refusal, and looks like one.**
+  `SUPPORTED_TARGETS` is `EMITTERS`, and the partitioner only ever sees a node
+  whose target is in it. An op that is missing from the table is therefore never
+  rejected -- it is never considered, no message is printed, and the only
+  symptom is a delegate that does not appear. The visible cost so far has been
+  three ops that a sibling in the same family already covered:
+  `aten.mean.default` (where `aten.mean.dim` was wired), the reduce-all
+  `aten.max.default` (where `aten.amax.default` was wired), and
+  `aten.relu.default`, `aten.hardtanh.default` and `aten.pow.Tensor_Scalar` with
+  exponent 2 (where `aten.clamp.default` and the unary table's clamp and square
+  entry points were wired). `test/test_overload_census.py` is the census for the
+  rest of them, one row per overload, and it fails in both directions -- when an
+  unwired target gains an emitter and when a wired one starts refusing.
+- **Three edge ops are the same clamp entry point, and it carries its bounds in
+  params.** `HTP_OPS_UNARY_CLAMP` (`unary_ops.cc:29`) is not a function of the
+  op kind alone: params[3] and params[4] are the fp16 bit patterns of its two
+  bounds, and the dispatcher routes it to `htp_ops_clamp_fp16_chunk` instead of
+  the rest of the table. torch computes `hardtanh` as `clamp` and gives
+  `min_val`/`max_val` the slots `min`/`max` occupy, so one emitter covers
+  `clamp.default` and `hardtanh.default`; `relu` is that clamp between zero and
+  infinity, which is the `max(x, 0)` torch computes; and `relu6` is
+  `hardtanh(x, 0, 6)`. The kernel's compares are unordered, so a NaN would come
+  back as the upper bound, and it restores the input where `|x| > 0x7c00`
+  instead (`unary_ops.cc:505-509`) -- that bit test is the whole reason relu may
+  be spelled this way, since `add_relu(x, 0)` is the form whose NaN behaviour is
+  not documented anywhere.
+- **`torch.max(x)` and `torch.max(x, dim)` are different ops.** The reduce-all
+  form is a value and nothing else, and its target is `aten.max.default`; it
+  reaches the same REDUCTION command `amax` already reached. The `dim` form is
+  `aten.max.dim`, a two-output node whose second output is indices, so it needs
+  the all-readers-are-getitem-0 rule the pool has before it can be placed, and
+  it is not covered. `torch.max(x)` and `torch.amax(x)` agree in every value and
+  differ only in which zero a signed-zero input returns and in the payload of a
+  NaN, which is the byte-level caveat `fmod` already carries.
 - **The reduction enum has no minimum.** `HtpOpsReductionOpType` is `sum = 1,
   maximum = 2, mean = 3` (`eltwise_ops.cc:2441-2445`) and the dispatcher rejects
   every other value, so `aten.amin` is not reachable by writing an emitter: it
   needs a kernel that does not exist, and stays on the portable kernels.
   `argmax`/`argmin` are in the same position, since the kernel returns values
   only. Sum and maximum are one command each, over a single contiguous span of
-  the buffer.
+  the buffer, and `torch.mean(x)` is the widest span of the same kind:
+  `[1][numel][1]`, which is the kernel's `inside == 1` path.
 - **`fmod` is the truncated remainder, `remainder` is not.** `HTP_OPS_BINARY_MOD`
   computes `a - trunc(a/b)*b` with a zero divisor answering zero
   (`eltwise_ops.cc:148-166`), which is torch's `fmod`; the floored remainder
@@ -639,6 +674,23 @@ Working and verified without a device:
   `BINARY_ELEMENTWISE` command that does `max(a + b, 0)`, which is the only form
   of a rectifier the DSP has. See `test/test_pool.py`, `test/test_sum_amax.py`,
   `test/test_fmod.py` and `test/test_add_relu.py`.
+- the overloads the ops above were missing reach the DSP too. `torch.mean(x)`
+  lowers to one REDUCTION over `[1][numel][1]`, the same command
+  `torch.mean(x, dim=None)` produces; `torch.max(x)` lowers to one REDUCTION of
+  kind 2, the command `torch.amax(x)` already produced; and `relu`, `hardtanh`,
+  `relu6` and `x ** 2` each lower to one UNARY command, with the fp16 bit
+  patterns of their bounds pinned as the params. The host interpreter reproduces
+  torch on all of them, including NaN, both infinities and a signed zero, and
+  `test/test_overload_census.py` pins every other overload of every family in
+  `OP_SUPPORT.md` as wired, refused or unwired. `torch.mean(x, dim=())` and
+  `torch.sum(x, dim=())` and `torch.amax(x, dim=())` all read an empty dim set
+  as every dim, which is what torch computes for them, and all three now
+  delegate. `torch.mean(x, dim=1, dtype=torch.float32)` and `torch.mean(x,
+  dtype=torch.float32)` are now refused the way `sum` already was: the kernel
+  stores fp16, so a mean that requests a width is a different op, and a fp32
+  tensor rounded to fp16 was the same defect the sum gate was added for. See
+  `test/test_overload_reductions.py`, `test/test_overload_clamp.py` and
+  `test/test_overload_census.py`.
 
 Not done yet:
 
@@ -725,6 +777,28 @@ Not done yet:
   torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour is not documented here;
   and that an add whose sum has another reader still gets the command, which is a
   partition question rather than a kernel one.
+- **the clamp entry point has never run anywhere but on the host.** Four edge
+  ops now reach it -- `clamp`, `hardtanh`, `relu` and `relu6` -- and the
+  arithmetic the tests model is a transcription of `htp_ops_clamp_fp16_chunk`
+  (`unary_ops.cc:498-541`), not the kernel. Unverified on device: that the two
+  bounds really are read as fp16 bit patterns out of params[3] and params[4] and
+  in that order; that the NaN restore's bit test (`|x| > 0x7c00`) is the test the
+  kernel performs, since it is the only thing standing between a NaN input and
+  the upper bound; that the vector loop's unordered compares agree with the
+  scalar tail the tests also model (`Q6_Q_vcmp_gt_VhfVhf` on a NaN is not
+  documented here); that an upper bound of `+inf`, which is what makes relu a
+  `max(x, 0)`, really is a compare that never fires on the DSP; and that the
+  fp16 literal `6.0` narrows to the same word `F.relu6` compares against. This
+  is the one place in this batch where a delegated op's correctness rests on a
+  NaN path no host test can exercise, and it is worth a device run before
+  trusting `relu` on data that can be NaN.
+- **`torch.mean(x)` / `torch.max(x)` / `x ** 2` have never run anywhere but on
+  the host either**, in the same sense as the other reductions: the span
+  `[1][numel][1]` and the unary square are transcriptions. The mean's span is
+  the same one the `dim=None` form already produced, so it adds no new kernel
+  question; `max` adds the signed-zero and NaN-payload tie-break `amax` does not
+  exercise; and `x ** 2` adds only that `(float)x * (float)x` rounds the way
+  fp16 multiplication does, which the host model agrees with.
 
 ## Open design points
 

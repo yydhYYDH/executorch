@@ -7,11 +7,14 @@
 """`relu(x + y)` as one command, and only when the caller asks for the fusion.
 
 The kernel's element-wise op type 8 is `max(a + b, 0)`, and no ATen op carries
-it: the graph writes an add and a rectifier, and there is no unary relu on the
-DSP for the second one. `FuseAddReluPass` rewrites the pair into the single node
-the emitter table has the subtype for; these tests pin the rewrite, the command
-it produces, its numbers, and the fact that without the pass the two nodes stay
-two nodes.
+it: the graph writes an add and a rectifier, and the DSP has no relu op type
+(`HtpOpsUnaryOpType`) for the second one. `FuseAddReluPass` rewrites the pair
+into the single node the emitter table has the subtype for; these tests pin the
+rewrite, the command it produces, its numbers, and what a graph without the pass
+gets instead. That last test changed when `aten.relu.default` gained an emitter:
+the rectifier is now the unary clamp, so the unfused graph reaches the DSP as
+two commands rather than one, and the pass buys a command rather than a
+round trip.
 """
 
 import os
@@ -48,6 +51,13 @@ from torch.export import export  # noqa: E402
 _BINARY = 19
 _ADD_RELU = 8
 _ADD = 1
+
+#: DSP_OP_UNARY, HTP_OPS_UNARY_CLAMP, and relu's two fp16 bounds: zero, and the
+#: infinity that makes the clamp's upper compare a no-op.
+_UNARY = 4
+_CLAMP = 15
+_ZERO = 0x0000
+_POS_INF = 0x7C00
 
 
 class _RectifiedSum(torch.nn.Module):
@@ -138,20 +148,29 @@ def test_a_rectified_sum_becomes_one_element_wise_command():
     assert got.tobytes() == expected.numpy().reshape(-1).tobytes()
 
 
-def test_the_rectifier_stays_on_the_host_without_the_pass():
+def test_without_the_pass_the_rectifier_is_a_second_command():
     """The pass is the caller's, so this is what a graph gets without it.
 
-    The add still reaches the DSP -- it is an element-wise op like any other --
-    and the rectifier runs on the host, which is a round trip through the arena
-    for the same arithmetic the fused command does in one step.
+    The add reaches the DSP as it always did. The rectifier reaches it too, now
+    that `aten.relu.default` is emitted as the unary clamp, which is one command
+    more than the fused form needs -- and still one round trip fewer than
+    leaving the rectifier on the portable kernels, which is what used to happen.
+    The two commands are the same arithmetic as the fused one, so the numbers
+    are checked here as well.
     """
     x = torch.randn(4, 8, dtype=torch.float16)
-    blob, commands = _commands(_program(_RectifiedSum(), (x, x)))
-    assert [command.type for command in commands] == [_BINARY]
+    y = torch.randn(4, 8, dtype=torch.float16)
+    blob, commands = _commands(_program(_RectifiedSum(), (x, y)))
+    assert [command.type for command in commands] == [_BINARY, _UNARY]
     assert commands[0].params[3] == _ADD
+    assert list(commands[1].params[:5]) == [32, _CLAMP, 2, _ZERO, _POS_INF]
+    got = _run(blob, (x, y))
+    expected = torch.nn.functional.relu(x + y)
+    assert got.tobytes() == expected.numpy().reshape(-1).tobytes()
+    # The op the test is about is still in the graph; it is inside the delegate
+    # now rather than in the part the portable kernels keep.
     assert any(
-        "aten.relu.default" in target
-        for target in _call_targets(_program(_RectifiedSum(), (x, x)))
+        "aten.relu.default" in target for target in _call_targets(_edge(_RectifiedSum(), (x, y)))
     )
 
 

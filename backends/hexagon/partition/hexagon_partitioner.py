@@ -39,6 +39,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     MAX_POOL2D_WITH_INDICES,
     max_pool_getitem,
     max_pool_is_emittable,
+    mean_result_width_is_emittable,
     MEAN_TARGETS,
     MM_TARGETS,
     NATIVE_LAYER_NORM,
@@ -47,6 +48,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     PERMUTE_TARGETS,
     pool_spec,
     POOL_TARGETS,
+    pow_is_square,
     quantized_matmul_is_refused,
     reduction_dims,
     REDUCTION_TARGETS,
@@ -57,6 +59,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     SLICE_TARGETS,
     softmax_reduces_the_inner_axis,
     SOFTMAX_TARGETS,
+    SQUARE_POW_TARGETS,
     sum_dim_is_emittable,
     SUM_TARGETS,
     update_cache_layout,
@@ -268,14 +271,22 @@ def _mean_reduces_one_span(node: torch.fx.Node) -> bool:
     val = src.meta.get("val")
     if val is None or val.dim() == 0:
         return False
-    dims = node.args[1]
+    # aten.mean.dim carries the dim and aten.mean.default has none, so the
+    # second slot is absent on the overload that reduces everything. A missing
+    # dim means every dim on both, and every dim is one span: the kernel reduces
+    # the whole buffer as [1][numel][1].
+    dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
     if dims is None:
-        # An omitted dim means every dim on this overload, and every dim is one
-        # span: the kernel reduces the whole buffer as [1][numel][1].
         return True
     dims = [dims] if isinstance(dims, int) else list(dims)
+    # An empty dim set is not "reduce nothing": `torch.mean(x, dim=())` is
+    # `torch.mean(x)` to the last bit, and so is `torch.sum(x, dim=())` and
+    # `torch.amax(x, dim=())`. The reduction table reads it that way already
+    # (`reduction_dims`), so this function refusing it left `torch.mean(x,
+    # dim=())` on the portable kernels while the other two delegated the
+    # identical reduction.
     if not dims:
-        return False
+        return True
     rank = val.dim()
     norm = sorted(d % rank for d in dims)
     return norm == list(range(norm[0], norm[0] + len(norm)))
@@ -391,7 +402,19 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # A weight-only matmul goes to a GEMV kernel, and the conditions the
             # flat path just checked are not the ones that decide it.
             return False
-        if node.target in MEAN_TARGETS and not _mean_reduces_one_span(node):
+        if node.target in MEAN_TARGETS:
+            if not _mean_reduces_one_span(node):
+                return False
+            if not mean_result_width_is_emittable(node):
+                # The kernel accumulates in fp32 and stores fp16, so a mean that
+                # names another dtype is a different op -- the rule
+                # sum_dim_IntList already carries in sum_dim_is_emittable. Both
+                # mean overloads used to skip it, and torch.mean(x, dim=1,
+                # dtype=torch.float32) came back as fp16 values widened to fp32.
+                return False
+        if node.target in SQUARE_POW_TARGETS and not pow_is_square(node):
+            # Only x ** 2 maps to the unary square kernel; another exponent is a
+            # different function, not a narrower command.
             return False
         if node.target in REDUCTION_TARGETS:
             # One contiguous span, the same shape rule mean has; sum additionally

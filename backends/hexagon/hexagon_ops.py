@@ -760,16 +760,20 @@ def _clamp_bound_bits(bound, unbounded: float) -> int:
     return int(torch.tensor(value, dtype=torch.float16).view(torch.uint16).item())
 
 
-def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
+def _emit_clamp_bounds(node: torch.fx.Node, ctx, lower, upper) -> TensorRef:
+    """DSP_OP_UNARY's clamp entry point, with the two bounds given outright.
+
+    Three edge ops are this one command: clamp, hardtanh (whose schema carries
+    min_val and max_val in the positions clamp's min and max occupy, and which
+    torch itself computes as clamp), and relu, which is clamp between zero and
+    infinity. The kernel compares unordered but restores the input where it is a
+    NaN (`htp_ops_clamp_fp16_chunk`, unary_ops.cc:505-509), so all three answer
+    NaN with NaN as torch does.
+    """
     src = node.args[0]
     _require_arena_dtype(node, "clamp input")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    # The bounds arrive positionally and are not always both there: a one-bound
-    # clamp is min= that bound, and a clamp with no bounds at all is the
-    # identity, which the infinities below express on their own.
-    lower = node.args[1] if len(node.args) > 1 else None
-    upper = node.args[2] if len(node.args) > 2 else None
     op_index = ctx.emit(
         node,
         Op(
@@ -788,6 +792,30 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
     )
     _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
+
+
+def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.clamp and aten.hardtanh, whose bounds arrive in the same slots.
+
+    The bounds are positional and not always both there: a one-bound clamp is
+    min= that bound, and a clamp with no bounds at all is the identity, which
+    the infinities in _clamp_bound_bits express on their own.
+    """
+    lower = node.args[1] if len(node.args) > 1 else None
+    upper = node.args[2] if len(node.args) > 2 else None
+    return _emit_clamp_bounds(node, ctx, lower, upper)
+
+
+def _emit_relu(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.relu as clamp(x, 0, inf).
+
+    torch's relu is max(x, 0), and the clamp kernel's upper bound of infinity is
+    a compare that never fires, so the command is that max. The DSP's unary
+    table has no relu of its own (HtpOpsUnaryOpType, unary_ops.cc:15-31), which
+    is why the op had been left to the portable kernels; the clamp entry point
+    is the form that does exist.
+    """
+    return _emit_clamp_bounds(node, ctx, 0.0, None)
 
 
 def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
@@ -2175,13 +2203,24 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
-# The reductions. The DSP collapses one contiguous (outside, reduce, inside)
-# span of the buffer, so the reduced dims have to be adjacent; the caller's
-# support checks enforce that before an emitter ever runs.
+# REDUCTION collapses one contiguous span, so the reduced dims have to be
+# adjacent; the callers' support checks enforce that before an emitter runs.
 SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
 AMAX = exir_ops.edge.aten.amax.default
-REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX})
+MAX_DEFAULT = exir_ops.edge.aten.max.default
+REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX, MAX_DEFAULT})
 SUM_TARGETS = frozenset({SUM_DIM})
+
+# The mean family's two overloads, both of which are this same span rule: .dim
+# names the axes and .default has none, which is the whole buffer.
+MEAN_DIM = exir_ops.edge.aten.mean.dim
+MEAN_DEFAULT = exir_ops.edge.aten.mean.default
+MEAN_TARGETS = frozenset({MEAN_DIM, MEAN_DEFAULT})
+
+# The unary kernel's square entry point, reached as x ** 2. to_edge emits no
+# aten.square.default at all, so pow.Tensor_Scalar is the form that exists.
+POW_TENSOR_SCALAR = exir_ops.edge.aten.pow.Tensor_Scalar
+SQUARE_POW_TARGETS = frozenset({POW_TENSOR_SCALAR})
 
 
 def reduction_dims(node: torch.fx.Node) -> Optional[list]:
@@ -2264,6 +2303,40 @@ def _emit_amax(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
 
 
+def _emit_max_default(node: torch.fx.Node, ctx) -> TensorRef:
+    """torch.max(x): every element, as the single span amax already takes.
+
+    The overload carries no dim, so the whole buffer is one
+    ``[1][numel][1]`` span -- the same shape, the same kernel and the same
+    seeding that torch.amax reaches through AMAX. Its values are torch.amax's;
+    the two differ only in the sign of a zero and in the payload of a NaN,
+    which is the byte-level caveat fmod already carries.
+    """
+    return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
+
+
+def pow_is_square(node: torch.fx.Node) -> bool:
+    """Whether this pow is x ** 2, the one exponent with a unary kernel.
+
+    to_edge leaves both ``x ** 2`` and ``torch.square(x)`` as pow.Tensor_Scalar
+    (aten.square.default is not what the exporter emits), and the DSP's
+    HTP_OPS_UNARY_SQUARE computes ``(float)x * (float)x``, which is the same
+    value as fp16 multiplication for every exponent of two.
+    """
+    if node.target is not POW_TENSOR_SCALAR:
+        return False
+    exponent = node.args[1] if len(node.args) > 1 else node.kwargs.get("exponent")
+    if isinstance(exponent, bool):
+        return False
+    return isinstance(exponent, (int, float)) and exponent == 2
+
+
+def _emit_square_pow(node: torch.fx.Node, ctx) -> TensorRef:
+    if not pow_is_square(node):
+        raise RuntimeError("hexagon: only x ** 2 has a unary kernel here")
+    return _unary("square")(node, ctx)
+
+
 def sum_dim_is_emittable(node: torch.fx.Node) -> bool:
     """Whether this sum is the fp16 sum the kernel computes.
 
@@ -2279,8 +2352,38 @@ def sum_dim_is_emittable(node: torch.fx.Node) -> bool:
     return dtype is None
 
 
+def mean_result_width_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this mean asks for the width the kernel stores.
+
+    Both mean overloads make dtype keyword-only, and the kernel accumulates in
+    fp32 and stores fp16, so a requested dtype is a different op rather than a
+    narrower command -- exactly the rule `sum_dim_is_emittable` enforces on
+    sum.dim_IntList. mean.dim did not carry that check, so
+    `torch.mean(x, dim=1, dtype=torch.float32)` reached a kernel that stored
+    fp16 and let the runtime widen it: a fp32 tensor whose values were rounded
+    to fp16, which is the same defect the sum gate was added for.
+    """
+    return node.kwargs.get("dtype") is None
+
+
 def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
     """aten.mean.dim as a single REDUCTION."""
+    if not mean_result_width_is_emittable(node):
+        raise RuntimeError("hexagon: this mean asks for another width")
+    return _emit_reduction(node, ctx, REDUCTION_MEAN)
+
+
+def _emit_mean_default(node: torch.fx.Node, ctx) -> TensorRef:
+    """torch.mean(x): every dim, which is the whole buffer as one span.
+
+    The overload has no dim at all, so it is the widest form of what mean.dim
+    already emits -- ``[1][numel][1]`` -- and the kernel's inside==1 path is the
+    one the whole-tensor mean takes. Same rule, same command, one target name
+    further: without this entry `torch.mean(x)` left the graph whole rather than
+    failing, which is why it went unnoticed next to mean.dim.
+    """
+    if not mean_result_width_is_emittable(node):
+        raise RuntimeError("hexagon: this mean asks for another width")
     return _emit_reduction(node, ctx, REDUCTION_MEAN)
 
 
@@ -3134,6 +3237,15 @@ EMITTERS = {
     exir_ops.edge.aten.silu.default: _unary("silu"),
     exir_ops.edge.aten.clamp.default: _emit_clamp,
     exir_ops.edge.aten.clamp.out: _emit_clamp,
+    # torch computes hardtanh as clamp and gives min_val/max_val the slots
+    # clamp's min/max occupy, so one emitter covers both (and relu6, which is
+    # F.hardtanh(x, 0, 6)).
+    exir_ops.edge.aten.hardtanh.default: _emit_clamp,
+    # relu has no entry of its own in the unary table; it is the clamp above
+    # with these bounds.
+    exir_ops.edge.aten.relu.default: _emit_relu,
+    # x ** 2 and torch.square both arrive as pow.Tensor_Scalar.
+    POW_TENSOR_SCALAR: _emit_square_pow,
     ROW_GUARD: _emit_row_guard,
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),
@@ -3160,6 +3272,8 @@ EMITTERS = {
     # matmul emitter reads it and the node itself emits nothing.
     DQ_PER_CHANNEL: _emit_dequantize,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
+    MEAN_DEFAULT: _emit_mean_default,
+    MAX_DEFAULT: _emit_max_default,
     SUM_DIM: _emit_sum_dim,
     AMAX: _emit_amax,
     MAX_POOL2D: _emit_pool2d,
@@ -3222,7 +3336,6 @@ BMM_TARGETS = frozenset({exir_ops.edge.aten.bmm.default})
 ADDMM_TARGETS = frozenset({exir_ops.edge.aten.addmm.default})
 
 # REDUCTION collapses one contiguous span, so the reduced dims must be adjacent.
-MEAN_TARGETS = frozenset({exir_ops.edge.aten.mean.dim})
 
 # Views: the operand's bytes read under another shape. Only the forms that
 # keep a contiguous layout are listed -- select_copy's other overload reads the

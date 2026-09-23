@@ -67,6 +67,10 @@ REDUCTION_SUM = 1
 REDUCTION_MAXIMUM = 2
 REDUCTION_MEAN = 3
 
+#: HTP_OPS_UNARY_CLAMP, the one HtpOpsUnaryOpType whose params carry operands
+#: of their own: params[3] and params[4] are its two fp16 bounds.
+_UNARY_CLAMP = 15
+
 #: The DSP pool kernel's two selectors and its channel block
 #: (`hvx_pool2d_fp16`).
 POOL_MAX = 0
@@ -628,12 +632,28 @@ _UNARY = {
 def _run_unary(command: Command, params: List[int], arena: Arena) -> None:
     """Element-wise, one element at a time, from htp_ops_unary_apply_fp16."""
     numel, op_type = params[0], params[1]
+    refs = list(command.inputs) + list(command.outputs)
+    source = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)[:numel]
+    if op_type == _UNARY_CLAMP:
+        # clamp is the one unary type whose entry point is not
+        # htp_ops_unary_compute_fp16_chunk: params[3] and params[4] are the fp16
+        # bit patterns of its bounds, and htp_ops_clamp_fp16_chunk compares
+        # against those (unary_ops.cc:498-541). The compares are unordered, so a
+        # NaN would otherwise come back as the upper bound; the kernel restores
+        # the input where |x| > 0x7c00 -- an all-ones exponent with a non-zero
+        # mantissa -- which is what torch's clamp does as well.
+        lo = np.array([params[3]], dtype=np.uint16).view(np.float16)[0]
+        hi = np.array([params[4]], dtype=np.uint16).view(np.float16)[0]
+        values = source.astype(np.float32)
+        clamped = np.clip(values, np.float32(lo), np.float32(hi))
+        isnan = (np.frombuffer(source.tobytes(), dtype=np.uint16) & 0x7FFF) > 0x7C00
+        out = np.where(isnan, values, clamped).astype(np.float16)
+        _store(arena, arena.address(refs[1]), out.tobytes())
+        return
     if op_type not in _UNARY:
         raise UnsupportedOp(
             f"blob: unary op {op_type} uses a DSP approximation, not modelled"
         )
-    refs = list(command.inputs) + list(command.outputs)
-    source = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)[:numel]
     out = _UNARY[op_type](source.astype(np.float32)).astype(np.float16)
     _store(arena, arena.address(refs[1]), out.tobytes())
 

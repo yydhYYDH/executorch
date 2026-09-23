@@ -245,7 +245,22 @@ SUPPORTED: List[OpSupport] = [
         REDUCTION,
         ARENA_FP16,
         "Reduced dims must be one contiguous span (the kernel collapses a single "
-        "[outside][reduce][inside] view); rank >= 1.",
+        "[outside][reduce][inside] view); rank >= 1. A missing dim and an empty "
+        "dim list both mean every dim -- torch reduces the whole tensor for "
+        "`mean(x, dim=())` exactly as for `mean(x)` -- which is the one span "
+        "[1][numel][1]. The dtype argument must be absent, as on sum.dim_IntList: "
+        "the kernel accumulates in fp32 and stores fp16, so a mean that names "
+        "another width is a different op rather than a narrower command.",
+    ),
+    OpSupport(
+        "aten.mean.default",
+        REDUCTION,
+        ARENA_FP16,
+        "Every dim, as the single span [1][numel][1]. The overload carries no dim "
+        "argument at all, so there is nothing that could be non-adjacent. This is "
+        "the target `torch.mean(x)` produces where `torch.mean(x, dim=1)` produces "
+        "mean.dim, and it emits the same command as `torch.mean(x, dim=None)`. The "
+        "dtype rule is mean.dim's.",
     ),
     OpSupport(
         "aten.sum.dim_IntList",
@@ -262,6 +277,45 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "Same single-span rule as mean.dim. There is no minimum in "
         "HtpOpsReductionOpType (sum, maximum, mean), so amin stays portable.",
+    ),
+    OpSupport(
+        "aten.max.default",
+        REDUCTION,
+        ARENA_FP16,
+        "Every element, as the same [1][numel][1] span amax takes and through the "
+        "same kernel. `torch.max(x)` and `torch.amax(x)` are the same value; they "
+        "differ only in which zero a signed-zero input returns and in the payload "
+        "of a NaN, which is the byte-level caveat fmod already carries. This is "
+        "the target the reduce-all overload produces, where `torch.max(x, dim)` "
+        "is max.dim and is not covered.",
+    ),
+    OpSupport(
+        "aten.relu.default",
+        UNARY,
+        ARENA_FP16,
+        "clamp between zero and infinity: torch's relu is max(x, 0), and the "
+        "clamp entry point is the only form in the DSP's unary table that "
+        "expresses it (there is no relu op type). The kernel restores a NaN input "
+        "by a bit test, so relu(NaN) is NaN as in torch.",
+    ),
+    OpSupport(
+        "aten.hardtanh.default",
+        UNARY,
+        ARENA_FP16,
+        "min_val and max_val occupy the slots clamp's min and max occupy, and "
+        "torch computes hardtanh as clamp, so one emitter covers both. `relu6` is "
+        "this op with (0, 6) -- `F.relu6`, `nn.ReLU6` and `nn.Hardtanh` all "
+        "arrive here.",
+    ),
+    OpSupport(
+        "aten.pow.Tensor_Scalar",
+        UNARY,
+        ARENA_FP16,
+        "Exponent 2 only, which is HTP_OPS_UNARY_SQUARE (`(float)x * (float)x`). "
+        "`x ** 2` and `torch.square(x)` both arrive as this target -- `to_edge` "
+        "emits no aten.square.default -- and they agree with the kernel for every "
+        "exponent of two. Another exponent is a different function, not a "
+        "narrower command, and stays portable.",
     ),
     OpSupport(
         "aten.max_pool2d.default",
@@ -595,6 +649,79 @@ NOT_SUPPORTED = [
         "REDUCTION collapses one contiguous span only.",
     ),
     (
+        "aten.amin.default, aten.min.default and aten.min.dim",
+        "HtpOpsReductionOpType is sum, maximum and mean (eltwise_ops.cc:2441-2445) "
+        "and the dispatcher rejects anything else, so there is no minimum to select "
+        "-- this needs a kernel, not an emitter. min.dim is a two-output node whose "
+        "second output is indices, which no reduction kernel here produces.",
+    ),
+    (
+        "aten.max.dim values-only",
+        "The values are what amax computes, but the node is the two-output form: "
+        "its second output is indices, which need positions rather than values, so "
+        "placing it needs the same all-readers-are-getitem-0 rule max_pool2d has "
+        "(and its own getitem producer). `torch.amax(x, dim)` and `torch.max(x)` "
+        "reach the covered targets instead.",
+    ),
+    (
+        "aten.argmax.default / aten.argmin.default",
+        "A reduction kernel that returns values and no positions.",
+    ),
+    (
+        "aten.split_with_sizes_copy.default, aten.topk.default and aten.sort.default",
+        "Multi-output ops with no producer for the extra outputs. Only the getitems "
+        "reading a layer norm's result, a max pool's values or the fused add+norm's "
+        "outputs are placed, so these stay portable together with their getitems.",
+    ),
+    (
+        "aten.eq / ne / gt / lt / ge / le, aten.where.self and masked_fill",
+        "The DSP's comparison writes int32 1/0 or fp16 1.0/0.0 and has no one-byte "
+        "mode, so a node declaring torch.bool cannot be handed one without an "
+        "out-of-bounds write; `where` additionally needs a select the unary and "
+        "binary tables do not have. A bool operand is refused at the gate for the "
+        "same reason (operand_dtypes_are_readable).",
+    ),
+    (
+        "aten.sin / cos / expm1 defaults, and aten.erf.default",
+        "sin, cos and expm1 have entries in HtpOpsUnaryOpType but no emitter, and "
+        "they run the DSP's own approximations, whose error is unmeasured. erf has "
+        "no entry at all. None of them is a missing line in a table next to a "
+        "validated kernel the way x ** 2 was.",
+    ),
+    (
+        "aten.full / full_like / arange / scalar_tensor",
+        "Not kernels: nothing emits a tensor that was not read from memory. A "
+        "lifted constant is carried as a delegate weight and needs no command, "
+        "which is why `x * torch.full(...)` still delegates its multiply.",
+    ),
+    (
+        "aten.repeat.default, aten.flip.default, aten.constant_pad_nd.default",
+        "No command describes them: a tile, an axis reversal and a pad are each a "
+        "different region walk from the blits the backend has.",
+    ),
+    (
+        "aten._adaptive_avg_pool2d.default",
+        "The pool command takes one fixed window and stride; an adaptive output "
+        "sizes the window per output position.",
+    ),
+    (
+        "aten.leaky_relu.default, aten.elu.default, aten._log_softmax.default",
+        "No kernel: leaky_relu needs a slope the binary table has no form for, elu "
+        "an exponential the unary table does not carry, and log_softmax composes a "
+        "log with a softmax in a way no single command describes.",
+    ),
+    (
+        "aten.prod.default, aten.var.correction, aten.cumsum.default",
+        "No kernel. The reduction table has sum, maximum and mean; a running "
+        "product, a second moment and a prefix scan are each a different walk.",
+    ),
+    (
+        "aten.clamp.Tensor and aten.pow.Tensor_Tensor",
+        "The operand is the parameter: clamp's entry point carries its bounds as "
+        "two fp16 params and cannot hold a tensor, and there is no pow kernel at "
+        "all. Both stay portable rather than being read as a scalar operand.",
+    ),
+    (
         "aten.cat.default with more than three operands",
         "A command holds at most three 12-int regions.",
     ),
@@ -658,6 +785,8 @@ PREDICATES = [
     "pool_spec",
     "reduction_dims",
     "sum_dim_is_emittable",
+    "mean_result_width_is_emittable",
+    "pow_is_square",
     "max_pool_is_emittable",
 ]
 
