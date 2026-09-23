@@ -494,9 +494,11 @@ Working and verified without a device:
   the matmul patches its rows;
 - on Qwen3-0.6B the partitioner takes 1967 nodes into 29 subgraphs -- one per
   layer, with all 28 attention nodes among them -- and leaves 825 on the
-  portable kernels, 711 of which are shape guards. With the fusion passes
-  switched off the export splits into 169 subgraphs and leaves 2121 nodes
-  behind;
+  portable kernels, 711 of which are shape guards. This count predates the mask
+  refusal in `_sdpa_fits_dsp_limits`: an attention node that carries a mask is
+  no longer taken, so an export that has them delegates fewer than 28. With the
+  fusion passes switched off the export splits into 169 subgraphs and leaves
+  2121 nodes behind;
 - the compile-spec check is exercised on the host over real blobs, from both
   sides: the writer's side in `test/test_compile_specs.py` and the runtime's in
   the ET-free `hexagon_compat.h`, which the same test compiles and drives. That
