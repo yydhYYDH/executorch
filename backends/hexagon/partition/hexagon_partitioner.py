@@ -243,6 +243,10 @@ def _mean_reduces_one_span(node: torch.fx.Node) -> bool:
     if val is None or val.dim() == 0:
         return False
     dims = node.args[1]
+    if dims is None:
+        # An omitted dim means every dim on this overload, and every dim is one
+        # span: the kernel reduces the whole buffer as [1][numel][1].
+        return True
     dims = [dims] if isinstance(dims, int) else list(dims)
     if not dims:
         return False

@@ -1794,10 +1794,14 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
     src = node.args[0]
     _require_arena_dtype(node, "mean")
     dims = node.args[1]
-    dims = [dims] if isinstance(dims, int) else list(dims)
     shape = src.meta["val"].shape
     rank = len(shape)
-    norm = sorted(d % rank for d in dims)
+    # An omitted dim means every dim, which is the whole tensor as one span.
+    if dims is None:
+        norm = list(range(rank))
+    else:
+        dims = [dims] if isinstance(dims, int) else list(dims)
+        norm = sorted(d % rank for d in dims)
 
     def _prod(values) -> int:
         n = 1
