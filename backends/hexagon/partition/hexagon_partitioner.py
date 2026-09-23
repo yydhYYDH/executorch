@@ -13,6 +13,7 @@ from executorch.backends.hexagon.hexagon_backend import (
     SUPPORTED_TARGETS,
 )
 from executorch.backends.hexagon.hexagon_ops import (
+    _dequantize_is_fused,
     _scalar_arg,
     _scalar_source,
     ADD_RMS_NORM,
@@ -25,7 +26,6 @@ from executorch.backends.hexagon.hexagon_ops import (
     CAST_TARGETS,
     cat_region,
     CAT_TARGETS,
-    _dequantize_is_fused,
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
     DQ_PER_CHANNEL,

@@ -353,13 +353,14 @@ def _emit_select_copy(node: torch.fx.Node, ctx) -> TensorRef:
     if region is None:
         return _emit_alias(node, ctx)
     out = ctx.result_for(node, _numel(node))
-    ctx.emit(node, 
+    ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(node.args[0])],
             outputs=[out],
             params=[1, FP16_BYTES, 1] + region,
-        )
+        ),
     )
     return ctx.record(node, out)
 
@@ -380,7 +381,8 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
         inputs.append(ctx.operand(region.patch_source))
         patch = (_SLICE_OFFSET_PARAM, len(inputs) - 1)
     out = ctx.result_for(node, _numel(node))
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=inputs,
@@ -389,7 +391,7 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
             params=[1, FP16_BYTES, 1] + region.region,
             patch=patch,
             patch_scale=region.patch_scale,
-        )
+        ),
     )
     # Rows are the sliced dimension's leading shape, at index 7 past the header
     # and the region's three offsets.
@@ -482,13 +484,14 @@ def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
     tensors = node.args[0]
     params = cat_region(node)
     out = ctx.result_for(node, _numel(node))
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(tensor) for tensor in tensors],
             outputs=[out],
             params=params,
-        )
+        ),
     )
     # Every region repeats the row count at its own size1 slot, so each one has
     # to move with the length; the regions that mirror it are patched with it.
@@ -623,13 +626,14 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     if folded is not None:
         return folded
     out = ctx.result_for(node, _numel(node))
-    ctx.emit(node, 
+    ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(node.args[0])],
             outputs=[out],
             params=[1, FP16_BYTES, 1] + permute_region(node),
-        )
+        ),
     )
     return ctx.record(node, out)
 
@@ -679,7 +683,8 @@ def _unary(op_name: str):
         _require_arena_dtype(node, f"unary {op_name} input")
         numel = _numel(node)
         out = ctx.result_for(node, numel)
-        op_index = ctx.emit(node, 
+        op_index = ctx.emit(
+            node,
             Op(
                 type=DSP_OP_UNARY,
                 inputs=[ctx.operand(src)],
@@ -690,7 +695,7 @@ def _unary(op_name: str):
                     UNARY_OP_TYPES[op_name],
                     FP16_BYTES,
                 ],
-            )
+            ),
         )
         _patch_dynamic_numel(ctx, op_index, node)
         return ctx.record(node, out)
@@ -719,7 +724,8 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
     # identity, which the infinities below express on their own.
     lower = node.args[1] if len(node.args) > 1 else None
     upper = node.args[2] if len(node.args) > 2 else None
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(src)],
@@ -732,7 +738,7 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
                 _clamp_bound_bits(lower, float("-inf")),
                 _clamp_bound_bits(upper, float("inf")),
             ],
-        )
+        ),
     )
     _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
@@ -752,7 +758,8 @@ def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "mul scalar")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(values)],
@@ -764,7 +771,7 @@ def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
                 struct.unpack("<i", struct.pack("<f", float(scale)))[0],
                 0,
             ],
-        )
+        ),
     )
     _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
@@ -782,7 +789,8 @@ def _emit_row_guard(node: torch.fx.Node, ctx) -> TensorRef:
     numel = _numel(node)
     row = int(values.meta["val"].shape[-1])
     out = ctx.result_for(node, numel)
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(mask), ctx.operand(values)],
@@ -794,7 +802,7 @@ def _emit_row_guard(node: torch.fx.Node, ctx) -> TensorRef:
                 row,
                 _clamp_bound_bits(pad, float("-inf")),
             ],
-        )
+        ),
     )
     _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
@@ -870,7 +878,8 @@ def _binary(op_name: str):
         out_shape_plan = ctx.upper_shape(out_shape)
 
         out = ctx.result_for(node, out_numel)
-        op_index = ctx.emit(node, 
+        op_index = ctx.emit(
+            node,
             Op(
                 type=DSP_OP_BINARY_ELEMENTWISE,
                 inputs=[ctx.operand(lhs), ctx.operand(rhs)],
@@ -886,7 +895,7 @@ def _binary(op_name: str):
                     0,  # output is not a 4-byte float
                     *_broadcast_tail(lhs, rhs, out_shape_plan, ctx),
                 ],
-            )
+            ),
         )
         _patch_dynamic_product(ctx, op_index, out_shape, 0)
         if isinstance(lhs, torch.fx.Node):
@@ -974,13 +983,14 @@ def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
     # is not enough here: the bytes have to be written out.
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    ctx.emit(node, 
+    ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[source],
             outputs=[out],
             params=[1, FP16_BYTES, 1, 0, 0, 0, 1, 1, numel, 0, 0, 1, 0, 0, 1],
-        )
+        ),
     )
     return ctx.record(node, out)
 
@@ -1030,7 +1040,8 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
 
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    ctx.emit(node, 
+    ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[cache],
@@ -1052,11 +1063,12 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
                 run,
                 1,
             ],
-        )
+        ),
     )
     # dstOffset is the token position times one whole cached position, which is
     # what patch_scale is for. dst is the output, at index 3.
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[value, cache, pos],
@@ -1064,7 +1076,7 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
             params=[1, FP16_BYTES, 3, 0, 0, 0, 1, rows, run, 0, run, 1, 0, run, 1],
             patch=(5, 2),
             patch_scale=inner,
-        )
+        ),
     )
     # The rows this writes are the value's tokens, so they scale with the
     # length; the full-cache copy above does not and is left alone.
@@ -1537,7 +1549,7 @@ def _emit_quantized_matmul(
                 inputs=[ctx.operand(activation), ctx.builder.add_weights(packed), bias_ref],
                 outputs=[out],
                 params=params,
-            )
+            ),
         )
     else:
         packed = pack_w8a16_gemv_weight(weight, k, n)
@@ -1553,7 +1565,7 @@ def _emit_quantized_matmul(
                 ],
                 outputs=[out],
                 params=params,
-            )
+            ),
         )
     return ctx.record(node, out)
 
@@ -1598,7 +1610,8 @@ def _matmul_command(
         if batches > 1
         else (0, 0, 0)
     )
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_BATCH_MATMUL,
             inputs=[lhs, rhs, ABSENT, ABSENT, ABSENT],
@@ -1616,7 +1629,7 @@ def _matmul_command(
                 steps=steps,
                 hmx_prepacked=hmx_prepacked,
             ),
-        )
+        ),
     )
     if ctx.is_dynamic_dim(m):
         m_scale = _dynamic_scale(ctx, m)
@@ -1747,7 +1760,8 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     if beta == 0.0:
         return ctx.record(node, out)
 
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_BINARY_ELEMENTWISE,
             inputs=[target, ctx.operand(bias)],
@@ -1763,7 +1777,7 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
                 0,  # output is not a 4-byte float
                 *_broadcast_tail((m, n), bias, (m, n), ctx),
             ],
-        )
+        ),
     )
     if ctx.is_dynamic_dim(m):
         ctx.add_dynamic_patch(op_index, 0, n, 0)
@@ -1792,7 +1806,8 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
         return n
 
     out = ctx.result_for(node, _numel(node))
-    ctx.emit(node, 
+    ctx.emit(
+        node,
         Op(
             type=DSP_OP_REDUCTION,
             inputs=[ctx.operand(src)],
@@ -1804,7 +1819,7 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
                 REDUCTION_MEAN,
                 FP16_BYTES,
             ],
-        )
+        ),
     )
     return ctx.record(node, out)
 
@@ -1823,7 +1838,8 @@ def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
 
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_SOFTMAX,
             inputs=[ctx.operand(src)],
@@ -1831,7 +1847,7 @@ def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
             # The DSP reduces the middle axis of an [outside][channel][inside]
             # view, so the reduction dim is described by its strides.
             params=[outside, channel, inside, FP16_BYTES],
-        )
+        ),
     )
     _patch_dynamic_product(ctx, op_index, shape[:dim], 0)
     _patch_dynamic_product(ctx, op_index, [shape[dim]], 1)
@@ -1856,7 +1872,8 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     # The kernel applies gamma itself and reads it as fp32, so the weight is
     # stored at that width rather than in a following elementwise multiply.
     gamma = ctx.constant(weight, torch.float32)
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_LAYER_NORM,
             # beta is ABSENT: RMSNorm has no bias, and a zero-size operand still
@@ -1864,7 +1881,7 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(source), gamma, ABSENT],
             outputs=[out],
             params=[outer, inner, _float_bits(float(eps)), 1],
-        )
+        ),
     )
     _patch_dynamic_product(ctx, op_index, shape[:-1], 0)
     return ctx.record(node, out)
@@ -1898,13 +1915,14 @@ def _emit_rope(node: torch.fx.Node, ctx) -> TensorRef:
         ctx.operand(cos),
         ctx.operand(sin),
     ]
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_ROPE,
             inputs=inputs,
             outputs=[out, out],
             params=[batch_seq, num_head, 0, head_dim, head_dim, 0],
-        )
+        ),
     )
     _patch_dynamic_product(ctx, op_index, shape[:-2], 0)
     return ctx.record(node, out)
@@ -1981,7 +1999,8 @@ def _emit_add_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
 
     # The kernel applies gamma itself and reads it as fp32.
     gamma = ctx.constant(weight, torch.float32)
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_ADD_FUSE_LAYERNORM,
             # beta is ABSENT: RMSNorm has no bias and the kernel's RMSNorm path
@@ -1989,7 +2008,7 @@ def _emit_add_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(residual), ctx.operand(branch), gamma, ABSENT],
             outputs=[normalized, residual_out],
             params=[outer, inner, _float_bits(float(eps)), 1],
-        )
+        ),
     )
     _patch_dynamic_product(ctx, op_index, shape[:-1], 0)
     for sink, ref in ((norm_sink, normalized), (add_sink, residual_out)):
@@ -2074,7 +2093,8 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
         (arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None
     ]
     normalized = ctx.activation_for_shape(shape) if affine else out
-    norm_op_index = ctx.emit(node, 
+    norm_op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_LAYER_NORM,
             # Order matters: dst is the DSP's mapped_ptrs[3], so the three
@@ -2083,14 +2103,15 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(src), ABSENT, ABSENT],
             outputs=[normalized],
             params=[outer, inner, _float_bits(eps), 0],
-        )
+        ),
     )
     _patch_dynamic_product(ctx, norm_op_index, outer_shape, 0)
 
     result = normalized
     for index, (arg, kind) in enumerate(affine):
         target = out if index == len(affine) - 1 else ctx.activation_for_shape(shape)
-        affine_op_index = ctx.emit(node, 
+        affine_op_index = ctx.emit(
+            node,
             Op(
                 type=DSP_OP_BINARY_ELEMENTWISE,
                 inputs=[result, ctx.operand(arg)],
@@ -2111,7 +2132,7 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
                         ctx,
                     ),
                 ],
-            )
+            ),
         )
         _patch_dynamic_product(ctx, affine_op_index, outer_shape, 0)
         _patch_dynamic_product(ctx, affine_op_index, outer_shape, 1)
@@ -2286,7 +2307,8 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     paged = ctx.options.attn_paged
     page_size = 256 if paged else 0
 
-    op_index = ctx.emit(node, 
+    op_index = ctx.emit(
+        node,
         Op(
             type=DSP_OP_FLASH_ATTN,
             inputs=inputs,
@@ -2310,7 +2332,7 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
                 0,  # value_c4
             ],
             patch=patch,
-        )
+        ),
     )
     if ctx.is_dynamic_dim(q_shape[1]):
         ctx.add_dynamic_patch(op_index, 0, 1, 0)

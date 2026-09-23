@@ -23,10 +23,10 @@ import subprocess
 import sys
 import tempfile
 
+import executorch
+
 import pytest
 import torch
-
-import executorch
 
 # The checkout directory is itself named executorch, so putting its parent on
 # the path makes "import executorch" resolve to this tree. Without it the
@@ -52,7 +52,9 @@ from torch.export import export  # noqa: E402
 
 _HEXAGON = pathlib.Path(__file__).resolve().parents[1]
 _RUNTIME_SOURCE = _HEXAGON / "runtime" / "hexagon_backend.cpp"
-_DSP_SOURCE = _HEXAGON / "third-party" / "mnn-htp-ops" / "src" / "dsp" / "execute_command.cc"
+_DSP_SOURCE = (
+    _HEXAGON / "third-party" / "mnn-htp-ops" / "src" / "dsp" / "execute_command.cc"
+)
 
 
 class _Mm(torch.nn.Module):
@@ -118,7 +120,9 @@ def test_a_node_that_emits_several_commands_appears_once_per_command():
     Which is what the handle means: the commands a single aten op decomposes
     into are all that op's time.
     """
-    program = to_edge(export(_LayerNorm(), (torch.randn(4, 8, dtype=torch.float16),))).exported_program()
+    program = to_edge(
+        export(_LayerNorm(), (torch.randn(4, 8, dtype=torch.float16),))
+    ).exported_program()
     result = HexagonBackend.preprocess(program, [])
     commands = _command_count(result.processed_bytes)
     assert commands > 1
@@ -456,9 +460,7 @@ def test_the_offline_pipeline_reports_a_node_per_command():
         reloaded = parse_etrecord(path)
         graph = next(iter(reloaded._delegate_map))
         instruction_id = int(next(iter(reloaded._delegate_map[graph])))
-        command_map = reloaded._delegate_map[graph][str(instruction_id)][
-            "delegate_map"
-        ]
+        command_map = reloaded._delegate_map[graph][str(instruction_id)]["delegate_map"]
         assert command_map
 
         durations = {index: 11 - index for index in range(len(command_map))}

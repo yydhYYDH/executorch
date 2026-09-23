@@ -37,9 +37,9 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
     ATTN_PAGED_SPEC,
     EXTERNAL_WEIGHTS_MAX_BYTES_SPEC,
-    HMX_PREPACK_SPEC,
     HexagonBackend,
     HexagonCompileOptions,
+    HMX_PREPACK_SPEC,
 )
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
