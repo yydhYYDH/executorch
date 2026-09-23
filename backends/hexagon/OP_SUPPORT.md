@@ -94,7 +94,7 @@ Each of these is a deliberate exclusion: the node stays on the portable kernels 
 | `aten.permute_copy.default reversing axes inside a group, or needing more than three groups` | No single blit region describes it; the emitter refuses rather than reading the wrong elements. |
 | `aten.slice_copy.Tensor with step != 1` | A region describes one run per row, so a step is out. |
 | `casts from/to int64, and int64 select_copy` | The kernels read two-byte elements; int64 values (such as start_pos) stay where the patch mechanism can reach them. |
-| `aten.split / getitem of a split` | No producer for the extra outputs; only layer-norm and fused add+norm getitems are placed. |
+| `aten.split / getitem of a split` | No producer for the extra outputs; only the getitems that read a layer norm's result, a max pool's values or the fused add+norm's outputs are placed. |
 | `aten.bmm.default with a broadcast batch` | One tile geometry and one step are derived from the shapes; a broadcast batch is not described by them. |
 | `llama.custom_sdpa shapes other than the one FLASH_ATTN form` | Non-4-D operands, a head_dim mismatch, or n_kv_heads that does not divide the query heads stay portable. |
 | `a vision attention the fusion pass did not state as one op` | The fused op is the only thing the emitter knows: the decomposed pattern, a mask, a causal bias, an unequal query and key run, a scale that is not a constant, or operands that are not the head transposes of `[batch, tokens, heads, headDim]` tensors all stay on the portable kernels. |

@@ -615,8 +615,9 @@ NOT_SUPPORTED = [
     ),
     (
         "aten.split / getitem of a split",
-        "No producer for the extra outputs; only layer-norm and fused add+norm "
-        "getitems are placed.",
+        "No producer for the extra outputs; only the getitems that read a layer "
+        "norm's result, a max pool's values or the fused add+norm's outputs are "
+        "placed.",
     ),
     (
         "aten.bmm.default with a broadcast batch",
