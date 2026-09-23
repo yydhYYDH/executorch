@@ -353,7 +353,7 @@ def _emit_select_copy(node: torch.fx.Node, ctx) -> TensorRef:
     if region is None:
         return _emit_alias(node, ctx)
     out = ctx.result_for(node, _numel(node))
-    ctx.builder.add_op(
+    ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(node.args[0])],
@@ -380,7 +380,7 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
         inputs.append(ctx.operand(region.patch_source))
         patch = (_SLICE_OFFSET_PARAM, len(inputs) - 1)
     out = ctx.result_for(node, _numel(node))
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=inputs,
@@ -482,7 +482,7 @@ def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
     tensors = node.args[0]
     params = cat_region(node)
     out = ctx.result_for(node, _numel(node))
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(tensor) for tensor in tensors],
@@ -623,7 +623,7 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     if folded is not None:
         return folded
     out = ctx.result_for(node, _numel(node))
-    ctx.builder.add_op(
+    ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[ctx.operand(node.args[0])],
@@ -679,7 +679,7 @@ def _unary(op_name: str):
         _require_arena_dtype(node, f"unary {op_name} input")
         numel = _numel(node)
         out = ctx.result_for(node, numel)
-        op_index = ctx.builder.add_op(
+        op_index = ctx.emit(node, 
             Op(
                 type=DSP_OP_UNARY,
                 inputs=[ctx.operand(src)],
@@ -719,7 +719,7 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
     # identity, which the infinities below express on their own.
     lower = node.args[1] if len(node.args) > 1 else None
     upper = node.args[2] if len(node.args) > 2 else None
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(src)],
@@ -752,7 +752,7 @@ def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "mul scalar")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(values)],
@@ -782,7 +782,7 @@ def _emit_row_guard(node: torch.fx.Node, ctx) -> TensorRef:
     numel = _numel(node)
     row = int(values.meta["val"].shape[-1])
     out = ctx.result_for(node, numel)
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_UNARY,
             inputs=[ctx.operand(mask), ctx.operand(values)],
@@ -870,7 +870,7 @@ def _binary(op_name: str):
         out_shape_plan = ctx.upper_shape(out_shape)
 
         out = ctx.result_for(node, out_numel)
-        op_index = ctx.builder.add_op(
+        op_index = ctx.emit(node, 
             Op(
                 type=DSP_OP_BINARY_ELEMENTWISE,
                 inputs=[ctx.operand(lhs), ctx.operand(rhs)],
@@ -974,7 +974,7 @@ def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
     # is not enough here: the bytes have to be written out.
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    ctx.builder.add_op(
+    ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[source],
@@ -1030,7 +1030,7 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
 
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    ctx.builder.add_op(
+    ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[cache],
@@ -1056,7 +1056,7 @@ def _emit_update_cache(node: torch.fx.Node, ctx) -> TensorRef:
     )
     # dstOffset is the token position times one whole cached position, which is
     # what patch_scale is for. dst is the output, at index 3.
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_RASTER_BLIT,
             inputs=[value, cache, pos],
@@ -1568,6 +1568,7 @@ def _emit_dequantize(node: torch.fx.Node, ctx) -> TensorRef:
 
 
 def _matmul_command(
+    node: torch.fx.Node,
     ctx,
     lhs,
     rhs,
@@ -1595,7 +1596,7 @@ def _matmul_command(
         if batches > 1
         else (0, 0, 0)
     )
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_BATCH_MATMUL,
             inputs=[lhs, rhs, ABSENT, ABSENT, ABSENT],
@@ -1644,6 +1645,7 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
     )
     out = ctx.result_for(node, m * n)
     _matmul_command(
+        node,
         ctx,
         ctx.operand(lhs),
         weight,
@@ -1682,6 +1684,7 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
     )
     out = ctx.result_for(node, batches * m * n)
     _matmul_command(
+        node,
         ctx,
         ctx.operand(lhs),
         weight,
@@ -1728,6 +1731,7 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
         ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
     )
     _matmul_command(
+        node,
         ctx,
         ctx.operand(lhs),
         weight,
@@ -1741,7 +1745,7 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     if beta == 0.0:
         return ctx.record(node, out)
 
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_BINARY_ELEMENTWISE,
             inputs=[target, ctx.operand(bias)],
@@ -1786,7 +1790,7 @@ def _emit_mean_dim(node: torch.fx.Node, ctx) -> TensorRef:
         return n
 
     out = ctx.result_for(node, _numel(node))
-    ctx.builder.add_op(
+    ctx.emit(node, 
         Op(
             type=DSP_OP_REDUCTION,
             inputs=[ctx.operand(src)],
@@ -1817,7 +1821,7 @@ def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
 
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_SOFTMAX,
             inputs=[ctx.operand(src)],
@@ -1850,7 +1854,7 @@ def _emit_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     # The kernel applies gamma itself and reads it as fp32, so the weight is
     # stored at that width rather than in a following elementwise multiply.
     gamma = ctx.constant(weight, torch.float32)
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_LAYER_NORM,
             # beta is ABSENT: RMSNorm has no bias, and a zero-size operand still
@@ -1892,7 +1896,7 @@ def _emit_rope(node: torch.fx.Node, ctx) -> TensorRef:
         ctx.operand(cos),
         ctx.operand(sin),
     ]
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_ROPE,
             inputs=inputs,
@@ -1975,7 +1979,7 @@ def _emit_add_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
 
     # The kernel applies gamma itself and reads it as fp32.
     gamma = ctx.constant(weight, torch.float32)
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_ADD_FUSE_LAYERNORM,
             # beta is ABSENT: RMSNorm has no bias and the kernel's RMSNorm path
@@ -2068,7 +2072,7 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
         (arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None
     ]
     normalized = ctx.activation_for_shape(shape) if affine else out
-    norm_op_index = ctx.builder.add_op(
+    norm_op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_LAYER_NORM,
             # Order matters: dst is the DSP's mapped_ptrs[3], so the three
@@ -2084,7 +2088,7 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
     result = normalized
     for index, (arg, kind) in enumerate(affine):
         target = out if index == len(affine) - 1 else ctx.activation_for_shape(shape)
-        affine_op_index = ctx.builder.add_op(
+        affine_op_index = ctx.emit(node, 
             Op(
                 type=DSP_OP_BINARY_ELEMENTWISE,
                 inputs=[result, ctx.operand(arg)],
@@ -2280,7 +2284,7 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     paged = ctx.options.attn_paged
     page_size = 256 if paged else 0
 
-    op_index = ctx.builder.add_op(
+    op_index = ctx.emit(node, 
         Op(
             type=DSP_OP_FLASH_ATTN,
             inputs=inputs,

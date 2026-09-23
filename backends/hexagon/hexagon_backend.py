@@ -14,6 +14,7 @@ from executorch.backends.hexagon.hexagon_ops import EMITTERS, pack_hmx_weight
 from executorch.backends.hexagon.serialization.blob import (
     ALIGNMENT,
     BlobBuilder,
+    Op,
     TensorRef,
 )
 from executorch.exir._serialize._named_data_store import (
@@ -250,6 +251,12 @@ class BlobContext:
         self._output_index = output_index
         self.dynamic_sequence = dynamic_sequence
         self.dynamic_example = dynamic_example
+        # DSP command index -> the debug handle of the node that asked for it.
+        # This is the delegate's half of the profiling contract: the runtime
+        # logs a profiling event per command numbered by that index, and
+        # PreprocessResult hands this map to EXIR, which stores it in the
+        # ETRecord as the delegate mapping that names the node again.
+        self.debug_handle_map: Dict[int, Tuple[int, ...]] = {}
         self.has_symbolic_shape = any(
             isinstance(dim, torch.SymInt)
             for node in graph_module.graph.nodes
@@ -533,6 +540,21 @@ class BlobContext:
         self.producer[node] = ref
         return ref
 
+    def emit(self, node: torch.fx.Node, op: Op) -> int:
+        """Appends this node's command and returns its index in the blob.
+
+        Every emitter adds through here rather than through the builder, so the
+        index the runtime reports a command under is the index this map is keyed
+        by. A node whose meta carries no debug handle -- a hand-built graph, or
+        an op EXIR never numbered -- is simply absent, and its command shows up
+        in a profile as a row nothing points back to.
+        """
+        op_index = self.builder.add_op(op)
+        handle = node.meta.get("debug_handle")
+        if handle is not None:
+            self.debug_handle_map[op_index] = (int(handle),)
+        return op_index
+
 
 class HexagonBackend(BackendDetails):
     @staticmethod
@@ -732,6 +754,7 @@ class HexagonBackend(BackendDetails):
         return PreprocessResult(
             processed_bytes=context.builder.build(),
             data_store_output=_named_data_store(context.builder),
+            debug_handle_map=context.debug_handle_map,
         )
 
 
