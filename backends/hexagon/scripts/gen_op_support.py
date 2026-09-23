@@ -47,6 +47,11 @@ ADD_LAYER_NORM = "DSP_OP_ADD_FUSE_LAYERNORM"
 ROPE = "DSP_OP_ROPE"
 BLIT = "DSP_OP_RASTER_BLIT"
 FLASH_ATTN = "DSP_OP_FLASH_ATTN"
+# The weight-only quantized matmul's two GEMV entries. A matmul whose weight
+# arrives as a per-channel dequantize is emitted as one of these instead of a
+# BATCH_MATMUL, so both matmul rows below name three commands.
+Q4A16_GEMV = "DSP_OP_MATMUL_Q4A16_GEMV_I8"
+W8A16_GEMV = "DSP_OP_MATMUL_W8A16_GEMV_I8"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -59,7 +64,8 @@ class OpSupport:
     #: Canonical edge op name, e.g. ``aten.abs.default``.
     op: str
     #: DSP op type constant name in hexagon_ops.py, or None when the emitter
-    #: produces no command.
+    #: produces no command. A row that can emit more than one command joins the
+    #: constant names with " / ".
     dsp_op: Optional[str]
     #: What the kernels actually read and write.
     dtype: str
@@ -182,11 +188,15 @@ SUPPORTED: List[OpSupport] = [
     # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
     OpSupport(
         "aten.mm.default",
-        MATMUL,
+        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV}",
         ARENA_FP16,
         "Contiguous 2-D operands only; contraction dims must match; all sizes and "
         "steps must fit int32. A visible constant weight with m*k*n >= 32768 is "
-        "pre-packed in the HMX tile order at export.",
+        "pre-packed in the HMX tile order at export. A weight that arrives as a "
+        "per-channel dequantize is emitted as one GEMV command instead, which needs "
+        "M == 1, K % 64 == 0 and N % 32 == 0.",
+        "weight-only int4 or int8, per-channel symmetric; the kernel quantizes the "
+        "fp16 activation to int8 per token",
     ),
     OpSupport(
         "aten.bmm.default",
@@ -197,11 +207,26 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.addmm.default",
-        MATMUL,
+        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV}",
         ARENA_FP16,
         "alpha must be 1 and beta 0 or 1; 2-D contiguous matmuls; the bias is read "
         "right-aligned against the 2-D result, so at most 2-D and broadcastable. "
-        "Emitted as the matmul plus one broadcast add.",
+        "Emitted as the matmul plus one broadcast add, or as one GEMV command with "
+        "the bias as its last operand when the weight is quantized (M == 1, "
+        "K % 64 == 0, N % 32 == 0, and the bias exactly n values).",
+        "weight-only int4 or int8, per-channel symmetric; the kernel quantizes the "
+        "fp16 activation to int8 per token",
+    ),
+    OpSupport(
+        "quantized_decomposed.dequantize_per_channel.default",
+        None,
+        "the stored int4/int8 weight is read by the GEMV kernel; this node emits no "
+        "command of its own",
+        "The scaling a weight-only quantized matmul carries. Delegated only when "
+        "every reader is a quantized matmul the GEMV entries admit; the matmul packs "
+        "the stored low-bit weight itself, so this node records an ABSENT operand "
+        "rather than materializing anything.",
+        "weight-only int4 or int8, per-channel symmetric",
     ),
     # --- reductions / softmax --------------------------------------------
     OpSupport(
@@ -404,9 +429,15 @@ NOT_SUPPORTED = [
         "same bytes back through in_place with nothing gained.",
     ),
     (
-        "q4a16 quantized matmul",
-        "The pack64 activation/output repack is not wired up; the quantized matmul "
-        "path is not implemented.",
+        "prefill (M > 1) with a quantized weight",
+        "The two GEMV entries read one activation row linearly; M > 1 needs the "
+        "pack64 activation and an output repack, so those nodes stay on the "
+        "portable kernels.",
+    ),
+    (
+        "w8a8 with a static activation scale",
+        "No kernel accepts an int8 activation tensor: both GEMV entries quantize the "
+        "fp16 row inside the kernel, per token, with an uncalibrated absmax scale.",
     ),
     (
         "softmax over a non-last axis",
@@ -483,6 +514,7 @@ PREDICATES = [
     "layer_norm_normalizes_the_trailing_dims",
     "layer_norm_is_emittable",
     "add_rms_norm_is_emittable",
+    "quantized_matmul_is_emittable",
 ]
 
 
@@ -508,7 +540,9 @@ def _verify_predicates() -> None:
 def _dsp_cell(support: OpSupport) -> str:
     if support.dsp_op is None:
         return "none (no command)"
-    return f"`{support.dsp_op}` ({getattr(ops, support.dsp_op)})"
+    return " / ".join(
+        f"`{name}` ({getattr(ops, name)})" for name in support.dsp_op.split(" / ")
+    )
 
 
 def _rows() -> List[OpSupport]:
