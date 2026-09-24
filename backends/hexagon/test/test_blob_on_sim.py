@@ -2199,6 +2199,13 @@ def test_the_other_two_tails_keep_a_nan_as_well(cases, simulated):
     Both cases carry a NaN inside the vector loop and one past it, so this fails
     if either half loses it. The comparison is per-NaN: which payload comes back
     is the kernel's business, but that it is a NaN is not.
+
+    What the vector half of each keeps is a NaN whose sign bit is *clear*, which
+    is what both cases feed and what the fp16 add produces for them: measured on
+    the simulator, an element whose operands are `0xfe00` comes back `0.0` at a
+    vector lane of `add_relu`, since `Q6_Vhf_vmax_VhfVhf` sends a sign-bit NaN to
+    the other operand. The tails, now that they ask by magnitude, keep both.
+    Nothing here asserts what a sign-bit NaN at a vector lane answers.
     """
     for tag, vector_end, inside, tail in (
         ("BJ", 64, (3,), (95,)),  # amax: the reduction's inside extent, 100 wide

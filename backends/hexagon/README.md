@@ -891,13 +891,13 @@ Not done yet:
   8192 KiB the simulator's manager reports, which refuses a reduction wider than
   `kp = 1364` -- 4832 input channels over a 3x3 window. Whether a device hands
   out that much VTCM, and whether the two fixed blocks really cost what the
-  arithmetic assumes, is exactly what has not been measured. The im2col kernel's other entry
-  points (`CONV1X1_DIRECT_FP16`, the weight-only quantized convolutions), its
-  scale-block parameters (`scaleBlockNum`, `scaleAsymmetric`) and the
-  `outputBytes` bound check, which this emitter turns off by passing 0, are
-  unread beyond the fields the fp16 path uses. The depthwise walk's `relu` and
-  `relu6` params are pinned off, because `to_edge` leaves a relu as its own node,
-  so the kernel's fused activations are untested here.
+  arithmetic assumes, is exactly what has not been measured. The im2col kernel's
+  other entry points (`CONV1X1_DIRECT_FP16`, the weight-only quantized
+  convolutions), its scale-block parameters (`scaleBlockNum`, `scaleAsymmetric`)
+  and the `outputBytes` bound check, which this emitter turns off by passing 0,
+  are unread beyond the fields the fp16 path uses. The depthwise walk's `relu`
+  and `relu6` params are pinned off, because `to_edge` leaves a relu as its own
+  node, so the kernel's fused activations are untested here.
 - **pooling has now run on hexagon-sim** -- max pooling bit-for-bit against torch
   and average pooling within 1.95e-3, the fp16 `1/count` divisor, on both
   `countType` forms -- and `sum` has run through the run-time patch above. A
@@ -929,13 +929,17 @@ Not done yet:
   trip -- a smaller claim than it made before `aten.relu.default` had an emitter.
   `test/test_add_relu.py` pins the rewrite, the command and its numbers, and
   `test_blob_on_sim.py` now runs the command itself through the kernel on a NaN
-  that lands on both sides of its vector boundary. Unverified on device: that the
-  **vector** path's `max(a + b, 0)` propagates a NaN where torch's relu does,
-  since `Q6_Vhf_vfmax`'s NaN behaviour is not documented here -- the scalar half
-  used to answer a sign-bit-set NaN with `0.0` where the vector half kept it, and
-  no longer does (`VENDORING.md`, modification 4); and that an add whose sum has
-  another reader still gets the command, which is a partition question rather than
-  a kernel one.
+  that lands on both sides of its vector boundary -- a NaN whose sign bit the
+  fp16 add sets, which is the value the scalar half used to answer with `0.0` and
+  no longer does (`VENDORING.md`, modification 4). A NaN that arrives with its
+  sign bit already set is still a wrong number at a vector lane: driven that way
+  on the simulator, the lane answers `0.0` where torch answers the NaN, because
+  `Q6_Vhf_vmax_VhfVhf` sends a sign-bit NaN to the other operand, and that
+  instruction is behind the rectifier as well as behind the reduction.
+  Unverified on device: what silicon does with the NaN this suite feeds, whose
+  sign bit is clear, and whether the sign-bit lane above behaves any differently
+  there; and that an add whose sum has another reader still gets the command,
+  which is a partition question rather than a kernel one.
 - **the clamp entry point has run on hexagon-sim, and the NaN path it was feared
   for is not one path but two.** The kernel walks `size & -64` elements a vector
   at a time and the rest one at a time, and until this branch the two halves

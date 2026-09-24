@@ -105,12 +105,20 @@ correctness fix:
    write the same test out inline instead of calling it), and nothing else in
    either file changed.
 
-   The reduction one is partial: `Q6_Vhf_vmax_VhfVhf` in that op's vector half
-   answers a NaN whose sign bit is set by returning the other operand, so the
-   vector half still differs from torch, and from the now-fixed tail, for that
-   value. Left as it is rather than masked over, because keeping a NaN there
-   means carrying a predicate through the fold and through the five vector
-   rotations that finish it, which is a different change from this one.
+   Two of the three are partial, in the same way and for the same reason.
+   `Q6_Vhf_vmax_VhfVhf` answers a NaN whose sign bit is set by returning the
+   other operand, and that instruction is the vector half of the reduction's fold
+   *and* the rectifier behind `add_relu`'s `max(a + b, 0)`. Both vector halves
+   therefore still differ from torch, and from their now-fixed tails, for that
+   value: driven on hexagon-sim with operands of `0xfe00`, a vector-lane element
+   of `add_relu` comes back `0.0` where torch and the tail keep the NaN. The
+   clamp is the one of the three whose two halves agree on every NaN, because its
+   vector loop restores the input when the bit test matches rather than comparing
+   -- measured by driving its sweep with `0xfe00` in place of the NaN it carries,
+   which no case in this checkout asserts.
+   Left as it is rather than masked over, because keeping a NaN in the max means
+   carrying a predicate through the fold and through the five vector rotations
+   that finish it, which is a different change from this one.
 
 ## Defects found in this snapshot
 
