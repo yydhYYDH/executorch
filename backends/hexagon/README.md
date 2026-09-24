@@ -667,8 +667,12 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   torch -- 4.88e-4 against a reference peaking at 0.57;
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
   (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
-  1.56e-2 against a reference of 16.9. The `embedding` on its own is not
-  delegated at all and lands on the portable kernels;
+  1.56e-2 against a reference of 16.9. An `embedding` on its own is not delegated
+  when its indices are int64 and lands on the portable kernels instead -- not
+  because a gather cannot be delegated but because the kernel reads
+  `const int32_t[]` and the partitioner refuses the dtype. The same table with
+  int32 indices reaches one delegate, which is the form the simulator comparison
+  below runs;
 - single-op `add`, `amax` and `sum` graphs each reach one delegate; `add` and
   `amax` answer bit-for-bit, and `sum` is 5.86e-3 out, one and a half ULP of its
   largest element;
@@ -684,6 +688,13 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   fold -- see the reduction paragraph;
 - `DSP_OP_ZERO` (24), in the command stream of the widest convolution, executed
   without error;
+- **whether the simulator stands for silicon, which is a separate measurement from
+  whether the device matches torch.** One blob per kernel family, extracted from
+  the `.pte` the phone ran and handed to `hexagon_sim.run` unchanged, run both
+  ways and compared as raw fp16 bits. Nine cases over seven paths are identical,
+  including the 3x3 convolution -- the one that goes through the HMX unit, where
+  the simulator's `--mhmx=3` is a second implementation of that hardware and not a
+  recompilation of the first. The details are with the evidence tiers below;
 - the transport and the deployment: `[hexagon] rpc timeout NOT armed ...
   0x80000414` is the first line of every run and changes nothing, every answer is
   byte-identical across repeats, and 430 runs of the convolution graph in three
@@ -845,6 +856,42 @@ Working and verified without a device:
   should be read as covering them. Every other attention path here -- the vision
   kernel and the decomposed `scaled_dot_product_attention` -- is a plain loop and
   does run.
+
+**Whether the simulator computes what silicon computes has now been measured, and
+on the paths below it does, bit for bit.** This file had a fourth evidence tier
+waiting on that question and it now has an answer: until this measurement, a case
+that passed only on `hexagon-sim` was evidence about a model of the DSP, and on
+these paths it is evidence about the DSP. Nine cases over seven families, one blob
+each, extracted from the `.pte` the phone ran and handed to `hexagon_sim.run`
+unchanged, so the two runs are the same bytes and not two exports that happen to
+look alike, agree exactly on the reduction over a run-time-patched span, `amax`
+over a 100-wide fold with a NaN inside it and without, the flat binary add, the
+row gather, the max pool, the depthwise convolution and the 3x3 im2col
+convolution. Three of them say more than "they agree":
+
+- the reduction agrees with the phone *and the two differ from torch by the same
+  5.86e-3*, which is what makes that difference the kernel's own accumulation
+  order rather than anything FastRPC, the skel or the phone contributed;
+- the rounding-sensitive convolution -- fp16 weights drawn from a normal
+  distribution, where the integer weights the other convolution case uses cannot
+  fail -- differs from torch at 1152 of its 4096 outputs by at most one ULP and
+  agrees with the phone at all 4096, so the two HMX implementations agree about
+  rounding and not only about the layout they walk;
+- the NaN `amax` disagrees with torch at exactly one element, in the NaN's
+  payload: `0x7e00` from the phone and from the simulator, `0xffff` from torch.
+  That is two NaNs, not two numbers.
+
+**Keep the two claims apart when quoting them.** "The simulator answered the
+phone's bits" is a statement about two implementations of a kernel agreeing.
+"The phone answered torch's number" is a statement about the kernel itself. Where
+both hold they hold for different reasons and neither implies the other.
+
+What this does not do is upgrade the paths it did not measure -- the quantized
+matrix forms, the attention kernels, `softmax`, the normalizations, `fmod` -- or
+survive a change of arch or dtype, since every case here is v79 and fp16.
+`test_blob_on_sim.py`'s own `amax` NaN cases are the standing caution: they reduce
+the other axis, so `inside = 100`, and never reach the function the device takes
+for the shape a user's `torch.amax(x, dim=1)` produces.
 
 Not done yet:
 

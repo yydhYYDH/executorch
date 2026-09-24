@@ -22,14 +22,30 @@ rather than letting it be read as stale.** The device run `../README.md` now
 records was made with `executor_runner` and a `.pte`; no case in this directory
 ran on a phone, and `pytest` still has no path that touches one. A device result
 elsewhere is not a substitute for a case here, because the two do not look at the
-same thing. Where the same command has now been seen both ways, the rectifier
-agreed -- a sign-bit NaN is answered `0.0` on silicon exactly as `hexagon-sim`
-answers it -- and the reduction did not: this directory's `amax` NaN cases
-(`_AmaxAt`, tags `BJ` and `BL`) reduce the axis that leaves `inside = 100 >= 64`,
-so the kernel takes `htp_ops_reduce_fp16_inside_vector_range`, where a device run
-of a `torch.amax(x, dim=1)` on a two-dimensional tensor has `inside = 1` and takes
+same thing. Where the same command has now been seen both ways it agreed -- a
+sign-bit NaN is answered `0.0` on silicon exactly as `hexagon-sim` answers it --
+and where it has not, the reason was a case reaching a different function rather
+than a disagreement: this directory's `amax` NaN cases (`_AmaxAt`, tags `BJ` and
+`BL`) reduce the axis that leaves `inside = 100 >= 64`, so the kernel takes
+`htp_ops_reduce_fp16_inside_vector_range`, where a device run of a
+`torch.amax(x, dim=1)` on a two-dimensional tensor has `inside = 1` and takes
 `htp_ops_reduce_max_fp16_inside1_hvx` instead. Read a green case here as a
 statement about the function it happens to reach.
+
+**The scaffold these cases run on has since been checked against the phone
+directly, and that is the answer the paragraph above was working around.** Nine
+blobs, one per kernel family, taken out of the `.pte` the phone ran and handed to
+`hexagon_sim.run` unchanged, agree with the phone bit for bit: the reduction over
+a run-time-patched span, `amax` over a 100-wide fold with a NaN in it and
+without, the flat binary add, the row gather, the max pool, the depthwise
+convolution and the 3x3 im2col convolution. The convolution is the one worth
+naming, because it goes through HMX and `--mhmx=3` is a second implementation of
+that unit rather than a recompilation of it, and because the case was run with
+fp16 weights drawn from a normal distribution: it differs from torch at 1152 of
+4096 outputs by up to one ULP and agrees with the phone at all 4096. So on those
+seven paths a green case here is evidence about the DSP, not about a model of it.
+The caveat above still governs which function that evidence is about, and nothing
+outside those seven paths is upgraded.
 
 ## Simulator buffers must be 128-byte aligned, explicitly
 
