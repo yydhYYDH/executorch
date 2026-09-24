@@ -624,14 +624,17 @@ its weight layout had an authority to check a packer against: the packer's bytes
 equal the vendored reorder's on the simulator, both kernels answer
 layout-blind expectations bit for bit across both dispatch branches, and a whole
 blob built by the emitter agrees three ways (torch, the host interpreter and the
-simulator) on six shapes. Not verified: no device has executed any of these
-entries, so VTCM as a device sizes it, alignment and the multi-worker DMA
-staging the simulator leaves out are all unmeasured; and of the three packers
-here, two are transcriptions -- the int4 GEMV one is written down twice in the
-vendored tree and cross-checked against the kernel's read path, the int8 one
-only against the kernel's own permuted activation splat -- while the prefill one
-is the byte-for-byte comparison above. The speedup, the real numbers and the
-FastRPC/skel deployment all need a device.
+simulator) on six shapes. Not verified at the time of writing: no device had
+executed any of these entries, so VTCM as a device sizes it, alignment and the
+multi-worker DMA staging the simulator leaves out are all unmeasured; and of the
+three packers here, two are transcriptions -- the int4 GEMV one is written down
+twice in the vendored tree and cross-checked against the kernel's read path, the
+int8 one only against the kernel's own permuted activation splat -- while the
+prefill one is the byte-for-byte comparison above. That gap has since narrowed
+for the entry itself: a device run at `M > 1` is in "Status", which measures the
+numbers and the K at which the `m <= 32` path stops. The alignment and the
+multi-worker DMA staging the simulator's missing worker pool leaves out are still
+unmeasured, and the speedup is still unmeasured.
 
 ## Delegating a row gather
 
@@ -796,6 +799,52 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   when another process on the phone holds the VTCM, which is a shared device's
   problem rather than this backend's answer.
 
+A later set of device runs, on the same phone and the **same unchanged
+deployment** (`libhex-htp-skel-v79.so` md5 `db74410ba0f9a44ad8e6ed2d2d4421ec`,
+the runner from 24 Sep, blobs lowered at `abd68f1` -- four commits after the
+`10ab195` above, which is why these are listed separately rather than folded into
+that list):
+
+- **the element-wise select** (`WHERE`, `DSP_OP_SELECT` 26) answers torch **bit
+  for bit** from one command, both with the condition as a graph input and with
+  it baked in as a constant. A control that changes only the one-byte condition
+  width -- same command, same blob length, `params[5]` moved from `1` to `2` --
+  goes wrong on 12 of 24 elements, so the branch really does depend on the width
+  the emitter declares rather than on the command merely having run;
+- **the zero-filling `constant_pad_nd`** (`ZERO` 24 plus one `RASTER_BLIT`)
+  answers torch bit for bit on all 27 outputs. Its control is the sharper of the
+  two: moving the region's `dstOffset` by one leaves the blob the same length,
+  still reports `enter d0: ops=2` and still reports **`exit d0: ok`**, and writes
+  13 of 27 outputs in the wrong place. `exit d0: ok` therefore certifies that a
+  command ran, never that the numbers are right;
+- **`split`/`chunk`** writes its pieces with `RASTER_BLIT` and answers bit for
+  bit, including the case where the region the third piece reads is offset by the
+  extent of a middle piece nothing reads;
+- **the int4 weight prefill entry (22) has now run on a device at `M > 1`**,
+  which the offline sections below still say it has not. `[3][22][3]` at
+  `M=8 K=128 N=96` answers within a relative 4.5e-4 of the converted graph's own
+  fp32 `mm` over the *dequantized* weights -- the comparison that keeps 4-bit
+  weight rounding out of the kernel's error budget. A K ladder at `M=4`, `N=64`
+  holds that accuracy up to **`K = 12672`** (relative 3.9e-4 to 6.4e-4 at every
+  rung) and then fails at **`K = 12736` and `K = 12800`** with
+  `execute_command_group failed: 0x8000040d`, `exit d0: failed` and no output at
+  all, in under a second and reproducibly across three interleaved repeats. That
+  this is structural rather than the contention above is the clock and not the
+  code: contention lands at 10.1 s, and this lands in under one;
+- **that boundary is the stack, not the request.** The same `K = 12800` at
+  **`M = 40`** succeeds, and its activation arena is **ten times larger**
+  (`act=1029120` against `act=102912`), so a wider request is not what fails. The
+  `m <= 32` kernel holds its per-K-tile descriptors in a stack VLA
+  (`dma_desc_2d_t act_descs[safe_kp]`, `safe_kp = K/32`,
+  `matmul_q4fp16_mle32.c:513,528`) while the `m > 32` one `memalign`s the same
+  array (`matmul_q4fp16.c:965-966`), which is the one thing that differs, and
+  `0x8000040d` is the signature `skel/CMakeLists.txt` already records for a stack
+  overflow. **The host gate admits up to `K = 25216`; the `m <= 32` path stops at
+  12672 on this phone**, so the gate is about twice as wide as what a device will
+  actually run -- and its failure mode is a loud refusal rather than a wrong
+  number. Tightening the gate or moving that array off the stack are both open,
+  and neither is this section's decision to make.
+
 Working and verified without a device:
 
 - the vendored DSP library cross-compiles for v79 through the CMake build,
@@ -865,7 +914,8 @@ Working and verified without a device:
   weights do not fit the VTCM budget) has **never been reached** by any case
   here -- every shape used fits one chunk -- so it is unexercised rather than
   correct; and no case measures the timing, on the simulator or anywhere else;
-- the int4 weight prefill entry (22) does too, at every layer below the device:
+- the int4 weight prefill entry (22) does too, at every layer below the device
+  and, since then, on one as well (see "Status"):
   `test/test_prefill_on_sim.py` compares its packer with the vendored reorder on
   the simulator byte for byte, measures the two HVX operations that reorder is
   built on, and runs both dispatch branches against expectations that mention no
@@ -875,9 +925,11 @@ Working and verified without a device:
   simulator and requires all three to agree. One case in
   `test_prefill_on_sim.py` is a **defect pin rather than a feature test**: one
   output-channel chunk answers NaNs at `K == 64`, which is why the emitter always
-  asks for two. Not verified: no device, and the multi-worker DMA staging the
+  asks for two. Not verified: the multi-worker DMA staging the
   simulator's missing worker pool leaves unexercised (`qurt_cb_fwk_worker_init
-  returned: -4`) has never run;
+  returned: -4`) has never run, and the device run in "Status" says what the
+  numbers are and where the `m <= 32` path stops rather than anything about that
+  staging, which no device case here reaches;
 - a vision attention block goes all the way through once `FuseVisionAttention` is
   in the caller's `transform_passes`: a three-projection ViT attention over a
   dynamic patch count partitions into one delegate whose blob carries one
