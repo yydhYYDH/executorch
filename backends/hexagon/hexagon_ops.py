@@ -932,17 +932,18 @@ def permute_region(node: torch.fx.Node):
     """The blit region for a permutation of the axes, or None.
 
     A region is three nested loops with a stride per side, so a permutation is
-    describable exactly when the axes split into at most three groups, each a run
-    of consecutive axes that keeps its order in both layouts: such a run is one
-    loop whose size is the product of the run and whose strides are its last
-    axis's. `permute(w, [1, 0])` between a weight and its `mm` is the two-group
-    case, and it is the shape `htp_ops_prepare_transpose` recognises and routes
-    to the HVX transpose -- the inner run reads a contiguous source row and
+    describable exactly when the axes split into at most three groups that
+    advance, each a run of consecutive axes that keeps its order in both layouts:
+    such a run is one loop whose size is the product of the run and whose strides
+    are its last axis's. `permute(w, [1, 0])` between a weight and its `mm` is the
+    two-group case, and it is the shape `htp_ops_prepare_transpose` recognises and
+    routes to the HVX transpose -- the inner run reads a contiguous source row and
     writes a strided destination column. `permute(1, 0, 2, 3)` over a fused qkv
-    is the same split with the head run carried whole.
+    is the same split with the head run carried whole, and on a batch of one the
+    leading extent is a group that iterates once and spends no loop.
 
     A permutation that reverses the axes inside a group, or that needs a fourth
-    one, is refused rather than approximated: no single region describes it, and
+    loop, is refused rather than approximated: no single region describes it, and
     what it would emit reads the wrong elements rather than failing.
     """
     if len(node.args) < 2 or not isinstance(node.args[0], torch.fx.Node):
@@ -984,15 +985,24 @@ def permute_region(node: torch.fx.Node):
             groups.append((first, axis - 1))
             first = axis
     groups.append((first, rank - 1))
-    if len(groups) > 3:
-        return None
 
     levels = []
     for start, last in groups:
         run = 1
         for axis in range(start, last + 1):
             run *= int(source_value.shape[axis])
-        levels.append((run, source_strides[last], destinations[last]))
+        # A group of axes whose extents multiply to one is not a loop: it
+        # iterates once and neither stride ever advances, so it covers nothing
+        # the other levels do not while still spending one of the three. The
+        # head split of a batch-one attention -- `[1, tokens, heads, dim]` to
+        # `[1, heads, tokens, dim]`, which is every attention in a batch-one
+        # export -- splits into four groups of axes and three loops, so counting
+        # the batch group refuses a permutation that three levels describe
+        # exactly. What is refused is a fourth level that advances.
+        if run > 1:
+            levels.append((run, source_strides[last], destinations[last]))
+    if len(levels) > 3:
+        return None
     while len(levels) < 3:
         levels.append((1, 0, 0))
     # A run both sides read contiguously is one copy where it is innermost and

@@ -749,6 +749,31 @@ def test_a_permutation_needing_a_fourth_run_is_refused():
     )
 
 
+def test_a_head_split_on_a_batch_of_one_is_three_loops():
+    """The batch axis of a head split is an extent of one, so it is not a loop.
+
+    `[1, tokens, heads, dim]` to `[1, heads, tokens, dim]` is how a batch-one
+    export spells every head split -- an SD cross-attention's query, key, value
+    and its output merge, and the same shape in every vision tower. The axes
+    split into four groups, but the group holding the batch axis multiplies to
+    one: it iterates once and neither stride advances, so the permutation is
+    three levels and counting that group only refuses it. The identical split at
+    a batch of two needs four loops that do advance, and stays refused -- which
+    is what makes the acceptance a rule about extents rather than a loosening.
+    """
+    for shape in ((1, 16, 8, 40), (1, 77, 8, 40), (1, 4096, 8, 40), (1, 16, 5, 64)):
+        assert (
+            hexagon_ops.permute_region(_permute_copy(shape, (0, 2, 1, 3))) is not None
+        ), f"refused {shape}"
+    for shape in ((1, 16, 8, 40), (1, 16, 5, 64)):
+        _, got, expected = _run_permute(shape, (0, 2, 1, 3))
+        assert np.array_equal(got, expected), f"differs from torch at {shape}"
+
+    assert (
+        hexagon_ops.permute_region(_permute_copy((2, 16, 8, 40), (0, 2, 1, 3))) is None
+    )
+
+
 #: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed
 #: the kernel's approximated exponential; it turned out to need only the causal
 #: rule and the head grouping, so the interpreter covers it and the set below is
