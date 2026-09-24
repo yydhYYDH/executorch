@@ -131,6 +131,11 @@ _SOURCES = [
     "ops/matmul_q4block_gemv_i8.c",
     "ops/matmul_q4block_fp16_mle32.c",
     "ops/matmul_w8a16_gemv_i8.c",
+    # The topk kernel. It is the one in the library that fills two outputs: the
+    # emitter places the values and puts the positions in scratch, so what these
+    # cases establish is that the first output really is a maximum per row and
+    # that the two extents in the command are the ones the layout has.
+    "topk_ops.cc",
     # The kernels above call htp_probe_stage, which the device build defines in
     # execute_command.cc -- a translation unit with the whole op table behind it,
     # so the probe is linked on its own here. It is a trace hook and every kernel
@@ -552,6 +557,7 @@ _REDUCTION = 29
 _VISION_ATTENTION = 43
 _Q4A16_GEMV = 41
 _W8A16_GEMV = 45
+_TOPKV2_K1 = 27
 
 
 def _table_ints(oc, ic):
@@ -796,6 +802,29 @@ def _transpose_the_tiles(blob, k, n):
     return bytes(body)
 
 
+def _rewrite_the_row_stride(blob, stride):
+    """The same blob with the topk's row stride written one element shorter.
+
+    The command's first param is how many elements a row holds and its second is
+    how many rows there are, so this is the blob an emitter that had the two the
+    other way round -- or that padded the row out to something -- would have
+    written. Both extents are still read from the same operand and still written
+    to the same slots, so neither model is reading or writing outside them, and
+    the answer has to move: if it did not, the case above would be comparing
+    bytes that say nothing about which row the kernel folded.
+    """
+    header, commands = read_blob(blob)
+    assert len(commands) == 1 and commands[0].type == _TOPKV2_K1
+    assert commands[0].params[0] > stride and commands[0].params[1] * stride <= (
+        commands[0].inputs[0].size // 2
+    )
+    body = bytearray(blob)
+    # The op's four prefix words are type, input count, output count and param
+    # count; the params start straight after them.
+    struct.pack_into("<i", body, blob_interpreter.B.HEADER_SIZE + 16, stride)
+    return bytes(body)
+
+
 def _swap_the_nibble_pair(blob, k, n):
     """The same blob with every weight byte's two nibbles exchanged.
 
@@ -848,6 +877,20 @@ class _Clamp(torch.nn.Module):
         if self.kind == "relu6":
             return torch.nn.functional.relu6(x)
         return torch.clamp(x, self.lower, self.upper)
+
+
+class _TopkAt(torch.nn.Module):
+    """The values of `torch.topk(x, 1)`, which is the other two-output form.
+
+    It is the same shape of node `_MaxDimAt` is -- a tuple handed on through a
+    getitem, with the values reaching the method output -- and it is not the same
+    command underneath: the fold here is one row at a time, at a stride the
+    command carries as a param, and the kernel wants the positions output to be
+    real storage even though nothing reads it.
+    """
+
+    def forward(self, x):
+        return torch.topk(x, 1).values
 
 
 class _AmaxAt(torch.nn.Module):
@@ -1726,6 +1769,48 @@ def _branch_cases():
     #    difference the simulator reports is the one being tested.
     max_dim = _small((2, 100))
     cases.append(_case("CA", _MaxDimAt(), (max_dim,), _bits(_MaxDimAt()(max_dim))))
+
+    # 9. The topk. Its values are a row maximum like the amax's, and the command
+    #    is a different one: there is no span, there is a row stride and a row
+    #    count, and there is a second output the kernel dereferences and nothing
+    #    reads -- so the operand has to be non-null storage of the right width
+    #    even though the bytes are never copied out. Both shapes below are chosen
+    #    so that reading the stride wrongly moves a number: 33 columns is not a
+    #    multiple of 7, the period of the values, so no row is another row's
+    #    neighbour, and the values within a row are at distinct positions. The
+    #    first has a row of 33, which the kernel walks as one vector of 32 and a
+    #    one-element tail; the second has a row of 70, which is a vector and a
+    #    six-element tail behind a rank-3 operand, so the row count is a product
+    #    rather than a leading extent.
+    spread = (torch.arange(5 * 33) * 37 % 101).sub(50).div(8).reshape(5, 33).half()
+    assert int(
+        torch.topk(spread, 1).indices.unique().numel()
+    ) == 5, "the row maxima are not at five distinct positions"
+    cases.append(
+        _case(
+            "BN",
+            _TopkAt(),
+            (spread,),
+            _bits(torch.topk(spread, 1).values.reshape(-1)),
+        )
+    )
+    #    The control: the same blob with the stride off by one. A case whose
+    #    answer does not move here is a case that never read the param.
+    cases.append(
+        _case(
+            "BO",
+            _TopkAt(),
+            (spread,),
+            _bits(torch.topk(spread, 1).values.reshape(-1)),
+            kind="teeth",
+            mutate=lambda blob: _rewrite_the_row_stride(blob, 32),
+        )
+    )
+
+    deep = (torch.arange(2 * 3 * 70) * 53 % 199).sub(100).div(8).reshape(2, 3, 70).half()
+    cases.append(
+        _case("BP", _TopkAt(), (deep,), _bits(torch.topk(deep, 1).values.reshape(-1)))
+    )
     return cases
 
 

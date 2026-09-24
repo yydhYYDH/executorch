@@ -64,6 +64,7 @@ FP16_BYTES = 2
 
 SOFTMAX = 28
 REDUCTION = 29
+TOPKV2_K1_FP16 = 27
 
 #: HtpOpsReductionOpType.
 REDUCTION_SUM = 1
@@ -1180,6 +1181,32 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
     )
 
 
+def _run_topk(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_topkv2_k1_fp16: each row's maximum, and the first index holding it.
+
+    The kernel keeps the maximum's *bit pattern* over a row and then walks the
+    row again for the first position whose bits equal it, so an index it writes
+    is the first occurrence of the maximum -- which is not the position torch's
+    own kernel produces (see `hexagon_ops.TOPK`). The values are fp16 per row and
+    the indices int32 per row, whatever the graph declares the latter to be.
+    """
+    row_size, rows = params[0], params[1]
+    src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    if src.size < rows * row_size:
+        raise UnsupportedOp(
+            f"blob: {src.size} values do not fill [{rows}][{row_size}]"
+        )
+    row_major = np.ascontiguousarray(src[: rows * row_size].reshape(rows, row_size))
+    # The vector walk is a vmax over the row and the scalar tail only replaces a
+    # running maximum with something strictly greater, so a NaN never wins.
+    ranked = row_major.astype(np.float32)
+    ranked[np.isnan(row_major)] = -np.inf
+    best = ranked.max(axis=1).astype(np.float16)
+    first = (row_major.view(np.uint16) == best.view(np.uint16)[:, None]).argmax(axis=1)
+    _store(arena, arena.address(command.outputs[0]), best.tobytes())
+    _store(arena, arena.address(command.outputs[1]), first.astype(np.int32).tobytes())
+
+
 def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     """Sync attention, over the cache the op was handed rather than one it keeps.
 
@@ -1553,6 +1580,7 @@ _EXECUTORS = {
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,
+    TOPKV2_K1_FP16: _run_topk,
     UNARY: _run_unary,
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,
@@ -1572,6 +1600,7 @@ def execute(
     inputs: Sequence[np.ndarray],
     named_data: Optional[Dict[str, bytes]] = None,
     length: Optional[int] = None,
+    arena: Optional[Arena] = None,
 ) -> List[np.ndarray]:
     """Runs a blob over the host arena and returns its outputs by index.
 
@@ -1584,12 +1613,19 @@ def execute(
     names, which is what the runtime does; it is stated only when the operand
     handed over is the whole bound-sized slot an arena holds rather than the
     tensor a caller would pass.
+
+    `arena` is the arena to run in, for a caller that wants to read something
+    back out of it afterwards -- an activation an emitter filled and no output
+    names, which is the only way to see what a kernel wrote into a slot the graph
+    does not ask for. It has to be built over the same bytes and the same named
+    data, since those are what the caller would otherwise have supplied here.
     """
     header, commands = read_blob(data)
     if len(inputs) != header.n_inputs:
         raise ValueError(f"blob wants {header.n_inputs} inputs, got {len(inputs)}")
 
-    arena = Arena(header, data, "blob", named_data)
+    if arena is None:
+        arena = Arena(header, data, "blob", named_data)
     for index, tensor in enumerate(inputs):
         ref = _slot(commands, B.TensorSpace.INPUT, index)
         raw = tensor.tobytes()

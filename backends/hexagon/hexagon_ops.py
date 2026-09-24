@@ -43,6 +43,9 @@ DSP_OP_UNARY = 4
 # A memset over one operand, which is the only way to clear the padding lanes a
 # ragged channel count leaves in a blocked activation (blit_ops.cc:1724).
 DSP_OP_ZERO = 24
+# The one kernel that answers two outputs: htp_ops_topkv2_k1_fp16 writes a
+# maximum and its position per row (topk_ops.cc:48).
+DSP_OP_TOPKV2_K1_FP16 = 27
 
 # One command's parameters live in a fixed-size block of 40 ints
 # (serialization/hexagon_schema.h:44). The raster blit spends three of them on its
@@ -161,6 +164,9 @@ BINARY_OP_TYPES: Dict[str, int] = {
 
 # The DSP's default element format for these ops.
 FP16_BYTES = 2
+
+# What the topk kernel writes its positions as, whatever the graph says they are.
+INT32_BYTES = 4
 
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
@@ -1969,7 +1975,7 @@ def _values_getitem(node: torch.fx.Node, source_target) -> Optional[torch.fx.Nod
 def _values_sink(node: torch.fx.Node) -> torch.fx.Node:
     """The node whose output slot a two-output op's values end up in.
 
-    max_pool2d_with_indices and max.dim both hand their values on through a
+    max_pool2d_with_indices, max.dim and topk all hand their values on through a
     getitem, and that getitem is what downstream reads -- so it is the sink the
     emitter has to fill, not the tuple the kernel cannot describe.
     """
@@ -1977,7 +1983,9 @@ def _values_sink(node: torch.fx.Node) -> torch.fx.Node:
         (
             reader
             for reader in node.users
-            if max_pool_getitem(reader) is node or max_dim_getitem(reader) is node
+            if max_pool_getitem(reader) is node
+            or max_dim_getitem(reader) is node
+            or topk_getitem(reader) is node
         ),
         node,
     )
@@ -2959,6 +2967,144 @@ def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
 
 
+# The one kernel in this backend that answers two outputs, and the reason it
+# still lands under the values-only rule the pool and max.dim are under -- for a
+# different reason from theirs. `htp_ops_topkv2_k1_fp16` (topk_ops.cc:48) walks
+# each row of the last axis, keeps the maximum's bit pattern, and writes that
+# value and the first index whose bits equal it. k == 1 is not a subset of the
+# kernel: there is no other k, no rank argument and no second pass.
+#
+# What it writes for the position is not what torch writes. On a tie -- two
+# equal maxima, ordinary in fp16 -- torch's CPU kernel returns whichever index
+# its own partial sort lands on and this one returns the first. Measured:
+# `[1, 1, .5, -2, 1, .5, 0]` comes back as 1 from torch and 0 from the kernel,
+# a row of four equal values comes back as 2 from torch and 0 from the kernel,
+# and over 200 rows of quantized values torch matches neither the first nor the
+# last occurrence on 175 of them. Handing the graph's indices that answer would
+# put a position torch never produced into a tensor the model reads, which is
+# what a refusal is for; the values, which are the row's maximum either way, are
+# the half this emitter takes. The kernel dereferences both pointers, so the
+# other half gets a scratch slot nothing reads rather than being left ABSENT,
+# which would fail the command.
+#
+# The values carry the caveat max and amax already carry -- a NaN row and the
+# sign of a zero are where the DSP's maximum and torch's differ.
+TOPK = exir_ops.edge.aten.topk.default
+
+
+class TopkSpec(NamedTuple):
+    """The two extents htp_ops_topkv2_k1_fp16 walks: rowSize and rows."""
+
+    row_size: int
+    rows: int
+
+
+def _topk_arg(node: torch.fx.Node, name: str, index: int, default):
+    """A topk argument from wherever the graph put it, or the schema's default.
+
+    `to_edge` writes an argument it was given positionally -- `dim` lands in
+    args[2] -- and leaves one that kept its default out of the node altogether,
+    so a missing argument means the schema's value rather than an unknown one.
+    """
+    if name in node.kwargs:
+        return node.kwargs[name]
+    return node.args[index] if len(node.args) > index else default
+
+
+def topk_spec(node: torch.fx.Node) -> Optional[TopkSpec]:
+    """The row the kernel walks and how many of them, for a topk it answers.
+
+    Every condition is one the command has no argument for: k is 1 by
+    construction, the reduction axis is the last because the kernel advances
+    `rowSize` elements between rows, and both extents are integers in the
+    command, so a symbolic one would describe the shape it was exported at
+    instead of the run. `largest` is the same kind of limit -- there is no
+    descending walk to select -- and `sorted` is not a limit at all, since one
+    element is in order either way.
+    """
+    if node.target is not TOPK:
+        return None
+    k = _topk_arg(node, "k", 1, None)
+    if isinstance(k, bool) or not isinstance(k, int) or k != 1:
+        return None
+    if _topk_arg(node, "largest", 3, True) is not True:
+        return None
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return None
+    value = source.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dim() == 0:
+        return None
+    if not value.is_contiguous():
+        return None
+    shape = list(value.shape)
+    if not all(isinstance(extent, int) and extent > 0 for extent in shape):
+        return None
+    dim = _topk_arg(node, "dim", 2, -1)
+    if isinstance(dim, bool) or not isinstance(dim, int):
+        return None
+    if dim % value.dim() != value.dim() - 1:
+        return None
+    row_size = shape[-1]
+    return TopkSpec(row_size=row_size, rows=value.numel() // row_size)
+
+
+def topk_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The topk a getitem reads, when it reads the values and not the positions."""
+    return _values_getitem(node, TOPK)
+
+
+def topk_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this topk is one the kernel answers and nothing reads past it.
+
+    The same all-readers-take-the-values rule the pool and max.dim are under, for
+    the reason topk_getitem gives; a graph that reads the positions keeps the
+    values reader portable with the node it reads. The rule is not only about what
+    the kernel computes: the node declares its positions as int64 and this kernel
+    writes one int32 per row (topk_ops.cc:54), so a slot wide enough for the
+    declared dtype would have its upper half left as the arena held it. The width
+    is the smaller of the two reasons -- the position itself is the wrong number
+    -- and it is the one that would still stand if a future kernel broke ties
+    torch's way.
+    """
+    if node.target is not TOPK:
+        return True
+    if topk_spec(node) is None:
+        return False
+    return bool(node.users) and all(
+        topk_getitem(reader) is node for reader in node.users
+    )
+
+
+def _emit_topk(node: torch.fx.Node, ctx) -> TensorRef:
+    """k == 1 over the last axis as one TOPKV2_K1_FP16.
+
+    One input and two outputs, in the order the dispatcher reads them
+    (execute_command.cc:653): the values first, the positions second, both per
+    row. The graph has a slot for the first only, so the second is scratch -- four
+    bytes a row, which is the width the kernel writes, and not the eight the
+    node's own dtype would ask for. The kernel returns -1 without writing when
+    either pointer is null, so this slot has to exist even though nothing reads
+    it.
+    """
+    spec = topk_spec(node)
+    if spec is None:
+        raise RuntimeError("hexagon: this topk is not one the DSP kernel answers")
+    _require_arena_dtype(node, "topk")
+    out = ctx.result_for(_values_sink(node), spec.rows)
+    indices = ctx.builder.add_activation(spec.rows * INT32_BYTES)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_TOPKV2_K1_FP16,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out, indices],
+            params=[spec.row_size, spec.rows],
+        ),
+    )
+    return ctx.record(node, out)
+
+
 def pow_is_square(node: torch.fx.Node) -> bool:
     """Whether this pow is x ** 2, the one exponent with a unary kernel.
 
@@ -3927,6 +4073,9 @@ EMITTERS = {
     MAX_POOL2D: _emit_pool2d,
     MAX_POOL2D_WITH_INDICES: _emit_pool2d,
     AVG_POOL2D: _emit_pool2d,
+    # k == 1 over the last axis; the positions the kernel also writes go to
+    # scratch, because they are not the positions torch writes (see TOPK).
+    TOPK: _emit_topk,
     exir_ops.edge.aten.fmod.Tensor: _binary("mod"),
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,

@@ -161,12 +161,28 @@ _ROWS = [
         (_x(2, 3, 4),),
         [("aten.max.dim", "wired"), (_GETITEM, "wired")],
     ),
+    (
+        "a topk, reading the values",
+        lambda a: torch.topk(a, 1).values,
+        (_x(2, 8),),
+        [("aten.topk.default", "wired"), (_GETITEM, "wired")],
+    ),
+    (
+        "a topk, reading the positions",
+        lambda a: torch.topk(a, 1).indices,
+        (_x(2, 8),),
+        [("aten.topk.default", "refused"), (_GETITEM, "refused")],
+    ),
     # --- the producers it does not ------------------------------------------
     (
-        "topk's values",
+        "topk's values, for a k the kernel holds no second element for",
         lambda a: torch.topk(a, 2).values,
         (_x(8),),
-        [("aten.topk.default", "unwired"), (_GETITEM, "refused")],
+        # The getitem is accepted on its own -- a getitem is judged without
+        # looking at its producer, which is why the pool's dilated row reads the
+        # same way -- and the partition is still not formed, because that
+        # verdict does not cross a tuple.
+        [("aten.topk.default", "refused"), (_GETITEM, "wired")],
     ),
     (
         "sort's values",

@@ -69,6 +69,10 @@ POOL = "DSP_OP_POOL2D_FP16"
 DEPTHWISE = "DSP_OP_CONV_DEPTHWISE2D_FP16"
 IM2COL = "DSP_OP_IM2COL_CONVOLUTION_FP16"
 ZERO = "DSP_OP_ZERO"
+# The one kernel in the library that answers two outputs: each row's maximum and
+# the first position holding it. The emitter takes the first and puts the second
+# in scratch the graph never reads.
+TOPKV2_K1 = "DSP_OP_TOPKV2_K1_FP16"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -307,6 +311,26 @@ SUPPORTED: List[OpSupport] = [
         "reader of the indices keeps the whole node portable, values reader "
         "included. That getitem 0 is where the values are handed on, and it is the "
         "sink the command fills.",
+    ),
+    OpSupport(
+        "aten.topk.default",
+        TOPKV2_K1,
+        ARENA_FP16,
+        "k == 1 over the last axis: the kernel holds one element per row and has "
+        "no argument for k, no rank to walk and no descending form, so any other "
+        "k, any other dim, `largest=False` and a symbolic extent are all refused "
+        "by topk_spec and fall back together. That is also why the two extents "
+        "ride in the command as integers: a symbolic row would be a stride no "
+        "command can carry. `sorted` is not part of the rule, since one element "
+        "is in order either way. The node answers (values, indices) and the "
+        "kernel writes both, but the position it writes is the *first* occurrence "
+        "of the maximum while torch's own kernel returns whichever index its "
+        "partial sort lands on -- neither the first nor the last of a tie in "
+        "general -- so it is placed only when every reader takes getitem 0 "
+        "(topk_is_emittable, the rule max_pool2d and max.dim are under). The "
+        "other half goes to a scratch activation the kernel dereferences and "
+        "nothing reads. The values carry the signed-zero and NaN caveat "
+        "max.default has.",
     ),
     OpSupport(
         "aten.relu.default",
@@ -709,11 +733,24 @@ NOT_SUPPORTED = [
         "A reduction kernel that returns values and no positions.",
     ),
     (
-        "aten.split_with_sizes_copy.default, aten.topk.default and aten.sort.default",
+        "aten.split_with_sizes_copy.default and aten.sort.default",
         "Multi-output ops with no producer for the extra outputs. Only the getitems "
-        "reading a layer norm's result, a max pool's values, a max(x, dim)'s values "
-        "or the fused add+norm's outputs are placed, so these stay portable "
-        "together with their getitems.",
+        "reading a layer norm's result, a max pool's values, a max(x, dim)'s values, "
+        "a topk's values or the fused add+norm's outputs are placed, so these stay "
+        "portable together with their getitems.",
+    ),
+    (
+        "aten.topk.default reading .indices, or asking for another k, dim or order",
+        "The one kernel that writes positions writes the *first* occurrence of the "
+        "row maximum, and torch's own kernel returns whatever index its partial "
+        "sort lands on -- for a row of equal values torch answers 2 where this "
+        "answers 0, and over 200 rows of quantized values it matches neither the "
+        "first nor the last occurrence on 175 of them. A graph that reads the "
+        "positions would therefore be reading a number torch never produced, which "
+        "is what the all-readers-are-getitem-0 rule refuses. k != 1, another dim "
+        "and largest=False are refused by the same gate, because the kernel has "
+        "no argument for any of them. `torch.topk(x, 1).values`, `torch.amax(x, "
+        "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
     ),
     (
         "aten.eq / ne / gt / lt / ge / le, aten.where.self and masked_fill",
@@ -832,6 +869,7 @@ PREDICATES = [
     "pow_is_square",
     "max_pool_is_emittable",
     "max_dim_is_emittable",
+    "topk_is_emittable",
 ]
 
 

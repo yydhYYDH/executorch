@@ -302,7 +302,14 @@ _ROWS = [
         "topk",
         lambda a: torch.topk(a, 2, dim=-1).values,
         (_x(2, 3),),
-        [("aten.topk.default", "unwired"), (_GETITEM, "refused")],
+        # Wired and refused: the kernel holds one element per row, so k == 2 is
+        # an argument it has no slot for rather than an emitter this table
+        # lacks. The values getitem is still accepted on its own, because a
+        # getitem is judged without looking at its producer -- the same pair the
+        # dilated pool's row below carries -- and that verdict is not a
+        # partition: nothing forms one across a tuple, so the reader stays on
+        # the host with the node it reads.
+        [("aten.topk.default", "refused"), (_GETITEM, "wired")],
     ),
     (
         "sort",

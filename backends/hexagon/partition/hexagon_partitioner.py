@@ -69,6 +69,9 @@ from executorch.backends.hexagon.hexagon_ops import (
     SQUARE_POW_TARGETS,
     sum_dim_is_emittable,
     SUM_TARGETS,
+    TOPK,
+    topk_getitem,
+    topk_is_emittable,
     update_cache_layout,
     vision_attention_is_emittable,
     VISION_ATTENTION_TARGETS,
@@ -646,6 +649,13 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # The indices come out of the same node and no kernel here produces
             # them, so a graph that reads them keeps the pool portable.
             return False
+        if node.target is TOPK and not topk_is_emittable(node):
+            # The kernel does produce the positions, and they are not the ones
+            # torch produces (see TOPK), so a graph that reads them keeps the
+            # whole node portable exactly as the pool's reader of its indices
+            # does. A k, a dim or an order the one kernel has no argument for is
+            # the same verdict, from the same gate.
+            return False
         if node.target in POOL_TARGETS and pool_spec(node) is None:
             # The kernel walks its activation in the DSP's 64-channel blocked
             # layout, and only the C == 64 form of it is one this backend
@@ -707,6 +717,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 pass
             elif max_dim_getitem(node) is not None:
                 # The same for torch.max(x, dim)'s values.
+                pass
+            elif topk_getitem(node) is not None:
+                # The same for torch.topk's values; that node's own check has
+                # already refused a topk whose positions or arguments keep it
+                # portable.
                 pass
             else:
                 source = add_rms_norm_getitem(node)

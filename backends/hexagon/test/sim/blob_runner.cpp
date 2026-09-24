@@ -97,6 +97,14 @@ extern "C" int htp_ops_shared_gather(uint8_t *dst, uint8_t *indices, uint8_t *we
                                      int32_t selectSize, int32_t ic, int32_t oc,
                                      int32_t bytes, int32_t isInt4,
                                      int32_t scaleBlockNum, int32_t scaleAsymmetric);
+/* The one kernel here that fills two outputs. It is not in `dsp/ops.h`, and it
+ * is the only entry point in this file whose second output has no reader: the
+ * emitter allocates the positions a slot of their own because the kernel
+ * refuses to run without one, and nothing copies them out. A null there is a -1
+ * rather than a wrong number, which is why the return value is printed. */
+extern "C" int htp_ops_topkv2_k1_fp16(uint8_t *values, uint8_t *indices,
+                                      uint8_t *input, int32_t rowSize,
+                                      int32_t rows);
 extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation,
                                             uint8_t *weight, uint8_t *bias, int32_t k,
                                             int32_t n, int32_t scale_block_num,
@@ -132,6 +140,7 @@ enum {
   kBinaryElementwise = 19,
   kSharedGather = 23,
   kZero = 24,
+  kTopkV2K1 = 27,
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
@@ -335,6 +344,17 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                         params[0], params[1], params[2], params[3], params[4],
                         params[5], params[6], params[7], params[8], params[9],
                         params[10], params[11], params[12], params[13], params[14]);
+    return;
+  }
+  if (op.type == kTopkV2K1) {
+    /* Values, positions, operand, in that order: the positions are the second
+     * output the emitter allocates and nothing reads, and the two params are
+     * the row length and the row count. */
+    int ret = htp_ops_topkv2_k1_fp16(address(header, op.outputs[0]),
+                                     address(header, op.outputs[1]),
+                                     address(header, op.inputs[0]), params[0],
+                                     params[1]);
+    if (ret != 0) printf("%s topk returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kSharedGather) {
