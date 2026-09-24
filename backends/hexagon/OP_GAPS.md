@@ -133,6 +133,26 @@ the same node delegates or does not depending on a shape.
 | A two-output node is placed only when every reader takes the values output | `max.dim` (indices), `max_pool2d_with_indices`, `native_layer_norm` (`getitem 0`), `add_rms_norm` (`getitem 0` or 1) | the kernels compute values, not positions. `topk`'s kernel is the exception that proves it, and the rule would have to be extended for it |
 | The narrow view rule: a view that would be a partition boundary is copied instead | `view_copy`, `unsqueeze_copy`, `squeeze_copy`, `expand_copy`, `alias_copy` | nothing -- this is the rule working, and its symptom is a delegate one op shorter than it looks |
 
+The pool, convolution and gather rows above are admission geometry rather than
+missing support: each op has an emitter, and a model that produces the geometry
+delegates. What each gate takes, at the line that decides it (`hexagon_ops.py` and
+`hexagon_partitioner.py`; line numbers move with the file, the function names are
+the stable part):
+
+| gate | accepts | measured refusals | line |
+|---|---|---|---|
+| `pool_spec`: channel count | `C == 64` exactly, and for a 3-D `(C, H, W)` input it is `shape[0]` that is read | 32, 63, 65, 128 and every other count. Over C in {1,3,32,63,64,65,128} x kernel {2,3} x stride {1,2} x {max, avg}: only `C == 64` delegates, at any kernel and stride | `hexagon_ops.py:2110` |
+| `pool_spec`: window and counting | any static kernel and stride, `pad >= 0`, the output size floor division gives, every window inside its row | `dilation != (1, 1)`, `ceil_mode` (windows past the input, which the one-block geometry does not describe), `divisor_override` | `:2125`, `:2136`, `:2142` |
+| `conv_spec`: group count | `groups == 1`, the im2col path, at any channel count (3->16 and 64->64 both delegate, with a leading `ZERO` command when `C_in % 64 != 0`); or `groups == in_channels == out_channels` with one channel per group, the depthwise kernel | every count in between. `16->32 groups=16` is two outputs per group and reads like a depthwise at the call site, which is how a model comes to carry one and fall back; `32->64 groups=32` and `2->4 groups=2` the same | `:2410-2411` |
+| `max_pool2d_with_indices`: readers | every reader takes `getitem 0` | reading the indices leaves the pool on the portable kernels, whatever its shape | `hexagon_partitioner.py:607` |
+
+The gather's index width is the same kind of gate: `embedding`, `index_select` and
+`index.Tensor` take an int32 index tensor and refuse an int64 one (`:3733`), which
+is why a `tokens.to(torch.int32)` in the model is enough and an `nn.Embedding`
+spelled with `torch.long` indices is not. A graph can hold a delegate either way --
+the ops after the refused one form their own -- so a delegate count says nothing
+about which of the two happened, and the command stream does.
+
 ## 5. What the gaps cost a model
 
 Qwen3-0.6B, from the README's Status section: 1967 nodes reach 29 delegates (one
