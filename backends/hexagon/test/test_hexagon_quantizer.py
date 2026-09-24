@@ -36,6 +36,7 @@ from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
     owned_weight,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+    _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
@@ -57,6 +58,17 @@ from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
 
 _Q4A16 = blob_interpreter.MATMUL_Q4A16_GEMV_I8
 _W8A16 = blob_interpreter.MATMUL_W8A16_GEMV_I8
+
+
+class _Live(torch.nn.Module):
+    """`a @ b` over two run-time tensors: neither operand is a weight."""
+
+    def __init__(self, spelling):
+        super().__init__()
+        self.spelling = spelling
+
+    def forward(self, a, b):
+        return a @ b if self.spelling == "at" else torch.mm(a, b)
 
 
 class _Mm(torch.nn.Module):
@@ -126,16 +138,17 @@ def _at_program(scheme, x_shape, k, n):
 def _converted(scheme, m, k, n, module=_Mm):
     """The PT2E-converted module and its input, before any lowering."""
     x = torch.randn(m, k, dtype=torch.float32)
-    return _quantize(scheme, module(k, n).eval(), x)
+    converted, _ = _quantize(scheme, module(k, n).eval(), x)
+    return converted, x
 
 
-def _quantize(scheme, model, x):
+def _quantize(scheme, model, *inputs):
     """One PT2E trip over `model`: annotate, calibrate, convert."""
-    exported = torch.export.export(model, (x,))
+    exported = torch.export.export(model, inputs)
     prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
     with torch.no_grad():
-        prepared(x)
-    return convert_pt2e(prepared), x
+        prepared(*inputs)
+    return convert_pt2e(prepared), inputs
 
 
 def _annotated(model, x, scheme="q4a16"):
@@ -165,6 +178,19 @@ def _quantized_addmm_program(scheme, k, n, bias_shape):
     converted = convert_pt2e(prepared)
     program = to_edge(torch.export.export(converted, (x,))).exported_program()
     return program, converted, x
+
+
+def _support(program):
+    """The partitioner's own view of which of a program's inputs it owns.
+
+    A bare `HexagonOperatorSupport()` sees the graph and nothing else, and
+    whether a weight is a constant is a fact about the program's signature
+    rather than about the node -- a parameter and a run-time tensor are both
+    placeholders carrying a fake tensor. The partitioner passes the names of the
+    values the program owns, so a test that asks the support check a question
+    about a weight has to pass them too.
+    """
+    return HexagonOperatorSupport(_data_placeholders(program))
 
 
 def _node_of(program, target):
@@ -320,6 +346,66 @@ def test_a_batched_at_matmul_keeps_the_fp16_batch_matmul():
             assert op not in types, (scheme, shape, types)
 
 
+def _live_operand_program(scheme, spelling, k, n):
+    """The whole chain for a matmul whose second operand is a run-time tensor.
+
+    Both operands are method inputs, so there is no weight to recognise: this is
+    what the annotator reads as a weight when the caller hands the value in.
+    """
+    model = _Live(spelling).eval()
+    x = torch.randn(1, k, dtype=torch.float32)
+    b = torch.randn(k, n, dtype=torch.float32)
+    converted, inputs = _quantize(scheme, model, x, b)
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(converted, inputs),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    return lowered, converted, x, b
+
+
+def test_a_matmul_over_two_run_time_tensors_stays_portable():
+    """A scores-like matmul is annotated, and it still has to export.
+
+    `annotate` reads the operand's position rather than its provenance, so
+    `a @ b` and `mm(a, b)` over two live tensors get a per-channel observer for
+    something that is not a weight at all. The emitter needs those bytes in hand
+    and cannot have them, and which side says so is the whole point: the
+    partitioner refuses the chain, so the caller is left with portable kernels
+    rather than an export that fails part way through. The dequantize goes back
+    with it -- one delegated on its own would be a partition whose output
+    nothing ever wrote.
+    """
+    k, n = 64, 32
+    for spelling, multiply in (
+        ("at", torch.ops.aten.matmul.default),
+        ("mm", torch.ops.aten.mm.default),
+    ):
+        program, converted, _, _ = _live_operand_program("q4a16", spelling, k, n)
+        # The annotator did its part, so what refuses this is the partitioner
+        # and not an annotation that never happened.
+        converted_targets = {node.target for node in converted.graph.nodes}
+        assert multiply in converted_targets, (spelling, converted_targets)
+        assert (
+            torch.ops.quantized_decomposed.dequantize_per_channel.default
+            in converted_targets
+        ), (spelling, converted_targets)
+        graph = program.graph_module.graph
+        assert not [
+            node
+            for node in graph.nodes
+            if str(node.target).endswith("executorch_call_delegate")
+        ], (spelling, [node.name for node in graph.nodes])
+        assert exir_ops.edge.aten.mm.default in {
+            node.target for node in graph.nodes if node.op == "call_function"
+        }, spelling
+    # The same shape with a weight in that position does reach the kernel, so
+    # this cannot pass by way of a partitioner that refuses everything.
+    program, _, _ = _quantized_program("q4a16", 1, k, n)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, commands = read_blob(blob)
+    assert [c.type for c in commands] == [_Q4A16]
+
+
 def test_q4a16_weight_bytes_are_the_kernel_layout():
     """Pins the tile byte order without going through the unpacker.
 
@@ -371,7 +457,7 @@ def test_w8a16_weight_bytes_are_the_kernel_layout():
 
 def test_the_quantized_matmul_is_delegated():
     program, _, _ = _quantized_program("q4a16", 1, 64, 128)
-    support = HexagonOperatorSupport()
+    support = _support(program)
     mm = _mm_node(program)
     assert support.is_node_supported(None, mm)
     assert support.is_node_supported(None, mm.args[1])
@@ -385,7 +471,7 @@ def test_a_prefill_quantized_matmul_stays_portable():
     the portable kernels rather than reach an emitter that cannot place them.
     """
     program, _, _ = _quantized_program("q4a16", 8, 64, 128)
-    support = HexagonOperatorSupport()
+    support = _support(program)
     mm = _mm_node(program)
     assert not support.is_node_supported(None, mm)
     assert not support.is_node_supported(None, mm.args[1])
@@ -399,9 +485,9 @@ def test_a_shape_the_kernels_would_refuse_stays_portable():
     happen here: 96 is below no power of two, it just is not a multiple of 64,
     and 48 is not a multiple of the 32-channel tile.
     """
-    support = HexagonOperatorSupport()
     for k, n in ((96, 64), (64, 48)):
         program, _, _ = _quantized_program("q4a16", 1, k, n)
+        support = _support(program)
         mm = _mm_node(program)
         assert not support.is_node_supported(None, mm), (k, n)
         assert not support.is_node_supported(None, mm.args[1]), (k, n)
@@ -561,15 +647,16 @@ def test_a_bias_that_is_not_one_value_per_channel_stays_portable():
     Neither the shape check nor the emitter's broadcast machinery is what
     decides this one; it is the kernel's own reading of its bias operand.
     """
-    support = HexagonOperatorSupport()
     for bias_shape in ((1, 1), (1,)):
         program, _, _ = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
         addmm = _node_of(program, exir_ops.edge.aten.addmm.default)
+        support = _support(program)
         assert not support.is_node_supported(None, addmm), bias_shape
         assert not support.is_node_supported(None, addmm.args[2]), bias_shape
     for bias_shape in ((32,), (1, 32)):
         program, _, _ = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
         addmm = _node_of(program, exir_ops.edge.aten.addmm.default)
+        support = _support(program)
         assert support.is_node_supported(None, addmm), bias_shape
 
 

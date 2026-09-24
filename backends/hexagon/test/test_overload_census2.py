@@ -37,6 +37,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+    _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
     reset_unwired_overload_census,
@@ -100,10 +101,14 @@ def _edge_targets(model, inputs):
 
 
 def _accepted(model, inputs):
-    support = HexagonOperatorSupport()
     program = to_edge(
         export(_M(model), inputs), compile_config=_CONFIG
     ).exported_program()
+    # The program's own names, the way the partitioner builds this: a weight that
+    # is a constant is a fact about the signature, not about the node, so a
+    # support object that has not been told which inputs the program owns
+    # answers a different question.
+    support = HexagonOperatorSupport(_data_placeholders(program))
     return {
         _name(node.target)
         for node in program.graph_module.graph.nodes

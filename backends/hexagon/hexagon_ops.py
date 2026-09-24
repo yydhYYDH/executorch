@@ -1381,7 +1381,7 @@ def quantized_matmul_weight(node) -> Optional[torch.fx.Node]:
     return None
 
 
-def quantized_matmul_is_emittable(node: torch.fx.Node) -> bool:
+def quantized_matmul_is_emittable(node: torch.fx.Node, is_constant) -> bool:
     """Whether this matmul is one the GEMV emitter can place, in full.
 
     The support check, the dequantize's fusion test and the emitter all call
@@ -1390,6 +1390,17 @@ def quantized_matmul_is_emittable(node: torch.fx.Node) -> bool:
     reading it is one this accepts. The emitter cannot fall back -- it is past
     the partition boundary -- so a condition missing here is an export failure
     or, worse, a command the kernel reads past.
+
+    `is_constant` is the caller's own test for "a value whose bytes I can read
+    now", the same parameter the convolution and gather predicates take. The
+    emitter has to pack the stored low-bit tensor and read the scale beside it,
+    so a matmul whose weight operand is a run-time tensor instead of a
+    parameter, buffer or lifted constant is one the emitter can only fail on:
+    it is refused here, which puts the whole chain -- the dequantize with it --
+    back on the portable kernels. Which operands are constants is not visible
+    from the graph alone, since a parameter and a run-time tensor are both
+    placeholders carrying a fake tensor, so the answer has to come from the
+    caller that knows the program's signature.
     """
     if node.target in MM_TARGETS:
         if len(node.args) < 2:
@@ -1415,6 +1426,12 @@ def quantized_matmul_is_emittable(node: torch.fx.Node) -> bool:
     quantized = quantized_weight(quantized_matmul_weight(node))
     if quantized is None:
         return False
+    if not is_constant(quantized.weight) or not is_constant(quantized.scale):
+        # Both are values that have to be in hand at export: the emitter packs
+        # the one and rescales by the other. A weight the graph computes at
+        # run time -- a scores-like `a @ b` over two live tensors -- has no
+        # command here, and refusing it keeps the graph exportable.
+        return False
     value = activation.meta.get("val")
     if not isinstance(value, torch.Tensor) or not value.is_contiguous():
         # The kernel reads K contiguous fp16 with aligned 128-byte loads; a
@@ -1428,17 +1445,19 @@ def quantized_matmul_is_emittable(node: torch.fx.Node) -> bool:
     return _bias_is_one_value_per_channel(bias, geometry[2])
 
 
-def quantized_matmul_is_refused(node: torch.fx.Node) -> bool:
+def quantized_matmul_is_refused(node: torch.fx.Node, is_constant) -> bool:
     """Whether this matmul carries a weight-only weight nothing here can run.
 
     A matmul whose weight is the weight-only pattern goes to a GEMV kernel
     rather than to the flat path, and that kernel has conditions of its own.
     One that fails them has to fall back whole -- the dequantize with it -- so
-    this is asked about the matmul and answered for both.
+    this is asked about the matmul and answered for both. A weight the export
+    cannot read is one of those conditions, which is why `is_constant` is
+    forwarded rather than a local test standing in for the emitter's.
     """
     if quantized_weight(quantized_matmul_weight(node)) is None:
         return False
-    return not quantized_matmul_is_emittable(node)
+    return not quantized_matmul_is_emittable(node, is_constant)
 
 
 def _bias_is_one_value_per_channel(bias, n: int) -> bool:
@@ -1461,7 +1480,7 @@ def _bias_is_one_value_per_channel(bias, n: int) -> bool:
         return False
 
 
-def _dequantize_is_fused(node: torch.fx.Node) -> bool:
+def _dequantize_is_fused(node: torch.fx.Node, is_constant) -> bool:
     """Whether every reader of this dequantize is a quantized matmul we can run.
 
     The dequantize emits nothing; it exists so the matmul's weight arrives as a
@@ -1473,7 +1492,8 @@ def _dequantize_is_fused(node: torch.fx.Node) -> bool:
     if not node.users or quantized_weight(node) is None:
         return False
     return all(
-        quantized_matmul_weight(user) is node and quantized_matmul_is_emittable(user)
+        quantized_matmul_weight(user) is node
+        and quantized_matmul_is_emittable(user, is_constant)
         for user in node.users
     )
 
@@ -1592,7 +1612,9 @@ def _emit_quantized_matmul(
     if geometry is None:
         raise RuntimeError("hexagon: quantized matmul has no static geometry")
     m, k, n = geometry
-    if not quantized_matmul_is_emittable(node):
+    if not quantized_matmul_is_emittable(
+        node, lambda operand: ctx.constant_value(operand) is not None
+    ):
         raise RuntimeError(
             f"hexagon: quantized matmul {m}x{k}x{n} is not one the support check "
             "admits; the partitioner should not have delegated it"

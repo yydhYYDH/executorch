@@ -444,7 +444,9 @@ class HexagonOperatorSupport(OperatorSupportBase):
         # The placeholders the program owns rather than the caller handing them
         # in, which is the question a row gather's table has to answer. Without
         # the program there is no way to tell one from a method input, and the
-        # only operand provably a constant on its own is a get_attr.
+        # only operand provably a constant on its own is a get_attr: a support
+        # object built without these refuses every op whose weight has to be
+        # read at export, which is why the partitioner passes the program's own.
         self.data_names = frozenset(data_names or ())
 
     def is_data_placeholder(self, node: torch.fx.Node) -> bool:
@@ -479,7 +481,7 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # The weight-only pattern's dequantize. It is delegated only when
             # every reader is a quantized matmul the GEMV kernels can run; the
             # node itself emits nothing.
-            return _dequantize_is_fused(node)
+            return _dequantize_is_fused(node, self.is_data_placeholder)
         if node.target in sdpa and not _sdpa_fits_dsp_limits(node):
             return False
         if node.target in BINARY_TARGETS and not _broadcast_fits_dsp_limits(node):
@@ -490,9 +492,12 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in ADDMM_TARGETS and not _addmm_fits_flat_path(node):
             return False
-        if quantized_matmul_is_refused(node):
+        if quantized_matmul_is_refused(node, self.is_data_placeholder):
             # A weight-only matmul goes to a GEMV kernel, and the conditions the
-            # flat path just checked are not the ones that decide it.
+            # flat path just checked are not the ones that decide it. One whose
+            # weight the export cannot read is refused here rather than at the
+            # emitter, so the caller gets a portable kernel instead of a failed
+            # export.
             return False
         if node.target in MEAN_TARGETS:
             if not _mean_reduces_one_span(node):
