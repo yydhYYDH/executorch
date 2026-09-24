@@ -861,8 +861,9 @@ Not done yet:
   slot each and require the answer to follow: exchanging `tokens` with `heads`
   moves it 0.83, a scale of zero (uniform attention over the keys) moves it 0.41,
   and shrinking the workspace operand to one byte makes the kernel refuse -- the
-  host model refuses it in its own words, and the DSP writes nothing, so that
-  operand is the one the check is about and not merely one the answer ignores.
+  host model refuses it in its own words, and on `hexagon-sim` the kernel writes
+  nothing, so that operand is the one the check is about and not merely one the
+  answer ignores.
   Note which attention this is: the flash kernel behind `llama.custom_sdpa`
   starts a worker pool, which the simulated QuRT cannot (`qurt_cb_fwk_worker_init`
   returns -4), and that entry point stays out of the suite; the vision kernel is

@@ -23,9 +23,19 @@ Nothing here has been relicensed. Of the four modifications listed under "Local
 modifications", the first two are build-environment fixes and do not change
 behavior; the other two are ExecuTorch's own -- one instrumentation that only
 runs when the host passes a profile buffer, and one correctness fix to the scalar
-tails of three kernels. Separately, one defect was found in this snapshot and is
+tails of three kernels. Those last two are the only changes this PR makes to the
+vendored sources. Separately, one defect was found in this snapshot and is
 described under "Defects found in this snapshot"; that one is not fixed here, and
 nothing in this directory was changed for it.
+
+The pin above is a revision of `htp-ops-lib`, not a byte-for-byte description of
+this directory, and this PR did not make it one: 19 of the 70 files under
+`include/` and `src/dsp/` differ from it, 2125 changed lines in all, of which the
+four items below account for a small part. The per-file counts and what is
+attributed to whom are under "How much of this directory is not the pin"; an
+unattributed difference is not this PR's change and not a defect anyone here
+found, but a reviewer should know it is there before reading a diff of this
+directory.
 
 ## Why the DSP side is kept verbatim
 
@@ -63,11 +73,21 @@ Each command is a FlatBuffers `DSPCOMMAND::Command` at `(cmd_fd, cmd_offset)`:
 
 Four. The first two are forced by the build environment, the third is
 instrumentation that only runs when the host asks for it, and the fourth is a
-correctness fix:
+correctness fix. The first two arrived with this directory; the third and fourth
+are the two changes this PR makes to it, and nothing else under `include/` or
+`src/dsp/` was edited by this PR:
 
-1. `src/dsp/vtcm_mgr.cc` — one `#include "flatbuffers/flatbuffers.h"` removed.
-   The file never references the `flatbuffers::` namespace, and adding the
-   dependency for a dead include would couple the skel to flatbuffers.
+1. `src/dsp/vtcm_mgr.cc` and `include/dsp/vtcm_mgr.h` — three changes, of which
+   the second and third are not upstream anywhere: the
+   `#include "flatbuffers/flatbuffers.h"` is removed (the file never references
+   the `flatbuffers::` namespace, and keeping the dependency for a dead include
+   would couple the skel to flatbuffers); `reset()` grows an `#ifdef
+   HTP_OPS_KEEP_VTCM` early return, an experiment that is off by default because
+   holding the reservation across delegates changes what the next delegate
+   measures; and the header declares `vtcm_manager_get_vtcm_alloc_end()`, which
+   `src/dsp/loop_ops.cc:976` reads to keep a planned HMX tile's working set
+   inside the end of the reservation. Measured against the pin: 10 lines added
+   and 1 removed in the `.cc`, 9 added in the `.h`.
 2. `schema/current/Command_generated.h` is checked in rather than generated.
    Upstream generates it with `flatc` from `schema/Command.fbs`; the checked-in
    header is that schema generated with flatc 24.3.25 -- the version its own
@@ -87,7 +107,9 @@ correctness fix:
    the op-selection paths are untouched, so a call without one behaves as
    upstream. It now also records each command's kernel microseconds in the last
    int of its probe record and marks the header with a version, which is what
-   the host-side profiler reads to attribute time to individual ops.
+   the host-side profiler reads to attribute time to individual ops. This PR's
+   whole change to that file is 24 lines added and 7 removed against the commit
+   the PR starts from (the file differs from the pin by more, see below).
 4. Three kernels answered a NaN differently in the scalar tail they finish their
    vector loop with than the vector loop itself does, and differently from
    torch. `htp_ops_clamp_fp16_chunk` (`src/dsp/unary_ops.cc`, the clamp behind
@@ -103,7 +125,10 @@ correctness fix:
    those three functions, and the `htp_ops_fp16_bits_are_nan` helper the
    reduction fold reads (`src/dsp/eltwise_ops.cc`; the clamp tail and `add_relu`
    write the same test out inline instead of calling it), and nothing else in
-   either file changed.
+   either file changed. Against the commit this PR starts from that is 13 lines
+   added and 3 removed in `src/dsp/unary_ops.cc`, and 27 added and 2 removed in
+   `src/dsp/eltwise_ops.cc`; both files differ from the pin by much more than
+   that, and the rest of it is not this PR's (see below).
 
    Two of the three are partial, in the same way and for the same reason.
    `Q6_Vhf_vmax_VhfVhf` answers a NaN whose sign bit is set by returning the
@@ -120,12 +145,58 @@ correctness fix:
    carrying a predicate through the fold and through the five vector rotations
    that finish it, which is a different change from this one.
 
+## How much of this directory is not the pin
+
+Every file under `include/` and `src/dsp/` diffed against the pin at `b8c533a`,
+changed lines counted:
+
+| file | added | removed |
+| --- | --- | --- |
+| `src/dsp/loop_ops.cc` | 603 | 40 |
+| `src/dsp/eltwise_ops.cc` | 384 | 14 |
+| `src/dsp/unary_ops.cc` | 187 | 3 |
+| `src/dsp/execute_command.cc` | 178 | 10 |
+| `src/dsp/attention_sync_process.cc` | 164 | 23 |
+| `src/dsp/attention_hmx.cc` | 159 | 27 |
+| `src/dsp/attention_push_kv.cc` | 91 | 3 |
+| `src/dsp/attention_common.hpp` | 56 | 2 |
+| `src/dsp/attention_entry.cc` | 46 | 4 |
+| `src/dsp/attention_private.hpp` | 30 | 2 |
+| `src/dsp/hmx_queue.cc` | 29 | 0 |
+| `src/dsp/worker_pool.cc` | 15 | 0 |
+| `src/dsp/commu.cc` | 11 | 0 |
+| `src/dsp/vtcm_mgr.cc` | 10 | 1 |
+| `src/dsp/attention_sync_setup.cc` | 9 | 7 |
+| `include/dsp/vtcm_mgr.h` | 9 | 0 |
+| `src/dsp/region_ops.h` | 5 | 0 |
+| `include/dsp/hmx_utils.h` | 2 | 0 |
+| `include/dsp/worker_pool.h` | 1 | 0 |
+
+51 of the 70 files are byte-identical; those 19 are the rest, 2125 changed lines
+in all. Five of them are the modifications above: `src/dsp/vtcm_mgr.cc` and
+`include/dsp/vtcm_mgr.h` (1), `src/dsp/execute_command.cc` (3),
+`src/dsp/unary_ops.cc` and `src/dsp/eltwise_ops.cc` (4). Even in those five, most
+of the difference is not ours -- this PR's own change is 24/7, 13/3 and 27/2
+lines against the commit it starts from, against 178/10, 187/3 and 384/14 here.
+
+The other 14 files are not attributed: `loop_ops.cc`, the seven `attention_*`
+files, `hmx_queue.cc`, `worker_pool.cc`, `commu.cc`, `region_ops.h`,
+`hmx_utils.h` and `worker_pool.h`. They carry entry-point parameters and symbols
+the pin's own history has no record of -- `MNN_ATTN_SRC_BYPASS`,
+`MNN_ATTN_WEIGHT_CACHEALLOC`, `g_attn_dma_fault`, `HMX_FP16_MAX_TILES_PER_LOAD`,
+`hmxTileBudget`, `hmxFlags`, `worker_pool_debug_state` -- so this directory came
+from a tree that is not exactly the pin, or from the pin plus changes nobody
+recorded. **This PR did not edit any of them**, and none of them is a defect
+found here; a reviewer reading a diff of this directory should know which 14
+files are in that position before asking what ExecuTorch changed in them.
+
 ## Defects found in this snapshot
 
-One, and it is not fixed here.
+One, and it is not fixed here. **No file in this directory was changed for it**;
+the only vendored changes in this PR are items 3 and 4 above.
 
 The pin above is not a byte-for-byte description of this directory, and this
-branch did not make it one. Measured against a clean checkout of `b8c533a`: of
+branch did not make it one (the per-file counts are in the section above): of
 the 70 files under `include/` and `src/dsp/` that the pin has, 51 are
 byte-identical and 19 differ, 2125 changed lines in all, and the four items above
 account for only part of that. The attention kernels also carry entry-point

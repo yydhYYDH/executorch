@@ -5,7 +5,8 @@ Three things live here beyond the ordinary pytest files. `test_blob_on_sim.py`,
 blob, compile the vendored `mnn-htp-ops` DSP sources for v79 with `hexagon_sim.py`,
 and run them under `hexagon-sim` against the same fixtures. `blob_interpreter.py`
 is a host model of the same command stream, so every case is compared three ways:
-torch, the host model, the DSP.
+torch, the host model, and the kernel as `hexagon-sim` runs it -- never on
+silicon, which no case in this directory has touched.
 
 Run them the way the rest of the backend is run:
 

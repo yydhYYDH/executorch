@@ -4,13 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Real blobs, executed on the DSP.
+"""Real blobs, executed on hexagon-sim.
 
 The host interpreter runs the same bytes in Python and the simulator runs them
 through the real kernels, so the comparison spans the emitters, the blob layout
 and the kernels at once. Nothing between the three is hand-written, which is
 what makes this different from test_hexagon_sim.py, whose descriptors are typed
 out by hand.
+
+This file, like the other `*_on_sim` modules, says "the DSP" for the kernel as
+the simulator runs it: the arithmetic and the dispatch are the device's, the
+silicon is not. Nothing here has run on a device, and a case passing here is not
+evidence that it runs there.
 
 These are the same subgraphs test_blob_interpreter.py checks: the concatenate,
 slice and transpose behind one blit chain, the fused norm, the cache advance
