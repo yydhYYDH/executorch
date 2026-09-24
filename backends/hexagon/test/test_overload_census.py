@@ -53,6 +53,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+    _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
@@ -104,29 +105,38 @@ def _has_emitter(name: str) -> bool:
     return any(_name(key) == name for key in hexagon_ops.EMITTERS)
 
 
-def _edge_nodes(model, inputs):
-    """The edge graph's call_function nodes, before any partitioning."""
-    program = to_edge(
+def _edge_program(model, inputs):
+    return to_edge(
         export(model, inputs),
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
+
+
+def _edge_nodes(model, inputs):
+    """The edge graph's call_function nodes, before any partitioning."""
     return [
-        node for node in program.graph_module.graph.nodes if node.op == "call_function"
+        node
+        for node in _edge_program(model, inputs).graph_module.graph.nodes
+        if node.op == "call_function"
     ]
 
 
 def _accepted(model, inputs):
     """The edge targets the partitioner takes, in graph order.
 
-    This is the same predicate `HexagonPartitioner` calls, and only nodes it
-    accepts are ever partitioned, so a target absent from this list is one that
-    produces no delegate command.
+    This is the same predicate `HexagonPartitioner` calls, over the same support
+    object it builds: `partition` passes the names of the program's own tensors,
+    and a bare `HexagonOperatorSupport()` would have an empty set of them, which
+    makes every gate that wants a constant weight stricter than the partitioner
+    is. Only nodes this list contains are ever partitioned, so a target absent
+    from it is one that produces no delegate command.
     """
-    support = HexagonOperatorSupport()
+    program = _edge_program(model, inputs)
+    support = HexagonOperatorSupport(_data_placeholders(program))
     return [
         _name(node.target)
-        for node in _edge_nodes(model, inputs)
-        if support.is_node_supported({}, node)
+        for node in program.graph_module.graph.nodes
+        if node.op == "call_function" and support.is_node_supported({}, node)
     ]
 
 

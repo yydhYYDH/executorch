@@ -430,6 +430,71 @@ def _note_unwired_target(node: torch.fx.Node) -> None:
         )
 
 
+# Every node whose target *is* in the emitter table and that the support check
+# turned away anyway -- a geometry, a dtype, an operand width or a group count the
+# kernels here cannot run -- as {target: count}.
+#
+# This is the other half of the same complaint. A target with an emitter looks
+# supported, so a reader of the table expects it to run, and the gates that can
+# refuse it are spread over a dozen predicates and a dozen more argument checks.
+# The result is the shape the spelling census found: `nn.MaxPool2d(2)` lowers to a
+# graph with no delegate at all because the pool wants exactly 64 channels,
+# `nn.Conv2d(16, 32, groups=16)` is a grouped convolution with no kernel behind it
+# while the `Conv2d(3, 16)` beside it runs, and `nn.Embedding` with int64 indices
+# is refused while the same table with int32 ones is gathered on the DSP. None of
+# those printed anything, and the model still returns torch's answer, so the only
+# symptom is a delegate that contains fewer ops than the graph reads.
+#
+# The count is by target and carries no reason: which gate refused a node is a
+# property of the gate, and this cannot know it without a second call into every
+# one of them. The gates themselves are documented in the README and pinned by
+# `test_refused_targets.py`.
+_REFUSED: Dict[str, int] = {}
+
+
+def refused_overload_census() -> Dict[str, int]:
+    """The refused targets counted so far, as a copy.
+
+    Keyed by target and not by family: unlike the unwired case, "which overload"
+    is exactly what the emitter table already says, and the question here is
+    which op fell back.
+    """
+    return dict(_REFUSED)
+
+
+def reset_refused_overload_census() -> None:
+    """Start the census over, for a caller that counts one model at a time."""
+    _REFUSED.clear()
+
+
+def _note_refused_target(node: torch.fx.Node) -> None:
+    """Count and (at debug) report a target the table has and this node still lost.
+
+    Only called for a target that is in `SUPPORTED_TARGETS`, which is what makes
+    this the complement of `_note_unwired_target`: an op with no emitter at all
+    (`aten.erf`) is neither a gap in the table nor a refusal, and neither counter
+    reports it.
+
+    A target with no schema is skipped, which in practice means `getitem`. It is a
+    lowering artifact and not an op anyone wrote, and a refused one is the shadow
+    of the node it reads -- the pool whose indices are read is refused in the same
+    graph and is the entry a reader wants to see.
+    """
+    if node.op != "call_function" or node.target not in SUPPORTED_TARGETS:
+        return
+    if _schema_name(node.target) is None:
+        return
+    target = getattr(node.target, "__name__", str(node.target))
+    _REFUSED[target] = _REFUSED.get(target, 0) + 1
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        _LOGGER.debug(
+            "hexagon: %s is in the emitter table and this node was refused "
+            "anyway, so it stays on the portable kernels; node %s",
+            target,
+            node.name,
+        )
+
+
 class HexagonOperatorSupport(OperatorSupportBase):
     """Accepts the ops the DSP has a kernel for, at a dtype it can run.
 
@@ -455,7 +520,20 @@ class HexagonOperatorSupport(OperatorSupportBase):
             node.op == "placeholder" and node.name in self.data_names
         )
 
-    def is_node_supported(self, _submodules, node: torch.fx.Node) -> bool:
+    def is_node_supported(self, submodules, node: torch.fx.Node) -> bool:
+        """Whether the DSP runs this node, counting the ones it does not.
+
+        The verdict is `_verdict`'s, unchanged; the wrapper exists only so that a
+        rejection has one place to be reported from, whichever of the gates below
+        is the one that returned. An accepted node pays a call frame and nothing
+        else -- no allocation, no per-gate instrumentation.
+        """
+        supported = self._verdict(submodules, node)
+        if not supported:
+            _note_refused_target(node)
+        return supported
+
+    def _verdict(self, _submodules, node: torch.fx.Node) -> bool:
         if node.op != "call_function":
             return False
         # Resolving the attention overloads also registers their emitter, and the

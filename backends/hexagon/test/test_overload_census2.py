@@ -101,13 +101,19 @@ def _edge_targets(model, inputs):
 
 
 def _accepted(model, inputs):
+    """The edge targets the partitioner takes, from the support object it builds.
+
+    A bare `HexagonOperatorSupport()` has an empty `data_names`, which makes every
+    gate that wants a constant weight stricter than the partitioner is: it can
+    report a refusal that does not happen, never an acceptance that does not. A
+    weight that is a constant is a fact about the signature, not about the node.
+    No row here is affected -- 122 rows of the two census files were compared both
+    ways -- but the object is built the way `partition` builds it so that a row
+    needing a constant weight cannot quietly measure the wrong thing.
+    """
     program = to_edge(
         export(_M(model), inputs), compile_config=_CONFIG
     ).exported_program()
-    # The program's own names, the way the partitioner builds this: a weight that
-    # is a constant is a fact about the signature, not about the node, so a
-    # support object that has not been told which inputs the program owns
-    # answers a different question.
     support = HexagonOperatorSupport(_data_placeholders(program))
     return {
         _name(node.target)

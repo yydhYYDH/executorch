@@ -374,6 +374,47 @@ Things that bite:
   another: a per-tensor `dequantize` is not the per-channel one the table speaks
   for, and `aten.amin` is not the `aten.amax` it speaks for, so neither is
   counted and both are pinned row by row in the second census instead.
+- **The partitioner counts the refusals of the ops it does have, too.** The case
+  above is a target the table is missing; the other half of the same complaint is
+  a target the table *has* and that a gate turned away anyway -- a geometry, a
+  dtype, an operand width or a group count the kernels here cannot run. Those
+  look supported to a reader of the table and to whoever reads a delegate count,
+  and the gates that can refuse one are spread over a dozen predicates and a dozen
+  argument checks, so nothing prints. `refused_overload_census()`, keyed by
+  target, and one `DEBUG` line report them, from the same place and on the same
+  terms as the unwired counter: only on the path that was already returning
+  `False`, and with a no-op control pinning that no verdict moves. The three
+  cases the spelling census found, all of them geometry rather than a missing
+  kernel:
+  - `nn.MaxPool2d` and `nn.AvgPool2d` take **exactly 64 channels**, which is
+    `pool_spec`'s one-block rule above: measured over channels 1, 3, 32, 63, 64,
+    65 and 128 at kernel 2 and 3 and stride 1 and 2, only 64 lowers to a delegate.
+    Kernel size, stride, padding, batch, an fp32 input and the 3-D `(C, H, W)`
+    spelling all pass; dilation other than one, `ceil_mode` and
+    `divisor_override` are refused by gates of their own, and reading the
+    indices a max pool returns puts the pool out of the partition
+    (`max_pool_is_emittable`).
+  - a **grouped convolution** runs only when `groups == in_channels ==
+    out_channels` with one channel per group (the depthwise kernel) or when
+    `groups == 1`. `nn.Conv2d(16, 32, 3, padding=1, groups=16)` is neither --
+    a model written to have "a depthwise convolution" there has two output
+    channels per group -- and falls back while the `nn.Conv2d(3, 16)` beside it
+    runs, which is the graph the device paragraph below describes; `(32, 64, 32)`,
+    `(16, 16, 8)`, `(16, 16, 4)` and `(16, 16, 2)` are refused the same way.
+  - `nn.Embedding` and `index_select` gather on the DSP only with **int32
+    indices**: an int64 index tensor is refused for the reason in the gather
+    section above, and the row that looks like it contradicts this is a delegate
+    holding the ops *after* the gather. `embedding -> add -> amax` with int64
+    tokens is one delegate whose commands are `BINARY` and `REDUCTION`; the same
+    graph with int32 tokens is one delegate whose commands are `SHARED_GATHER`,
+    `BINARY` and `REDUCTION`.
+  `test/test_refused_targets.py` pins each boundary in both directions, and it
+  builds its `HexagonOperatorSupport` the way `HexagonPartitioner.partition`
+  does, with `_data_placeholders` of the program: an object built without them
+  has an empty `data_names`, so a parameter reads as an ordinary placeholder and
+  every gate that wants a constant weight refuses more than the partitioner does.
+  That is stricter, never looser, so it can only invent a refusal -- but a census
+  row built on one would be exactly that invention.
 - **Three edge ops are the same clamp entry point, and it carries its bounds in
   params.** `HTP_OPS_UNARY_CLAMP` (`unary_ops.cc:29`) is not a function of the
   op kind alone: params[3] and params[4] are the fp16 bit patterns of its two

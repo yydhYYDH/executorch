@@ -27,6 +27,7 @@ from executorch.backends.hexagon import hexagon_ops
 from executorch.backends.hexagon.hexagon_backend import SUPPORTED_TARGETS
 from executorch.backends.hexagon.partition import hexagon_partitioner
 from executorch.backends.hexagon.partition.hexagon_partitioner import (
+    _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
     reset_unwired_overload_census,
@@ -247,12 +248,12 @@ def test_the_diagnostic_cannot_change_a_verdict(monkeypatch):
         (lambda a: torch.mean(a), (torch.randn(2, 3, 4, dtype=F16),)),
         (lambda a: torch.erf(a), (torch.randn(8, dtype=F16),)),
     ]
-    support = HexagonOperatorSupport()
 
     def verdicts():
         out = []
         for forward, inputs in corpus:
             program = _lower(forward, inputs)
+            support = HexagonOperatorSupport(_data_placeholders(program))
             out.append(
                 (
                     _delegates(program),
