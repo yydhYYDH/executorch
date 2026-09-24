@@ -664,7 +664,12 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
 
 - a three-delegate convolution graph (`conv3x3`, a depthwise `conv3x3`, `relu`,
   `maxpool`, `conv1x1`) runs all three rounds and lands within one fp16 ULP of
-  torch -- 4.88e-4 against a reference peaking at 0.57;
+  torch -- 4.88e-4 against a reference peaking at 0.57. Only part of that graph
+  reached the DSP: the partitioner left the depthwise `conv3x3` and the
+  `maxpool` outside the delegates, so what the three command streams contain is
+  two im2col convolutions and one unary rectifier. The whole-graph agreement
+  therefore rests on those ops running on silicon with the other two on the
+  portable kernels, which is a different claim from "this graph ran on the DSP";
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
   (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
   1.56e-2 against a reference of 16.9. An `embedding` on its own is not delegated
