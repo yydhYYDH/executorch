@@ -35,11 +35,11 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+    conv_spec,
     CONV_VTCM_BYTES,
+    conv_vtcm_bytes,
     CONV_VTCM_FIXED_BYTES,
     CONV_VTCM_STAGING_TILES,
-    conv_spec,
-    conv_vtcm_bytes,
     pack_conv_bias,
     pack_conv_weight,
     pack_depthwise_weight,

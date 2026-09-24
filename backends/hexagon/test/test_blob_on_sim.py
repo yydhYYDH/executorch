@@ -1963,7 +1963,9 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     # The blob on disk still describes the bound: the run-time length only ever
     # reaches this command through the patch, which is what the case decides.
     assert _tagged(cases, "V").commands[0].params[1] == _UPPER
-    assert _tagged(cases, "BL").commands[0].params[1] == _UPPER, "the amax is not bound-sized"
+    assert (
+        _tagged(cases, "BL").commands[0].params[1] == _UPPER
+    ), "the amax is not bound-sized"
     assert (
         blob_interpreter.read_dynamic_trailer(_tagged(cases, "W").blob) is None
     ), "the control still carries its trailer"
@@ -2330,13 +2332,12 @@ def test_a_dynamic_span_and_a_nan_fold_hold_at_once(cases, simulated):
     dsp = _from_bits(simulated["BL0"])
     want = np.isnan(_from_bits(expected))
     mismatch = np.flatnonzero(np.isnan(dsp) != want)
-    assert not mismatch.size, (
-        "the DSP and torch disagree on which columns are NaN: "
-        + ", ".join(
-            f"{int(index)} is {dsp[index]} on the DSP and "
-            f"{_from_bits(expected)[index]} in torch"
-            for index in mismatch
-        )
+    assert (
+        not mismatch.size
+    ), "the DSP and torch disagree on which columns are NaN: " + ", ".join(
+        f"{int(index)} is {dsp[index]} on the DSP and "
+        f"{_from_bits(expected)[index]} in torch"
+        for index in mismatch
     )
     for column in (3, 95):
         assert np.isnan(
