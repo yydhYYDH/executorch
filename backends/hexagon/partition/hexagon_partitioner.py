@@ -9,6 +9,7 @@ import weakref
 from typing import Dict, final, FrozenSet, Optional, Set
 
 import torch
+from executorch.backends.hexagon.fold_transposes import FoldConstantTransposes
 from executorch.backends.hexagon.hexagon_backend import (
     HexagonBackend,
     HexagonCompileOptions,
@@ -908,6 +909,30 @@ class HexagonPartitioner(Partitioner):
         self.delegation_spec = DelegationSpec(
             HexagonBackend.__name__, self.compile_options.to_compile_specs()
         )
+
+    def transform_for_pre_decomposition(
+        self, exported_program: ExportedProgram
+    ) -> ExportedProgram:
+        """Fold a weight's preparation into the constant it computes.
+
+        EXIR calls this ahead of the split, on the ATen program, so a
+        `conv_transpose2d` whose weight is written as `flip(permute(weight))` --
+        the shape a diffuse model's FIR upsampler exports -- arrives at the
+        partitioner with a constant weight instead of a graph computation. That
+        is the difference between the convolution walk carrying it and the node
+        staying portable: `conv_spec` reads the weight to pack the command's
+        weight section, and a computed weight is one it cannot read.
+
+        It is registered here rather than left to a caller's `transform_passes`
+        because it is not an optimisation a caller may skip -- without it a
+        supported geometry is silently not supported. `partition` cannot do it:
+        EXIR asserts the graph module is unchanged by that call.
+
+        Nothing data-dependent is folded. A chain that does not end at a
+        constant is left alone, so a weight that is a run-time input still
+        reaches a portable kernel.
+        """
+        return FoldConstantTransposes()(exported_program).exported_program
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         graph_module = exported_program.graph_module
