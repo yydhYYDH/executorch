@@ -337,8 +337,11 @@ The two gaps that are not of that shape:
 
 1. **Quantized prefill (`M > 1`) for the int8 weight** -- the int4 half landed and
    its row has left §2; this is the half of the only functional gap that is left,
-   and the work is a packer for kernel 42's tile order rather than a kernel. Until
-   it exists, a w8a16 model above one row stays on the portable kernels.
+   and the work is a packer for kernel 42's tile order rather than a kernel. The
+   shape limit that stays beside it is the one §4 states, `K % 64 == 0` and
+   `N % 32 == 0`, which is the granularity the block-scaled form (34) exists for.
+   Until the packer exists, a w8a16 model above one row stays on the portable
+   kernels.
 2. **`aten.where` via `DSP_OP_SELECT`** -- **done.** This entry used to say the
    open question was whether the kernel's condition operand accepts what a
    comparison writes; that question was the wrong way round and is now closed. The
