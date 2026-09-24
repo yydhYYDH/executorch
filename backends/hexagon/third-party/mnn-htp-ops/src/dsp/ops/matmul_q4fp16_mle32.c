@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "dsp/dma_utils.h"
@@ -431,6 +432,20 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
   (void) weight_int4_bytes_per_np;
   (void) act_bytes_per_mp;
 
+  /* One 2-D descriptor per K/32 step, and at 32 bytes each that is exactly K
+   * bytes: on the stack it made this branch's frame grow with K, which is what
+   * the phone cannot afford to have on its command thread -- K = 12736 aborts
+   * there while the M > 32 branch is fine at K = 25216. So it is built once,
+   * here, and held across every output tile rather than rebuilt in each one,
+   * the way hmx_matmulq4fp16_part already does it. */
+  const int      kp                    = K / 32;
+  const int      safe_kp               = kp > 0 ? kp : 1;
+  dma_desc_2d_t *act_descs             = (dma_desc_2d_t *) memalign(
+      64, (size_t) safe_kp * sizeof(dma_desc_2d_t));
+  if (act_descs == NULL) {
+    return AEE_ENOMEMORY;
+  }
+
   hmx_manager_enable_execution();
   hmx_unit_acquire();
   hmx_init_column_scales(vtcm_hmx_scales, Q6_V_vsplat_R(0x3c00));
@@ -444,7 +459,6 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
 #endif
 
   int np = N / 32;
-  int kp = K / 32;
   int act_treat = 0;
   int tileCount = (np + np_chunk - 1) / np_chunk;
 
@@ -510,7 +524,6 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
     // 1. Issue DMA for chunk 0
     SET_WEIGHT_DMA(chunk_starts[0], chunk_counts[0], 0, 0, -1);
 
-    int safe_kp = kp > 0 ? kp : 1;
     if (!dequant_in_weight) {
       memset(&scale_desc[0], 0, sizeof(dma_desc_2d_t));
       scale_desc[0].type       = DMA_DESC_TYPE_2D;
@@ -525,7 +538,6 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
       scale_desc[0].dst_stride = 64;
       scale_desc[0].next       = 0;
     }
-    _Alignas(64) dma_desc_2d_t act_descs[safe_kp];
     if (act_treat == 0) {
       if (M > 1) {
         for (int k = 0; k < kp; ++k) {
@@ -676,6 +688,7 @@ static int hmx_matmulq4fp16_mle32_part(const MatmulParam *param) {
 
   hmx_unit_release();
   hmx_manager_disable_execution();
+  free(act_descs);
   return 0;
 }
 
