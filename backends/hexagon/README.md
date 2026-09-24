@@ -857,7 +857,7 @@ Working and verified without a device:
   `test/sim/conv_runner.cpp`, and ten im2col geometries covering 3x3 with stride
   and padding, 1x1, no padding, a dilated window, a batch of two, an input
   narrower than a 32-channel group and an output that is not a whole number of
-  32-channel tiles, including MobileNetV2's `ic=3, oc=32, k=3, s=2, p=1` stem.
+  32-position tiles, including MobileNetV2's `ic=3, oc=32, k=3, s=2, p=1` stem.
   Two whole blobs also run the full three-way comparison -- emitter, host
   interpreter, simulator, torch -- in `test/test_blob_on_sim.py`. See
   "Op contracts, and the traps in them" for the kernel defect the same simulator
