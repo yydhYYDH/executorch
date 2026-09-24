@@ -379,9 +379,11 @@ def test_a_mask_the_kernel_reads_is_accepted_and_the_rest_are_refused():
     # One query row: `flash_attn_try_single_token_output` returns `pV` for
     # qo_len == 1 && seq_current == 0 && seq_add == 1 before any mask code runs
     # (attention_entry.cc:215-218,364-367), so this is the geometry whose mask
-    # the kernel would drop.
+    # the kernel would drop. The mask's rows are the query's, or the row-count
+    # clause is what refuses this node and the assertion holds whatever the
+    # query extent was.
     assert not sdpa_mask_fits_dsp_limits(
-        _node((_QO_LEN, _MAX_KV_LEN), qo_len=1)
+        _node((1, _MAX_KV_LEN), qo_len=1)
     ), "the first-token shortcut would ignore the mask"
     # Past 64 rows the kernel stops segmenting the query into blocks and the
     # emitter's reservation is sized for 64 (attention_sync_setup.cc:263-266).
