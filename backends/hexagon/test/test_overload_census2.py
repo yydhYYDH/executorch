@@ -194,7 +194,7 @@ _ROWS = [
         "a split",
         lambda a: torch.split(a, 2, dim=0)[0],
         (_x(6, 3),),
-        [("aten.split_with_sizes_copy.default", "unwired"), (_GETITEM, "refused")],
+        [("aten.split_with_sizes_copy.default", "wired"), (_GETITEM, "wired")],
     ),
     (
         "instance norm's two outputs",
@@ -575,10 +575,8 @@ _RECURRENT_ROWS = [
             "aten.cat.default": 1,
             "aten.expand_copy.default": 1,
             "aten.full.default": 2,
-            "aten.split_with_sizes_copy.default": 3,
-            _GETITEM: 12,
         },
-        6,
+        3,
     ),
     (
         "RNN",
@@ -595,10 +593,8 @@ _RECURRENT_ROWS = [
             "aten.cat.default": 1,
             "aten.expand_copy.default": 1,
             "aten.full.default": 1,
-            "aten.split_with_sizes_copy.default": 6,
-            _GETITEM: 18,
         },
-        6,
+        3,
     ),
 ]
 
@@ -641,11 +637,15 @@ def test_the_recurrent_ops_are_unrolled_before_the_partitioner(
     """`aten.lstm.input` never reaches the partitioner: it is unrolled first.
 
     What is delegated is the per-step arithmetic the unrolling leaves behind, and
-    what stops it is the step boundary: the split of the fused weight matrix into
-    gates (its getitems are the whole reason the getitem rule is a rule), the
-    `cat` that gathers the steps, and the `full` the initial state became. The
-    counts are here so a change in how much of a recurrent model is on the DSP is
-    a failed row rather than a number nobody watches.
+    what stops it is the step boundary: the `cat` that gathers the steps, the
+    `full` the initial state became, and the `expand` beside them. The split of
+    the fused weight matrix into gates used to be a cut point as well -- it was
+    the reader that made the getitem rule a rule, with twelve to eighteen refused
+    getitems behind it -- and is now a blit per piece on the DSP instead, which is
+    why the LSTM and GRU rows have half the delegates they had and no split or
+    getitem left to refuse. The counts are here so a change in how much of a
+    recurrent model is on the DSP is a failed row rather than a number nobody
+    watches.
     """
     model = make().eval()
     inputs = (torch.randn(2, 3, 4),)

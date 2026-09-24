@@ -14,7 +14,7 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 
 import operator
 import struct
-from typing import Dict, List, NamedTuple, Optional
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -228,10 +228,11 @@ def _value_of(node: torch.fx.Node) -> torch.Tensor:
     """A node's value, or its first when the node hands out several.
 
     native_layer_norm returns (out, mean, rstd), so the node's own value is the
-    tuple; the tensor the kernel reads is its first element.
+    tuple; the tensor the kernel reads is its first element. A split hands its
+    pieces out in a list rather than a tuple, and is the same case.
     """
     value = node.meta["val"]
-    return value[0] if isinstance(value, tuple) else value
+    return value[0] if isinstance(value, (list, tuple)) else value
 
 
 def _numel(node: torch.fx.Node) -> int:
@@ -499,6 +500,239 @@ def _emit_slice_copy(node: torch.fx.Node, ctx) -> TensorRef:
         dim += len(source_shape)
     _patch_dynamic_rows(ctx, op_index, 7, region.region[4], source_shape[:dim])
     return ctx.record(node, out)
+
+
+# torch's split, the one multi-output op here whose every result a command
+# produces. It reaches this backend in the form `to_edge` leaves both
+# `aten.split.Tensor` and `aten.chunk` in: `split_with_sizes_copy`, whose results
+# the graph reads one getitem at a time. Each piece is the narrowing slice the
+# blit already runs, so the command list is a run per piece and the only thing
+# missing was a producer for the getitems -- the reason `aten.sort` still has
+# none is that no command here writes a sorted run.
+#
+# `split_copy.Tensor` is the same read with the piece size rather than the piece
+# list, where torch is free to cut the last piece short; a graph reaches it by
+# naming the functional op itself, since `torch.split` decomposes to the other
+# one. Both are read through the same spec, so the two spellings cannot disagree
+# about which slice a piece covers.
+SPLIT_WITH_SIZES_COPY = exir_ops.edge.aten.split_with_sizes_copy.default
+SPLIT_COPY = exir_ops.edge.aten.split_copy.Tensor
+
+SPLIT_TARGETS = frozenset({SPLIT_WITH_SIZES_COPY, SPLIT_COPY})
+
+
+class SplitSpec(NamedTuple):
+    """Everything a split's blits need: one run per piece, and its readers.
+
+    `start` and `extent` are counted in elements of the split axis, and the two
+    numbers a region needs are those times `inner`. `axis_extent` is the whole
+    axis, which is the row stride of the source. A piece the graph never reads
+    keeps its place in the list with no reader, because the offsets of the pieces
+    after it are what its extent is still needed for.
+    """
+
+    source: torch.fx.Node
+    dim: int
+    rows: int
+    inner: int
+    axis_extent: int
+    #: (start, extent, readers) per piece, in the order the outputs come out.
+    pieces: Tuple[Tuple[int, int, Tuple[torch.fx.Node, ...]], ...]
+
+
+def split_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The split a getitem reads a piece of, whatever the piece is."""
+    if node.target is not GETITEM or len(node.args) != 2:
+        return None
+    source = node.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return None
+    return source if source.target in SPLIT_TARGETS else None
+
+
+def split_spec(node: torch.fx.Node) -> Optional[SplitSpec]:
+    """The pieces this split's results cover, or None when it is not one.
+
+    Every gate here is a number a command has no argument for. The piece extents
+    and each piece's offset are baked into the region list when the command is
+    built, so a symbolic extent would describe the shape the graph was exported
+    at rather than the run, and the rows count strides between them, so a
+    symbolic one is the same problem. A piece list that does not add up to the
+    axis, an axis the source does not have, a source that is not the contiguous
+    layout these strides describe, a third width the arena does not hold, and a
+    result shape that disagrees with the piece it is supposed to hold all leave
+    the node on a portable kernel rather than reach a blit that reads it wrong.
+
+    The reader rule is the same one topk is under: every reader has to be a
+    getitem of a piece this spec names. A split whose tuple is handed on whole
+    has no command form at all, so it keeps the whole node portable rather than
+    leave a reader holding a tuple no kernel can be handed. A piece nothing reads
+    is not that case: its extent is still what the pieces after it are offset by,
+    and only its own blit is missing.
+    """
+    if node.target not in SPLIT_TARGETS:
+        return None
+    dim = _node_arg(node, "dim", 2, 0)
+    if isinstance(dim, bool) or not isinstance(dim, int):
+        return None
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return None
+    value = source.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dim() == 0:
+        return None
+    if not value.is_contiguous():
+        return None
+    if value.dtype not in (torch.float16, torch.float32):
+        return None
+    shape = list(value.shape)
+    if not all(isinstance(extent, int) and extent > 0 for extent in shape):
+        return None
+    if dim < 0:
+        dim += len(shape)
+    if not 0 <= dim < len(shape):
+        return None
+
+    sizes = _split_sizes(node, shape[dim])
+    if sizes is None:
+        return None
+    declared = node.meta.get("val")
+    if not isinstance(declared, (list, tuple)) or len(declared) != len(sizes):
+        return None
+
+    inner = 1
+    for extent in shape[dim + 1 :]:
+        inner *= extent
+    rows = 1
+    for extent in shape[:dim]:
+        rows *= extent
+
+    pieces = []
+    start = 0
+    for index, size in enumerate(sizes):
+        piece = declared[index]
+        if not isinstance(piece, torch.Tensor):
+            return None
+        expected = list(shape)
+        expected[dim] = size
+        if tuple(piece.shape) != tuple(expected):
+            return None
+        pieces.append((start, size, _split_piece_readers(node, index)))
+        start += size
+    if not any(readers for _, _, readers in pieces):
+        return None
+    return SplitSpec(source, dim, rows, inner, shape[dim], tuple(pieces))
+
+
+def _split_sizes(node: torch.fx.Node, axis_extent: int) -> Optional[Tuple[int, ...]]:
+    """The extent of each result, from whichever argument states it.
+
+    `split_with_sizes_copy` carries the list itself and only has to add up; the
+    other spelling carries one size and lets torch cut the last piece short,
+    which is the rule written out here.
+    """
+    if node.target is SPLIT_WITH_SIZES_COPY:
+        sizes = node.args[1] if len(node.args) > 1 else None
+        if not isinstance(sizes, (list, tuple)) or not sizes:
+            return None
+        if not all(
+            isinstance(size, int) and not isinstance(size, bool) and size > 0
+            for size in sizes
+        ):
+            return None
+        if sum(sizes) != axis_extent:
+            return None
+        return tuple(sizes)
+    size = _node_arg(node, "split_size", 1, None)
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return None
+    count = -(-axis_extent // size)
+    return (size,) * (count - 1) + (axis_extent - size * (count - 1),)
+
+
+def _split_piece_readers(node: torch.fx.Node, index: int) -> Tuple[torch.fx.Node, ...]:
+    """Every getitem that reads this piece, which is usually none or one."""
+    return tuple(
+        user
+        for user in node.users
+        if user.target is GETITEM
+        and len(user.args) == 2
+        and user.args[0] is node
+        and not isinstance(user.args[1], bool)
+        and user.args[1] == index
+    )
+
+
+def split_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this split is one the blit can write piece by piece.
+
+    Every user of the node is checked here rather than only the pieces with a
+    reader, because a user that is not a getitem of a named piece is one the
+    emitter has no buffer for: `split_with_sizes_copy` hands out a tuple, and a
+    consumer of the tuple itself is not its first element the way a layer norm's
+    reader is.
+    """
+    spec = split_spec(node)
+    if spec is None:
+        return False
+    return all(
+        user.target is GETITEM
+        and len(user.args) == 2
+        and user.args[0] is node
+        and isinstance(user.args[1], int)
+        and not isinstance(user.args[1], bool)
+        and 0 <= user.args[1] < len(spec.pieces)
+        for user in node.users
+    )
+
+
+def _emit_split(node: torch.fx.Node, ctx) -> TensorRef:
+    """One RASTER_BLIT per piece, each writing the run that piece covers.
+
+    The region is the one a narrowing `slice_copy` of the same piece builds --
+    same source offset, same row count, same run -- so a split of a tensor is
+    exactly the set of slices it stands for, and the blit that writes a piece is
+    byte for byte the blit `x[:, :n]` would have emitted for it.
+    """
+    spec = split_spec(node)
+    if spec is None:
+        raise RuntimeError("hexagon: this split is not one the blit can write")
+    source = ctx.operand(spec.source)
+    first = None
+    for start, extent, readers in spec.pieces:
+        run = extent * spec.inner
+        for reader in readers:
+            out = ctx.result_for(reader, run)
+            ctx.emit(
+                reader,
+                Op(
+                    type=DSP_OP_RASTER_BLIT,
+                    inputs=[source],
+                    outputs=[out],
+                    # region count, element bytes, source count, then the region.
+                    params=[
+                        1,
+                        FP16_BYTES,
+                        1,
+                        0,
+                        start * spec.inner,
+                        0,
+                        1,
+                        spec.rows,
+                        run,
+                        0,
+                        spec.axis_extent * spec.inner,
+                        1,
+                        0,
+                        run,
+                        1,
+                    ],
+                ),
+            )
+            ctx.record(reader, out)
+            if first is None:
+                first = out
+    return ctx.record(node, first)
 
 
 # The region's source offset, counted from the start of the params vector: the
@@ -3523,12 +3757,14 @@ class TopkSpec(NamedTuple):
     rows: int
 
 
-def _topk_arg(node: torch.fx.Node, name: str, index: int, default):
-    """A topk argument from wherever the graph put it, or the schema's default.
+def _node_arg(node: torch.fx.Node, name: str, index: int, default):
+    """An argument from wherever the graph put it, or the schema's default.
 
     `to_edge` writes an argument it was given positionally -- `dim` lands in
     args[2] -- and leaves one that kept its default out of the node altogether,
     so a missing argument means the schema's value rather than an unknown one.
+    Both topk and split are read through this: neither op's arguments survive
+    `to_edge` in a single place.
     """
     if name in node.kwargs:
         return node.kwargs[name]
@@ -3548,10 +3784,10 @@ def topk_spec(node: torch.fx.Node) -> Optional[TopkSpec]:
     """
     if node.target is not TOPK:
         return None
-    k = _topk_arg(node, "k", 1, None)
+    k = _node_arg(node, "k", 1, None)
     if isinstance(k, bool) or not isinstance(k, int) or k != 1:
         return None
-    if _topk_arg(node, "largest", 3, True) is not True:
+    if _node_arg(node, "largest", 3, True) is not True:
         return None
     source = node.args[0] if node.args else None
     if not isinstance(source, torch.fx.Node):
@@ -3564,7 +3800,7 @@ def topk_spec(node: torch.fx.Node) -> Optional[TopkSpec]:
     shape = list(value.shape)
     if not all(isinstance(extent, int) and extent > 0 for extent in shape):
         return None
-    dim = _topk_arg(node, "dim", 2, -1)
+    dim = _node_arg(node, "dim", 2, -1)
     if isinstance(dim, bool) or not isinstance(dim, int):
         return None
     if dim % value.dim() != value.dim() - 1:
@@ -4021,9 +4257,12 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
 def _emit_getitem(node: torch.fx.Node, ctx) -> TensorRef:
     """Re-points the layer norm result, the only getitem this backend takes."""
     source = node.args[0]
-    if isinstance(source, torch.fx.Node) and source.target is ADD_RMS_NORM:
-        # The fused add+norm records both getitems itself, at the output each
-        # index names; re-pointing to the op would collapse them to one.
+    if isinstance(source, torch.fx.Node) and (
+        source.target is ADD_RMS_NORM or source.target in SPLIT_TARGETS
+    ):
+        # A multi-output op records each of its own getitems itself, at the
+        # output each index names; re-pointing to the op would collapse them to
+        # one.
         return ctx.producer[node]
     return ctx.record(node, ctx.operand(source))
 
@@ -4622,6 +4861,8 @@ EMITTERS = {
     exir_ops.edge.aten._to_copy.default: _emit_alias,
     exir_ops.edge.aten.to.dtype: _emit_alias,
     exir_ops.edge.aten.slice_copy.Tensor: _emit_slice_copy,
+    SPLIT_WITH_SIZES_COPY: _emit_split,
+    SPLIT_COPY: _emit_split,
     exir_ops.edge.aten.cat.default: _emit_cat,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
     # A zero-filling constant pad: a memset for the border and one region for the

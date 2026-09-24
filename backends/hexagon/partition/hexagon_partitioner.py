@@ -68,6 +68,9 @@ from executorch.backends.hexagon.hexagon_ops import (
     SLICE_TARGETS,
     softmax_reduces_the_inner_axis,
     SOFTMAX_TARGETS,
+    split_getitem,
+    split_is_emittable,
+    SPLIT_TARGETS,
     SQUARE_POW_TARGETS,
     sum_dim_is_emittable,
     SUM_TARGETS,
@@ -101,9 +104,12 @@ FP32_CONSTANT_TARGETS = frozenset({LAYER_NORM, NATIVE_LAYER_NORM})
 
 def _dtype_of(node: torch.fx.Node):
     val = node.meta.get("val")
-    # A multi-output op carries the whole tuple as its value; the first tensor is
-    # the one the kernels read, so that is the width the gate is about.
-    if isinstance(val, tuple):
+    # A multi-output op carries the whole tuple or list as its value; the first
+    # tensor is the one the kernels read, so that is the width the gate is about.
+    # A list matters as much as a tuple: `split_with_sizes_copy` hands its pieces
+    # out in one, and reading no dtype at all from it refused every split at this
+    # gate before any of its own arguments were looked at.
+    if isinstance(val, (list, tuple)):
         val = val[0] if val else None
     return getattr(val, "dtype", None)
 
@@ -666,6 +672,15 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # does. A k, a dim or an order the one kernel has no argument for is
             # the same verdict, from the same gate.
             return False
+        if node.target in SPLIT_TARGETS and not split_is_emittable(node):
+            # A split is one blit per piece, and each piece's offset and extent
+            # are baked into that command's region list. So a piece list that
+            # does not add up to the axis, an axis the source does not have, a
+            # source these strides do not describe, or a reader that takes the
+            # tuple rather than a piece all keep the whole node -- and its
+            # getitems -- on the portable kernels, which is a correct program
+            # rather than a blit reading a run the graph never asked for.
+            return False
         if node.target in POOL_TARGETS and pool_spec(node) is None:
             # The kernel walks its activation in the DSP's 64-channel blocked
             # layout, and only the C == 64 form of it is one this backend
@@ -714,9 +729,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
             return False
         if node.target is GETITEM:
-            # The getitem that reads a layer norm's first output, or one of the
-            # fused add+norm's two, is the one this backend can place; every
-            # other getitem (a split's, for one) has no producer here.
+            # The getitem that reads a layer norm's first output, a max pool's
+            # values, a max(x, dim)'s values, a topk's values, a piece of a
+            # split, or one of the fused add+norm's two, is the one this backend
+            # can place; every other getitem (a sort's, for one) has no producer
+            # here.
             source = layer_norm_getitem(node)
             if source is not None:
                 if not layer_norm_is_emittable(source):
@@ -732,6 +749,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 # The same for torch.topk's values; that node's own check has
                 # already refused a topk whose positions or arguments keep it
                 # portable.
+                pass
+            elif split_getitem(node) is not None:
+                # The same for a piece of a split, whose own check has already
+                # refused one whose pieces or readers it cannot write.
                 pass
             else:
                 source = add_rms_norm_getitem(node)

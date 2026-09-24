@@ -221,6 +221,44 @@ class _Addmm(torch.nn.Module):
         return torch.addmm(bias, x, weight)
 
 
+def _split_piece_three_early(blob):
+    """The split's third piece, addressed three elements early.
+
+    `srcOffset` is the fifth int of a region, and the blob's second command is
+    the third piece -- the middle piece is the one nothing reads. Three elements
+    back lands inside the middle piece, which is the run a blob would read if it
+    offset each piece by the ones it wrote instead of the ones torch declared.
+    """
+    _, commands = read_blob(bytes(blob))
+    assert [command.type for command in commands] == [
+        3,
+        3,
+        19,
+    ], "this control is written against the split's two blits and the add"
+    assert commands[1].params[4] == 32, "the third piece no longer starts at 32"
+    body = bytearray(blob)
+    # The op's record starts at the header plus one record per command before it,
+    # and its params start four prefix words in.
+    at = blob_interpreter.B.HEADER_SIZE + blob_interpreter.B.OP_SIZE + 4 * (4 + 4)
+    struct.pack_into("<i", body, at, 12)
+    return bytes(body)
+
+
+class _Split(torch.nn.Module):
+    """A split with a piece in the middle that nothing reads.
+
+    Each piece is one blit, and the third piece's source offset is where the
+    middle piece's extent puts it rather than where the emitted pieces end, so a
+    blob that packed only the pieces it wrote would read the third piece two
+    columns early. The values are distinct for the same reason: on a repeating
+    pattern a wrong offset reads the right numbers and the case says nothing.
+    """
+
+    def forward(self, x):
+        first, _, third = torch.split(x, 2, dim=1)
+        return first + third
+
+
 class _Scale(torch.nn.Module):
     """A broadcast, so one operand is read with a zero stride."""
 
@@ -1243,6 +1281,21 @@ def _cases():
     pick = _small((1, 4, 8))
     narrowed = _case("J", _Narrow(), (pick,), _bits(_Narrow()(pick)))
 
+    # `_small` cannot check a split's offsets: it repeats every seven elements,
+    # and the third piece here starts fourteen elements past the middle one, so
+    # a wrong offset would read the same numbers. Arange puts a different value
+    # at every stop instead.
+    split_source = torch.arange(2 * 6 * 8, dtype=torch.float32).reshape(2, 6, 8).half()
+    split_pieces = _case("BQ", _Split(), (split_source,), _bits(_Split()(split_source)))
+    split_pieces_control = _case(
+        "BR",
+        _Split(),
+        (split_source,),
+        _bits(_Split()(split_source)),
+        kind="teeth",
+        mutate=_split_piece_three_early,
+    )
+
     # Scaled by powers of two so the inputs stay exact in fp16 while reaching
     # far enough from zero to leave the flat part of the kernel's approximation.
     gate, up = _small((2, 16)) * 8, _small((2, 16)) * 4
@@ -1318,6 +1371,8 @@ def _cases():
         depthwise,
         pointwise,
         split,
+        split_pieces,
+        split_pieces_control,
         *([attention] if attention is not None else []),
         *_branch_cases(),
         *_pad_cases(),
@@ -1798,9 +1853,9 @@ def _branch_cases():
     #    six-element tail behind a rank-3 operand, so the row count is a product
     #    rather than a leading extent.
     spread = (torch.arange(5 * 33) * 37 % 101).sub(50).div(8).reshape(5, 33).half()
-    assert int(
-        torch.topk(spread, 1).indices.unique().numel()
-    ) == 5, "the row maxima are not at five distinct positions"
+    assert (
+        int(torch.topk(spread, 1).indices.unique().numel()) == 5
+    ), "the row maxima are not at five distinct positions"
     cases.append(
         _case(
             "BN",
@@ -1822,7 +1877,9 @@ def _branch_cases():
         )
     )
 
-    deep = (torch.arange(2 * 3 * 70) * 53 % 199).sub(100).div(8).reshape(2, 3, 70).half()
+    deep = (
+        (torch.arange(2 * 3 * 70) * 53 % 199).sub(100).div(8).reshape(2, 3, 70).half()
+    )
     cases.append(
         _case("BP", _TopkAt(), (deep,), _bits(torch.topk(deep, 1).values.reshape(-1)))
     )
@@ -2267,6 +2324,11 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["K"] == [19], "the gated activation is not a binary op"
     assert kinds["L"] == [4], "the fp32 round trip left a command behind"
     assert kinds["N"] == [3, 4], "the dynamic slice is not a blit"
+    assert kinds["BQ"] == [3, 3, 19], (
+        "the split is not one blit per piece it reads followed by the add: the "
+        "middle piece is unread, so three blits here would mean the emitter "
+        "wrote a run nothing consumes"
+    )
     assert any(
         command.patch_param != 0xFFFFFFFF for command in _tagged(cases, "N").commands
     ), "the dynamic slice has no patched parameter"
@@ -2631,6 +2693,34 @@ def test_the_gemv_control_can_tell_the_two_nibble_orders_apart(cases):
             _tagged(cases, tag).blob
             != _tagged(cases, "AJ" if tag == "AX" else "AL").blob
         ), f"{tag}: the control is the case it was meant to control"
+
+
+def test_the_split_pieces_reach_the_dsp_in_one_command_each(cases, simulated):
+    """The split's two blits, counted and answered on the DSP.
+
+    `BQ` splits six columns into three pairs and adds the first to the third, so
+    the graph reads two pieces and the middle one is dead: two blits and the add
+    is what arrived. `BR` is the same blob with the third piece's source offset
+    three elements early -- inside the piece nothing reads -- and the DSP has to
+    land where the host model lands and away from torch's answer, which is what
+    makes the run above evidence about the offsets rather than about the sums.
+    """
+    split = _tagged(cases, "BQ")
+    assert [command.type for command in split.commands] == [3, 3, 19]
+    assert [command.params[4] for command in split.commands[:2]] == [
+        0,
+        32,
+    ], "the two pieces the graph reads no longer start 32 elements apart"
+    assert simulated["BQ0"] == split.expected.view("uint16").tolist()
+
+    control = _tagged(cases, "BR")
+    assert control.blob != split.blob, "the control is the case it controls"
+    assert simulated["BR0"] == _host_bits(
+        control.host[0]
+    ), "the DSP did not follow the host model's shifted region"
+    assert (
+        simulated["BR0"] != control.expected.view("uint16").tolist()
+    ), "the shifted region answered torch's numbers, so the case is vacuous"
 
 
 def test_the_dsp_result_would_move_if_the_blob_did(cases):

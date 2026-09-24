@@ -512,16 +512,16 @@ _ROWS = [
         [("aten.cat.default", "wired"), ("aten.view_copy.default", "wired")],
     ),
     (
-        "split is a multi-output op with no producer",
+        "split is one blit per piece",
         lambda a: torch.split(a, 2, dim=0)[0],
         (_x(6, 3),),
-        [("aten.split_with_sizes_copy.default", "unwired"), (_GETITEM, "refused")],
+        [("aten.split_with_sizes_copy.default", "wired"), (_GETITEM, "wired")],
     ),
     (
         "chunk is the same op",
         lambda a: torch.chunk(a, 2, dim=0)[0],
         (_x(6, 3),),
-        [("aten.split_with_sizes_copy.default", "unwired"), (_GETITEM, "refused")],
+        [("aten.split_with_sizes_copy.default", "wired"), (_GETITEM, "wired")],
     ),
     (
         "slice along an outer dim",
@@ -899,6 +899,10 @@ def test_each_overload_row_matches_its_recorded_verdict(label, forward, inputs, 
         # the amax the reduction kernel already ran, and the rule that places
         # them is the pool's own.
         ("max.dim values", lambda a: torch.max(a, dim=1).values, (_x(2, 3, 4),)),
+        # split moved here when its pieces landed: the same row that was
+        # unwired plus a refused getitem is now one delegate, and it is the
+        # positive half of that move rather than a deletion.
+        ("split's first piece", lambda a: torch.split(a, 2, dim=0)[0], (_x(6, 3),)),
     ],
 )
 def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
@@ -916,7 +920,10 @@ def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
     "label,forward,inputs",
     [
         ("amin over one dim", lambda a: torch.amin(a, dim=1), (_x(2, 3, 4),)),
-        ("split", lambda a: torch.split(a, 2, dim=0)[0], (_x(6, 3),)),
+        # `split` stood here while it was an unwired multi-output op; it is now
+        # the first row of the closed-gap list below, and `sort` takes its place
+        # here because it is the same shape of gap with no command behind it.
+        ("sort's values", lambda a: torch.sort(a, dim=0)[0], (_x(6, 3),)),
         ("erf", lambda a: torch.erf(a), (_x(8),)),
         ("zeros_like", lambda a: torch.zeros_like(a), (_x(8),)),
         (

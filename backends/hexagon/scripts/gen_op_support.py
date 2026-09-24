@@ -528,6 +528,26 @@ SUPPORTED: List[OpSupport] = [
     ),
     # --- raster blits ----------------------------------------------------
     OpSupport(
+        "aten.split_with_sizes_copy.default",
+        BLIT,
+        ARENA_FP16,
+        "One blit per piece, each the narrowing slice that piece stands for. "
+        "Contiguous fp16/fp32 source, static shape and piece extents, pieces that "
+        "add up to the axis, and every reader a getitem of a piece. A piece nothing "
+        "reads keeps its place but emits no command. This is the form `torch.split` "
+        "and `torch.chunk` lower to, and the blit a piece emits is byte for byte the "
+        "one the equivalent narrowing slice emits.",
+    ),
+    OpSupport(
+        "aten.split_copy.Tensor",
+        BLIT,
+        ARENA_FP16,
+        "The same read with the piece size rather than the piece list, where torch "
+        "cuts a short last piece; one more row because the two are separate targets "
+        "with one shared spec. Unreachable from `torch.split`, which lowers to the "
+        "other spelling, so only a graph naming the functional op reaches it.",
+    ),
+    OpSupport(
         "aten.slice_copy.Tensor",
         BLIT,
         ARENA_FP16,
@@ -802,11 +822,12 @@ NOT_SUPPORTED = [
         "A reduction kernel that returns values and no positions.",
     ),
     (
-        "aten.split_with_sizes_copy.default and aten.sort.default",
-        "Multi-output ops with no producer for the extra outputs. Only the getitems "
-        "reading a layer norm's result, a max pool's values, a max(x, dim)'s values, "
-        "a topk's values or the fused add+norm's outputs are placed, so these stay "
-        "portable together with their getitems.",
+        "aten.sort.default",
+        "A multi-output op with no producer for the extra outputs. Only the "
+        "getitems reading a layer norm's result, a max pool's values, a max(x, "
+        "dim)'s values, a topk's values, a piece of a split or the fused add+norm's "
+        "outputs are placed, so a sort stays portable together with its getitems: "
+        "no command here writes a sorted run.",
     ),
     (
         "aten.topk.default reading .indices, or asking for another k, dim or order",
@@ -911,10 +932,11 @@ NOT_SUPPORTED = [
         "where the patch mechanism can reach them.",
     ),
     (
-        "aten.split / getitem of a split",
-        "No producer for the extra outputs; only the getitems that read a layer "
-        "norm's result, a max pool's values, a max(x, dim)'s values or the fused "
-        "add+norm's outputs are placed.",
+        "aten.split / getitem of a split over a symbolic axis or with symbolic "
+        "piece sizes",
+        "A piece's offset and extent are baked into the region list when the "
+        "command is built, so both have to be numbers at export. A static split "
+        "reaches the covered target instead.",
     ),
     (
         "aten.bmm.default with a broadcast batch",
