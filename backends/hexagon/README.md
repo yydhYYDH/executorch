@@ -741,6 +741,48 @@ end against torch's own answer. What none of that covers is the device: see
 below.
 
 
+## Folding a batch norm into the convolution before it
+
+`FoldBatchNormIntoConv` (opt-in, via `transform_passes`) applies a batch norm that
+follows a convolution to that convolution's weights and drops the node. There is
+no `DSP_OP_*` for a normalization, so a batch norm not only falls back to a
+portable kernel but splits the delegate chain around it: a stack of
+conv/BN/relu blocks lowers to one delegate per convolution plus one for the
+trailing rectifier, and every split in between is a round trip through the CPU.
+Over four such blocks the fold takes 5 delegates to 1 -- the phone's runner then
+prints a single `enter d0: ops=20` where it printed `ops=4`, `ops=5`, `ops=5`,
+`ops=5` and `ops=1` -- with the same twenty commands in the same one blob, and
+the `.pte` 90,756 -> 86,308 bytes. The delegate bytes are identical to those of
+the same weights fused by hand and written as a model with no batch norm at all,
+on the host and on the phone.
+
+The rewrite is
+`backends/transforms/fuse_batch_norm_with_conv.FuseBatchNormWithConvPass`, imported
+rather than reimplemented. Two things it leaves to its caller are done here, and
+both are measurable: the unfused convolution weight and bias are pruned
+(without that the `.pte` grows to 117,028 bytes on the fixture above, carrying a
+dead fp32 copy of every convolution weight), and the output specs are re-pointed
+when the folded batch norm is itself the graph's output (without that the export
+fails with `User output aten_convolution_default is not in the correct order`).
+The precondition upstream does not check is the training flag: it matches
+`aten.native_batch_norm.default`, whose fifth argument says whether the node
+means the batch statistics, and folding one that does would be a wrong answer
+with no error anywhere. A graph holding such a node, a convolution a residual
+branch also reads, and a batch norm with `affine=False` all keep their node.
+
+Every number above is measured against batch norms that are *not* the identity.
+A freshly constructed `BatchNorm2d` scales by `1/sqrt(1+eps)`, which is 1-5e-6:
+folding that is a no-op that a broken fold would also pass, and
+`test_fold_batch_norm.py` has a guard that keeps its own fixtures away from it.
+
+Where the numbers come from: the count of delegates, of portable batch norms and
+of commands is read from the lowered program and from the blob, not from whether
+the whole graph's output matched torch -- a graph can agree with torch while an
+op never reached the DSP. The device numbers are the phone's own
+`[hexagon] enter d0: ops=N` lines around the outputs it wrote, and the checks are
+run separately on host lowering, in `hexagon-sim`, and on the phone.
+
+
 ## Status
 
 Working and verified on a device. The whole of this list is one OnePlus 13
