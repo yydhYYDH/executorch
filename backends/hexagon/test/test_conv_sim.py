@@ -100,6 +100,11 @@ def simulated():
     try:
         return hexagon_sim.run(_RUNNER, _SOURCES, headers=_HEADERS)
     except hexagon_sim.Unavailable as error:
+        # A machine without the SDK has nothing to say here and skips; a runner
+        # that does not compile is a failure, because every assertion below is
+        # about what the simulator computed and a skip would read as agreement.
+        if str(error).startswith("compiling"):
+            pytest.fail(str(error), pytrace=False)
         pytest.skip(str(error))
 
 
@@ -213,6 +218,17 @@ def _unblock(flat, channels, batch, area):
         width = min(_PACK, channels - first)
         out[:, first : first + width] = values[cb, :, :, :width].transpose(0, 2, 1)
     return out
+
+
+def test_every_operand_the_kernels_read_is_vector_aligned(simulated):
+    """The addresses the kernels were handed, low bits and all.
+
+    An unaligned HVX access is wrong data rather than a crash, and these buffers
+    live in a shared object whose layout a change to the case list can move, so
+    the runner prints the low bits of every operand it passes and the cases below
+    are only worth reading if they are zero.
+    """
+    assert simulated["ALIGN"] == [0] * 8, "an operand is not 128-byte aligned"
 
 
 @pytest.mark.parametrize("case", _DEPTHWISE, ids=[case[0] for case in _DEPTHWISE])

@@ -116,11 +116,6 @@ extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation
 extern "C" void vtcm_manager_setup();
 extern "C" int vtcm_manager_acquire();
 extern "C" unsigned int vtcm_manager_get_vtcm_size();
-/* The vision tower's attention. It is a scalar walk over the score matrix
- * (attention_entry.cc:24-67), not the flash variant the existing suite excludes:
- * the flash kernel starts a worker pool, which the simulated QuRT cannot, while
- * this one never reaches the pool at all. */
-
 /* An HVX vector at `-mhvx-length=128b`, which is what every kernel here assumes
  * of the buffers it is handed. The static assertions below the buffers read this
  * back out of the declarations. */
@@ -370,6 +365,11 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
     return;
   }
   if (op.type == kVisionAttention) {
+    /* A scalar walk over the score matrix (attention_entry.cc:24-67), not the
+     * flash variant the suite excludes: the flash kernel starts a worker pool,
+     * which the simulated QuRT cannot, while this one never reaches the pool at
+     * all. Its prototype is `dsp/ops.h`'s rather than a local one, like the w8a16
+     * GEMV entry's. */
     float scale;
     memcpy(&scale, &params[4], 4);
     htp_ops_vision_attention_fp16(

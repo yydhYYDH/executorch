@@ -40,27 +40,59 @@ extern "C" int htp_ops_zero(uint8_t *dst, int32_t size);
 
 #define PACK 64
 #define TILE 32
-#define MAT_ALIGN __attribute__((aligned(128)))
+
+/* The kernels read and write these buffers a vector at a time, and an unaligned
+ * HVX access is wrong data rather than a crash. The attribute is what makes the
+ * address vector-aligned and the assertion below each declaration is what keeps
+ * it one: `__alignof__` on the object reads the attribute back, where an
+ * assertion on the address would not be a constant expression and one on the
+ * array's type would report its element's alignment. The run also prints the low
+ * bits of every operand, which is the check that does not depend on the compiler
+ * answering the assertion honestly. */
+enum { kVectorBytes = 128 };
+#define VECTOR_ALIGNED __attribute__((aligned(kVectorBytes)))
+#define REQUIRE_VECTOR_ALIGNMENT(name)                    \
+  static_assert(__alignof__(name) == kVectorBytes,        \
+                "the kernels read " #name " a vector at a time")
 
 #define MAX_BLOCKS 2
 #define MAX_BATCH 2
 #define MAX_AREA 81
 #define MAX_OC 128
 
-static MAT_ALIGN __fp16 dw_src[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
-static MAT_ALIGN __fp16 dw_wgt[MAX_BLOCKS * 3 * 3 * PACK];
-static MAT_ALIGN __fp16 dw_bias[MAX_BLOCKS * PACK];
-static MAT_ALIGN __fp16 dw_dst[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
+static __fp16 VECTOR_ALIGNED dw_src[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
+static __fp16 VECTOR_ALIGNED dw_wgt[MAX_BLOCKS * 3 * 3 * PACK];
+static __fp16 VECTOR_ALIGNED dw_bias[MAX_BLOCKS * PACK];
+static __fp16 VECTOR_ALIGNED dw_dst[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
 
-static MAT_ALIGN __fp16 cv_src[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
-static MAT_ALIGN __fp16 cv_wgt[4 * 3 * 3 * 4 * 1024];
-static MAT_ALIGN __fp16 cv_bias[MAX_OC + PACK];
-static MAT_ALIGN __fp16 cv_dst[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
+static __fp16 VECTOR_ALIGNED cv_src[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
+static __fp16 VECTOR_ALIGNED cv_wgt[4 * 3 * 3 * 4 * 1024];
+static __fp16 VECTOR_ALIGNED cv_bias[MAX_OC + PACK];
+static __fp16 VECTOR_ALIGNED cv_dst[MAX_BLOCKS * MAX_BATCH * MAX_AREA * PACK];
+
+REQUIRE_VECTOR_ALIGNMENT(dw_src);
+REQUIRE_VECTOR_ALIGNMENT(dw_wgt);
+REQUIRE_VECTOR_ALIGNMENT(dw_bias);
+REQUIRE_VECTOR_ALIGNMENT(dw_dst);
+REQUIRE_VECTOR_ALIGNMENT(cv_src);
+REQUIRE_VECTOR_ALIGNMENT(cv_wgt);
+REQUIRE_VECTOR_ALIGNMENT(cv_bias);
+REQUIRE_VECTOR_ALIGNMENT(cv_dst);
 
 static void print_bits(const char *tag, const void *values, int count) {
   printf("%s", tag);
   for (int i = 0; i < count; ++i) printf(" %04x", ((const uint16_t *)values)[i]);
   printf("\n");
+}
+
+/* What the kernels are handed, as the low bits of each address. */
+static void print_alignment(void) {
+  static const void *const buffers[] = {dw_src, dw_wgt, dw_bias,  dw_dst,
+                                        cv_src, cv_wgt, cv_bias, cv_dst};
+  uint16_t lows[sizeof(buffers) / sizeof(buffers[0])];
+  for (unsigned i = 0; i < sizeof(lows) / sizeof(lows[0]); ++i)
+    lows[i] = (uint16_t)((uintptr_t)buffers[i] & (kVectorBytes - 1));
+  print_bits("ALIGN", lows, (int)(sizeof(lows) / sizeof(lows[0])));
 }
 
 /* One digest of a packed weight, so the host can check that the bytes this
@@ -288,6 +320,7 @@ int main(void) {
   hmx_queue_setup();
   worker_pool_global_init();
 
+  print_alignment();
   for (unsigned i = 0; i < sizeof(depth_cases) / sizeof(depth_cases[0]); ++i)
     run_depthwise(depth_cases[i]);
   for (unsigned i = 0; i < sizeof(conv_cases) / sizeof(conv_cases[0]); ++i) {
@@ -296,7 +329,7 @@ int main(void) {
   }
 
   /* htp_ops_zero: the memset a ragged channel count needs before the pack. */
-  static uint8_t MAT_ALIGN scratch[256];
+  static uint8_t VECTOR_ALIGNED scratch[256];
   memset(scratch, 0xAB, sizeof(scratch));
   int zero_ret = htp_ops_zero(scratch, 130);
   /* Printed as hex, which is how every other tag reads its words. */
