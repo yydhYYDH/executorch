@@ -13,6 +13,7 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 """
 
 import operator
+import re
 import struct
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -291,6 +292,47 @@ def _upper_product(values, ctx=None) -> int:
             )
         )
     return result
+
+
+#: A bare dynamic symbol, as `torch.SymInt` prints one: `s53`. A dim derived from
+#: that symbol prints as an expression (`(((s53 - 1)//2)) + 1`), which is the tell
+#: that the extent would have to be divided rather than scaled.
+_RUNTIME_SYMBOL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+#: A dim the export has already resolved to one number. The graph a backend is
+#: handed for a delegate has had every symbol folded to the traced example, so
+#: this is what a moved dim looks like from inside an emitter.
+_SPECIALIZED = re.compile(r"\d+\Z")
+
+#: The three things a shape dim can be here, and what each one means.
+STATIC_DIM = "static"
+RUNTIME_DIM = "runtime"
+SPECIALIZED_DIM = "specialized"
+DERIVED_DIM = "derived"
+
+
+def extent_kind(value) -> str:
+    """Which of the four a shape dim is, read off how it prints.
+
+    A static dim is an int. The run-time length is the bare symbol, and reads as
+    one wherever the graph still carries the symbol. A delegate's subgraph
+    instead carries the symbol already resolved to the traced example, which is
+    a number that is still a `torch.SymInt` -- the only way to tell a dim that
+    moves, from an emitter, once the expression is gone. Anything left is an
+    expression over the symbol, whose extent no affine patch can rebuild.
+    """
+    if not isinstance(value, torch.SymInt):
+        return STATIC_DIM
+    text = str(value)
+    if _RUNTIME_SYMBOL.match(text):
+        return RUNTIME_DIM
+    if _SPECIALIZED.match(text):
+        return SPECIALIZED_DIM
+    return DERIVED_DIM
+
+
+def _is_runtime_symbol(value) -> bool:
+    """Whether a shape dim is the bare symbol the runtime hands a length for."""
+    return extent_kind(value) == RUNTIME_DIM
 
 
 def _patch_dynamic_product(ctx, op_index: int, values, param_index: int) -> None:
@@ -3150,6 +3192,10 @@ class ConvSpec(NamedTuple):
     upsample_x: int = 1
     tail_y: int = 0
     tail_x: int = 0
+    # The operand's height held the bare run-time symbol, so every extent below
+    # is the traced example's and the commands carry a patch the runtime
+    # resolves from the length it was handed. See `_patch_conv_extents`.
+    dynamic_h: bool = False
 
 
 def _zero_insert_regions(source_shape, spec: ConvSpec) -> List[int]:
@@ -3195,6 +3241,23 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     about which convolutions are delegated; `is_constant` is the caller's own
     test for "a value whose bytes I can read now", since both kernels take a
     weight this layer has to rearrange before the DSP ever sees it.
+
+    A height that is the run-time symbol is admitted, and everything below is
+    then the traced example's extent: the commands carry the example's numbers
+    plus a patch record per affected param, which is what
+    `_patch_conv_extents` writes. Three things keep that honest -- the height has
+    to be the symbol itself rather than an expression over it, the geometry has
+    to be affine in the height (one row per output row, and padding that leaves
+    the height alone), and the result's height has to be that same dim -- so the
+    extent the patch recomputes is the one torch's own shape rule gives.
+
+    Two graphs call this and they do not look the same. The partitioner sees the
+    edge graph, where the symbol is still a symbol; the emitter sees the
+    delegate's subgraph, where EXIR has already folded every symbol to the traced
+    example, so a dim that moves prints as its number and `extent_kind` can only
+    say that it is still a `torch.SymInt`. The expression test therefore holds
+    only on the partitioner's side, which is the side that decides: a node whose
+    height is a real expression is refused there and never reaches an emitter.
     """
     if node.target not in CONV_TARGETS:
         return None
@@ -3246,22 +3309,43 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         return None
     if value.dim() != 4 or kernel.dim() != 4 or result.dim() != 4:
         return None
-    if any(
-        isinstance(dim, torch.SymInt)
-        for dim in list(value.shape) + list(kernel.shape) + list(result.shape)
-    ):
+    # Only the operand's height may hold the run-time length. A batch, a channel
+    # count or the window's width that moved would each need its own patch over
+    # the arena's own geometry, and the weight is a constant whose extents are
+    # the export's. A height that is an expression over the symbol is the
+    # stride-2 case, which no affine patch can rebuild.
+    if any(isinstance(dim, torch.SymInt) for dim in kernel.shape):
         return None
-    batch, in_channels, in_h, in_w = value.shape
+    value_kinds = [extent_kind(dim) for dim in value.shape]
+    result_kinds = [extent_kind(dim) for dim in result.shape]
+    if any(kind == DERIVED_DIM for kind in value_kinds + result_kinds):
+        return None
+    if any(kind != STATIC_DIM for kind in value_kinds[0:2] + value_kinds[3:]):
+        return None
+    if any(kind != STATIC_DIM for kind in result_kinds[0:2] + result_kinds[3:]):
+        return None
+    dynamic_h = value_kinds[2] in (RUNTIME_DIM, SPECIALIZED_DIM)
+    if value_kinds[2] == SPECIALIZED_DIM and result_kinds[2] != SPECIALIZED_DIM:
+        return None
+    if dynamic_h and transposed:
+        # A transposed convolution's height is the interleaved one, and the patch
+        # this path writes describes the affine relation a plain convolution's
+        # height has to the run length. Neither of the two was measured against
+        # the other, so the combination stays on the portable kernels.
+        return None
+    batch, in_channels, in_h, in_w = (int(dim) for dim in value.shape)
     if transposed:
         # A transposed convolution's weight is indexed the other way round: the
         # leading axis is the input's channels and the second the output's share
         # of the group.
-        weight_in, per_group, kernel_y, kernel_x = kernel.shape
+        weight_in, per_group, kernel_y, kernel_x = (int(dim) for dim in kernel.shape)
         if weight_in * group != in_channels:
             return None
         out_channels = per_group * group
     else:
-        out_channels, per_group, kernel_y, kernel_x = kernel.shape
+        out_channels, per_group, kernel_y, kernel_x = (
+            int(dim) for dim in kernel.shape
+        )
         if per_group * group != in_channels:
             return None
     extents = (batch, in_channels, in_h, in_w, out_channels, kernel_y, kernel_x)
@@ -3296,8 +3380,23 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_x - 1) - 1) // stride[1] + 1
     if out_h <= 0 or out_w <= 0:
         return None
-    if list(result.shape) != [batch, out_channels, out_h, out_w]:
+    if [int(dim) for dim in result.shape] != [batch, out_channels, out_h, out_w]:
         return None
+    if dynamic_h and (
+        stride[0] != 1 or 2 * padding[0] != dilation[0] * (kernel_y - 1)
+    ):
+        # One output row per input row, and a window that starts on its own row:
+        # then the output height is the input height, which is the one relation
+        # an affine patch over the run length reproduces. A stride divides and a
+        # lopsided padding shifts; both need the extent itself, not a multiple
+        # of the length.
+        return None
+    if dynamic_h and value_kinds[2] == RUNTIME_DIM:
+        if str(result.shape[2]) != str(value.shape[2]):
+            # The height-preserving rule above says the result's height is the
+            # operand's, so torch's own shape rule has to spell it as that same
+            # symbol. Anything else is a relation this emitter has not seen.
+            return None
     # The region stride of a channel block is the plane's element count, and the
     # DSP holds it in an int32. The interleaved plane is the one the kernel and
     # the blit both address, so it is the one this bounds.
@@ -3345,6 +3444,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         upsample_x=upsample[1],
         tail_y=tail[0],
         tail_x=tail[1],
+        dynamic_h=dynamic_h,
     )
 
 
@@ -3526,6 +3626,7 @@ def _emit_channel_block_blit(
     area: int,
     channels: int,
     packing: bool,
+    dynamic_area: int = 0,
 ) -> None:
     """Move every 64-channel block, in as many commands as the parameter block allows.
 
@@ -3534,13 +3635,18 @@ def _emit_channel_block_blit(
     the three-int header, so a command moves at most three blocks and a wide
     enough tensor needs several commands. The count each command carries is its
     own chunk's, so the kernel still sees well-formed commands.
+
+    `dynamic_area` is what one row of the plane is worth in the run length, and
+    zero means the plane is static. A plane that moves turns each region's
+    offsets and pitches into multiples of the length, which is the one thing the
+    runtime can rebuild without the graph.
     """
     regions = _channel_block_regions(batch, area, channels, packing)
     for start in range(0, _channel_blocks(channels), BLIT_BLOCKS_PER_COMMAND):
         chunk = _channel_blocks(channels) - start
         if chunk > BLIT_BLOCKS_PER_COMMAND:
             chunk = BLIT_BLOCKS_PER_COMMAND
-        ctx.emit(
+        op_index = ctx.emit(
             node,
             Op(
                 type=DSP_OP_RASTER_BLIT,
@@ -3552,15 +3658,77 @@ def _emit_channel_block_blit(
                 ],
             ),
         )
+        if not dynamic_area:
+            continue
+        # Every region int that holds the plane extent is affine in the run-time
+        # height once the height is the length itself, and the block offsets are
+        # that extent times a static block index, which stays affine. The scales
+        # are read off `_channel_block_regions`' own expressions: the offset a
+        # packed block starts at counts whole blocks, and the pitches are each
+        # layout's own. The two layouts' non-plane pitches -- the row-major
+        # channel step is the plane and the blocked one's is a lane -- are the
+        # entries that stay static, and the two packings put them in different
+        # places.
+        for offset in range(chunk):
+            blocked_offset = (start + offset) * batch * dynamic_area * POOL_CHANNEL_BLOCK
+            row_major_offset = (start + offset) * POOL_CHANNEL_BLOCK * dynamic_area
+            if packing:
+                # source row-major, dest blocked.
+                scales = (
+                    0,
+                    row_major_offset,
+                    blocked_offset,
+                    0,
+                    0,
+                    dynamic_area,
+                    channels * dynamic_area,
+                    dynamic_area,
+                    0,
+                    dynamic_area * POOL_CHANNEL_BLOCK,
+                    0,
+                    0,
+                )
+            else:
+                # source blocked, dest row-major.
+                scales = (
+                    0,
+                    blocked_offset,
+                    row_major_offset,
+                    0,
+                    0,
+                    dynamic_area,
+                    dynamic_area * POOL_CHANNEL_BLOCK,
+                    0,
+                    0,
+                    channels * dynamic_area,
+                    dynamic_area,
+                    0,
+                )
+            base = 3 + offset * BLIT_REGION_INTS
+            for position, scale in enumerate(scales):
+                if scale > 0:
+                    ctx.add_dynamic_patch(op_index, base + position, scale, 0)
 
 
-def _emit_zero(ctx, node: torch.fx.Node, dest: TensorRef) -> None:
+def _emit_zero(
+    ctx, node: torch.fx.Node, dest: TensorRef, dynamic_frame_bytes: int = 0
+) -> None:
     """Clears a whole activation buffer with the DSP's own memset.
 
     `htp_ops_zero` takes one operand and a byte count (`blit_ops.cc:1724`), and
-    the command carries no inputs: the output is the buffer it clears.
+    the command carries no inputs: the output is the buffer it clears. The count
+    is a count of that buffer rather than of the tensor the graph reads, and the
+    runtime resizes the buffer for the run it is given
+    (`ResizeDynamicDelegate`, runtime/hexagon_backend.cpp), so a count left at
+    the export's longest length clears past the end of a shorter arena -- the one
+    number in a convolution's command group that is a buffer extent rather than a
+    tensor one. `dynamic_frame_bytes` is what one row of the buffer is worth, so
+    the runtime rebuilds the count the way it rebuilds the extents. It stays zero
+    everywhere the size does not move, which is every static graph and the pad,
+    the one other caller: a pad whose height is an expression is what
+    `constant_pad_region` refuses to emit at all.
     """
-    ctx.emit(
+    op_index = ctx.emit(
         node,
         Op(
             type=DSP_OP_ZERO,
@@ -3569,6 +3737,53 @@ def _emit_zero(ctx, node: torch.fx.Node, dest: TensorRef) -> None:
             params=[dest.size],
         ),
     )
+    if dynamic_frame_bytes:
+        ctx.add_dynamic_patch(op_index, 0, dynamic_frame_bytes, 0)
+
+
+def _blocked_activation(ctx, batch, height, width, channels) -> TensorRef:
+    """The 64-channel blocked buffer one convolution reads or writes.
+
+    A static height is the allocation the emitter has always made. The run-time
+    symbol instead sizes the buffer for the longest run the export allows and
+    records how many bytes the run it actually gets needs, which is the same
+    pairing the matmul and reduction paths use: the arena holds the bound, the
+    blob's layout says what of it this call owns, and the command's patched
+    extents say which part of that the kernel may read.
+    """
+    blocks = _channel_blocks(channels)
+    if not isinstance(height, torch.SymInt):
+        return ctx.builder.add_activation(
+            batch * int(height) * width * blocks * POOL_CHANNEL_BLOCK * FP16_BYTES
+        )
+    return ctx.activation_for_shape((blocks, batch, height, width, POOL_CHANNEL_BLOCK))
+
+
+def _patch_conv_extents(ctx, op_index: int, spec: ConvSpec, im2col: bool) -> None:
+    """Recompute the extents a convolution command baked in at export time.
+
+    The height, the output height and both plane strides reach the kernel as
+    param ints, and every one of them is the run-time length times a static
+    factor once the geometry is height-preserving and one row per output row.
+    `scale` is that factor -- the length itself for the two heights, a row of the
+    operand or of the result for the strides -- so the value the runtime writes
+    is the one the emitter would have written for a run of that length.
+    """
+    if not spec.dynamic_h:
+        return
+    if not im2col:
+        # The depthwise walk takes the two heights only; its plane strides are
+        # derived inside the kernel from in_h and in_w.
+        ctx.add_dynamic_patch(op_index, 1, 1, 0)
+        ctx.add_dynamic_patch(op_index, 3, 1, 0)
+        return
+    for param_index, scale in (
+        (11, 1),
+        (13, 1),
+        (14, spec.batch * spec.in_w * POOL_CHANNEL_BLOCK),
+        (17, spec.in_w * POOL_CHANNEL_BLOCK),
+    ):
+        ctx.add_dynamic_patch(op_index, param_index, scale, 0)
 
 
 def _emit_zero_insert(ctx, node: torch.fx.Node, source: TensorRef, spec: ConvSpec):
@@ -3623,16 +3838,23 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     bias_node = node.args[2] if len(node.args) > 2 else None
     out = ctx.result_for(node, _numel(node))
 
+    # The packed input holds the plane the kernel walks, and for a transposed
+    # convolution that is the interleaved plane the zero-insert writes, so its
+    # height is the spec's rather than the operand's. A plain convolution keeps
+    # the operand's own dim, which has to stay the symbol when it is the run-time
+    # length so the frame is sized from the length handed in.
+    in_h_dim = (
+        _value_of(node.args[0]).shape[2]
+        if spec.dynamic_h and not spec.transposed
+        else spec.in_h
+    )
+    out_h_dim = _value_of(node).shape[2] if spec.dynamic_h else spec.out_h
     in_area = spec.in_h * spec.in_w
     out_area = spec.out_h * spec.out_w
     packed_in = source
     if not _conv_layouts_agree(in_area, spec.in_channels):
-        packed_in = ctx.builder.add_activation(
-            spec.batch
-            * in_area
-            * _channel_blocks(spec.in_channels)
-            * POOL_CHANNEL_BLOCK
-            * FP16_BYTES
+        packed_in = _blocked_activation(
+            ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
         )
         if not spec.depthwise and spec.in_channels % POOL_CHANNEL_BLOCK:
             # The im2col fill copies whole 64-lane groups out of the blocked
@@ -3641,18 +3863,35 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             # NaN there would turn into another NaN rather than a zero. The pack
             # blit below writes only the channels the tensor has, so those lanes
             # have to be zeroed first.
-            _emit_zero(ctx, node, packed_in)
+            _emit_zero(
+                ctx,
+                node,
+                packed_in,
+                dynamic_frame_bytes=(
+                    spec.batch
+                    * spec.in_w
+                    * _channel_blocks(spec.in_channels)
+                    * POOL_CHANNEL_BLOCK
+                    * FP16_BYTES
+                    if spec.dynamic_h
+                    else 0
+                ),
+            )
         _emit_channel_block_blit(
-            ctx, node, source, packed_in, spec.batch, in_area, spec.in_channels, True
+            ctx,
+            node,
+            source,
+            packed_in,
+            spec.batch,
+            in_area,
+            spec.in_channels,
+            True,
+            dynamic_area=spec.in_w if spec.dynamic_h else 0,
         )
     packed_out = out
     if not _conv_layouts_agree(out_area, spec.out_channels):
-        packed_out = ctx.builder.add_activation(
-            spec.batch
-            * out_area
-            * _channel_blocks(spec.out_channels)
-            * POOL_CHANNEL_BLOCK
-            * FP16_BYTES
+        packed_out = _blocked_activation(
+            ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
         )
 
     if spec.depthwise:
@@ -3670,7 +3909,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             _channel_blocks(spec.out_channels) * POOL_CHANNEL_BLOCK,
             "depthwise",
         )
-        ctx.emit(
+        op_index = ctx.emit(
             node,
             Op(
                 type=DSP_OP_CONV_DEPTHWISE2D_FP16,
@@ -3699,6 +3938,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
                 ],
             ),
         )
+        _patch_conv_extents(ctx, op_index, spec, im2col=False)
     else:
         weight = ctx.packed_weights(
             weight_node,
@@ -3714,7 +3954,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             -(-spec.out_channels // 32) * 32 + 32,
             "im2col",
         )
-        ctx.emit(
+        op_index = ctx.emit(
             node,
             Op(
                 type=DSP_OP_IM2COL_CONVOLUTION_FP16,
@@ -3770,9 +4010,18 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
                 ],
             ),
         )
+        _patch_conv_extents(ctx, op_index, spec, im2col=True)
     if packed_out is not out:
         _emit_channel_block_blit(
-            ctx, node, packed_out, out, spec.batch, out_area, spec.out_channels, False
+            ctx,
+            node,
+            packed_out,
+            out,
+            spec.batch,
+            out_area,
+            spec.out_channels,
+            False,
+            dynamic_area=spec.out_w if spec.dynamic_h else 0,
         )
     return ctx.record(node, out)
 
