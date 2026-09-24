@@ -494,6 +494,12 @@ class _Addmm(torch.nn.Module):
 
 
 def _run_addmm(m, k, n):
+    # The draw is pinned because the comparison below is this file's one exact
+    # one: the reference accumulates the product in torch's order and the
+    # interpreter in the command's, so an unpinned draw disagrees on a boundary
+    # element about one draw in ten (31 of 300 measured), by one fp16 step. A
+    # seed makes that a property of the case rather than of the run.
+    torch.manual_seed(0)
     x = torch.randn(m, k, dtype=torch.float16)
     model = _Addmm(k, n)
     program = to_edge(export(model, (x,))).exported_program()
