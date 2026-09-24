@@ -1044,12 +1044,24 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 #endif
             const bool contiguousCols = lp->src0StrideXYZ[1] == 2;
             if (contiguousCols && lp->src0StrideXYZ[0] == K * 2) {
+                const __fp16* src0Tile =
+                    (const __fp16*)(src0Base + (int64_t)eBase * lp->src0StrideXYZ[0]);
                 if (K % 64 != 0 || validRows < 32) {
                     memset(vtcmActivationRaw, 0, rawBytes);
                 }
-                htp_ops_loop_hmx_copy_block(vtcmActivationRaw,
-                                            (const __fp16*)(src0Base + (int64_t)eBase * lp->src0StrideXYZ[0]),
-                                            (size_t)validRows * K * 2);
+                // The staging tile is read a row at a time at up_div(K, 64) * 64
+                // elements, the width the packed weight tiles use, so a flat copy
+                // of validRows * K would leave every row but the first starting
+                // short of where the reader looks for it.
+                const size_t rawStride = (size_t)htp_ops_loop_up_div(K, 64) * 64;
+                if (rawStride == (size_t)K) {
+                    htp_ops_loop_hmx_copy_block(vtcmActivationRaw, src0Tile, (size_t)validRows * K * 2);
+                } else {
+                    for (int r = 0; r < validRows; ++r) {
+                        memcpy(vtcmActivationRaw + (size_t)r * rawStride,
+                               src0Tile + (size_t)r * K, (size_t)K * sizeof(__fp16));
+                    }
+                }
                 htp_ops_loop_hmx_transform_activation_block(vtcmActivation, vtcmActivationRaw, K, validRows);
             } else {
                 htp_ops_loop_hmx_pack_activation_block(vtcmActivation, src0Base, lp, K, eBase, validRows);
