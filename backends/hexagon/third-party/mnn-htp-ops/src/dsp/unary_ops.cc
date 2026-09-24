@@ -493,8 +493,9 @@ static inline void htp_ops_unary_compute_fp16_chunk(__fp16* dst, const __fp16* s
 
 // clamp is min(max(x, lo), hi) in that order, the same order torch's portable
 // kernel applies, so a range whose lower bound sits above its upper one comes
-// back as the upper bound. Both steps are fp16 vector compares, and a NaN
-// input fails both and stays NaN.
+// back as the upper bound. A NaN input fails both compares and would come back
+// as the upper bound, so both halves of the walk restore it by the magnitude
+// test below and leave the input, payload and all, in place.
 static inline void htp_ops_clamp_fp16_chunk(__fp16* dst, const __fp16* src, int size, _Float16 lo, _Float16 hi) {
   union {
     _Float16 h;
@@ -508,9 +509,13 @@ static inline void htp_ops_clamp_fp16_chunk(__fp16* dst, const __fp16* src, int 
   // upper bound and comes back as that bound where torch returns the input. The
   // magnitude test is exact in bits -- a NaN is an all-ones exponent with a
   // non-zero mantissa, so |x| > 0x7c00 -- and restores the input, payload and
-  // all, without asking the compare unit about NaN a second time.
+  // all, without asking the compare unit about NaN a second time. The scalar
+  // tail below applies the same test, so a tensor of any length and any tail
+  // length answers a NaN the same way.
   const HVX_Vector vmag = Q6_Vh_vsplat_R(0x7fff);
   const HVX_Vector vinf = Q6_Vh_vsplat_R(0x7c00);
+  const uint16_t mag_mask = 0x7fff;
+  const uint16_t mag_inf = 0x7c00;
   const float lo_f = (float)lo;
   const float hi_f = (float)hi;
 
@@ -534,6 +539,11 @@ static inline void htp_ops_clamp_fp16_chunk(__fp16* dst, const __fp16* src, int 
     dst_ptr += vec_len;
   }
   for (; i < size; ++i) {
+    const uint16_t x_bits = ((const uint16_t*)src)[i];
+    if ((uint16_t)(x_bits & mag_mask) > mag_inf) {
+      dst[i] = src[i];
+      continue;
+    }
     const float x = (float)src[i];
     dst[i] = (__fp16)(x < lo_f ? lo_f : (x > hi_f ? hi_f : x));
   }

@@ -110,10 +110,24 @@ static inline HtpOpsBinaryLoadFunc htp_ops_binary_pick_load_func(const void* ptr
   return htp_ops_binary_is_aligned_128(ptr) ? htp_ops_binary_load_aligned : htp_ops_binary_load_unaligned;
 }
 
+// An all-ones exponent with a non-zero mantissa. The HVX max and min the vector
+// loops use keep such a value, and the scalar compares Hexagon emits for the
+// same expression do not, so the kernels whose two halves have to agree ask for
+// the bits rather than for an ordering.
+static inline bool htp_ops_fp16_bits_are_nan(uint16_t bits) {
+  return (uint16_t)(bits & 0x7fff) > 0x7c00;
+}
+
+// The scalar half of `max(a + b, 0)`, for the elements a flat run leaves over.
+// It has to answer what the vector half's `Q6_Vhf_vmax_VhfVhf(v, 0)` answers,
+// and that is the input when the input is a NaN: reading the sign bit alone
+// would call a negative NaN negative, and the tail would answer 0 where the
+// vector loop answers NaN.
 static inline _Float16 htp_ops_binary_relu_fp16_scalar(_Float16 value) {
   uint16_t bits;
   memcpy(&bits, &value, sizeof(bits));
-  if ((bits & 0x8000) != 0 && (bits & 0x7fff) != 0) {
+  const uint16_t magnitude = bits & 0x7fff;
+  if ((bits & 0x8000) != 0 && magnitude != 0 && magnitude <= 0x7c00) {
     return (_Float16)0.0f;
   }
   return value;
@@ -2507,7 +2521,18 @@ static inline void htp_ops_reduce_fp16_scalar_range(HtpOpsReductionTaskState* st
       __fp16 best = src_base[0];
       for (int r = 1; r < reduce; ++r) {
         const __fp16 value = src_base[r * inside];
-        best = value > best ? value : best;
+        // The vector half folds with `Q6_Vhf_vmax_VhfVhf`, which keeps a NaN;
+        // this fold does not order against one and would hand back the value it
+        // was reduced with instead. Ask for the bits, as the clamp kernel does.
+        uint16_t best_bits;
+        uint16_t value_bits;
+        memcpy(&best_bits, &best, sizeof(best_bits));
+        memcpy(&value_bits, &value, sizeof(value_bits));
+        if (htp_ops_fp16_bits_are_nan(value_bits)) {
+          best = value;
+        } else if (!htp_ops_fp16_bits_are_nan(best_bits)) {
+          best = value > best ? value : best;
+        }
       }
       dst[index] = best;
     } else {

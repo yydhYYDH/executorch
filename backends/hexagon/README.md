@@ -367,7 +367,8 @@ Things that bite:
   infinity, which is the `max(x, 0)` torch computes; and `relu6` is
   `hardtanh(x, 0, 6)`. The kernel's compares are unordered, so a NaN would come
   back as the upper bound, and it restores the input where `|x| > 0x7c00`
-  instead (`unary_ops.cc:505-509`) -- that bit test is the whole reason relu may
+  instead (`unary_ops.cc:505-509`, and the scalar tail below it since this
+  branch) -- that bit test is the whole reason relu may
   be spelled this way, since `add_relu(x, 0)` is the form whose NaN behaviour is
   not documented anywhere.
 - **`torch.max(x)` and `torch.max(x, dim)` are different ops.** The reduce-all
@@ -784,9 +785,12 @@ Working and verified without a device:
   clears and torch refuses; a reduction whose span arrives as a run-time patch,
   run at a length shorter than its export with the arena past that length filled
   with a value no correct answer can contain; max pooling; the clamp family on a
-  NaN; the vision attention on `[1,4,2,64]` and `[2,3,4,64]`; and both quantized
-  GEMV entries, whose expectation mentions neither a tile, a group, a nibble nor
-  a scale position. Average
+  NaN, on both sides of the kernel's vector boundary and over five lengths; the
+  two other kernels whose scalar tail answered a NaN differently from its vector
+  loop, `add_relu` and a reduction's maximum, each with a NaN in both halves; the
+  vision attention on `[1,4,2,64]` and `[2,3,4,64]`; and both quantized GEMV
+  entries, whose expectation mentions neither a tile, a group, a nibble nor a
+  scale position. Average
   pooling comes back within 1.95e-3, which is its fp16 `1/count` divisor, and the
   same file carries three controls that assert the opposite -- a row-major tile
   table, a blanked dynamic trailer and an exchanged pool layout each have to move
@@ -921,26 +925,35 @@ Not done yet:
   subtype for. Without the pass the pair still reaches the DSP, as a binary add
   and a unary clamp, so the pass buys a command rather than a round trip -- a
   smaller claim than it made before `aten.relu.default` had an emitter.
-  `test/test_add_relu.py` pins the rewrite, the command and its numbers -- all on
-  the host. Unverified on device: that the fp16 vector path's `max(a + b, 0)`
-  propagates a NaN where torch's relu does, since `Q6_Vhf_vfmax`'s NaN behaviour
-  is not documented here; and that an add whose sum has another reader still gets
-  the command, which is a partition question rather than a kernel one.
+  `test/test_add_relu.py` pins the rewrite, the command and its numbers, and
+  `test_blob_on_sim.py` now runs the command itself through the kernel on a NaN
+  that lands on both sides of its vector boundary. Unverified on device: that the
+  **vector** path's `max(a + b, 0)` propagates a NaN where torch's relu does,
+  since `Q6_Vhf_vfmax`'s NaN behaviour is not documented here -- the scalar half
+  used to answer a sign-bit-set NaN with `0.0` where the vector half kept it, and
+  no longer does (`VENDORING.md`, modification 4); and that an add whose sum has
+  another reader still gets the command, which is a partition question rather than
+  a kernel one.
 - **the clamp entry point has run on hexagon-sim, and the NaN path it was feared
-  for is not one path but two.** On a tensor of 64 fp16 elements or more the
-  kernel takes its vector loop and restores a NaN by the `(|x| & 0x7fff) > 0x7c00`
-  bit test: `relu`, `relu6` and `hardtanh(-1, 1)` all come back bit-for-bit
-  against torch, NaN included, and the two bounds are read as fp16 bit patterns
-  out of params[3] and params[4] in that order. Below one vector there is no
-  vector loop and no bit test -- `unary_ops.cc:536-539` is `x < lo ? lo : x > hi ?
-  hi : x` -- and on the simulator that answers a NaN with the *upper bound*:
-  `relu(NaN)` comes back as `+inf` where torch and the host model return the NaN.
-  No exception, no shape change, one wrong number. `test_blob_on_sim.py` reports
-  this as `xfail(strict=True)` on a 32-element case rather than asserting it
-  away, and the same file's 128-element cases are the ones that pass. Whether
-  silicon's scalar fp16 compare is ordered the way IEEE says, and so agrees with
-  torch instead, needs a device run before `relu` is trusted on data that can be
-  NaN; either way the kernel has no bit test on that path;
+  for is not one path but two.** The kernel walks `size & -64` elements a vector
+  at a time and the rest one at a time, and until this branch the two halves
+  answered a NaN differently. The vector loop restored one by the
+  `(|x| & 0x7fff) > 0x7c00` bit test; the tail (`unary_ops.cc:536-539`,
+  `x < lo ? lo : x > hi ? hi : x`) let the unordered compare send it to the upper
+  bound, so `relu(NaN)` came back as `+inf` -- `6.0` for `relu6`, `1.0` for
+  `hardtanh(-1, 1)` -- where torch and the host model return the NaN. No
+  exception, no shape change, one wrong number, and it was any length that is not
+  a multiple of 64 rather than only a short tensor: 32, 65, 100, 127 and 129 all
+  lose the NaNs in their tails on the simulator, and 64 and 128 do not. The tail
+  now carries the same bit test (`VENDORING.md`, modification 4), and
+  `test_blob_on_sim.py` asserts it on 32, 64, 100, 127 and 129 elements, all three
+  bounds, bit for bit against torch, rather than reporting it as an `xfail`
+  (`test_the_clamp_tail_answers_a_nan_with_the_nan`). The two bounds are read as
+  fp16 bit patterns out of params[3] and params[4] in that order. What is left for
+  a device run is the vector half: it restores a NaN through
+  `Q6_Q_vcmp_gt_VhfVhf`, whose unordered behaviour has no documented NaN result
+  here, so whether silicon's compare keeps the NaN where the simulator's does is
+  still open before `relu` is trusted on data that can be NaN;
 - **`torch.mean(x)` / `torch.max(x)` / `x ** 2` have never run anywhere but on
   the host either**, in the same sense as the other reductions: the span
   `[1][numel][1]` and the unary square are transcriptions. The mean's span is

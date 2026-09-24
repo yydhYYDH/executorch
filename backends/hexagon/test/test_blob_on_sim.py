@@ -541,6 +541,8 @@ def _tagged(cases, tag):
 _SHARED_GATHER = 23
 _POOL2D = 1
 _UNARY = 4
+_BINARY = 19
+_ADD_RELU = 8
 _REDUCTION = 29
 _VISION_ATTENTION = 43
 _Q4A16_GEMV = 41
@@ -843,6 +845,55 @@ class _Clamp(torch.nn.Module):
         return torch.clamp(x, self.lower, self.upper)
 
 
+class _AmaxAt(torch.nn.Module):
+    """The maximum over the first axis of a two-row tensor.
+
+    The reduced axis is the two rows, and everything after it -- the columns --
+    is the extent `htp_ops_reduction` vectorizes in 64-wide steps. A hundred
+    columns therefore leave six over for the scalar tail, which is the half of
+    the walk a width that is a multiple of 64 never reaches.
+    """
+
+    def forward(self, x):
+        return torch.amax(x, dim=0)
+
+
+class _RectifiedSum(torch.nn.Module):
+    """The pair `FuseAddReluPass` rewrites into the kernel's op type 8."""
+
+    def forward(self, x, y):
+        return torch.nn.functional.relu(x + y)
+
+
+#: The values the clamp sweep is about, in the order it cycles them: a NaN, both
+#: infinities, a negative zero, and four ordinary values the clamp has real work
+#: on. A NaN has to come back a NaN, and an infinity or a negative zero has to
+#: survive the bound it sits outside of.
+_SPECIALS = [
+    float("nan"),
+    float("inf"),
+    float("-inf"),
+    -0.0,
+    0.0,
+    2.5,
+    -2.5,
+    0.25,
+]
+
+
+def _clamp_operand(special, length):
+    """A `length`-element operand whose values repeat along the whole walk.
+
+    Every eighth element is a NaN, an infinity or a negative zero, so whichever
+    of the kernel's two halves a length sends to the scalar tail -- it walks
+    `length & -64` elements a vector at a time and the rest one at a time -- the
+    tail holds all four. The elements between them are ordinary values, so a case
+    is not only about the specials.
+    """
+    repeats = -(-length // len(_SPECIALS))
+    return special.repeat(repeats)[:length]
+
+
 def _vision_graph(batch, tokens, heads, head_dim, scale):
     """`et_hexagon.vision_attention` as one VISION_ATTENTION_FP16.
 
@@ -903,7 +954,7 @@ def _reduction_graph(dim):
     return _Sum()
 
 
-def _lowered_blob(model, args, dynamic_shapes):
+def _lowered_blob(model, args, dynamic_shapes, passes=()):
     """The blob the real pipeline produces, and the operands its delegate takes."""
     from executorch.backends.hexagon.partition.hexagon_partitioner import (
         HexagonPartitioner,
@@ -912,6 +963,7 @@ def _lowered_blob(model, args, dynamic_shapes):
 
     program = to_edge_transform_and_lower(
         export(model, tuple(args), dynamic_shapes=dynamic_shapes),
+        transform_passes=list(passes),
         partitioner=[HexagonPartitioner()],
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
@@ -1273,46 +1325,89 @@ def _branch_cases():
     # 3. The clamp family's NaN path. A NaN has to come back as a NaN: if the
     #    kernel's restore is not the bit test the branch read, the bound comes
     #    back instead and nothing raises.
-    torch.manual_seed(11)
-    special = torch.tensor(
-        [
-            float("nan"),
-            float("inf"),
-            float("-inf"),
-            -0.0,
-            0.0,
-            2.5,
-            -2.5,
-            0.25,
-        ],
-        dtype=torch.float16,
-    )
-    filled = torch.cat([special, torch.randn(24, dtype=torch.float16)]).reshape(2, 16)
-    # The kernel walks the tensor in one-HVX-vector chunks and finishes with a
-    # scalar tail (unary_ops.cc:517-539); only the chunk restores a NaN by the
-    # bit test, so the two sizes are two different code paths and both are here.
-    # 128 elements is two whole vectors with the specials in the first.
-    wide = torch.cat([special, torch.randn(120, dtype=torch.float16)]).reshape(4, 32)
-    for tag, model, operand, kind in (
-        ("X", _Clamp("relu"), wide, "nan"),
-        ("Y", _Clamp("relu6"), wide, "nan"),
-        ("Z", _Clamp("hardtanh", -1.0, 1.0), wide, "nan"),
-        # 32 elements is the tail alone; the case is the branch's own claim run
-        # where the kernel does not keep it, and it is reported rather than
-        # asserted away. See test_the_clamp_tail_answers_a_nan_with_the_bound.
-        ("AF", _Clamp("relu"), filled, "tail"),
+    #
+    #    The operand cycles a NaN, both infinities and a negative zero through
+    #    every eighth element, so whichever half of it a length sends through the
+    #    kernel's scalar tail carries all four. That is the point of the sweep:
+    #    the kernel walks `size & -64` elements a vector at a time and the rest
+    #    one at a time (unary_ops.cc:522-541), and until the clause below was
+    #    added the two halves answered a NaN differently, so 32 and 65 and 100
+    #    and 127 and 129 are five different walks and not five of one.
+    special = torch.tensor(_SPECIALS, dtype=torch.float16)
+    # BA..BK rather than the next letters after Z: every single letter and every
+    # "A?" pair was already taken by the time this branch met the others, and two
+    # fixtures sharing a tag is not cosmetic -- `_tagged` returns the first match
+    # and the runner dispatches by tag, so the second case would be checked
+    # against the first one's answer.
+    for tag, model, length in (
+        ("BA", _Clamp("relu"), 32),
+        ("BB", _Clamp("relu"), 64),
+        ("BC", _Clamp("relu"), 100),
+        ("BD", _Clamp("relu"), 127),
+        ("BE", _Clamp("relu"), 129),
+        ("BF", _Clamp("relu6"), 32),
+        ("BG", _Clamp("relu6"), 100),
+        ("BH", _Clamp("hardtanh", -1.0, 1.0), 32),
+        ("BI", _Clamp("hardtanh", -1.0, 1.0), 100),
     ):
+        operand = _clamp_operand(special, length)
         cases.append(
-            _case(
-                tag,
-                model,
-                (operand,),
-                _bits(model(operand).half()),
-                kind=kind,
-            )
+            _case(tag, model, (operand,), _bits(model(operand).half()), kind="bits")
         )
 
-    # 4. The pool: the packed window walk between two blits, with the geometry
+    # 128 elements is two whole vectors, so the specials in the first one never
+    # reach the tail. Kept beside the sweep as the vector-only reference for all
+    # three bounds.
+    torch.manual_seed(11)
+    wide = torch.cat([special, torch.randn(120, dtype=torch.float16)]).reshape(4, 32)
+    for tag, model in (
+        ("X", _Clamp("relu")),
+        ("Y", _Clamp("relu6")),
+        ("Z", _Clamp("hardtanh", -1.0, 1.0)),
+    ):
+        cases.append(_case(tag, model, (wide,), _bits(model(wide).half()), kind="nan"))
+
+    # 4. The two other kernels whose scalar half had the same hole as the clamp
+    #    family above: the fold a reduction's maximum walks its tail with, and
+    #    the scalar relu `add_relu` falls back to. A NaN in the tail came back as
+    #    the value it was folded against -- the other row, or a zero -- where the
+    #    vector half of each keeps the NaN.
+    #
+    #    `inside` is the extent the reduction vectorizes, so a 2x100 tensor
+    #    reduced over its first axis leaves columns 64..99 to the tail and puts a
+    #    NaN in each half: column 3 goes through the vector loop, column 95 does
+    #    not. The comparison is per-NaN rather than per-bit because the payload
+    #    each half picks is its own; only the NaN itself is the contract.
+    columns = _small((2, 100))
+    columns[0, 3] = float("nan")
+    columns[0, 95] = float("nan")
+    cases.append(
+        _case("BJ", _AmaxAt(), (columns,), _bits(_AmaxAt()(columns)), kind="nan")
+    )
+
+    # 80 elements is inside the vector loop and 16 of them are left over, so the
+    # same split again: element 4 answers from the vector half and element 76
+    # from the scalar one. Two operands rather than one repeated, because a blob
+    # whose two inputs are the same tensor is one input to the exporter.
+    from executorch.backends.hexagon.add_relu import FuseAddReluPass
+
+    left, right = _small((2, 40)), _small((2, 40))
+    left[0, 4] = left[1, 36] = float("nan")
+    right[0, 4] = right[1, 36] = float("nan")
+    cases.append(
+        _case(
+            "BK",
+            None,
+            (left, right),
+            _bits(torch.nn.functional.relu(left + right)),
+            blob=_lowered_blob(
+                _RectifiedSum(), (left, right), {}, passes=(FuseAddReluPass(),)
+            ),
+            kind="nan",
+        )
+    )
+
+    # 5. The pool: the packed window walk between two blits, with the geometry
     #    the emitter asserts the fast path wants. C is 64, the one channel count
     #    the support check admits.
     pooled = (
@@ -1655,21 +1750,80 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["S"] == kinds["U"], "the control is not a copy of the gather case"
     assert kinds["V"] == [_REDUCTION], "the dynamic sum is not a reduction"
     assert kinds["V"] == kinds["W"], "the control is not a copy of the sum case"
-    for tag in ("X", "Y", "Z", "AF"):
+    for tag in ("X", "Y", "Z"):
         assert kinds[tag] == [_UNARY], f"{tag}: the clamp family is not the unary one"
+    # The sweep's point is that both halves of the kernel's walk are reached, and
+    # that the half this bug was in is the one holding a NaN. Each case states
+    # the element count the blob itself declares, and every case whose length is
+    # not a multiple of the vector has to carry a NaN *past* the boundary --
+    # otherwise the case passes on a kernel that only restores NaN in the vector
+    # loop, which is the kernel this sweep exists to separate.
+    sweep = {
+        "BA": 32,  # the scalar tail alone
+        "BB": 64,  # one whole vector, no tail
+        "BC": 100,  # one vector, then 36 tail elements
+        "BD": 127,  # one vector, then 63 tail elements
+        "BE": 129,  # two vectors, then one tail element
+        "BF": 32,  # relu6's bound, on the tail alone
+        "BG": 100,  # relu6's bound, on both halves
+        "BH": 32,  # hardtanh's two bounds, on the tail alone
+        "BI": 100,  # hardtanh's two bounds, on both halves
+    }
+    for tag, length in sweep.items():
+        case = _tagged(cases, tag)
+        assert kinds[tag] == [_UNARY], f"{tag}: the clamp family is not the unary one"
+        declared = next(iter(case.commands)).params[0]
+        assert declared == length, f"{tag}: the command clamps {declared} elements"
+        vector_end = length & -64
+        answer = _from_bits(case.expected.view("uint16").tolist())
+        tail = np.isnan(answer[vector_end:]) if vector_end < length else None
+        if vector_end == length:
+            continue
+        assert tail is not None and tail.any(), (
+            f"{tag}: the tail of a {length}-element walk ({vector_end}..{length - 1}) "
+            "holds no NaN, so the case cannot tell the two halves apart"
+        )
+    assert {length % 64 == 0 for length in sweep.values()} == {
+        True,
+        False,
+    }, "the sweep only walks one half of the kernel"
+    assert (
+        min(sweep.values()) < 64 <= max(sweep.values())
+    ), "the sweep leaves either the tail-alone or the multi-vector case out"
     assert all(
         next(iter(_tagged(cases, tag).commands)).params[0] >= 64
         for tag in ("X", "Y", "Z")
     ), "a clamp case is short enough to run the scalar tail"
-    assert (
-        next(iter(_tagged(cases, "AF").commands)).params[0] < 64
-    ), "AF is meant to be the scalar tail alone"
     for tag in ("AA", "AB", "AC"):
         # The emitter's two blits around the command are part of the command
         # being what it claims: without them the kernel reads other channels.
         assert kinds[tag] == [3, _POOL2D, 3], f"{tag}: the pool is not pack/pool/unpack"
     for tag in ("AD", "AE"):
         assert kinds[tag] == [_VISION_ATTENTION], f"{tag}: not a vision attention"
+    # The two kernels fixed beside the clamp: each has to be the command it
+    # claims, and each has to carry a NaN on both sides of its boundary -- index
+    # 3 and 4 are inside the vector loop, 95 and 36 are past it -- or it settles
+    # nothing about the half this bug was in.
+    assert kinds["BJ"] == [_REDUCTION], "the amax is not a reduction"
+    assert kinds["BJ"] == kinds["V"], "the amax is not the same command as the sum"
+    amax = next(iter(_tagged(cases, "BJ").commands))
+    assert list(amax.params[:5]) == [1, 2, 100, 2, 2], f"amax: {list(amax.params)}"
+    answer = _from_bits(_tagged(cases, "BJ").expected.view("uint16").tolist())
+    assert np.isnan(answer[3]) and np.isnan(
+        answer[95]
+    ), "the amax case does not carry a NaN on both sides of the vector"
+    assert kinds["BK"] == [_BINARY], "the rectified sum is not a binary op"
+    add_relu = next(iter(_tagged(cases, "BK").commands))
+    assert list(add_relu.params[:8]) == [
+        80,
+        80,
+        80,
+        _ADD_RELU,
+        2,
+        2,
+        0,
+        0,
+    ], f"add_relu: {list(add_relu.params)}"
 
     # The quantized matmuls, on the op type they claim. Every one of them is a
     # GEMV: a prefill-shaped matmul on the same weight has no kernel here and
@@ -1743,7 +1897,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert (
         blob_interpreter.read_dynamic_trailer(_tagged(cases, "W").blob) is None
     ), "the control still carries its trailer"
-    for tag in ("S", "X", "Y", "Z", "AF", "AA", "AB", "AC", "AD", "AE"):
+    for tag in ("S", "X", "Y", "Z", "BA", "AA", "AB", "AC", "AD", "AE"):
         assert (
             blob_interpreter.read_dynamic_trailer(_tagged(cases, tag).blob) is None
         ), f"{tag}: a static blob carries a trailer"
@@ -1784,10 +1938,6 @@ def test_every_blob_agrees_three_ways(cases, simulated):
                 _host_bits(case.host[0]) == expected_bits
             ), f"{case.tag}: the host model disagrees with torch"
             assert dsp == expected_bits, f"{case.tag}: the DSP disagrees with torch"
-        elif case.kind == "tail":
-            # The one case the DSP does not agree on, and a real wrong answer
-            # rather than a tolerance: it is asserted on its own, below.
-            continue
         elif case.kind == "nan":
             # Bit-exact, except that one NaN is as good as another: the claim is
             # that a NaN comes back as a NaN rather than as the bound.
@@ -1885,6 +2035,9 @@ def test_a_nan_comes_back_as_a_nan_and_not_as_the_bound(cases, simulated):
     comes back as the upper bound: no exception, no wrong shape, one wrong
     number. `nan` comparisons pass on either answer by construction, so this is
     the assertion with teeth -- and it is on the DSP's own output.
+
+    `X` to `Z` are 128 elements, which is the vector loop and nothing else; the
+    sweep below is every length where the tail holds one of the specials.
     """
     for tag, bound in (("X", None), ("Y", 6.0), ("Z", 1.0)):
         dsp = _from_bits(simulated[f"{tag}0"])
@@ -1895,32 +2048,114 @@ def test_a_nan_comes_back_as_a_nan_and_not_as_the_bound(cases, simulated):
             ), f"{tag}: a NaN input came back as the upper bound {bound}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the simulator answers a NaN with the upper bound when the clamp runs "
-    "its scalar tail: unary_ops.cc:536-539 has no NaN bit test, and `x > hi` is "
-    "true for a NaN there. Reported in SIM-report.md rather than asserted away.",
-)
-def test_the_clamp_tail_answers_a_nan_with_the_bound(cases, simulated):
-    """A wrong answer found on the simulator, on a tensor shorter than one vector.
+def test_the_clamp_tail_answers_a_nan_with_the_nan(cases, simulated):
+    """The scalar tail restores a NaN, on every length that reaches it.
 
-    `htp_ops_clamp_fp16_chunk` restores a NaN by the `(|x| & 0x7fff) > 0x7c00`
-    bit test inside its vector loop (unary_ops.cc:531-532). A tensor of fewer
-    than 64 fp16 elements never reaches that loop: `vec_end` is zero and every
-    element goes through `x < lo ? lo : x > hi ? hi : x`, which has no bit test
-    at all. On the simulator that answers a NaN with the upper bound -- `inf` for
-    relu -- where torch, and the host model, return the NaN.
+    The bug this closes was found on the simulator and reported rather than
+    asserted away: `htp_ops_clamp_fp16_chunk` restored a NaN by the
+    `(|x| & 0x7fff) > 0x7c00` bit test inside its vector loop
+    (unary_ops.cc:531-532) and the scalar tail it finishes with had no bit test
+    at all, only `x < lo ? lo : x > hi ? hi : x`. A NaN fails both fp16 compares
+    -- they are not ordered -- so a length that never entered the vector loop
+    answered a NaN with the upper bound: `inf` for relu, `6.0` for relu6, `1.0`
+    for hardtanh, where torch returns the input.
 
-    The case is 32 elements, so it is the tail and nothing else; `X` above is the
-    same claim on 128 elements, which is the path that does keep it.
+    `vec_end` is `size & -64`, so this was never about short tensors: every
+    length that is not a multiple of 64, which is 63 of the first 64, sent its
+    last `size & -64 .. size - 1` elements down the path that lost the NaN. The
+    sweep is those lengths on both sides of the vector, and the case above is the
+    same claim where there is no tail at all.
+
+    The bit test is now in both halves, so this is a plain assertion: the tail
+    answers the NaN, payload and all, and the three bounds answer their own.
     """
-    assert _tagged(cases, "AF").kind == "tail"
-    dsp = _from_bits(simulated["AF0"])
-    host = _from_bits(_host_bits(_tagged(cases, "AF").host[0]))
-    assert np.isnan(host[0]), f"the host model answered {host[0]}"
-    assert np.isnan(
-        dsp[0]
-    ), f"the DSP answered {dsp[0]} for a NaN in a 32-element tensor"
+    for tag, length, bound in (
+        ("BA", 32, None),  # relu: the tail alone, upper bound +inf
+        ("BB", 64, None),  # relu: one whole vector, no tail to get wrong
+        ("BC", 100, None),  # relu: one vector, 36 elements of tail
+        ("BD", 127, None),  # relu: one vector, 63 elements of tail
+        ("BE", 129, None),  # relu: two vectors, one element of tail
+        ("BF", 32, 6.0),  # relu6's bound, on the tail alone
+        ("BG", 100, 6.0),  # relu6's bound, on both halves
+        ("BH", 32, 1.0),  # hardtanh's two bounds, on the tail alone
+        ("BI", 100, 1.0),  # hardtanh's two bounds, on both halves
+    ):
+        case = _tagged(cases, tag)
+        assert next(iter(case.commands)).params[0] == length
+        dsp = _from_bits(simulated[f"{tag}0"])
+        host = _from_bits(_host_bits(case.host[0]))
+        # The operand's own NaN is at index 0 and every eighth element after it,
+        # so a length that reaches the tail has a NaN in the tail as well.
+        for index in range(0, length, 8):
+            assert np.isnan(
+                dsp[index]
+            ), f"{tag}: the DSP answered {dsp[index]} for the NaN at {index}"
+            assert np.isnan(
+                host[index]
+            ), f"{tag}: the host model answered {host[index]} at {index}"
+            if bound is not None:
+                assert dsp[index] != np.float16(bound), (
+                    f"{tag}: the DSP answered the upper bound {bound} for the NaN "
+                    f"at {index}, which is {'the tail' if index >= length & -64 else 'the vector loop'}"
+                )
+        # And the values that are not specials still clamp: a tail that restored
+        # every element would pass the loop above.
+        assert np.array_equal(
+            dsp.view(np.uint16), case.expected.view("uint16")
+        ), f"{tag}: the DSP side is not torch bit for bit"
+
+
+def test_the_other_two_tails_keep_a_nan_as_well(cases, simulated):
+    """The same class of defect, found by looking for it in the other kernels.
+
+    Two more walks have a vector half and a scalar half that disagreed on a NaN,
+    and neither is a short-tensor case: it is any element the vector loop does
+    not reach, which for a reduction is a whole row narrower than 32 columns or
+    the tail of a wider one, and for `add_relu` is any length that is not a
+    multiple of the vector.
+
+    `htp_ops_reduce_fp16_scalar_range` folded `best = value > best ? value : best`
+    (eltwise_ops.cc:2521-2523) and `htp_ops_binary_relu_fp16_scalar` answered a
+    sign-bit-set NaN with zero (eltwise_ops.cc:113-119). A NaN came back as the
+    value it was folded against, or as `0.0`, where the vector half of each --
+    `Q6_Vhf_vmax_VhfVhf`, and the same instruction behind the rectifier --
+    returns it.
+
+    Both cases carry a NaN inside the vector loop and one past it, so this fails
+    if either half loses it. The comparison is per-NaN: which payload comes back
+    is the kernel's business, but that it is a NaN is not.
+    """
+    for tag, vector_end, inside, tail in (
+        ("BJ", 64, (3,), (95,)),  # amax: the reduction's inside extent, 100 wide
+        ("BK", 64, (4,), (76,)),  # add_relu: 80 elements, 16 of them over
+    ):
+        case = _tagged(cases, tag)
+        dsp = _from_bits(simulated[f"{tag}0"])
+        host = _from_bits(_host_bits(case.host[0]))
+        want = np.isnan(case.expected.view(np.float16))
+        mismatch = np.flatnonzero(np.isnan(dsp) != want)
+        assert not mismatch.size, (
+            f"{tag}: the DSP and torch disagree on which elements are NaN: "
+            + ", ".join(
+                f"{int(index)} is {dsp[index]} on the DSP and {case.expected[index]} "
+                "in torch"
+                for index in mismatch
+            )
+        )
+        for index in inside:
+            assert index < vector_end, f"{tag}: {index} is not in the vector loop"
+            assert np.isnan(
+                dsp[index]
+            ), f"{tag}: the vector loop answered {dsp[index]} for the NaN at {index}"
+        for index in tail:
+            assert index >= vector_end, f"{tag}: {index} is not in the tail"
+            assert np.isnan(dsp[index]), (
+                f"{tag}: the tail answered {dsp[index]} for the NaN at {index} "
+                "instead of the NaN"
+            )
+            assert np.isnan(
+                host[index]
+            ), f"{tag}: the host model answered {host[index]} at {index}"
 
 
 def test_the_vision_case_can_tell_the_two_layouts_apart(cases):

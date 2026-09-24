@@ -19,10 +19,13 @@ upstream, so the license is retained here as `LICENSE`, copied verbatim from
 the upstream tree at the revision above, and the attribution required by section
 4 of the license is in `NOTICE`.
 
-Nothing here has been relicensed. The two modifications listed under "Local
-modifications" are build-environment fixes and do not change behavior. One defect
-was found in this snapshot and is described under "Defects found in this
-snapshot"; it is not fixed here and nothing in this directory was changed for it.
+Nothing here has been relicensed. Of the four modifications listed under "Local
+modifications", the first two are build-environment fixes and do not change
+behavior; the other two are ExecuTorch's own -- one instrumentation that only
+runs when the host passes a profile buffer, and one correctness fix to the scalar
+tails of three kernels. Separately, one defect was found in this snapshot and is
+described under "Defects found in this snapshot"; that one is not fixed here, and
+nothing in this directory was changed for it.
 
 ## Why the DSP side is kept verbatim
 
@@ -58,17 +61,24 @@ Each command is a FlatBuffers `DSPCOMMAND::Command` at `(cmd_fd, cmd_offset)`:
 
 ## Local modifications
 
-Three. The first two are forced by the build environment; the third is
-instrumentation that only runs when the host asks for it:
+Four. The first two are forced by the build environment, the third is
+instrumentation that only runs when the host asks for it, and the fourth is a
+correctness fix:
 
 1. `src/dsp/vtcm_mgr.cc` — one `#include "flatbuffers/flatbuffers.h"` removed.
    The file never references the `flatbuffers::` namespace, and adding the
    dependency for a dead include would couple the skel to flatbuffers.
 2. `schema/current/Command_generated.h` is checked in rather than generated.
    Upstream generates it with `flatc` from `schema/Command.fbs`; the checked-in
-   header is byte-identical to upstream's, and `flatc` is not part of the
-   Hexagon SDK. `schema/current/Command.fbs` is kept as the source of truth, so
-   the header can be regenerated whenever flatc is available.
+   header is that schema generated with flatc 24.3.25 -- the version its own
+   static assertion requires -- and declares the same seven accessors
+   (`type`, `inputs`, `outputs`, `params`, `fd`, `offset`, `size`) as the header
+   in the upstream tree. It is not byte-identical to that header: the older flatc
+   upstream used writes its own scaffolding (raw field offsets rather than `VT_`
+   constants, `MiniReflectTypeTable` rather than builders). `flatc` is not part of
+   the Hexagon SDK. `schema/current/Command.fbs` is kept as the source of truth,
+   byte-identical to upstream's, so the header can be regenerated whenever flatc
+   is available.
 3. The profile buffer (`htp_ops_execute_command_group_profile`, and the probe
    records and stage writes in `src/dsp/execute_command.cc` plus the `htp_probe_stage`
    calls in the attention kernels) is ExecuTorch's, not upstream's. It exists
@@ -78,11 +88,47 @@ instrumentation that only runs when the host asks for it:
    upstream. It now also records each command's kernel microseconds in the last
    int of its probe record and marks the header with a version, which is what
    the host-side profiler reads to attribute time to individual ops.
+4. Three kernels answered a NaN differently in the scalar tail they finish their
+   vector loop with than the vector loop itself does, and differently from
+   torch. `htp_ops_clamp_fp16_chunk` (`src/dsp/unary_ops.cc`, the clamp behind
+   relu, relu6 and hardtanh) returned the bound, `htp_ops_binary_relu_fp16_scalar`
+   (`src/dsp/eltwise_ops.cc`, the scalar half of `add_relu`) returned zero, and
+   the maximum fold in `htp_ops_reduce_fp16_scalar_range` (`src/dsp/eltwise_ops.cc`)
+   returned the value it was reduced against. Each now asks for the NaN by the
+   `(|x| & 0x7fff) > 0x7c00` bit test the vector half already used and leaves the
+   input in place, so a NaN that lands in the tail comes back a NaN. The three
+   are covered on hexagon-sim by `backends/hexagon/test/test_blob_on_sim.py`,
+   whose clamp sweep and `test_the_other_two_tails_keep_a_nan_as_well` go red
+   without them. Replaying this on an upstream update means the bit tests in
+   those three functions, and the `htp_ops_fp16_bits_are_nan` helper the
+   reduction fold reads (`src/dsp/eltwise_ops.cc`; the clamp tail and `add_relu`
+   write the same test out inline instead of calling it), and nothing else in
+   either file changed.
+
+   The reduction one is partial: `Q6_Vhf_vmax_VhfVhf` in that op's vector half
+   answers a NaN whose sign bit is set by returning the other operand, so the
+   vector half still differs from torch, and from the now-fixed tail, for that
+   value. Left as it is rather than masked over, because keeping a NaN there
+   means carrying a predicate through the fold and through the five vector
+   rotations that finish it, which is a different change from this one.
 
 ## Defects found in this snapshot
 
-One, and it is not fixed here: the sources in this directory are byte-identical to
-the revision above except for the three items under "Local modifications".
+One, and it is not fixed here.
+
+The pin above is not a byte-for-byte description of this directory, and this
+branch did not make it one. Measured against a clean checkout of `b8c533a`: of
+the 70 files under `include/` and `src/dsp/` that the pin has, 51 are
+byte-identical and 19 differ, 2125 changed lines in all, and the four items above
+account for only part of that. The attention kernels also carry entry-point
+parameters, a DMA-fault probe and compile-time bypass and cache-allocation knobs
+(`MNN_ATTN_SRC_BYPASS`, `MNN_ATTN_WEIGHT_CACHEALLOC`, `g_attn_dma_fault`), and
+the HMX path carries a tile budget (`hmxFlags`, `hmxTileBudget`,
+`HMX_FP16_MAX_TILES_PER_LOAD`) that `hexagon_ops.py` plans for, a
+`worker_pool_debug_state` entry and a VTCM alloc-end guard -- none of which the
+list above describes. Re-vendoring this directory means diffing it against the
+pinned revision rather than trusting the pin; attributing the rest of those 19
+files is left to whoever does that.
 
 ### `store_output_tile_fp16` puts the wrong channel tile's bias in a ragged position tile
 
