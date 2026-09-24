@@ -482,3 +482,23 @@ def test_a_parameter_is_only_a_constant_with_the_partitioners_data_names():
     assert (
         _support(_program(pool, pool_inputs)).is_node_supported({}, pool_node) is True
     )
+
+
+def test_a_lowering_counts_each_refused_node_once():
+    """The count is nodes, not calls into the support check.
+
+    `to_edge_transform_and_lower` asks the predicate about the same node twice
+    (measured: this graph reports 2 before the dedupe), so a real lowering and the
+    `_refusals` helper above -- one pass over the graph -- disagreed by that
+    factor, and the number a caller reads after a lowering is the inflated one.
+    """
+    _delegates(*_pool(3))
+    assert refused_overload_census() == {MAX_POOL: 1}
+
+
+def test_two_nodes_of_the_same_target_count_twice():
+    """The dedupe is by node and not by target: two refusals are two."""
+    pool = _Pool(3)
+    inputs = (torch.randn(1, 3, 16, 16, dtype=F16),)
+    _delegates(_M(lambda x: pool(x) + pool(x * 0.5)), inputs)
+    assert refused_overload_census() == {MAX_POOL: 2}

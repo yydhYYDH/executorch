@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import weakref
 from typing import Dict, final, FrozenSet, Optional, Set
 
 import torch
@@ -368,6 +369,18 @@ _LOGGER = logging.getLogger(__name__)
 # here; those are pinned row by row in `test_overload_census2.py` instead.
 _UNWIRED: Dict[str, Dict[str, int]] = {}
 
+# The nodes already counted, so that the numbers stay counts of nodes. The
+# partitioner asks the support check about a node once, but a lowering asks about
+# the same node twice (measured: `nn.MaxPool2d(2)` with `refused_overload_census`
+# read after one `to_edge_transform_and_lower` reports 2), and any reader of the
+# census would otherwise be reading twice the measurement it looks like.
+#
+# Weak, so a census nobody resets cannot pin a graph's nodes in memory, and keyed
+# by the node rather than by its name because names repeat across graphs: a caller
+# counting two models without resetting in between would otherwise fold them
+# together and undercount, which is the same wrong number in the other direction.
+_UNWIRED_NODES: "weakref.WeakSet[torch.fx.Node]" = weakref.WeakSet()
+
 # Rebuilt rather than computed at import: the attention overloads register their
 # emitter on first use, after this module has been imported.
 _EMITTED_FAMILIES: Optional[FrozenSet[str]] = None
@@ -395,6 +408,9 @@ def unwired_overload_census() -> Dict[str, Dict[str, int]]:
 
     A test asserts on this rather than on the log: the log is off by default and
     the counter is what a census can compare between two runs.
+
+    A count is a number of nodes, not of calls into the support check: a node is
+    counted once however many times the partitioner asks about it.
     """
     return {family: dict(targets) for family, targets in _UNWIRED.items()}
 
@@ -402,6 +418,7 @@ def unwired_overload_census() -> Dict[str, Dict[str, int]]:
 def reset_unwired_overload_census() -> None:
     """Start the census over, for a caller that counts one model at a time."""
     _UNWIRED.clear()
+    _UNWIRED_NODES.clear()
 
 
 def _note_unwired_target(node: torch.fx.Node) -> None:
@@ -410,10 +427,16 @@ def _note_unwired_target(node: torch.fx.Node) -> None:
     Called only where the support check has already decided the node stays off
     the DSP, so nothing here can change what is supported: the return value is
     the same `False`, no emitter runs, and the command stream is untouched.
+
+    The node is counted once, on its first visit and not on the later ones a
+    single lowering makes to the same node.
     """
     family = _schema_name(node.target)
     if family is None or family not in _emitted_families():
         return
+    if node in _UNWIRED_NODES:
+        return
+    _UNWIRED_NODES.add(node)
     target = getattr(node.target, "__name__", str(node.target))
     targets = _UNWIRED.setdefault(family, {})
     targets[target] = targets.get(target, 0) + 1
@@ -451,6 +474,11 @@ def _note_unwired_target(node: torch.fx.Node) -> None:
 # `test_refused_targets.py`.
 _REFUSED: Dict[str, int] = {}
 
+# The refused nodes already counted, for the reason `_UNWIRED_NODES` exists: a
+# count here is a number of nodes, not of calls into the support check, and one
+# `to_edge_transform_and_lower` asks about the same node twice.
+_REFUSED_NODES: "weakref.WeakSet[torch.fx.Node]" = weakref.WeakSet()
+
 
 def refused_overload_census() -> Dict[str, int]:
     """The refused targets counted so far, as a copy.
@@ -458,6 +486,9 @@ def refused_overload_census() -> Dict[str, int]:
     Keyed by target and not by family: unlike the unwired case, "which overload"
     is exactly what the emitter table already says, and the question here is
     which op fell back.
+
+    A count is a number of nodes, not of calls into the support check: one
+    refused node is one, and a graph with two of them is two.
     """
     return dict(_REFUSED)
 
@@ -465,6 +496,7 @@ def refused_overload_census() -> Dict[str, int]:
 def reset_refused_overload_census() -> None:
     """Start the census over, for a caller that counts one model at a time."""
     _REFUSED.clear()
+    _REFUSED_NODES.clear()
 
 
 def _note_refused_target(node: torch.fx.Node) -> None:
@@ -479,11 +511,17 @@ def _note_refused_target(node: torch.fx.Node) -> None:
     lowering artifact and not an op anyone wrote, and a refused one is the shadow
     of the node it reads -- the pool whose indices are read is refused in the same
     graph and is the entry a reader wants to see.
+
+    The node is counted once, on its first visit and not on the later ones a
+    single lowering makes to the same node.
     """
     if node.op != "call_function" or node.target not in SUPPORTED_TARGETS:
         return
     if _schema_name(node.target) is None:
         return
+    if node in _REFUSED_NODES:
+        return
+    _REFUSED_NODES.add(node)
     target = getattr(node.target, "__name__", str(node.target))
     _REFUSED[target] = _REFUSED.get(target, 0) + 1
     if _LOGGER.isEnabledFor(logging.DEBUG):

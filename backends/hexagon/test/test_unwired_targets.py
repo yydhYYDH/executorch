@@ -79,10 +79,10 @@ def _delegates(program):
 
 
 def _shape():
-    """The census as families to target names, without the repeat counts.
+    """The census as families to target names, which is what the rows state.
 
-    A count is how many times the partitioner asked about a node rather than how
-    many nodes there are, so it is not the part these tests state.
+    The counts are asserted separately, by the two tests below: they are numbers
+    of nodes now, and stating them in every row would bury the names.
     """
     return {
         family: sorted(targets) for family, targets in unwired_overload_census().items()
@@ -288,3 +288,26 @@ def test_the_gap_the_census_found_is_closed():
     )
     assert _delegates(program) == 1
     assert _shape() == {}
+
+
+def test_a_lowering_counts_each_node_once():
+    """The count is nodes, not calls into the support check.
+
+    `to_edge_transform_and_lower` asks the predicate about the same node twice
+    (measured: this graph reports 2 before the dedupe), which is why `_shape`
+    above stated only the names for so long.
+    """
+    _lower(lambda a, b: torch.fmod(a, 2.0), _XY)
+    assert unwired_overload_census() == {"aten::fmod": {"aten.fmod.Scalar": 1}}
+
+
+def test_two_nodes_of_the_same_target_count_twice():
+    """Two refusals of one target are two: the dedupe is by node.
+
+    Every row in `_GAPS` happens to lower to one node of its target -- `roll`
+    fmods twice in its decomposition and still arrives as one -- so this case is
+    built rather than found, which is also what makes it a statement about the
+    counter instead of about an expression.
+    """
+    _lower(lambda a, b: torch.fmod(a, 2.0) + torch.fmod(a, 3.0), _XY)
+    assert unwired_overload_census() == {"aten::fmod": {"aten.fmod.Scalar": 2}}
