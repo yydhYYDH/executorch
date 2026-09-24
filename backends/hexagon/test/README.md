@@ -41,8 +41,15 @@ without, the flat binary add, the row gather, the max pool, the depthwise
 convolution and the 3x3 im2col convolution. Each of those is its own one-delegate
 model and not a node of the graph `../README.md` ran: the max pool and the
 depthwise convolution there are single-op blobs that did delegate, while the same
-two ops inside that graph did not, and why is not established yet -- the two
-observations are recorded and no cause is claimed. The convolution is the one
+two ops inside that graph did not, and why is now established: the two call sites
+do not ask for the same geometry. `pool_spec` admits a pooling window only when
+its channel count is exactly `POOL_CHANNEL_BLOCK`, and `conv_spec` admits only
+`groups == 1` or a genuine depthwise convolution, one input channel per group.
+The graph's pool sees 32 channels, and its convolution is 16 input channels to 32
+outputs across 16 groups -- two outputs per group -- so neither operand set is the
+shape the gates accept, and both call sites fall back for a reason a reader can
+see rather than a capability the backend lacks. `OP_GAPS.md` carries the
+condition with its line numbers and the 56-cell channel grid behind it. The convolution is the one
 worth naming, because it goes through HMX and `--mhmx=3` is a second
 implementation of that unit rather than a recompilation of it, and because the
 case was run with
@@ -95,6 +102,23 @@ this in mind whenever you touch a runner in `sim/` -- `blob_runner.cpp`,
   entries -- has to align that array itself. The one thing that must not happen
   is a passing suite that depends on the compiler happening to place an array
   where the HVX wants it.
+
+## A missing dispatch is a zero-filled answer, not an error
+
+`blob_runner.cpp` writes a result only for a command it has a `case` for. A
+command with no `case` prints `UNSUPPORTED <n>` and leaves the output arena as it
+found it, which is zeros -- so the run still looks like a run and the numbers
+still look like numbers. Work on the `topk` kernel began with a fixture that
+returned all zeros; that was first read as the kernel disagreeing with torch
+rather than as a harness that had never been taught op 27. The dispatch was added
+along with the emitter, and the general rule is worth stating anyway: when a new
+command is emitted, teach the runner to run it before believing anything it
+prints.
+
+The `UNSUPPORTED <n>` marker is itself hard to notice, because `hexagon_sim.py`
+reads output as tag/value pairs and `27` is valid hex. The line announcing that
+nothing ran therefore arrives as data. A zero-filled result is the one kind of
+wrong answer that is indistinguishable from a right one at a glance.
 
 ## What the simulator cannot run
 
