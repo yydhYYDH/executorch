@@ -673,7 +673,8 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   one UNARY; `d2` is ZERO, RASTER_BLIT, IM2COL_CONVOLUTION_FP16, RASTER_BLIT.
   There is no pool command and no depthwise walk in any of them. A graph whose
   whole output agrees with torch is one claim and an op having run on the DSP is
-  another, and this list is about the second;
+  another, and this list is about the second. Neither the depthwise nor the
+  pooling paragraph below gains a device run from this graph;
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
   (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
   1.56e-2 against a reference of 16.9. An `embedding` on its own is not delegated
