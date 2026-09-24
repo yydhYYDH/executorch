@@ -844,6 +844,15 @@ that list):
   actually run -- and its failure mode is a loud refusal rather than a wrong
   number. Tightening the gate or moving that array off the stack are both open,
   and neither is this section's decision to make.
+- **the transposed convolution** runs its six commands -- `ZERO`, a weight blit,
+  `ZERO` again, the zero-insert interleave, one `IM2COL_CONVOLUTION_FP16` and the
+  output repack -- without error, and answers torch within a relative 6.6e-4 on a
+  `(1, 8, 4, 4)` fp16 input at `stride 2, padding 1`. The convolution that
+  consumes the interpolated plane had not been run even on the simulator, so this
+  is the first time that path met either. It is also the first entry here whose
+  blob was checked to be tree-independent: the same `.pte` and the same device
+  bytes come out of the branch this work landed from and out of this tip, which
+  is what makes a device result on the branch a result on the tip.
 
 Working and verified without a device:
 
