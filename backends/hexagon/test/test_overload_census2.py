@@ -399,8 +399,24 @@ _QUANTIZED_ROWS = [
         ],
     ),
     (
+        # This row used to be the pair's refused case: the weight-only path was
+        # M == 1 only, so a prompt longer than one token left every matmul on the
+        # portable kernels. The prefill entry took that shape, so the verdict
+        # moved with it and the refusal it used to cover is now the w8a16 row
+        # below, which has no prefill entry.
         "q4a16 with more than one row",
         "q4a16",
+        2,
+        64,
+        32,
+        [
+            ("quantized_decomposed.dequantize_per_channel.default", "wired"),
+            ("aten.mm.default", "wired"),
+        ],
+    ),
+    (
+        "w8a16 with more than one row",
+        "w8a16",
         2,
         64,
         32,
