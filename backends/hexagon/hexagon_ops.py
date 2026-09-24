@@ -3890,6 +3890,26 @@ def upsample_regions(node: torch.fx.Node):
         return None
     batch, channels, in_h, in_w = source_value.shape
     out_batch, out_channels, out_h, out_w = result_value.shape
+    # Every one of these six is written into the command as a number. The source
+    # plane sets the region's `size` and both of its source strides, the
+    # destination plane sets the destination stride and the phase offsets, and
+    # the two quotients between them -- `stride_y` and `stride_x` -- are not only
+    # values but the *count* of regions, since the phases are enumerated over
+    # them. A command is therefore a schedule drawn for one particular shape, and
+    # no field in it says "and this number comes from the run-time shape
+    # instead": the runtime patch mechanism is per parameter, and none of these
+    # twelve has a patch registered. An extent that is a symbol is a height the
+    # caller chooses, and emitting it from the traced example would bake that
+    # example's geometry into the arena the upper bound sized, so the node stays
+    # on a portable kernel instead. This is the same rule the backend applies to
+    # a delegated op whose parameters no patch can rebuild, and a stricter one
+    # than `add` and `relu` apply: those tolerate a single dynamic symbol, which
+    # is the case their patch machinery can rebuild.
+    if any(
+        extent_kind(extent) != STATIC_DIM
+        for extent in (batch, channels, in_h, in_w, out_h, out_w)
+    ):
+        return None
     if (batch, channels) != (out_batch, out_channels):
         return None
     if min(batch, channels, in_h, in_w) <= 0:

@@ -44,13 +44,16 @@ from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
     BLIT_BLOCKS_PER_COMMAND,
     BLIT_REGION_INTS,
+    extent_kind,
+    STATIC_DIM,
     upsample_regions,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+    _nearest_upsample_is_emittable,
     HexagonPartitioner,
 )
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from torch.export import export  # noqa: E402
+from torch.export import Dim, export  # noqa: E402
 
 _BLIT = 3
 
@@ -377,4 +380,148 @@ def test_the_sd_upsample_block_reaches_the_dsp_whole():
     # pack and unpack.
     assert types.count(_BLIT) == 4, types
     assert 12 in types, "the im2col convolution"
+    assert _run(data, [x.numpy()]).tobytes() == _expected(module, x).tobytes()
+
+
+def _lower_dynamic(module, x, dynamic_shapes):
+    """Lower a program whose shape is the caller's, not the example's."""
+    return to_edge_transform_and_lower(
+        export(module.eval(), (x,), dynamic_shapes=dynamic_shapes),
+        partitioner=[HexagonPartitioner()],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+
+
+def _portable(program):
+    """The ops the DSP did not take, by schema name where the op has one."""
+    names = []
+    for node in program.graph_module.graph.nodes:
+        if node.op != "call_function":
+            continue
+        if node.target is torch.ops.higher_order.executorch_call_delegate:
+            continue
+        schema = getattr(node.target, "_schema", None)
+        names.append(getattr(schema, "name", str(node.target)))
+    return names
+
+
+def _regions_of_the_blob(commands):
+    """Every region the blob carries, in order, as twelve-int lists."""
+    regions = []
+    for command in commands:
+        if command.type != _BLIT:
+            continue
+        body = command.params[_HEADER:]
+        for start in range(0, command.params[0] * BLIT_REGION_INTS, BLIT_REGION_INTS):
+            regions.append(list(body[start : start + BLIT_REGION_INTS]))
+    return regions
+
+
+@pytest.mark.parametrize(
+    "shape,scale", [((1, 3, 8, 8), 2), ((2, 4, 6, 6), 3), ((1, 1, 5, 7), 2)]
+)
+def test_the_region_parameters_in_the_blob_are_the_static_shape(shape, scale):
+    """The numbers the command ships are the static extents, field by field.
+
+    A verdict is not enough here: the whole failure this pins was a graph that
+    lowered cleanly and one delegate short of nothing, carrying geometry drawn
+    from the *example* rather than the model. So read the regions back out of the
+    blob and check the four quantities that decide which source element reaches
+    which destination cell against the input tensor's own shape -- the size of
+    the plane it reads, the strides it reads it with, and the destination stride
+    it writes at. Sizes come from the tensor, not from a second copy of the
+    emitter, so an emitter that baked a different shape cannot agree with both.
+    """
+    module = _Nearest(scale)
+    x = _exact(shape, 31)
+    batch, channels, in_h, in_w = shape
+    out_h, out_w = in_h * scale, in_w * scale
+
+    data, commands = _blob(_lower(module, (x,)))
+    regions = _regions_of_the_blob(commands)
+    assert len(regions) == scale * scale
+
+    phases = {(region[2]) for region in regions}
+    assert phases == {py * out_w + px for py in range(scale) for px in range(scale)}
+    for region in regions:
+        assert region[1] == 0
+        assert region[3:6] == [batch * channels, in_h, in_w]
+        assert region[6:9] == [in_h * in_w, in_w, 1]
+        assert region[9:12] == [out_h * out_w, scale * out_w, scale]
+
+    # The comparison discriminates: the same twelve fields drawn for a plane one
+    # row taller -- which is what a symbolic extent used to produce, silently, in
+    # a blob of the very same length -- is not the region the blob carries.
+    elsewhere = [
+        0,
+        0,
+        0,
+        batch * channels,
+        in_h + 1,
+        in_w,
+        (in_h + 1) * in_w,
+        in_w,
+        1,
+        out_h * out_w,
+        scale * out_w,
+        scale,
+    ]
+    assert elsewhere != regions[0]
+
+
+@pytest.mark.parametrize("side", [8, 12, 16])
+def test_a_symbolic_extent_emits_no_command_whatever_the_example(side):
+    """A shape the caller chooses is refused, and the example does not decide.
+
+    Measured before this gate existed: the same dynamic program, lowered from
+    three examples, produced three different region plans in three blobs of the
+    same 1092 bytes, while the arena was sized by the upper bound -- so the
+    geometry published was one example's and the arena was the maximum's. The
+    three examples are here so that the answer cannot be right for one of them by
+    luck, and the assertion is on **what was emitted**: no delegate at all, and
+    the node still portable, rather than on a verdict about a delegate object.
+    """
+    module = _Nearest(2)
+    x = _exact((1, 3, side, side), 33)
+    dynamic = {"x": {2: Dim("h", min=4, max=32), 3: Dim("w", min=4, max=32)}}
+
+    program = export(module.eval(), (x,), dynamic_shapes=dynamic)
+    nodes = [
+        node
+        for node in program.graph_module.graph.nodes
+        if node.target is torch.ops.aten.upsample_nearest2d.vec
+    ]
+    assert len(nodes) == 1
+    node = nodes[0]
+    # The reason, stated as the kind of each extent rather than as a shape: the
+    # height and width are not concrete ints here, and those are two of the six
+    # the region's numbers are drawn from.
+    assert extent_kind(node.meta["val"].shape[2]) != STATIC_DIM
+    assert extent_kind(node.meta["val"].shape[3]) != STATIC_DIM
+    assert upsample_regions(node) is None
+    assert not _nearest_upsample_is_emittable(node)
+
+    edge = _lower_dynamic(module, x, dynamic)
+    assert _delegates(edge) == []
+    # The node kept its portable spelling rather than losing the op: it is the
+    # decomposed `aten::upsample_nearest2d`, since the edge dialect splits the
+    # overload, and what matters is that the DSP took none of it.
+    assert any("upsample_nearest2d" in name for name in _portable(edge))
+
+
+def test_a_static_model_still_emits_after_the_symbolic_refusal():
+    """The positive control, at the same parameter level as the refusal.
+
+    The audience of this emitter is a static model -- SD's up-blocks and its VAE
+    decoder are both exported at one resolution -- so a guard that also closed
+    the static door would be a fix that removes the feature. Same module, same
+    input shape, one static export: it has to reach one delegate that carries the
+    blit commands, next to the symbolic case above reaching none.
+    """
+    module = _Nearest(2)
+    x = _exact((1, 3, 8, 8), 34)
+    data, commands = _blob(_lower(module, (x,)))
+    types = [command.type for command in commands]
+    assert types.count(_BLIT) == 2, types
+    assert _regions_of_the_blob(commands)[0][3:6] == [3, 8, 8]
     assert _run(data, [x.numpy()]).tobytes() == _expected(module, x).tobytes()
