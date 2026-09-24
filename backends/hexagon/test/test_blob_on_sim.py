@@ -954,6 +954,16 @@ def _reduction_graph(dim):
     return _Sum()
 
 
+def _amax_graph(dim):
+    """`amax(x, dim)` over the same kind of sequence, for the maximum's fold."""
+
+    class _Max(torch.nn.Module):
+        def forward(self, x):
+            return torch.amax(x, dim=dim)
+
+    return _Max()
+
+
 def _lowered_blob(model, args, dynamic_shapes, passes=()):
     """The blob the real pipeline produces, and the operands its delegate takes."""
     from executorch.backends.hexagon.partition.hexagon_partitioner import (
@@ -1316,6 +1326,48 @@ def _branch_cases():
             (sequence,),
             expected,
             blob=blob,
+            length=_RUN,
+            kind="teeth",
+            mutate=_strip_trailer,
+        )
+    )
+
+    # 2b. The same span on a maximum rather than a sum, which is where two
+    #     changes meet: the trailer decides how many rows the fold sees, and this
+    #     op's fold is the one whose scalar tail was losing a NaN. A hundred
+    #     columns wide, so the tail exists -- columns 64..99 are folded one at a
+    #     time -- with a NaN in each half of the walk. Both have to hold at once,
+    #     and neither case below covers the other: the sum's tail is not a fold
+    #     that can lose a NaN, and the static amax's span is not patched. A
+    #     command that reads the exported bound answers 256.0 instead, the poison
+    #     behind the live rows, which is what the control is for.
+    dynamic_max = _sequence(100)
+    dynamic_max[0, 0, 3] = float("nan")
+    dynamic_max[0, 0, 95] = float("nan")
+    max_blob = _lowered_blob(
+        _amax_graph(1),
+        (torch.zeros(1, _RUN, 100, dtype=torch.float16),),
+        {"x": {1: Dim("tokens", min=1, max=_UPPER)}},
+    )
+    max_expected = _bits(torch.amax(dynamic_max[:, :_RUN, :], dim=1))
+    cases.append(
+        _case(
+            "BL",
+            None,
+            (dynamic_max,),
+            max_expected,
+            blob=max_blob,
+            length=_RUN,
+            kind="nan",
+        )
+    )
+    cases.append(
+        _case(
+            "BM",
+            None,
+            (dynamic_max,),
+            max_expected,
+            blob=max_blob,
             length=_RUN,
             kind="teeth",
             mutate=_strip_trailer,
@@ -1750,6 +1802,14 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["S"] == kinds["U"], "the control is not a copy of the gather case"
     assert kinds["V"] == [_REDUCTION], "the dynamic sum is not a reduction"
     assert kinds["V"] == kinds["W"], "the control is not a copy of the sum case"
+    assert kinds["BL"] == [_REDUCTION], "the dynamic amax is not a reduction"
+    assert kinds["BL"] == kinds["V"], "the amax is not the same command as the sum"
+    assert kinds["BM"] == kinds["BL"], "the span control is not a copy of the amax"
+    assert list(next(iter(_tagged(cases, "BL").commands)).params[:3]) == [
+        1,
+        _UPPER,
+        100,
+    ], "the amax command does not describe the exported bound"
     for tag in ("X", "Y", "Z"):
         assert kinds[tag] == [_UNARY], f"{tag}: the clamp family is not the unary one"
     # The sweep's point is that both halves of the kernel's walk are reached, and
@@ -1891,12 +1951,25 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         _UPPER,
     ), f"the trailer names axis {dynamic.axis} up to {dynamic.max_length}"
     assert dynamic.patches == [(0, 1, 1, 0)], f"the sum patched {dynamic.patches}"
+    amax_dynamic = blob_interpreter.read_dynamic_trailer(_tagged(cases, "BL").blob)
+    assert amax_dynamic is not None, "the dynamic amax carries no trailer"
+    assert (amax_dynamic.axis, amax_dynamic.max_length) == (
+        1,
+        _UPPER,
+    ), f"its trailer names axis {amax_dynamic.axis} up to {amax_dynamic.max_length}"
+    assert amax_dynamic.patches == [
+        (0, 1, 1, 0)
+    ], f"the amax patched {amax_dynamic.patches}"
     # The blob on disk still describes the bound: the run-time length only ever
     # reaches this command through the patch, which is what the case decides.
     assert _tagged(cases, "V").commands[0].params[1] == _UPPER
+    assert _tagged(cases, "BL").commands[0].params[1] == _UPPER, "the amax is not bound-sized"
     assert (
         blob_interpreter.read_dynamic_trailer(_tagged(cases, "W").blob) is None
     ), "the control still carries its trailer"
+    assert (
+        blob_interpreter.read_dynamic_trailer(_tagged(cases, "BM").blob) is None
+    ), "the amax control still carries its trailer"
     for tag in ("S", "X", "Y", "Z", "BA", "AA", "AB", "AC", "AD", "AE"):
         assert (
             blob_interpreter.read_dynamic_trailer(_tagged(cases, tag).blob) is None
@@ -2233,6 +2306,53 @@ def test_the_pool_case_can_tell_the_packed_layout_apart(cases):
     ), (
         "reading the buffer as blocks gives the same answer, so this case does "
         "not see the layout at all"
+    )
+
+
+def test_a_dynamic_span_and_a_nan_fold_hold_at_once(cases, simulated):
+    """The run-time patch and the maximum's tail fix, on one command.
+
+    The two changes this case sits between were made apart: one decides how many
+    rows a reduction folds, by patching the span at run time, and one decides
+    what the fold does with a NaN in the elements its vector loop leaves over.
+    Neither case in this file exercised the pair -- the sum has a patched span but
+    no fold that can lose a NaN, and the static amax has the fold but its span is
+    a compile-time constant.
+
+    So the assertion is both at once, on the DSP: the NaN in the vector half
+    (column 3) and the one in the tail (column 95) come back NaNs, every other
+    column is torch's maximum over the three live rows, and the poison past them
+    is nowhere in the answer. The control is the same blob with the trailer
+    blanked, which is what the emitter produced before the patch: it folds the
+    whole exported bound and answers the poison instead.
+    """
+    expected = _tagged(cases, "BL").expected.view("uint16").tolist()
+    dsp = _from_bits(simulated["BL0"])
+    want = np.isnan(_from_bits(expected))
+    mismatch = np.flatnonzero(np.isnan(dsp) != want)
+    assert not mismatch.size, (
+        "the DSP and torch disagree on which columns are NaN: "
+        + ", ".join(
+            f"{int(index)} is {dsp[index]} on the DSP and "
+            f"{_from_bits(expected)[index]} in torch"
+            for index in mismatch
+        )
+    )
+    for column in (3, 95):
+        assert np.isnan(
+            dsp[column]
+        ), f"the dynamic amax answered {dsp[column]} for the NaN at {column}"
+    assert np.array_equal(
+        dsp[~want], _from_bits(expected)[~want]
+    ), "the DSP is not torch bit for bit where the columns are not NaN"
+    assert _POISON not in dsp.tolist(), (
+        "the patched command answered the poison behind the live rows, so its "
+        "span is the exported bound and not the run-time length"
+    )
+    unpatched = _from_bits(simulated["BM0"])
+    assert float(unpatched[0]) == _POISON, (
+        f"the control answered {float(unpatched[0])} rather than the {_POISON} a "
+        "whole-bound fold gives, so nothing in this file shows the patch applied"
     )
 
 
