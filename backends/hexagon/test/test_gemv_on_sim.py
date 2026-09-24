@@ -50,6 +50,31 @@ _CONFIGS = (
     ("W8B", 128, 64, "w8a16"),
 )
 
+#: Wide-K rungs, where the two kernels' `sf_from_w` bound can be reached. Both
+#: entries are emitted with `scale_block_num == 1`, the configuration that makes
+#: the int32 accumulator span the whole K -- `|w| * 127 * k` for a constant
+#: weight -- and `sf_from_w`'s magic number is documented for `|x| < 2^22`. The
+#: safe rungs are the widest K that still answers exactly; the wide ones are the
+#: narrowest K that does not. The boundary therefore has a measurement on either
+#: side of it instead of a claim.
+_WIDE_SAFE = (
+    ("W8S", 256, 32, "w8a16"),
+    ("Q4S", 4224, 32, "q4a16"),
+)
+_WIDE = (
+    ("W8W", 512, 32, "w8a16"),
+    ("Q4W", 8192, 32, "q4a16"),
+)
+#: The qualifier, at the same K as the widest failing rung: weights drawn with a
+#: sign, so the per-channel sum cancels (`|sum w| / sum |w|` measures 0.001 here)
+#: and the accumulator stays a factor of two below the bound. These rungs are the
+#: control for "is it wide K, or wide K with a coherently signed column".
+_WIDE_MIXED = (
+    ("W8M", 8192, 32, "w8a16"),
+    ("Q4M", 8192, 32, "q4a16"),
+)
+_WIDE_TAGS = {tag for tag, _, _, _ in _WIDE + _WIDE_SAFE + _WIDE_MIXED}
+
 
 def _weight(k, n, scheme):
     """Random small integers, with every row distinct.
@@ -73,6 +98,56 @@ def _scale(n):
     return (2.0**-4) * (1 + (np.arange(n) % 4)).astype(np.float32)
 
 
+def _wide_scale(n):
+    """A power of two small enough that the wide-K answers stay fp16-exact.
+
+    The wide rungs answer `|w| * k * scale`, which at 127 * 8192 would leave
+    fp16's integers behind; 2^-5 keeps the widest of them at 1792.
+    """
+    return np.full(n, 2.0**-5, dtype=np.float32)
+
+
+def _wide_operands():
+    """The wide rungs' bytes, and the weight the runner's accumulator sees.
+
+    The weights are constant rather than random because the quantity under test
+    is `sum_k |w[k, n]|` as it enters the int32 accumulator: a random sign would
+    make the sum cancel and the bound unreachable, which is the opposite of what
+    this ladder is for.
+    """
+    weights, packed = {}, {}
+    for tag, k, n, scheme in _WIDE + _WIDE_SAFE:
+        weight = torch.full((k, n), 127 if scheme == "w8a16" else 7, dtype=torch.int32)
+        scale = _wide_scale(n)
+        weights[tag] = (weight, scale)
+        if scheme == "q4a16":
+            packed[f"kQ4{tag[2:]}"] = pack_q4a16_gemv_weight(weight, scale, k, n)
+        else:
+            packed[f"kW8{tag[2:]}"] = pack_w8a16_gemv_weight(weight, k, n)
+            packed[f"kScales{tag[2:]}"] = scale.tobytes()
+    return weights, packed
+
+
+def _mixed_operands():
+    """Wide-K rungs whose weights carry both signs, drawn as the small shapes are.
+
+    Same generator as `_weight`, so the draw is reproducible and a failure can be
+    re-run; the scale is the wide one so the answers stay fp16-exact in the
+    arithmetic even where the kernel's rounding is a few ulp wide.
+    """
+    weights, packed = {}, {}
+    for tag, k, n, scheme in _WIDE_MIXED:
+        weight = _weight(k, n, scheme)
+        scale = _wide_scale(n)
+        weights[tag] = (weight, scale)
+        if scheme == "q4a16":
+            packed[f"kQ4{tag[2:]}"] = pack_q4a16_gemv_weight(weight, scale, k, n)
+        else:
+            packed[f"kW8{tag[2:]}"] = pack_w8a16_gemv_weight(weight, k, n)
+            packed[f"kScales{tag[2:]}"] = scale.tobytes()
+    return weights, packed
+
+
 def _operands():
     """The packed bytes and the fp16 answers the runner is expected to print."""
     weights, packed = {}, {}
@@ -85,6 +160,10 @@ def _operands():
         else:
             packed[f"kW8{tag[2:]}"] = pack_w8a16_gemv_weight(weight, k, n)
             packed[f"kScales{tag[2:]}"] = scale.tobytes()
+    for build in (_wide_operands, _mixed_operands):
+        extra_weights, extra_packed = build()
+        weights.update(extra_weights)
+        packed.update(extra_packed)
     return weights, packed
 
 
@@ -112,7 +191,7 @@ def _parse(stdout):
             continue
         if parts[0].endswith("failed"):
             raise AssertionError(line)
-        if parts[0] not in {tag for tag, _, _, _ in _CONFIGS}:
+        if parts[0] not in {tag for tag, _, _, _ in _CONFIGS} | _WIDE_TAGS:
             continue
         rows.setdefault(parts[0], {})[int(parts[1])] = [
             int(value, 16) for value in parts[2:]
@@ -210,3 +289,107 @@ def test_one_at_k_reads_weight_row_k(measured, tag, k, n, scheme):
             f"row {[i for i in range(k) if np.array_equal(got.view(np.uint16), expected[i].view(np.uint16))]} "
             f"and not row {at}"
         )
+
+
+def _wide_answer(measured, tag, n):
+    """The all-ones row the runner printed for a wide-K rung."""
+    rows = measured[1]
+    assert tag in rows, f"{tag}: the runner printed no all-ones row"
+    return np.array(rows[tag][-1], dtype=np.uint16).view(np.float16)
+
+
+@pytest.mark.parametrize("tag,k,n,scheme", _WIDE_SAFE)
+def test_a_wide_k_inside_the_accumulator_bound_is_exact(measured, tag, k, n, scheme):
+    """The rung below the bound: `scale[n] * sum_k w[k, n]`, bit for bit.
+
+    Constant weights, one everywhere on the activation, and K wide enough that
+    the accumulator is within a factor of two of `sf_from_w`'s documented
+    `|x| < 2^22` -- 127 * 256 * 127 = 4 129 024 against 4 194 304 for W8S, and
+    7 * 8192 * 127 = 3 761 664 for Q4S. Both answer exactly, which is what makes
+    the failure one rung above a boundary rather than a broken kernel.
+    """
+    weights, _, _ = measured
+    weight, scale = weights[tag]
+    expected = (scale * weight.numpy().sum(axis=0)).astype(np.float16)
+    got = _wide_answer(measured, tag, n)
+    assert np.array_equal(got.view(np.uint16), expected.view(np.uint16)), (
+        f"{tag}: K = {k} answered {got[:8].tolist()} where the arithmetic says "
+        f"{expected[:8].tolist()}"
+    )
+
+
+@pytest.mark.parametrize("tag,k,n,scheme", _WIDE)
+@pytest.mark.xfail(
+    strict=True,
+    reason="the int32 accumulator passes sf_from_w's |x| < 2^22 domain and the "
+    "scale it feeds back is wrong: measured, not inferred -- see this module's "
+    "_WIDE ladder and the docstring below",
+)
+def test_a_wide_k_past_the_accumulator_bound_answers_wrongly(
+    measured, tag, k, n, scheme
+):
+    """The rung above the bound: the kernel answers a wrong number and says 0.
+
+    This test asserts the *correct* answer, so it fails today, deliberately, and
+    `strict=True` makes it fail the other way -- as an XPASS -- the day the
+    kernel is fixed, which is the signal to turn this into an ordinary test.
+
+    Measured on hexagon-sim with constant weights (so nothing cancels) and an
+    activation of one everywhere, against `scale[n] * sum_k w[k, n]`:
+
+      W8W  K =  512, accumulator 8 258 048:  3032 against 2032    (+49%)
+      Q4W  K = 8192, accumulator 7 282 688:  2552 against 1792    (+42%)
+
+    and the same kernels answer bit-for-bit one rung below (W8S, Q4S above) as
+    well as at K = 8192 with a random-sign weight, where the sum cancels and the
+    worst channel's accumulator reaches 1.8e6 against the bound of 4.19e6 (that
+    rung is `test_a_wide_k_with_mixed_signs_stays_inside_the_bound`, and it is
+    correct to the rounding, not bit-for-bit). So the defect is not "wide K" but
+    "wide K with a coherently signed weight column", and it is silent: the
+    kernel's return code is 0 in both cases, and at K = 4224 on the w8a16 rung
+    the answer is not merely wrong but infinite.
+
+    What this does *not* say: which instruction is at fault. The threshold
+    matches 2^22 at both weight scales, which is `sf_from_w`'s documented
+    domain, and nothing else in either translation unit changes there.
+    """
+    weights, _, _ = measured
+    weight, scale = weights[tag]
+    expected = (scale * weight.numpy().sum(axis=0)).astype(np.float16)
+    got = _wide_answer(measured, tag, n)
+    assert np.array_equal(got.view(np.uint16), expected.view(np.uint16)), (
+        f"{tag}: K = {k} answered {got[:8].tolist()} where the arithmetic says "
+        f"{expected[:8].tolist()}"
+    )
+
+
+@pytest.mark.parametrize("tag,k,n,scheme", _WIDE_MIXED)
+def test_a_wide_k_with_mixed_signs_stays_inside_the_bound(measured, tag, k, n, scheme):
+    """K = 8192 on its own does not reach the bound; a coherent sign does.
+
+    The failing rungs use constant weights, which is what maximizes the
+    accumulator and is not what a trained weight matrix looks like. Here the
+    weights carry both signs at the same K, so the per-channel sum cancels --
+    `|sum_k w| / sum_k |w|` is 0.001 for this draw -- and the worst of the 32
+    output channels reaches 1.8e6 of accumulator against a bound of 4.19e6, which
+    this test asserts rather than assumes. The answer is then asserted to be
+    correct to the rounding and not bit-for-bit, because a mixed-sign column makes
+    the fp32 the accumulator is converted into itself only 2^-12 accurate:
+    measured, 2.1e-4 relative, a few ulp, where the failing rungs are 49%.
+    """
+    weights, _, _ = measured
+    weight, scale = weights[tag]
+    sums = weight.numpy().astype(np.float64).sum(axis=0)
+    accumulator = np.abs(sums).max() * 127
+    assert accumulator < 2.0**22, (
+        f"{tag}: the worst channel's accumulator is {accumulator:.6g}, at or past "
+        f"the {2.0**22} bound, so this is not the control it claims to be"
+    )
+    exact = scale.astype(np.float64) * sums
+    got = _wide_answer(measured, tag, n).astype(np.float64)
+    error = np.abs(got - exact)
+    assert np.isfinite(got).all(), f"{tag}: not every output is finite"
+    assert (error <= 1e-3 * np.abs(exact)).all(), (
+        f"{tag}: worst relative error {(error / np.abs(exact)).max():.3g}, which is "
+        f"not rounding"
+    )

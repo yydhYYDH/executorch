@@ -43,8 +43,10 @@ static inline HVX_VectorPair unpack_vrmpy_weight_128(HVX_Vector v_int4) {
 
 /* An HVX vector at `-mhvx-length=128b`, which is what the kernels here assume of
  * the buffers they are handed; the assertions below read it back out of the
- * declarations, since a byte array gives the linker no reason to align. */
-enum { kVectorBytes = 128, kMaxK = 128, kMaxN = 64 };
+ * declarations, since a byte array gives the linker no reason to align. kMaxK
+ * is 8192 because the wide-K probes below need an activation that wide; the
+ * shapes the per-position walk runs stay at 64 and 128. */
+enum { kVectorBytes = 128, kMaxK = 8192, kMaxN = 64 };
 
 static uint8_t g_act[kMaxK * 2] __attribute__((aligned(kVectorBytes)));
 static uint16_t g_out[kMaxN] __attribute__((aligned(kVectorBytes)));
@@ -105,6 +107,32 @@ static void w8(const uint8_t *packed, const uint8_t *scales, const char *tag, in
   }
 }
 
+/* The all-ones answer alone: the per-position walk above prints one line per k,
+ * and these shapes have thousands. `sf_from_w` turns the int32 accumulator into
+ * fp32 with a magic number documented for |x| < 2^22, and with
+ * `scale_block_num == 1` that accumulator spans the whole K, so the shapes here
+ * are the ones where the bound can be reached. The weights are constant, so
+ * nothing cancels and the accumulator is `|w| * 127 * k`: 127 * 127 * 512 for
+ * W8W, 7 * 127 * 8192 for Q4W, against a bound of 4194304. */
+static void q4_all_ones(const uint8_t *packed, const char *tag, int k, int n) {
+  activation(k, -1);
+  for (int i = 0; i < kMaxN; ++i) g_out[i] = 0xaaaa;
+  int ret = htp_ops_matmul_q4a16_gemv_i8((uint8_t *) g_out, g_act,
+                                         (uint8_t *) packed, NULL, k, n, 1, 0);
+  if (ret != 0) printf("%s failed %d\n", tag, ret);
+  print_row(tag, -1, n);
+}
+
+static void w8_all_ones(const uint8_t *packed, const uint8_t *scales,
+                        const char *tag, int k, int n) {
+  activation(k, -1);
+  for (int i = 0; i < kMaxN; ++i) g_out[i] = 0xaaaa;
+  int ret = hmx_matmulw8a16block_gemv_i8((uint8_t *) g_out, g_act, packed, scales,
+                                         (uint8_t *) g_bias, k, n, 1);
+  if (ret != 0) printf("%s failed %d\n", tag, ret);
+  print_row(tag, -1, n);
+}
+
 int main(void) {
   vtcm_manager_setup();
   printf("vtcm acquired=%d\n", vtcm_manager_acquire());
@@ -133,5 +161,16 @@ int main(void) {
   q4(kQ4B, "Q4B", 128, 64);
   w8(kW8A, kScalesA, "W8A", 64, 32);
   w8(kW8B, kScalesB, "W8B", 128, 64);
+
+  /* The wide-K ladder: two rungs inside the accumulator bound, where the answer
+   * has to be exact, and two past it. */
+  w8_all_ones(kW8S, kScalesS, "W8S", 256, 32);
+  q4_all_ones(kQ4S, "Q4S", 4224, 32);
+  w8_all_ones(kW8W, kScalesW, "W8W", 512, 32);
+  q4_all_ones(kQ4W, "Q4W", 8192, 32);
+  /* And the control: the same K with weights of both signs, where the
+   * per-channel sum cancels and the accumulator stays below the bound. */
+  w8_all_ones(kW8M, kScalesM, "W8M", 8192, 32);
+  q4_all_ones(kQ4M, "Q4M", 8192, 32);
   return 0;
 }
