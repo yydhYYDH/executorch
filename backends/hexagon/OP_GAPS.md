@@ -9,7 +9,9 @@
      file it was read from, so a reader can tell a measurement from a reading. -->
 
 Computed against `53369ff` on 2026-09-24. The library inventory below is the
-vendored tree at that commit.
+vendored tree at that commit. The three verdict counts and the `topk` entry were
+updated when `topk`'s values half landed, which is why §2 counts one command
+more than that commit did.
 
 ## The three verdicts
 
@@ -23,8 +25,12 @@ The distinction matters because only the last one is a gap that hides. A refused
 node costs speed; an unwired op costs speed and leaves nothing to grep for.
 `unwired_overload_census()` (`partition/hexagon_partitioner.py`) records every
 target absent from the table while its family is present, and
-`test_overload_census.py` + `test_overload_census2.py` pin 144 rows whose 184 op
-verdicts are 88 wired, 41 refused and 55 unwired.
+`test_overload_census.py` + `test_overload_census2.py` pin 127 census rows whose
+184 op verdicts are 92 wired, 41 refused and 51 unwired. That count is one
+verdict per op listed in the row tables those two files are parametrized over --
+the rule the appendix writes out, so the numbers can be re-derived rather than
+believed; the same two files collect 146 tests, because a handful of them assert
+inside a body instead of once per row.
 
 ## 1. The vendored library has no kernel at all
 
@@ -49,7 +55,7 @@ contain the operator, so an emitter would have nothing to call.
 ## 2. Kernels present, nothing on the host emits them
 
 `htp_command.h:32-81` declares 48 op types. 43 have a `case` in
-`execute_command.cc`, and the host side emits 18 of them. The other 24 are
+`execute_command.cc`, and the host side emits 19 of them. The other 23 are
 kernels the skel links and exports with nothing that can reach them:
 
 | value | DSP op | kernel | what an emitter would serve |
@@ -66,9 +72,8 @@ kernels the skel links and exports with nothing that can reach them:
 | 22 | `DSP_OP_MATMUL_Q4A16_FP16` | `htp_ops_matmul_q4a16_fp16` | **quantized prefill** (`M > 1`) |
 | 25 | `DSP_OP_CAST` | `htp_ops_cast` | deliberately unused, as 7 |
 | 26 | `DSP_OP_SELECT` | `htp_ops_select` | `cond ? a : b`. The only ATen node that maps is `aten.where.self`, refused today for the bool reason below |
-| 27 | `DSP_OP_TOPKV2_K1_FP16` | `htp_ops_topkv2_k1_fp16(values, indices, input, rowSize, rows)` | **`topk`'s two outputs**: this kernel produces both, so the gap is the emitter and the getitem rule, not a kernel |
 | 30 | `DSP_OP_RELU6` | `htp_ops_relu6` | deliberately unused: `relu6` is `hardtanh(0, 6)` and goes through `UNARY`/`CLAMP`, the entry point that restores a NaN by a bit test |
-| 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | a reduction under a mask |
+| 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | not an emitter: the kernel wants a separate fp16 `[O][R]` predicate operand (`eltwise_ops.cc:2959`) that no ATen node carries, and the graphs that come closest already answer correctly as two commands. A fusion target, not a missing line -- §7 |
 | 32 | `DSP_OP_TMAC_A16W1` | `htp_ops_tmac_a16w1_fp16` | 1-bit weights |
 | 33 | `DSP_OP_FLASH_ATTENTION_BLOCK` | `htp_ops_flash_attention_block` | a blockwise attention |
 | 34 | `DSP_OP_MATMUL_Q4A16_BLOCK_FP16` | `htp_ops_matmul_q4block_a16_fp16` | quantized prefill, block-scaled form |
@@ -79,15 +84,25 @@ kernels the skel links and exports with nothing that can reach them:
 | 42 | `DSP_OP_MATMUL_W8A16_BLOCK_FP16` | `hmx_matmul_w8a16_block_fp16` | quantized prefill, int8 weights |
 | 44 | `DSP_OP_VISION_FLASH_ATTENTION_FP16` | `htp_ops_vision_flash_attention_fp16` | a vision attention variant |
 
-Of the 48, 43 have a dispatcher case: the 18 the host emits, the 24 above, and
+Of the 48, 43 have a dispatcher case: the 19 the host emits, the 23 above, and
 `GET_INFO`(20), which the host never emits either. The 5 without one are
 `RESERVED_0`(0), `RESERVED_21`(21), `COMMAND_GROUP`(99) and `MAX`(100) --
 protocol, not gaps -- and `DSP_OP_POST_ATTN_REDUCE_FUSE`(35), which §6 is about.
 
+`DSP_OP_TOPKV2_K1_FP16`(27) was in this table and is not any more: `topk` with
+`k == 1` over the last axis now lowers to it, which is why the counts above read
+19 and 23 rather than 18 and 24. What it took is §3's last entry and the shape
+of the decision is worth keeping: the kernel answers *two* outputs where every
+other kernel here answers one or none, and the second one (the position) is
+refused on purpose. A reader looking for the row that used to be in its place
+should read §3 and §4 together.
+
 ## 3. One emitter away, inside a family that is already wired
 
 These are the cheapest real gaps: the kernel is there, the command is there, and
-the only thing missing is the line that produces it.
+the only thing missing is the line that produces it. The last entry is the one
+that has since been closed, kept here because what it decided is the shape the
+next two-output kernel will have to decide too.
 
 - **`aten.sin`, `aten.cos`, `aten.expm1`**: subtypes `SIN`(14), `COS`(13),
   `EXPM1`(12) exist and have kernels, and `UNARY_OP_TYPES` already carries all
@@ -108,8 +123,20 @@ the only thing missing is the line that produces it.
   `where` (`test_overload_census.py`, row "prelu decomposes, and the where stays
   put"). Reaching the kernel would take a fusion pass of the `mul_silu.py` kind,
   not an emitter.
-- **`aten.topk.default`**: the kernel answers both outputs; the missing pieces
-  are the emitter and the all-readers-are-getitem-0 rule (§4).
+- **`aten.topk.default`**: this was the fourth, and it is done. The kernel
+  answers both outputs -- `htp_ops_topkv2_k1_fp16(values, indices, input,
+  rowSize, rows)` -- and what it took was the emitter plus the
+  all-readers-are-getitem-0 rule (§4), not a kernel. `k == 1` over the last axis
+  now emits one command whose params are the row length and the row count; the
+  values are bit-identical to torch on the host, in `blob_interpreter.py` and on
+  hexagon-sim. The positions are refused, and the reason is measured rather than
+  assumed: this kernel writes the **first** occurrence of the row maximum while
+  torch's own kernel writes whichever index its partial sort stops on, which
+  over 200 rows of quantized values is neither the first nor the last occurrence
+  175 times. Handing the graph a position torch never produced is the one thing
+  a refusal is unambiguously for, so `topk_is_emittable` keeps the whole node on
+  the portable kernels whenever anything reads it. (The width would refuse it
+  anyway: the node declares int64 and the kernel writes one int32 a row.)
 
 ## 4. Shape and parameter limits of the ops that are supported
 
@@ -130,7 +157,7 @@ the same node delegates or does not depending on a shape.
 | The GEMV entries read one activation row linearly | the weight-only quantized matmul: `M == 1`, `K % 64 == 0`, `N % 32 == 0` | pack64 activation + output repack, i.e. §2's `MATMUL_*_BLOCK_FP16` entries |
 | A command holds three 12-int regions | `cat` (at most 3 operands), `permute_copy` (at most 3 ordered groups, no reversal inside one) | a command form with more regions |
 | A blit describes one run per row | `slice_copy` with `step != 1` | a strided run, or a different command |
-| A two-output node is placed only when every reader takes the values output | `max.dim` (indices), `max_pool2d_with_indices`, `native_layer_norm` (`getitem 0`), `add_rms_norm` (`getitem 0` or 1) | the kernels compute values, not positions. `topk`'s kernel is the exception that proves it, and the rule would have to be extended for it |
+| A two-output node is placed only when every reader takes the values output | `max.dim` (indices), `max_pool2d_with_indices`, `topk` (indices), `native_layer_norm` (`getitem 0`), `add_rms_norm` (`getitem 0` or 1) | not a rule waiting to be relaxed: `max.dim` and the pool have kernels that compute values rather than positions, and `topk` is the one kernel here that answers both -- and its positions are refused anyway, because the position it writes is the first occurrence of the row maximum while torch writes whichever index its partial sort stops on, which over 200 rows of quantized values is neither the first nor the last 175 times |
 | The narrow view rule: a view that would be a partition boundary is copied instead | `view_copy`, `unsqueeze_copy`, `squeeze_copy`, `expand_copy`, `alias_copy` | nothing -- this is the rule working, and its symptom is a delegate one op shorter than it looks |
 
 The pool, convolution and gather rows above are admission geometry rather than
@@ -212,13 +239,20 @@ The two gaps that are not of that shape:
 
 1. **Quantized prefill (`M > 1`)** -- the only functional gap: it is the
    difference between a quantized model that runs and one that only decodes.
-2. **`TOPKV2_K1_FP16` and `MASKED_REDUCTION`** -- sampling and masked reduction
-   are what a decoder needs next, and both have kernels.
-3. **`aten.where` via `DSP_OP_SELECT`** -- `prelu` decomposes into `gt` + `mul` +
+2. **`aten.where` via `DSP_OP_SELECT`** -- `prelu` decomposes into `gt` + `mul` +
    `where`, so this one command is what a fusable prelu (and every masked write)
    is waiting on. The open question is whether the kernel's condition operand
    accepts what a comparison writes, since a `torch.bool` node cannot be handed
    an int32 buffer.
+3. **A masked reduction as a fusion** -- `DSP_OP_MASKED_REDUCTION` is not a node
+   that cannot be placed. The shape that comes closest,
+   `(a * m.unsqueeze(-1)).sum(-2)`, already lowers to a `mul` and a `sum` that
+   answer correctly on the DSP, so this kernel would replace two commands with
+   one: worth doing where a profile says the merge pays, and nowhere else. It is
+   also the only item here with a soundness precondition to prove, because the
+   kernel tests `mask != 0` rather than `mask == 1`: the operand has to be exactly
+   0.0/1.0, which a lifted constant can be checked for and a run-time mask
+   cannot.
 4. **`sin`/`cos`/`expm1`** -- the emitters are trivial; what they need first is a
    measurement of the approximations' error.
 5. Everything else in §1 would need a kernel that does not exist, and everything
@@ -231,7 +265,9 @@ The two gaps that are not of that shape:
 PYTHONPATH=src python -m pytest backends/hexagon/test/test_op_support.py
 PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py
 
-# 144 rows, 184 verdicts
+# the census counts in the header: one verdict per op listed in the row tables
+# these two files are parametrized over (_ROWS, _QUANTIZED_ROWS), not per
+# collected test -- 127 rows and 184 verdicts against 146 collected
 PYTHONPATH=src python -m pytest \
   backends/hexagon/test/test_overload_census.py \
   backends/hexagon/test/test_overload_census2.py
