@@ -23,6 +23,10 @@ from executorch.backends.hexagon.hexagon_ops import (
     add_rms_norm_is_emittable,
     ADDMM_TARGETS,
     ALIAS_TARGETS,
+    BATCH_NORM_TARGETS,
+    batch_norm_getitem,
+    batch_norm_is_emittable,
+    batch_norm_normalizes_one_span,
     BINARY_TARGETS,
     BMM_TARGETS,
     CAST_TARGETS,
@@ -37,10 +41,16 @@ from executorch.backends.hexagon.hexagon_ops import (
     gather_table,
     GATHER_TARGETS,
     GETITEM,
+    GROUP_NORM_TARGETS,
+    group_norm_getitem,
+    group_norm_is_emittable,
+    group_norm_normalizes_one_group_per_row,
     LAYER_NORM,
     layer_norm_getitem,
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
+    LOG_SOFTMAX_TARGETS,
+    log_softmax_shifts_within_the_arena,
     MAX_DIM,
     max_dim_getitem,
     max_dim_is_emittable,
@@ -728,36 +738,65 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
             return False
+        if node.target in LOG_SOFTMAX_TARGETS and not log_softmax_shifts_within_the_arena(
+            node
+        ):
+            # The emitted composition sums at most one per element into an fp16,
+            # so a span the export knows to be longer than 65504 would saturate
+            # that sum and answer with infinities. Past that length the node
+            # stays on the portable kernels, which is also where an axis other
+            # than the last one goes.
+            return False
+        if node.target in GROUP_NORM_TARGETS:
+            # The command takes one mean and one variance per row, so the group
+            # count has to divide the channels and the normalized shape has to be
+            # the trailing dims of the view the kernel walks. It also carries no
+            # weight: the affine is emitted as two element-wise commands, which
+            # is why the operands have to be one element per channel.
+            if not group_norm_normalizes_one_group_per_row(node):
+                return False
+        if node.target in BATCH_NORM_TARGETS:
+            # Only the batch-of-one view instance_norm exports is one contiguous
+            # span per channel; a wider batch normalizes each channel over the
+            # batch as well, which no single row of this command describes.
+            if not batch_norm_normalizes_one_span(node):
+                return False
         if node.target is GETITEM:
-            # The getitem that reads a layer norm's first output, a max pool's
-            # values, a max(x, dim)'s values, a topk's values, a piece of a
-            # split, or one of the fused add+norm's two, is the one this backend
-            # can place; every other getitem (a sort's, for one) has no producer
-            # here.
-            source = layer_norm_getitem(node)
-            if source is not None:
-                if not layer_norm_is_emittable(source):
-                    return False
-            elif max_pool_getitem(node) is not None:
-                # The max pool's values; that node's own check has already
-                # refused a pool whose indices anything else reads.
-                pass
-            elif max_dim_getitem(node) is not None:
-                # The same for torch.max(x, dim)'s values.
-                pass
-            elif topk_getitem(node) is not None:
-                # The same for torch.topk's values; that node's own check has
-                # already refused a topk whose positions or arguments keep it
-                # portable.
-                pass
-            elif split_getitem(node) is not None:
-                # The same for a piece of a split, whose own check has already
-                # refused one whose pieces or readers it cannot write.
-                pass
-            else:
-                source = add_rms_norm_getitem(node)
-                if source is None or not add_rms_norm_is_emittable(source):
-                    return False
+            # The first output of one of the three norms, of a pool, of max.dim,
+            # of a topk or of a split is the one this backend can place; every
+            # other getitem (a sort's, for one) has no producer here.
+            source = None
+            for getitem, emittable in (
+                (layer_norm_getitem, layer_norm_is_emittable),
+                (group_norm_getitem, group_norm_is_emittable),
+                (batch_norm_getitem, batch_norm_is_emittable),
+            ):
+                source = getitem(node)
+                if source is not None:
+                    if not emittable(source):
+                        return False
+                    break
+            if source is None:
+                if max_pool_getitem(node) is not None:
+                    # The max pool's values; that node's own check has already
+                    # refused a pool whose indices anything else reads.
+                    pass
+                elif max_dim_getitem(node) is not None:
+                    # The same for torch.max(x, dim)'s values.
+                    pass
+                elif topk_getitem(node) is not None:
+                    # The same for torch.topk's values; that node's own check has
+                    # already refused a topk whose positions or arguments keep it
+                    # portable.
+                    pass
+                elif split_getitem(node) is not None:
+                    # The same for a piece of a split, whose own check has already
+                    # refused one whose pieces or readers it cannot write.
+                    pass
+                else:
+                    source = add_rms_norm_getitem(node)
+                    if source is None or not add_rms_norm_is_emittable(source):
+                        return False
         if _emits_no_command(node) and not _alias_keeps_the_same_bytes(node):
             # A narrowing select reaches the same emitter through its own region
             # rather than by re-pointing, so the alias test is not the last word.

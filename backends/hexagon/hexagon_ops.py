@@ -208,8 +208,27 @@ WHERE = exir_ops.edge.aten.where.self
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
 NATIVE_LAYER_NORM = exir_ops.edge.aten.native_layer_norm.default
+# GroupNorm reaches the backend as native_group_norm, whose normalized span is
+# one group's channels times the spatial product: the trailing dims of an
+# [N*group][(C/group)*HxW] view of the input, which is the layer norm kernel's
+# [outer][inner] view with outer = N*group.
+NATIVE_GROUP_NORM = exir_ops.edge.aten.native_group_norm.default
+# InstanceNorm reaches it as the batch norm without running statistics, over a
+# [1, N*C, *spatial] view. The batch axis the exporter made one is what turns
+# per-channel statistics into the per-(n, c) ones the op is named for.
+BATCH_NORM_NO_STATS = exir_ops.edge.aten._native_batch_norm_legit.no_stats
+LOG_SOFTMAX = exir_ops.edge.aten._log_softmax.default
 GETITEM = operator.getitem
 SOFTMAX_TARGETS = frozenset({exir_ops.edge.aten._softmax.default})
+LOG_SOFTMAX_TARGETS = frozenset({LOG_SOFTMAX})
+GROUP_NORM_TARGETS = frozenset({NATIVE_GROUP_NORM})
+BATCH_NORM_TARGETS = frozenset({BATCH_NORM_NO_STATS})
+
+# The longest reduced span a log_softmax may carry. The shift makes every
+# exponential at most one, so the sum of them is at most the span's length, and
+# the kernel stores that sum as fp16; past 65504 it saturates and the log of it
+# is an infinity rather than a large negative number.
+LOG_SOFTMAX_MAX_SPAN = 65504
 
 
 def softmax_reduces_the_inner_axis(node: torch.fx.Node) -> bool:
@@ -222,6 +241,26 @@ def softmax_reduces_the_inner_axis(node: torch.fx.Node) -> bool:
     over anything but the last axis stays on the portable kernels.
     """
     return int(node.args[1]) in (-1, node.meta["val"].dim() - 1)
+
+
+def log_softmax_shifts_within_the_arena(node: torch.fx.Node) -> bool:
+    """Whether this log_softmax's shifted sum is one the kernel can store.
+
+    The composition below is the log-sum-exp the softmax kernel computes
+    internally, written out so the answer is not a second rounding of a
+    probability: with the span's maximum subtracted, every exponential is at
+    most one and their sum is at most the span's length. The kernel stores that
+    sum as fp16, so a span longer than 65504 is a saturated sum, a log of
+    infinity and a row of infinities where torch has finite values. The span is
+    the last axis (see softmax_reduces_the_inner_axis), whose extent the export
+    knows whether or not it is static.
+    """
+    if not softmax_reduces_the_inner_axis(node):
+        return False
+    shape = list(node.meta["val"].shape)
+    return _upper_product([shape[int(node.args[1]) % len(shape)]]) <= (
+        LOG_SOFTMAX_MAX_SPAN
+    )
 
 
 def _value_of(node: torch.fx.Node) -> torch.Tensor:
@@ -4286,31 +4325,60 @@ def _emit_add_rms_norm(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, normalized)
 
 
-def layer_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
-    """The layer norm a getitem reads, when it reads the first output.
+def _first_output_getitem(node: torch.fx.Node, source_target):
+    """The node a getitem reads, when it reads the first of its outputs.
 
-    native_layer_norm returns (out, mean, rstd) and the DSP has a command for
-    out alone, so getitem 0 is the only reader a partition can carry.
+    native_layer_norm, native_group_norm and the batch norm all hand out
+    (out, statistics...) and the DSP has a command for out alone, so getitem 0 is
+    the only reader a partition can carry.
     """
     if node.target is not GETITEM or len(node.args) != 2:
         return None
     source, index = node.args
     if index != 0 or not isinstance(source, torch.fx.Node):
         return None
-    return source if source.target is NATIVE_LAYER_NORM else None
+    return source if source.target is source_target else None
+
+
+def layer_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The layer norm a getitem reads, when it reads the first output."""
+    return _first_output_getitem(node, NATIVE_LAYER_NORM)
+
+
+def group_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The group norm a getitem reads, when it reads the first output."""
+    return _first_output_getitem(node, NATIVE_GROUP_NORM)
+
+
+def batch_norm_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The batch norm a getitem reads, when it reads the first output."""
+    return _first_output_getitem(node, BATCH_NORM_NO_STATS)
+
+
+def _only_the_first_output_is_read(node: torch.fx.Node, getitem) -> bool:
+    """Whether every reader of this multi-output norm takes its first output.
+
+    The statistics come out of the same node and nothing here produces them, so
+    a graph that reads one keeps the whole node on the portable kernels -- along
+    with the readers of out, which would otherwise be left holding a tuple no
+    kernel can be handed.
+    """
+    return bool(node.users) and all(getitem(reader) is node for reader in node.users)
 
 
 def layer_norm_is_emittable(node: torch.fx.Node) -> bool:
-    """Whether every reader of this layer norm takes the output the kernel writes.
+    """Whether every reader of this layer norm takes the output the kernel writes."""
+    return _only_the_first_output_is_read(node, layer_norm_getitem)
 
-    mean and rstd come out of the same node and nothing here produces them, so a
-    graph that reads either one keeps the whole node on the portable kernels --
-    along with the readers of out, which would otherwise be left holding a tuple
-    no kernel can be handed.
-    """
-    return bool(node.users) and all(
-        layer_norm_getitem(reader) is node for reader in node.users
-    )
+
+def group_norm_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this group norm takes the output the kernel writes."""
+    return _only_the_first_output_is_read(node, group_norm_getitem)
+
+
+def batch_norm_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this batch norm takes the output the kernel writes."""
+    return _only_the_first_output_is_read(node, batch_norm_getitem)
 
 
 def layer_norm_normalizes_the_trailing_dims(node: torch.fx.Node) -> bool:
@@ -4410,8 +4478,405 @@ def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _declared_extent(value):
+    """The extent one of `native_group_norm`'s own arguments names.
+
+    A static export gives the op plain ints for N, C and HxW; a dynamic one gives
+    the `sym_size` node they were read from, and its meta holds the symbol whose
+    bound the emitter's params are built from -- so that bound is what this
+    compares. None means the argument is neither, which is refused rather than
+    guessed at.
+    """
+    if isinstance(value, torch.fx.Node):
+        value = value.meta.get("val")
+    if isinstance(value, torch.SymInt):
+        return eval_upper_bound(value)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def group_norm_normalizes_one_group_per_row(node: torch.fx.Node) -> bool:
+    """Whether this group norm is the [rows][inner] view the norm kernel takes.
+
+    Every argument the command cannot carry is refused here rather than at the
+    emitter: the group count has to divide the channels, the declared N, C and
+    HxW have to be the input's own extents, the epsilon has to be a number
+    rather than a run-time tensor, and both weights one element per channel. The
+    input has to be contiguous, because the row per (batch, group) the command
+    describes is the input's own layout only then -- a batch dim, the channel
+    dim and the group axis are what the rows walk.
+    """
+    if len(node.args) < 8:
+        return False
+    src = node.args[0]
+    if not isinstance(src, torch.fx.Node):
+        return False
+    value = src.meta.get("val")
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.dim() < 3
+        or not value.is_contiguous()
+        or value.dtype not in (torch.float16, torch.float32)
+    ):
+        return False
+    shape = list(value.shape)
+    declared = [
+        _declared_extent(node.args[3]),
+        _declared_extent(node.args[4]),
+        _declared_extent(node.args[5]),
+    ]
+    if None in declared:
+        return False
+    if declared != [
+        _upper_product([shape[0]]),
+        _upper_product([shape[1]]),
+        _upper_product(shape[2:]),
+    ]:
+        return False
+    channels = _upper_product([shape[1]])
+    group = node.args[6]
+    if isinstance(group, bool) or not isinstance(group, int) or group <= 0:
+        return False
+    if channels % group:
+        return False
+    if _scalar_arg(node, "eps", 7, 1e-5) is None:
+        return False
+    for operand in (node.args[1], node.args[2]):
+        if operand is None:
+            continue
+        if not isinstance(operand, torch.fx.Node) or _numel(operand) != channels:
+            return False
+    return group_norm_is_emittable(node)
+
+
+def batch_norm_normalizes_one_span(node: torch.fx.Node) -> bool:
+    """Whether this batch norm is the [rows][inner] view the norm kernel takes.
+
+    Without running statistics the op's statistics are the batch's, whatever the
+    training flag says, and the normalization is over every axis but the channel
+    one. That is one contiguous span per channel exactly when the batch axis is
+    one, which is the view instance_norm exports: [N, C, *spatial] flattened to
+    [1, N*C, *spatial] so that each (n, c) pair becomes a channel of its own. A
+    wider batch normalizes each channel over the batch as well, which this
+    command -- one row per channel, no second axis to fold in -- cannot describe.
+    """
+    if len(node.args) < 6:
+        return False
+    src = node.args[0]
+    if not isinstance(src, torch.fx.Node):
+        return False
+    value = src.meta.get("val")
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.dim() < 3
+        or not value.is_contiguous()
+        or value.dtype not in (torch.float16, torch.float32)
+    ):
+        return False
+    shape = list(value.shape)
+    if _upper_product([shape[0]]) != 1:
+        return False
+    # The no-stats op always reduces the batch; this flag only says which
+    # statistics a caller believed it was asking for. `training=False` on it
+    # returns nothing at all in this torch build (a segfault, measured), so the
+    # graph the exporter produces here carries True.
+    if node.args[3] is not True:
+        return False
+    if _scalar_arg(node, "eps", 5, 1e-5) is None:
+        return False
+    channels = _upper_product([shape[1]])
+    for operand in (node.args[1], node.args[2]):
+        if operand is None:
+            continue
+        if not isinstance(operand, torch.fx.Node) or _numel(operand) != channels:
+            return False
+    return batch_norm_is_emittable(node)
+
+
+def _channel_broadcast_shape(channels: int, rank: int) -> tuple:
+    """The shape a per-channel weight is read under: ``(1, C, 1, ...)``.
+
+    Every norm here normalizes along one axis of the tensor it is handed and its
+    weights sit on that axis, which is dim 1 for all of them. The bytes are the
+    operand's own -- a (C,) tensor row-major is a (1, C, 1, 1) tensor -- so this
+    describes an existing buffer rather than asking for a copy of it.
+    """
+    return (1, channels) + (1,) * (rank - 2)
+
+
+def _emit_elementwise(
+    node, ctx, lhs, rhs, kind: str, lhs_shape, rhs_shape, out_shape, out
+) -> None:
+    """One BINARY_ELEMENTWISE command, with every shape given by the caller.
+
+    `_binary` reads its shapes off the node's own operands, which is right where
+    the graph's two tensors are the two the DSP reads. Here they are not: a
+    weight the graph declares as (C,) is read as (1, C, 1, 1), and one operand
+    is an activation this emitter allocated rather than a node's result. The
+    shape each operand is walked under is therefore the caller's to state.
+    """
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_BINARY_ELEMENTWISE,
+            inputs=[lhs, rhs],
+            outputs=[out],
+            params=[
+                _upper_product(out_shape),
+                _upper_product(lhs_shape),
+                _upper_product(rhs_shape),
+                BINARY_OP_TYPES[kind],
+                FP16_BYTES,
+                FP16_BYTES,
+                0,  # inputs are not 4-byte floats
+                0,  # output is not a 4-byte float
+                *_broadcast_tail(
+                    ctx.upper_shape(lhs_shape),
+                    ctx.upper_shape(rhs_shape),
+                    ctx.upper_shape(out_shape),
+                    ctx,
+                ),
+            ],
+        ),
+    )
+    _patch_dynamic_product(ctx, op_index, out_shape, 0)
+    _patch_dynamic_product(ctx, op_index, lhs_shape, 1)
+    _patch_dynamic_product(ctx, op_index, rhs_shape, 2)
+    for axis, size in enumerate(out_shape):
+        if ctx.is_dynamic_dim(size):
+            ctx.add_dynamic_patch(op_index, 9 + axis, _dynamic_scale(ctx, size), 0)
+
+
+def _emit_norm_affine(node, ctx, source, shape, affine, out) -> TensorRef:
+    """The mul and the add that apply gamma and beta after the norm.
+
+    The kernel normalizes without them, for the reason rms_norm's emitter gives:
+    a subgraph carries no tensors, so a weight reaches it as an operand at the
+    width the arena holds, and the affine is the same pair of element-wise
+    commands layer_norm already spends on its own. The cost is one rounding to
+    fp16 before the multiply and one after the add, on kernels that are fp16 in
+    and out regardless.
+    """
+    rank = len(shape)
+    result = source
+    for index, (weight, kind) in enumerate(affine):
+        target = out if index == len(affine) - 1 else ctx.activation_for_shape(shape)
+        _emit_elementwise(
+            node,
+            ctx,
+            result,
+            ctx.operand(weight),
+            kind,
+            shape,
+            _channel_broadcast_shape(_numel(weight), rank),
+            shape,
+            target,
+        )
+        result = target
+    return result
+
+
+def _emit_group_norm(node: torch.fx.Node, ctx) -> TensorRef:
+    """GroupNorm as the norm kernel over one row per (batch, group).
+
+    The op's statistics are one mean and one variance per group over that
+    group's channels and the whole spatial block, which is exactly one row of an
+    [N*group][(C/group)*HxW] view of the input -- the [outer][inner] span
+    DSP_OP_LAYER_NORM already reduces. Nothing else has to be emitted for the
+    statistics: the kernel accumulates in fp32 and divides, and its epsilon is
+    this op's, so the variance it computes is the one native_group_norm defines
+    rather than a second moment computed elsewhere.
+    """
+    src = node.args[0]
+    weight, bias = node.args[1], node.args[2]
+    group = int(node.args[6])
+    eps = _scalar_arg(node, "eps", 7, 1e-5)
+    _require_arena_dtype(node, "group_norm input")
+
+    # The input's own extents rather than the op's arguments, which are the same
+    # for every node the gate admits -- and are a `sym_size` node rather than a
+    # number when the batch axis is dynamic, which has no upper bound to take.
+    shape = list(_value_of(node).shape)
+    outer_shape = [shape[0], group]
+    inner_shape = [shape[1] // group] + shape[2:]
+    rows = _upper_product(outer_shape, ctx)
+    inner = _upper_product(inner_shape, ctx)
+
+    sink = next(
+        (reader for reader in node.users if group_norm_getitem(reader) is node), node
+    )
+    out = ctx.result_for(sink, rows * inner)
+    affine = [
+        (arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None
+    ]
+    normalized = ctx.activation_for_shape(shape) if affine else out
+    norm_op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_LAYER_NORM,
+            # Order matters: dst is the DSP's mapped_ptrs[3], so the three inputs
+            # must be exactly src, gamma, beta -- null here, which the kernel
+            # tests for and skips.
+            inputs=[ctx.operand(src), ABSENT, ABSENT],
+            outputs=[normalized],
+            params=[rows, inner, _float_bits(eps), 0],
+        ),
+    )
+    # Both counts can hold the run-time length -- the outer one through the batch
+    # axis and the inner one through a spatial extent -- so both are patched with
+    # the length they were written for, as the reduction emitter patches its own
+    # two. Without the inner one the command would reduce the allocation rather
+    # than the buffer, which is a wrong answer rather than a failure.
+    _patch_dynamic_product(ctx, norm_op_index, outer_shape, 0)
+    _patch_dynamic_product(ctx, norm_op_index, inner_shape, 1)
+    _emit_norm_affine(node, ctx, normalized, shape, affine, out)
+    return ctx.record(node, out)
+
+
+def _emit_batch_norm(node: torch.fx.Node, ctx) -> TensorRef:
+    """InstanceNorm as the norm kernel over one row per (batch, channel).
+
+    The exporter flattens [N, C, *spatial] to [1, N*C, *spatial] so the batch
+    norm reduces the spatial block of each (n, c) pair on its own, which is one
+    row of the [channels][spatial] view the kernel already reduces. The affine
+    is per row here rather than per channel of a nested axis: the weights arrive
+    already repeated to the flattened channel count, so one stride-zero operand
+    covers them.
+    """
+    src = node.args[0]
+    weight, bias = node.args[1], node.args[2]
+    eps = _scalar_arg(node, "eps", 5, 1e-5)
+    _require_arena_dtype(node, "batch_norm input")
+
+    shape = list(_value_of(node).shape)
+    outer_shape = shape[1:2]
+    inner_shape = shape[2:]
+    rows = _upper_product(outer_shape, ctx)
+    inner = _upper_product(inner_shape, ctx)
+
+    sink = next(
+        (reader for reader in node.users if batch_norm_getitem(reader) is node), node
+    )
+    out = ctx.result_for(sink, rows * inner)
+    affine = [
+        (arg, kind) for arg, kind in ((weight, "mul"), (bias, "add")) if arg is not None
+    ]
+    normalized = ctx.activation_for_shape(shape) if affine else out
+    norm_op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_LAYER_NORM,
+            inputs=[ctx.operand(src), ABSENT, ABSENT],
+            outputs=[normalized],
+            params=[rows, inner, _float_bits(eps), 0],
+        ),
+    )
+    _patch_dynamic_product(ctx, norm_op_index, outer_shape, 0)
+    _patch_dynamic_product(ctx, norm_op_index, inner_shape, 1)
+    _emit_norm_affine(node, ctx, normalized, shape, affine, out)
+    return ctx.record(node, out)
+
+
+def _emit_log_softmax(node: torch.fx.Node, ctx) -> TensorRef:
+    """log_softmax as the log-sum-exp the softmax kernel computes internally.
+
+    The short composition -- the SOFTMAX command followed by the unary log of
+    its result -- is the obvious one and it is measurably wrong at fp16. The
+    softmax kernel stores probabilities two bytes wide, and a row of logits with
+    a realistic spread drives the small ones under fp16's subnormal floor: over
+    a 1000-way log_softmax of unit-variance logits scaled by three, log(softmax)
+    came back infinite on 136 of 4000 outputs where torch's smallest is -23.2,
+    and over 16-way rows it is already 8x further from torch than this form.
+    Because the softmax's output is the whole of the intermediate, no tolerance
+    or gate on the input can recover those values.
+
+    Subtracting the row maximum first is what the kernel does internally anyway,
+    and it is the step that has to be visible to the output: x - m is a number
+    of the log_softmax's own size, so rounding it costs one fp16 ulp of the
+    answer rather than the answer. What is left of the log-sum-exp -- the sum of
+    at most 1s and its log -- is small, well-conditioned, and lands on a log
+    that the unary table already carries. Six commands, no new kernel: the
+    maximum, the shift, the exponential, the sum, the log of it, and the
+    subtraction that also removes the shift.
+    """
+    src = node.args[0]
+    _require_arena_dtype(node, "log_softmax input")
+    if not softmax_reduces_the_inner_axis(node):
+        raise RuntimeError("hexagon: this log_softmax does not reduce the inner axis")
+
+    shape = list(node.meta["val"].shape)
+    dim = int(node.args[1]) % len(shape)
+    outer_shape = shape[:dim]
+    span = shape[dim : dim + 1]
+    inside_shape = shape[dim + 1 :]
+    reduced_shape = outer_shape + [1] + inside_shape
+    outer = _upper_product(outer_shape, ctx)
+    span_upper = ctx.upper_bound(shape[dim])
+    inside = _upper_product(inside_shape, ctx)
+    numel = _numel(node)
+
+    def reduce_spans(kind: int, source, out) -> int:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_REDUCTION,
+                inputs=[source],
+                outputs=[out],
+                params=[outer, span_upper, inside, kind, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, outer_shape, 0)
+        _patch_dynamic_product(ctx, index, span, 1)
+        _patch_dynamic_product(ctx, index, inside_shape, 2)
+        return index
+
+    def unary(kind: str, source, out, count, count_shape) -> None:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_UNARY,
+                inputs=[source],
+                outputs=[out],
+                params=[count, UNARY_OP_TYPES[kind], FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, count_shape, 0)
+
+    # The row maximum, which is the shift the exponentials need and the term the
+    # last subtraction removes again.
+    maximum = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_MAXIMUM, ctx.operand(src), maximum)
+
+    shifted = ctx.activation_for_shape(shape)
+    _emit_elementwise(
+        node, ctx, ctx.operand(src), maximum, "sub", shape, reduced_shape, shape, shifted
+    )
+
+    exponentials = ctx.activation_for_shape(shape)
+    unary("exp", shifted, exponentials, numel, shape)
+
+    total = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_SUM, exponentials, total)
+
+    correction = ctx.activation_for_shape(reduced_shape)
+    unary("log", total, correction, _upper_product(reduced_shape, ctx), reduced_shape)
+
+    out = ctx.result_for(node, numel)
+    _emit_elementwise(
+        node,
+        ctx,
+        shifted,
+        correction,
+        "sub",
+        shape,
+        reduced_shape,
+        shape,
+        out,
+    )
+    return ctx.record(node, out)
+
+
 def _emit_getitem(node: torch.fx.Node, ctx) -> TensorRef:
-    """Re-points the layer norm result, the only getitem this backend takes."""
+    """Re-points a norm's result, the only getitems this backend takes."""
     source = node.args[0]
     if isinstance(source, torch.fx.Node) and (
         source.target is ADD_RMS_NORM or source.target in SPLIT_TARGETS
@@ -4978,11 +5443,19 @@ EMITTERS = {
     # to_edge rewrites softmax.int into _softmax, which is the name the
     # partitioner then sees.
     exir_ops.edge.aten._softmax.default: _emit_softmax,
+    # The log-sum-exp the softmax kernel computes internally, written out as
+    # commands: the unary table has a log but no op that fuses it with a
+    # softmax, and the two-command composition loses the small probabilities.
+    LOG_SOFTMAX: _emit_log_softmax,
     # to_edge grows native_layer_norm out of layer_norm; the functional form is
     # kept for a graph that reaches the backend without that rewrite.
     exir_ops.edge.aten.layer_norm.default: _emit_layer_norm,
     NATIVE_LAYER_NORM: _emit_layer_norm,
-    # The getitem that reads a layer norm's first output.
+    # GroupNorm and InstanceNorm are the same kernel over another view of the
+    # input: rows of a group, or rows of a (batch, channel) pair.
+    NATIVE_GROUP_NORM: _emit_group_norm,
+    BATCH_NORM_NO_STATS: _emit_batch_norm,
+    # The getitem that reads a norm's first output.
     GETITEM: _emit_getitem,
     exir_ops.edge.aten.mm.default: _emit_mm,
     exir_ops.edge.aten.bmm.default: _emit_bmm,

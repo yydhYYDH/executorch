@@ -8,11 +8,15 @@
      question, and what either costs a real model. Every claim below names the
      file it was read from, so a reader can tell a measurement from a reading. -->
 
-Computed against `53369ff` on 2026-09-24 and re-measured once `hexagon-select`,
-`hexagon-prefill` and `hexagon-padscan` were merged into `b7183d9`. The library
-inventory below is the vendored tree, which none of those three changed. Section 2
-counts two commands more than `b7183d9` did, because two kernels have left its
-table: `DSP_OP_SELECT`(26) and `DSP_OP_MATMUL_Q4A16_FP16`(22).
+Computed against `53369ff` on 2026-09-24 and re-measured as the parallel branches
+landed -- `topk`'s values half before `b7183d9`, then the element-wise select, the
+quantized prefill entry, the zero-filling pad, the split, the transposed
+convolution and the three norms. The library inventory below is the vendored tree,
+which none of them changed. Section 2 counts two commands more than `b7183d9` did,
+because two kernels have left its table: `DSP_OP_SELECT`(26) and
+`DSP_OP_MATMUL_Q4A16_FP16`(22). Section 1 lost a row for a different reason:
+`_log_softmax` gained no kernel, but it is a composition of commands that already
+exist, which is also why §3's last entry is a composition rather than a kernel.
 
 ## The three verdicts
 
@@ -48,7 +52,6 @@ contain the operator, so an emitter would have nothing to call.
 | `aten.prod.default`, `aten.var.correction`, `aten.cumsum.default` | A running product, a second moment and a prefix scan are each a different walk from the three reductions that exist |
 | `aten.erf.default` | No `HtpOpsUnaryOpType` entry: the enum is 1..17 (`unary_ops.cc:14-31`) |
 | `aten.leaky_relu.default`, `aten.elu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no `elu` |
-| `aten._log_softmax.default` | Composes a log with a softmax in a way no single command describes |
 | `aten.convolution.default with transposed=True` and a dilation above 1, or a group count other than 1 | A transposed convolution *is* a window walk once its input is interleaved with zeros: `conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc), k - 1 - p)`, which `conv_spec` emits on the same two kernels. The undilated, one-group case is therefore supported. A dilated transposed window is a different identity, and neither kernel carries a channel mapping for a group count between 1 and `C_in` |
 | `aten.conv3d.default`, `aten.conv_transpose3d.input` | `Im2ColParameter` is `padX`, `padY`, `dilateX`, `dilateY`, `strideX`, `strideY`, `kernelX`, `kernelY`, `iw`, `ih`, `ow`, `oh` -- no depth axis exists (`ops.h:45`), so nothing here walks a volume. 3-D is a different kernel rather than another parameter set, and the two-dimensional identity above cannot be stretched to it: EXIR spells both 3-D forms as their own targets, which `CONV_TARGETS` never names |
 | `aten.upsample_nearest2d`, `aten.upsample_bilinear2d`, `aten._upsample_*` | No sampling command: `DSPOpType` (`htp_command.h:32`) has no upsample case and no kernel source mentions interpolation. The blit kernel's regions are affine index maps, and nearest is `out[i] = in[i / s]` -- a division, which no constant source stride can express, while bilinear needs weights that vary with position. `upsample_bicubic2d` is not this row: export decomposes it into arithmetic that delegates already carry (see `OP_SUPPORT.md`) |
@@ -57,6 +60,14 @@ contain the operator, so an emitter would have nothing to call.
 | `aten.pow.Tensor_Tensor` | No pow kernel, and the unary table's `SQUARE` is exponent 2 only |
 | `aten.clamp.Tensor` | The clamp entry point carries its bounds as two fp16 params, so an operand bound has nowhere to go |
 | `aten.full`, `aten.full_like`, `aten.arange`, `aten.scalar_tensor` | Not kernels: nothing emits a tensor that was not read from memory |
+
+`aten._log_softmax.default` was a row in this table and is not any more, and
+neither `aten.native_group_norm.default` nor
+`aten._native_batch_norm_legit.no_stats` -- the batch-of-one view InstanceNorm
+exports -- belongs in it. The enum has no kernel for any of the three, but "no
+kernel" and "nothing an emitter can call" are different claims: each of them is a
+composition of commands that do exist, so an emitter *can* call something. §3's
+last entry is what that composition is and why it is not the obvious one.
 
 ## 2. Kernels present, nothing on the host emits them
 
@@ -190,6 +201,25 @@ emitter: a one-byte bool output for the comparisons.
   a refusal is unambiguously for, so `topk_is_emittable` keeps the whole node on
   the portable kernels whenever anything reads it. (The width would refuse it
   anyway: the node declares int64 and the kernel writes one int32 a row.)
+- **The three norms**: `aten.native_group_norm.default`,
+  `aten._native_batch_norm_legit.no_stats` and `aten._log_softmax.default` all
+  landed the same way `topk` did not: no kernel was added and nothing under
+  `third-party/` changed. Each is a view of an op that is already wired. A group
+  norm is one mean and one variance per group over that group's channels and the
+  whole spatial block, which is one row per (batch, group) of the input's own
+  `[N*G][(C/G)*H*W]` view -- the row `DSP_OP_LAYER_NORM` already reduces -- plus
+  the two elementwise commands a per-channel affine needs, because the kernel
+  takes no weight. InstanceNorm exports as the no-stats batch norm over a
+  `[1, N*C, spatial]` view for the same reason, one row per (batch, channel),
+  and the batch-of-one gate that keeps a wider batch portable is in §4.
+  `log_softmax` is six commands rather than the two the name suggests: the row's
+  maximum, the shift, the exponentials, their sum, the log of it, and the
+  subtraction that removes the shift. `log(softmax(x))` is the composition that
+  does not work -- the softmax command stores its small probabilities as fp16
+  zeroes, and the log of a zero is the kernel's -65504, which
+  `test/test_log_softmax.py` measures against torch's finite answer on a row
+  that saturates. The shift also bounds what the sum holds at the row length,
+  which is why a span past 65504 elements is refused rather than saturated.
 
 ## 4. Shape and parameter limits of the ops that are supported
 

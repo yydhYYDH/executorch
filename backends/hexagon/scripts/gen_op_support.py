@@ -496,6 +496,46 @@ SUPPORTED: List[OpSupport] = [
     ),
     # --- norms -----------------------------------------------------------
     OpSupport(
+        "aten.native_group_norm.default",
+        f"{LAYER_NORM} / {BINARY}",
+        ARENA_FP16,
+        "GroupNorm is the norm kernel over one row per (batch, group) of the "
+        "input's [N*G][(C/G)*H*W] view: the group count must divide the channels, "
+        "the node's N, C and HxW must be the input's own extents, and eps a "
+        "compile-time scalar. The kernel takes no weight, so the affine is two "
+        "elementwise commands against a per-channel operand, one element per "
+        "channel. The input must be contiguous, and every reader of the node has "
+        "to be getitem 0 -- the mean and the rstd the op also returns have no "
+        "command behind them and keep the whole node portable.",
+    ),
+    OpSupport(
+        "aten._native_batch_norm_legit.no_stats",
+        f"{LAYER_NORM} / {BINARY}",
+        ARENA_FP16,
+        "The batch-of-one view InstanceNorm exports: the exporter flattens "
+        "[N, C, *spatial] to [1, N*C, *spatial] so per-channel statistics become "
+        "per-(n, c) ones, which is one row per (batch, channel) of an [N*C][H*W] "
+        "view. A batch wider than one normalizes each channel over the batch as "
+        "well, which one contiguous span per channel cannot describe, so it stays "
+        "portable; so does the training flag being false, and any operand that is "
+        "not contiguous or any weight that is not one element per row. The affine "
+        "is two elementwise commands, as for the group norm.",
+    ),
+    OpSupport(
+        "aten._log_softmax.default",
+        f"{REDUCTION} / {BINARY} / {UNARY}",
+        ARENA_FP16,
+        "Last axis only, and the shifted log-sum-exp: the row's maximum, the "
+        "shift, the exponentials, their sum, the log of it, and the subtraction "
+        "that removes the shift. The shift is not decoration -- a log of the "
+        "softmax command stores its small probabilities as fp16 zeroes and the "
+        "log of one is the kernel's -65504 -- and it also bounds what the sum "
+        "holds, so a reduced span longer than 65504 elements is refused rather "
+        "than saturated. The `half_to_float` argument is ignored, as it is on the "
+        "softmax path: the arena is fp16 and the runtime narrows or widens at the "
+        "boundary.",
+    ),
+    OpSupport(
         "aten.layer_norm.default",
         LAYER_NORM,
         "src fp16; gamma/beta fp32",
@@ -913,10 +953,12 @@ NOT_SUPPORTED = [
         "sizes the window per output position.",
     ),
     (
-        "aten.leaky_relu.default, aten.elu.default, aten._log_softmax.default",
-        "No kernel: leaky_relu needs a slope the binary table has no form for, elu "
-        "an exponential the unary table does not carry, and log_softmax composes a "
-        "log with a softmax in a way no single command describes.",
+        "aten.leaky_relu.default, aten.elu.default",
+        "No kernel: leaky_relu needs a slope the binary table has no form for, and "
+        "elu an exponential the unary table does not carry. Neither is a missing "
+        "line next to a validated kernel, which is why `aten._log_softmax.default` "
+        "-- no kernel either -- is wired instead: it is a composition of commands "
+        "that do exist.",
     ),
     (
         "aten.prod.default, aten.var.correction, aten.cumsum.default",
@@ -989,6 +1031,9 @@ PREDICATES = [
     "sdpa_targets",
     "layer_norm_normalizes_the_trailing_dims",
     "layer_norm_is_emittable",
+    "group_norm_normalizes_one_group_per_row",
+    "batch_norm_normalizes_one_span",
+    "log_softmax_shifts_within_the_arena",
     "add_rms_norm_is_emittable",
     "quantized_matmul_is_emittable",
     "conv_spec",

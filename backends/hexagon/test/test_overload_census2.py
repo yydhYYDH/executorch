@@ -200,10 +200,15 @@ _ROWS = [
         "instance norm's two outputs",
         lambda a: torch.nn.functional.instance_norm(a),
         (_x(2, 3, 4),),
+        # The exporter flattens the batch into the channel axis, so the op's
+        # per-(n, c) statistics are one row of a [N*C][H*W] view -- the span the
+        # norm kernel already reduces. The second view is the alias back to the
+        # exported shape, and the batch norm's second and third outputs are the
+        # op's own accumulators, which nothing here reads.
         [
             ("aten.view_copy.default", "wired"),
-            ("aten._native_batch_norm_legit.no_stats", "unwired"),
-            (_GETITEM, "refused"),
+            ("aten._native_batch_norm_legit.no_stats", "wired"),
+            (_GETITEM, "wired"),
             ("aten.view_copy.default", "wired"),
         ],
     ),
@@ -213,11 +218,16 @@ _ROWS = [
             a, 2, torch.ones(4, dtype=F16), torch.zeros(4, dtype=F16)
         ),
         (_x(2, 4, 3),),
+        # One mean and one variance per group over that group's channels and the
+        # whole spatial block is one row per (batch, group) of an
+        # [N*G][(C/G)*H*W] view. The two fulls are the affinity the expression
+        # builds in the graph rather than a parameter; they stay on the portable
+        # kernels and reach the delegate as operands, one element per channel.
         [
             ("aten.full.default", "unwired"),
             ("aten.full.default", "unwired"),
-            ("aten.native_group_norm.default", "unwired"),
-            (_GETITEM, "refused"),
+            ("aten.native_group_norm.default", "wired"),
+            (_GETITEM, "wired"),
         ],
     ),
     # --- the copies ---------------------------------------------------------

@@ -487,10 +487,25 @@ _ROWS = [
         [("aten._softmax.default", "refused")],
     ),
     (
-        "log_softmax has no emitter",
+        "log_softmax over the last axis",
         lambda a: torch.nn.functional.log_softmax(a, dim=-1),
         (_x(2, 8),),
-        [("aten._log_softmax.default", "unwired")],
+        # No command describes a log softmax and the unary table has no such
+        # entry, so this one is six commands: the row's maximum, the shift, the
+        # exponentials, their sum, the log of it, and the subtraction that puts
+        # the shift back. The two-command log(softmax(x)) is the obvious
+        # composition and it is not the one emitted -- the softmax stores its
+        # small probabilities as fp16 zeroes and the log of one is the kernel's
+        # -65504, where the shifted form keeps the answer at the logit's own size.
+        [("aten._log_softmax.default", "wired")],
+    ),
+    (
+        "log_softmax over another axis is refused",
+        lambda a: torch.nn.functional.log_softmax(a, dim=0),
+        (_x(2, 8),),
+        # The composition is written for a span with nothing inside it: every
+        # command reduces the row and broadcasts back over it.
+        [("aten._log_softmax.default", "refused")],
     ),
     # --- shape: what cat/stack/split/slice/select/permute/view each become ---
     (

@@ -706,9 +706,47 @@ def _f32(value):
     return np.float32(value)
 
 
-#: The unary ops computed exactly. The rest -- log, rsqrt, expm1, cos and sin --
-#: go through the DSP's own fast approximations, so a host model would be
-#: guessing at them rather than reproducing them.
+def _fast_logf(x):
+    """htp_ops_unary_fast_logf, transcribed operation for operation.
+
+    The kernel's log is not libm: it takes the exponent out of the fp32 bits,
+    folds the mantissa into [1, sqrt(2)) and evaluates the series in
+    t = (m - 1)/(m + 1) up to t^7, then adds e*ln2 back. Every step of that is
+    an fp32 operation the host can round the same way, so a transcription
+    reproduces the kernel's value rather than approximating it -- which is what
+    makes a comparison against this a comparison of bits. A non-positive input
+    comes back as -65504 and not as an infinity, which is the kernel's own
+    choice (unary_ops.cc:55-58).
+
+    log is one of the unary types with no HVX path at all: unary_ops.cc sends
+    only expm1, sigmoid, gelu, silu and tanh to a vector routine and evaluates
+    everything else, log included, through htp_ops_unary_apply_fp16.
+    """
+    values = np.asarray(x, dtype=np.float32)
+    out = np.full(values.shape, _f32(-65504.0), dtype=np.float32)
+    positive = values > _f32(0.0)
+    bits = np.ascontiguousarray(values[positive]).view(np.uint32)
+    exponent = (((bits >> np.uint32(23)) & np.uint32(0xFF)).astype(np.int32) - 127)
+    mantissa = ((bits & np.uint32(0x007FFFFF)) | np.uint32(0x3F800000)).view(np.float32)
+    big = mantissa > _f32(1.41421356237)
+    mantissa = np.where(big, mantissa * _f32(0.5), mantissa)
+    exponent = exponent + big.astype(np.int32)
+    t = (mantissa - _f32(1.0)) / (mantissa + _f32(1.0))
+    t2 = t * t
+    t3 = t * t2
+    t5 = t3 * t2
+    t7 = t5 * t2
+    ln_m = _f32(2.0) * (
+        t + t3 * _f32(1.0 / 3.0) + t5 * _f32(1.0 / 5.0) + t7 * _f32(1.0 / 7.0)
+    )
+    out[positive] = ln_m + exponent.astype(np.float32) * _f32(0.69314718056)
+    return out
+
+
+#: The unary ops the kernel computes elementwise and exactly. log is here
+#: because the transcription above is the kernel's own arithmetic; the ones left
+#: out -- rsqrt, expm1, cos and sin -- have fast approximations this file has not
+#: transcribed, and a host model of them would be guessing.
 _UNARY = {
     1: lambda x: np.where(x < 0, -x, x),  # abs
     2: lambda x: -x,  # neg
@@ -717,6 +755,7 @@ _UNARY = {
     ),
     4: lambda x: 1.0 / (1.0 + np.exp(-x)),  # sigmoid
     5: lambda x: np.exp(x),  # exp
+    6: _fast_logf,  # log
     7: lambda x: np.where(x >= 8, x, np.where(x <= -8, 0.0, x / (1.0 + np.exp(-x)))),
     8: lambda x: np.tanh(x),  # tanh
     9: lambda x: x * x,  # square
@@ -747,7 +786,7 @@ def _run_unary(command: Command, params: List[int], arena: Arena) -> None:
         return
     if op_type not in _UNARY:
         raise UnsupportedOp(
-            f"blob: unary op {op_type} uses a DSP approximation, not modelled"
+            f"blob: unary op {op_type} has no transcription in this file"
         )
     out = _UNARY[op_type](source.astype(np.float32)).astype(np.float16)
     _store(arena, arena.address(refs[1]), out.tobytes())

@@ -26,6 +26,7 @@ arena answers garbage rather than failing: read `test/README.md` before touching
 the fixtures or the runner.
 """
 
+import operator
 import os
 import pathlib
 import struct
@@ -147,6 +148,15 @@ _SOURCES = [
 #: The fused norm reduces in a different order than numpy does, so it is compared
 #: with a tolerance rather than by bits.
 _NORM_TOLERANCE = 2e-2
+
+#: Small, because the fixture's answers are. An answer here runs to -25, where an
+#: fp16 has an ulp of 0.0156, and the two legs land inside a quarter of one:
+#: measured at 4.9e-4 for the host model and 3.9e-3 for the kernel under
+#: hexagon-sim, the difference between them being the exponential the two
+#: compute -- numpy's and the DSP's own expf -- and not the shift, which is what
+#: keeps the answer's size in the answer. The ceiling is above both measurements
+#: and two thousand times below the 24 a missing shift would move it by.
+_LOG_SOFTMAX_TOLERANCE = 1e-2
 
 #: Measured, not assumed. htp_ops_softmax exponentiates with hvx_my_exp2_vhf, a
 #: degree-six polynomial in fp16 evaluated with qfloat multiplies, and divides by
@@ -365,6 +375,87 @@ def _norm_graph(shape, eps):
     root = torch.nn.Module()
     root.weight = torch.nn.Parameter(_norm_weight(shape[-1]), requires_grad=False)
     return _program(torch.fx.GraphModule(root, graph))
+
+
+class _GroupNorm(torch.nn.Module):
+    """GroupNorm as the exporter writes it, with a hand-made affine."""
+
+    def __init__(self, groups, channels):
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(groups, channels)
+        with torch.no_grad():
+            self.norm.weight.copy_(_norm_weight(channels))
+            self.norm.bias.copy_(_norm_weight(channels) * 0.5 - 0.5)
+
+    def forward(self, x):
+        return self.norm(x)
+
+
+def _batch_norm_graph(shape, eps):
+    """A no-stats batch norm with a per-row affine, as instance_norm exports it.
+
+    The graph is built rather than exported because the export repeats a
+    (C,)-shaped weight out to (N*C,) through an `aten.repeat` the backend does
+    not place, and this case is about the kernel and not about that fallback:
+    the weight here is already the repeated one, which is what the command reads.
+    """
+    rows = shape[1]
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    weight = graph.get_attr("weight")
+    weight.meta["val"] = torch.empty(rows, dtype=torch.float16)
+    bias = graph.get_attr("bias")
+    bias.meta["val"] = torch.empty(rows, dtype=torch.float16)
+    norm = graph.call_function(
+        exir_ops.edge.aten._native_batch_norm_legit.no_stats,
+        args=(x, weight, bias, True, 0.1, eps),
+    )
+    norm.meta["val"] = (
+        torch.empty(shape, dtype=torch.float16),
+        torch.empty((0,), dtype=torch.float16),
+        torch.empty((0,), dtype=torch.float16),
+    )
+    out = graph.call_function(operator.getitem, args=(norm, 0))
+    out.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    graph.output(out)
+    root = torch.nn.Module()
+    root.weight = torch.nn.Parameter(_instance_weight(rows), requires_grad=False)
+    root.bias = torch.nn.Parameter(_instance_weight(rows) * 0.5 - 0.5, requires_grad=False)
+    return _program(torch.fx.GraphModule(root, graph))
+
+
+def _instance_weight(rows):
+    """A per-row affine that is not the same for the two halves of the rows.
+
+    A weight that repeated itself over the batch would let a command that read
+    the wrong row of it pass.
+    """
+    return ((torch.arange(rows) % 7) * 0.25 + 0.5).half()
+
+
+class _LogSoftmax(torch.nn.Module):
+    """A last-axis log softmax over a row whose spread is a real one."""
+
+    def forward(self, x):
+        return torch.log_softmax(x, dim=-1)
+
+
+def _saturated_logits(shape):
+    """Rows in which every exponential but the largest one underflows fp16.
+
+    The logits are zero and minus twenty-four, and fp16's smallest subnormal is
+    6e-8 while e^-24 is 3.8e-11: eight hundred times further down than the
+    rounding that would decide whether a value is a subnormal or a zero. So both
+    the kernel and a host model of it store a zero, the sum of exponentials is
+    exactly one, and the log softmax of the row is the row. Each row puts its
+    maximum in another column, so a command that reduced the wrong axis or read
+    the wrong row would show.
+    """
+    values = torch.full(shape, -24.0)
+    for row in range(shape[0]):
+        values[row, (row * 5) % shape[1]] = 0.0
+    return values.half()
 
 
 def _cache_graph(cache_shape, value_shape):
@@ -596,6 +687,10 @@ _REDUCTION = 29
 _VISION_ATTENTION = 43
 _Q4A16_GEMV = 41
 _W8A16_GEMV = 45
+#: DSP_OP_LAYER_NORM, named because two of the norms this file carries are told
+#: apart by the view they reduce rather than by the op they came from, and both
+#: emit this one command.
+_LAYER_NORM = 8
 _TOPKV2_K1 = 27
 
 
@@ -1354,6 +1449,77 @@ def _cases():
     else:
         attention = None
 
+    # The three norms this change placed, each as the view its command reduces
+    # over: a group's channels and spatial block as one row, a (batch, channel)
+    # pair's spatial block as one row, and a log softmax as the shifted
+    # log-sum-exp rather than as a log of the softmax.
+    group_model = _GroupNorm(2, 4).half().eval()
+    group_norm_x = _small((2, 4, 3, 3))
+    with torch.no_grad():
+        group_expected = torch.nn.functional.group_norm(
+            group_norm_x.float(),
+            2,
+            group_model.norm.weight.float(),
+            group_model.norm.bias.float(),
+            1e-5,
+        )
+    group_norm = _case(
+        "CM",
+        group_model,
+        (group_norm_x,),
+        _bits(group_expected),
+        # The kernel's fp32 reduction order is its own, as it is for the fused
+        # norm above: measured at 9.8e-4, one ulp of an answer of size two.
+        kind="close",
+        tolerance=_NORM_TOLERANCE,
+    )
+    instance_x = _small((1, 8, 3, 3))
+    instance_rows = _instance_weight(8)
+    instance = _case(
+        "CN",
+        _batch_norm_graph((1, 8, 3, 3), 1e-5),
+        (instance_x,),
+        _bits(
+            torch.nn.functional.batch_norm(
+                instance_x.float(),
+                None,
+                None,
+                instance_rows.float(),
+                (instance_rows * 0.5 - 0.5).float(),
+                True,
+                0.1,
+                1e-5,
+            )
+        ),
+        kind="close",
+        tolerance=_NORM_TOLERANCE,
+    )
+    # A spread wide enough that the smallest exponential in the row underflows
+    # fp16: the shift is what keeps that out of the answer.
+    log_softmax_x = _small((4, 16)) * 4
+    log_softmax = _case(
+        "CO",
+        _LogSoftmax(),
+        (log_softmax_x,),
+        _bits(torch.log_softmax(log_softmax_x.float(), dim=-1)),
+        kind="close",
+        tolerance=_LOG_SOFTMAX_TOLERANCE,
+    )
+    # The same claim on a row where every exponential but one is under the floor
+    # by a factor of eight hundred, so that no rounding can decide whether it is
+    # zero: the answer is the logits themselves and both legs land on them
+    # exactly. The two commands this emitter does not use -- log of the softmax,
+    # and the sum before the shift -- are separated from it in
+    # test_log_softmax.py instead, because the first cannot be compared bit for
+    # bit here: the softmax command's own exponential is the one kernel the host
+    # model does not reproduce (see _SOFTMAX_TOLERANCE).
+    saturated = _saturated_logits((4, 16))
+    saturated_log_softmax = _case(
+        "CP",
+        _LogSoftmax(),
+        (saturated,),
+        _bits(torch.log_softmax(saturated.float(), dim=-1)),
+    )
     return [
         shapes,
         mm,
@@ -1373,6 +1539,10 @@ def _cases():
         split,
         split_pieces,
         split_pieces_control,
+        group_norm,
+        instance,
+        log_softmax,
+        saturated_log_softmax,
         *([attention] if attention is not None else []),
         *_branch_cases(),
         *_pad_cases(),
@@ -2494,6 +2664,28 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     ), "the values did not land in the getitem's output slot"
     amax = next(iter(_tagged(cases, "BJ").commands))
     assert list(amax.params[:5]) == [1, 2, 100, 2, 2], f"amax: {list(amax.params)}"
+    # The three norms: one layer norm per row the op reduces, and the affine as
+    # element-wise commands rather than as the kernel's own gamma, which this
+    # backend leaves null everywhere.
+    assert kinds["CM"] == [_LAYER_NORM, _BINARY, _BINARY], (
+        "the group norm is not a norm followed by its two affine commands"
+    )
+    assert list(next(iter(_tagged(cases, "CM").commands)).params[:2]) == [4, 18], (
+        "the group norm does not reduce one (batch, group) row of two channels "
+        "by nine values"
+    )
+    assert kinds["CN"] == [_LAYER_NORM, _BINARY, _BINARY], (
+        "the instance norm is not a norm followed by its two affine commands"
+    )
+    assert list(next(iter(_tagged(cases, "CN").commands)).params[:2]) == [8, 9], (
+        "the instance norm does not reduce one row per (batch, channel)"
+    )
+    assert kinds["CO"] == [_REDUCTION, _BINARY, _UNARY, _REDUCTION, _UNARY, _BINARY], (
+        "the log softmax is not the shifted log-sum-exp"
+    )
+    assert kinds["CP"] == [_REDUCTION, _BINARY, _UNARY, _REDUCTION, _UNARY, _BINARY], (
+        "the saturated log softmax is not the shifted log-sum-exp"
+    )
     answer = _from_bits(_tagged(cases, "BJ").expected.view("uint16").tolist())
     assert np.isnan(answer[3]) and np.isnan(
         answer[95]
