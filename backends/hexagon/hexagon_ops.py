@@ -83,6 +83,14 @@ DSP_OP_SHARED_GATHER = 23
 # op it serves carries the operands under the head transposes rather than the
 # head-major tensors a matmul wants.
 DSP_OP_VISION_ATTENTION_FP16 = 43
+# The element-wise select, `cond ? a : b`. Its condition operand is the one
+# operand in this backend that is not two bytes wide: htp_ops_select takes a
+# condBytes param and reads the condition bytewise when it is 1
+# (eltwise_ops.cc:2116-2125), which is exactly the width torch.bool has in the
+# `.pte`. The runtime copies an input at the size the blob declares for its slot,
+# so a bool operand reaches the arena as one byte per element and this command is
+# the only one that asks for it that way.
+DSP_OP_SELECT = 26
 
 # HtpOpsReductionType, from the DSP's eltwise_ops.cc (the whole enum: there is
 # no minimum, so `amin` has no kernel behind it and stays on the host).
@@ -167,6 +175,14 @@ FP16_BYTES = 2
 
 # What the topk kernel writes its positions as, whatever the graph says they are.
 INT32_BYTES = 4
+
+# A torch.bool is one byte per element in the `.pte`, and the arena holds what
+# the blob declares for an input's slot rather than a fixed width. SELECT is the
+# one command here that names this width; every other kernel reads two bytes.
+BOOL_BYTES = 1
+
+#: The element-wise select. The library's only ATen node for it.
+WHERE = exir_ops.edge.aten.where.self
 
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
@@ -1091,6 +1107,83 @@ def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def where_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this `where` is the shape htp_ops_select can walk.
+
+    The command takes one condition, two values and a size for each, and its own
+    guard admits a condition that is either the whole output or a single element
+    (eltwise_ops.cc:2403-2407). The values are admitted at the whole output, at
+    one element, or at a per-channel run, and the per-channel form is what the
+    prelu path uses -- it needs a channel count and an inner size this emitter
+    does not compute. So the form taken here is the strict one: all three
+    operands either match the output's element count or are a single element,
+    and the per-channel form stays on the portable kernels.
+
+    The condition's dtype is checked as well as its width, because a
+    torch.bool *is* one byte and any other one-byte tensor is not a flag the
+    kernel's `!= 0` test would read the way torch would.
+    """
+    result = _value_of(node)
+    if result.dtype not in (torch.float16, torch.float32):
+        return False
+    out_numel = result.numel()
+    cond = node.args[0]
+    if not isinstance(cond, torch.fx.Node):
+        return False
+    cond_value = _value_of(cond)
+    if cond_value.dtype is not torch.bool:
+        return False
+    for operand in node.args[:3]:
+        if not isinstance(operand, torch.fx.Node):
+            return False
+        value = _value_of(operand)
+        if value.numel() not in (out_numel, 1):
+            return False
+    return True
+
+
+def _emit_where(node: torch.fx.Node, ctx) -> TensorRef:
+    """`cond ? a : b` as one SELECT command.
+
+    The condition is the one operand whose width is not two bytes: the runtime
+    gives an input the size the blob declares for its slot, and the partitioner
+    tags a bool input at its own width, so one byte per element lands in the
+    arena and condBytes says so. Reading it as fp16 would take each element's
+    neighbour for its high half.
+    """
+    cond, lhs, rhs = node.args[0], node.args[1], node.args[2]
+    out_numel = _numel(node)
+    out = ctx.result_for(node, out_numel)
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_SELECT,
+            # The dispatcher's order: the condition first, then the value the
+            # test selects and the one it does not (execute_command.cc:646-651).
+            inputs=[ctx.operand(cond), ctx.operand(lhs), ctx.operand(rhs)],
+            outputs=[out],
+            params=[
+                out_numel,
+                _upper_product(tuple(_value_of(cond).shape), ctx),
+                _upper_product(tuple(_value_of(lhs).shape), ctx),
+                _upper_product(tuple(_value_of(rhs).shape), ctx),
+                FP16_BYTES,
+                # A torch.bool is one byte per element, and the kernel's `!= 0`
+                # test is the test torch makes.
+                BOOL_BYTES,
+                # The channel and inner sizes are read only by the per-channel
+                # input mode, which this emitter never asks for.
+                0,
+                0,
+            ],
+        ),
+    )
+    _patch_dynamic_numel(ctx, op_index, node)
+    for index, operand in enumerate((cond, lhs, rhs), start=1):
+        _patch_dynamic_numel(ctx, op_index, operand, index)
+    return ctx.record(node, out)
+
+
 def update_cache_layout(node: torch.fx.Node):
     """The cache-advance lowering's operands and geometry, or None.
 
@@ -1999,7 +2092,15 @@ def operand_dtypes_are_readable(node: torch.fx.Node) -> bool:
     the value: no error, just the wrong numbers. The case is reachable from an
     ordinary `x + (a > b)`, whose comparison is portable for a dtype reason of
     its own, so the consumer is refused here rather than left to read it.
+
+    SELECT is the exception, and it is an exception about the *slot* rather than
+    about the value: an input's slot is the size the blob declares for it, so a
+    bool operand of a `where` is copied in at one byte per element and read back
+    at that width by the one kernel that asks for it. Every other target here
+    reads two bytes, so for those the rule stands unchanged.
     """
+    if node.target in WHERE_TARGETS:
+        return True
     for arg in node.args:
         value = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
         if isinstance(value, torch.Tensor) and value.dtype is torch.bool:
@@ -4043,6 +4144,13 @@ EMITTERS = {
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),
     exir_ops.edge.aten.rsqrt.default: _unary("rsqrt"),
+    # sin and cos run the DSP's own fp32 polynomial rather than an HVX walk, so
+    # the error measured for them is the measurement in test_unary_sim.py and
+    # not a property of a vector approximation. expm1 is deliberately absent:
+    # its HVX form subtracts 1 in fp16, which for |x| below about 1e-3 leaves
+    # nothing of the value expm1 exists to compute.
+    exir_ops.edge.aten.sin.default: _unary("sin"),
+    exir_ops.edge.aten.cos.default: _unary("cos"),
     exir_ops.edge.aten.add.Tensor: _binary("add"),
     exir_ops.edge.aten.sub.Tensor: _binary("sub"),
     exir_ops.edge.aten.mul.Tensor: _binary("mul"),
@@ -4077,6 +4185,9 @@ EMITTERS = {
     # scratch, because they are not the positions torch writes (see TOPK).
     TOPK: _emit_topk,
     exir_ops.edge.aten.fmod.Tensor: _binary("mod"),
+    # `cond ? a : b`. The only ATen node the library's select kernel serves, and
+    # the only command here whose condition is one byte per element.
+    WHERE: _emit_where,
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
     exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
@@ -4124,6 +4235,10 @@ BINARY_TARGETS = frozenset(
 # Same reasoning as BINARY_TARGETS: mm derives its strides from the operand
 # shapes, which is only right for contiguous 2-D tiles.
 MM_TARGETS = frozenset({exir_ops.edge.aten.mm.default})
+
+# The one target whose condition operand is legitimately one byte wide, which is
+# why operand_dtypes_are_readable has to know its name.
+WHERE_TARGETS = frozenset({WHERE})
 
 # bmm is the same tile geometry with a batch axis in front of both operands.
 BMM_TARGETS = frozenset({exir_ops.edge.aten.bmm.default})

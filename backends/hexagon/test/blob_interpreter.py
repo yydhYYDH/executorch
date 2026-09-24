@@ -54,6 +54,7 @@ MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
 SHARED_GATHER = 23
 VISION_ATTENTION_FP16 = 43
+SELECT = 26
 
 #: The isInt4 slot of htp_ops_shared_gather that names an fp16 table, which is
 #: the only kind this backend stores; 2 and 3 are int4 and int8 tables.
@@ -855,6 +856,63 @@ def _run_zero(command: Command, params: List[int], arena: Arena) -> None:
     _store(arena, at, bytes(params[0]))
 
 
+#: The element size htp_ops_select_cond_at reads the condition at, keyed by the
+#: condBytes param. The kernel tests one whole element against zero, so a
+#: one-byte condition is a byte per flag and nothing wider (eltwise_ops.cc:2116).
+_COND_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32}
+
+
+def _run_select(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_select (eltwise_ops.cc:2380): `cond ? in1 : in2`, element by element.
+
+    The kernel picks its walk from three sizes: an operand of one element is
+    broadcast, the output's own size is read along, and anything else is the
+    per-channel mode this backend never emits. The condition is the one operand
+    whose width is a parameter rather than two bytes, which is what makes a
+    one-byte torch.bool readable.
+
+    The operands are read out of the arena from their own addresses rather than
+    out of the reference's own slice, because that is what the kernel does: it is
+    handed pointers and sized by params, so a descriptor that named more elements
+    than the slot holds reads whatever follows it. A model that stopped at the
+    slot's edge would answer a mutated descriptor correctly and the run would say
+    the encoding does not matter.
+    """
+    out_size, cond_size, in1_size, in2_size, bytes_, cond_bytes = params[:6]
+    if bytes_ != FP16_BYTES or cond_bytes not in _COND_DTYPES:
+        raise UnsupportedOp(
+            f"blob: a select over {bytes_}-byte values with {cond_bytes}-byte "
+            "conditions is not modelled"
+        )
+    if in1_size not in (1, out_size) or in2_size not in (1, out_size):
+        # A value of any other size is the kernel's per-channel mode, which reads
+        # params[6] and params[7]; this emitter never produces one.
+        raise UnsupportedOp(
+            "blob: a select with a per-channel value operand is not modelled"
+        )
+
+    cond_ref = command.inputs[0]
+    in1_ref, in2_ref = command.inputs[1], command.inputs[2]
+    out_ref = command.outputs[0]
+
+    def read(ref, dtype, count: int) -> np.ndarray:
+        at = arena.address(ref)
+        width = np.dtype(dtype).itemsize
+        if at + count * width > len(arena.bytes):
+            raise UnsupportedOp("blob: a select reads an operand past the arena")
+        return np.frombuffer(bytes(arena.bytes[at : at + count * width]), dtype=dtype)
+
+    cond_step = 0 if cond_size == 1 else 1
+    cond = read(cond_ref, _COND_DTYPES[cond_bytes], cond_step * (out_size - 1) + 1)
+    in1 = read(in1_ref, np.uint16, 1 if in1_size == 1 else out_size)
+    in2 = read(in2_ref, np.uint16, 1 if in2_size == 1 else out_size)
+
+    at = np.arange(out_size) * cond_step
+    on = np.zeros(out_size, dtype=np.intp) if in1_size == 1 else np.arange(out_size)
+    off = np.zeros(out_size, dtype=np.intp) if in2_size == 1 else np.arange(out_size)
+    _store(arena, arena.address(out_ref), np.where(cond[at] != 0, in1[on], in2[off]).tobytes())
+
+
 def _run_conv_depthwise2d(command: Command, params: List[int], arena: Arena) -> None:
     """hvx_conv_depthwise2d_fp16 (depthwise_conv_fp16.c:9), one lane at a time.
 
@@ -1577,6 +1635,7 @@ _EXECUTORS = {
     CONV_DEPTHWISE2D_FP16: _run_conv_depthwise2d,
     IM2COL_CONVOLUTION_FP16: _run_im2col_convolution,
     ZERO: _run_zero,
+    SELECT: _run_select,
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,

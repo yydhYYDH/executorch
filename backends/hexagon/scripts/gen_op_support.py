@@ -73,6 +73,11 @@ ZERO = "DSP_OP_ZERO"
 # the first position holding it. The emitter takes the first and puts the second
 # in scratch the graph never reads.
 TOPKV2_K1 = "DSP_OP_TOPKV2_K1_FP16"
+# The element-wise select. It is the one command whose operand is not the arena's
+# width: the condition is a torch.bool, and the kernel reads it one byte at a
+# time from the slot the blob sizes for it, which is why a comparison's result
+# can be handed to it at all.
+SELECT = "DSP_OP_SELECT"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -124,6 +129,27 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.tanh.default", UNARY, ARENA_FP16, "One input; element count preserved."
+    ),
+    OpSupport(
+        "aten.sin.default",
+        UNARY,
+        ARENA_FP16,
+        "One input. The DSP's own approximation: the angle is reduced in fp32 and "
+        "a truncated series evaluated, with no HVX walk, so this is not obviously "
+        "faster than the portable kernel. Measured on hexagon-sim against the "
+        "correct value: worst 3.9e-4 absolute inside four pi (0.4 fp16 ulp of the "
+        "answer) and 2.2e-3 past a thousand radians, where the reduction rather "
+        "than the series is what moves.",
+    ),
+    OpSupport(
+        "aten.cos.default",
+        UNARY,
+        ARENA_FP16,
+        "One input. As sin, and the series is one term shorter, so the error at "
+        "the ends of the reduced interval is larger: measured worst 8.9e-4 "
+        "absolute at `abs(x) == pi/2` (0.9 fp16 ulp) and 1.2e-3 past a "
+        "radians. Near cos's own zeros the absolute error is most of the value, "
+        "so a model that divides by cos should not rely on this.",
     ),
     OpSupport(
         "aten.sqrt.default", UNARY, ARENA_FP16, "One input; element count preserved."
@@ -205,6 +231,22 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "Fused gated activation `a * silu(b)`; produced by mul_silu.py from "
         "`mul(sigmoid(x), x)`. Same shape/scalar operand rule as the binary family.",
+    ),
+    # --- the element-wise select (DSP_OP_SELECT) -------------------------
+    OpSupport(
+        "aten.where.self",
+        SELECT,
+        "fp16 values, one byte per condition",
+        "The condition must be a torch.bool: it is the one operand the blob sizes "
+        "at its own width and the kernel reads one byte at a time, so any other "
+        "dtype here would be read at the wrong stride. All three operands must be "
+        "the output's element count or a single element, and both modes are "
+        "reachable: `masked_fill` reaches it with a one-element value. The kernel's "
+        "per-channel value mode needs a channel count and an inner size this emitter "
+        "does not compute, so it stays portable. The comparison that produces a "
+        "condition is not delegated -- its result is bool and no kernel here writes "
+        "one -- so the condition arrives as a delegate input or as a bool constant "
+        "weight.",
     ),
     # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
     OpSupport(
@@ -753,19 +795,38 @@ NOT_SUPPORTED = [
         "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
     ),
     (
-        "aten.eq / ne / gt / lt / ge / le, aten.where.self and masked_fill",
+        "aten.eq / ne / gt / lt / ge / le",
         "The DSP's comparison writes int32 1/0 or fp16 1.0/0.0 and has no one-byte "
         "mode, so a node declaring torch.bool cannot be handed one without an "
-        "out-of-bounds write; `where` additionally needs a select the unary and "
-        "binary tables do not have. A bool operand is refused at the gate for the "
-        "same reason (operand_dtypes_are_readable).",
+        "out-of-bounds write. A bool operand is refused at the gate for the same "
+        "reason (operand_dtypes_are_readable), with SELECT the one exception, "
+        "because it is the one command that declares the width it reads. The "
+        "comparison stays on the portable kernels and its result reaches a `where` "
+        "as an ordinary input, which is why `aten.where.self` is a supported row "
+        "and these are not.",
     ),
     (
         "aten.sin / cos / expm1 defaults, and aten.erf.default",
-        "sin, cos and expm1 have entries in HtpOpsUnaryOpType but no emitter, and "
-        "they run the DSP's own approximations, whose error is unmeasured. erf has "
-        "no entry at all. None of them is a missing line in a table next to a "
-        "validated kernel the way x ** 2 was.",
+        "erf has no entry in HtpOpsUnaryOpType at all. expm1 has one and its kernel "
+        "was measured and rejected: its HVX walk computes exp2 and subtracts 1 in "
+        "fp16, so for small arguments the result carries no correct digits -- the "
+        "measured relative error is 1.0 -- while a 21-element array of the same "
+        "values, which falls through to the kernel's fp32 `expf(x) - 1`, is exact. "
+        "Which of the two an array takes depends only on its length. What it does "
+        "past fp16's range is not the reason: it answers a small finite number "
+        "where the correct value overflows, and aten.exp is already wired with "
+        "exactly that behaviour. sin and cos are supported rows above, with the "
+        "error they were accepted at.",
+    ),
+    (
+        "aten.prelu.default",
+        "No emitter and no fusion pass: the node does not survive export, and the "
+        "partitioner sees `gt`, `mul` and `where` in its place. The `mul` and the "
+        "`where` delegate today as one multiply and one select, and the comparison "
+        "stays on the portable kernels because its result is bool. `DSP_OP_PRELU` "
+        "(39) exists in the library and nothing reaches it: fusing the three nodes "
+        "back into one command is a pass of the `mul_silu.py` kind, not another "
+        "emitter.",
     ),
     (
         "aten.full / full_like / arange / scalar_tensor",
@@ -870,6 +931,7 @@ PREDICATES = [
     "max_pool_is_emittable",
     "max_dim_is_emittable",
     "topk_is_emittable",
+    "where_is_emittable",
 ]
 
 

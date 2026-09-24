@@ -52,6 +52,7 @@ from blob_interpreter import (  # noqa: E402
     UnsupportedOp,
 )
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
+from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
 from executorch.exir import to_edge  # noqa: E402
@@ -917,6 +918,19 @@ class _MaxDimAt(torch.nn.Module):
 
     def forward(self, x):
         return torch.max(x, dim=0).values
+
+
+class _Where(torch.nn.Module):
+    """`cond ? a : b` with the condition as a method input.
+
+    The comparison that produces a condition is not delegated -- its result is
+    bool, and no kernel here writes one -- so the condition reaches the delegate
+    as an argument and is the only operand in the whole blob that is one byte per
+    element.
+    """
+
+    def forward(self, cond, a, b):
+        return torch.where(cond, a, b)
 
 
 class _RectifiedSum(torch.nn.Module):
@@ -1811,6 +1825,79 @@ def _branch_cases():
     cases.append(
         _case("BP", _TopkAt(), (deep,), _bits(torch.topk(deep, 1).values.reshape(-1)))
     )
+
+    # 10. The element-wise select, and its condition operand. This is the only
+    #    command here whose operand is not two bytes per element: the condition
+    #    is a torch.bool, and the kernel reads it at the width condBytes names.
+    #    Two things decide whether that works at all, and neither is visible in
+    #    an answer that happens to be right:
+    #
+    #      * the mask alternates, so the two-byte reading of the same bytes -- the
+    #        one a kernel that ignored condBytes would make -- answers True on
+    #        every element instead of on half of them. The teeth case below
+    #        patches condBytes to 2 and asserts exactly that, on the same blob;
+    #      * the two value operands are disjoint and in a fixed order, so reading
+    #        them the other way round, or reading `cond`'s two-byte form as an
+    #        fp16 value, cannot land on the right answer.
+    #
+    #    The shape is not a vector multiple on purpose: the kernel's generic walk
+    #    is element by element, and a length that is one makes an off-by-one in
+    #    the condition's stride show up as a missing element rather than as
+    #    padding nobody reads.
+    select_rows, select_cols = 3, 5
+    select_cond = (
+        torch.arange(select_rows * select_cols).reshape(select_rows, select_cols) % 2 == 0
+    )
+    select_on = (
+        torch.arange(1, select_rows * select_cols + 1)
+        .reshape(select_rows, select_cols)
+        .half()
+    )
+    select_off = -select_on
+    select_expected = torch.where(select_cond, select_on, select_off)
+    cases.append(
+        _case(
+            "CB",
+            _Where(),
+            (select_cond, select_on, select_off),
+            _bits(select_expected),
+        )
+    )
+    cases.append(
+        _case(
+            "CC",
+            None,
+            (select_cond, select_on, select_off),
+            _bits(select_expected),
+            blob=_tagged(cases, "CB").blob,
+            kind="teeth",
+            mutate=_condition_at_half_width,
+        )
+    )
+
+    # 11. The same kernel's other broadcast operand. A `masked_fill` reaches a
+    #     select with its fill value as a single element -- the descriptor is
+    #     `[n, n, 1, n, 2, 1, 0, 0]` -- which is a mode `where` itself never asks
+    #     for, so a command that got the widths right for CB can still read this
+    #     one as a whole vector and answer the arena's next bytes. The case is
+    #     written as the `where` that mode describes rather than as the
+    #     `masked_fill` that reaches it, because the fill in the real lowering is
+    #     a `scalar_tensor` the partitioner leaves on the host and this fixture
+    #     has no partitioner: what is being settled here is the kernel's operand
+    #     mode, on the blob the emitter produces for it. Any reading of that
+    #     operand other than one element answers a wrong number, because the two
+    #     bytes of the value are followed in the input section by the whole
+    #     output-sized operand: there is no padding to read instead.
+    fill = torch.tensor([-3.5], dtype=torch.float16)
+    fill_expected = torch.where(select_cond, fill.expand_as(select_on), select_on)
+    cases.append(
+        _case(
+            "CD",
+            _Where(),
+            (select_cond, fill, select_on),
+            _bits(fill_expected),
+        )
+    )
     return cases
 
 
@@ -1825,6 +1912,32 @@ def _from_bits(bits):
 def _host_bits(raw):
     """The interpreter returns bytes; read them as the fp16 the blob declares."""
     return np.frombuffer(bytes(raw), dtype="<u2").tolist()
+
+
+_SELECT = 26
+#: The index of SELECT's condBytes in its parameter vector
+#: (execute_command.cc:646-651 passes intParams[0..7] in order).
+_SELECT_COND_BYTES = 5
+
+
+def _condition_at_half_width(blob, op_index=0, value=2):
+    """The same blob with SELECT's condition declared two bytes per element.
+
+    This is the assumption the case exists to falsify: that a condition operand
+    is read the way every other operand here is. It is the reading a kernel that
+    ignored condBytes would make, and on an alternating mask it answers True
+    everywhere -- so the case's own answer moving is what shows the descriptor
+    is being read at all rather than that the bytes happen to agree.
+    """
+    at = (
+        _blob.HEADER_SIZE
+        + op_index * _blob.OP_SIZE
+        + 4 * 4
+        + _SELECT_COND_BYTES * 4
+    )
+    raw = bytearray(blob)
+    raw[at : at + 4] = struct.pack("<i", value)
+    return bytes(raw)
 
 
 def _fixture_header(cases):
@@ -1980,6 +2093,33 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["BJ"] == kinds["V"], "the amax is not the same command as the sum"
     assert kinds["CA"] == [_REDUCTION], "the max over a dim is not a reduction"
     assert kinds["CA"] == kinds["BJ"], "the two-output max is not the amax's command"
+    # The select, and the one thing about it the kernel cannot check for us: that
+    # its condition operand is one byte per element. The command names the width
+    # in params[5] and the slot has to be that size, or the runtime copies a bool
+    # tensor into a slot the blob sized for something else.
+    assert kinds["CB"] == [_SELECT], "the select is not a select"
+    assert kinds["CB"] == kinds["CC"], "the control is not a copy of the select case"
+    select = next(iter(_tagged(cases, "CB").commands))
+    assert list(select.params[:6]) == [15, 15, 15, 15, 2, 1], (
+        "the select command does not read a one-byte condition over fp16 values: "
+        f"{list(select.params[:8])}"
+    )
+    assert select.inputs[0].size == 15, (
+        f"the condition's slot is {select.inputs[0].size} bytes for 15 flags, so "
+        "the runtime would copy the wrong number of bytes into it"
+    )
+    assert [ref.size for ref in select.inputs[1:]] == [30, 30], (
+        "the two value operands are not fp16: "
+        f"{[ref.size for ref in select.inputs]}"
+    )
+    # The one-element value mode, on the same kernel and the same condition.
+    assert kinds["CD"] == [_SELECT], "the scalar-valued select is not a select"
+    scalar = next(iter(_tagged(cases, "CD").commands))
+    assert list(scalar.params[:6]) == [15, 15, 1, 15, 2, 1], list(scalar.params[:6])
+    assert scalar.inputs[1].size == 2, (
+        f"the broadcast value's slot is {scalar.inputs[1].size} bytes, not the one "
+        "fp16 element the mode reads"
+    )
     # The values of a two-output node are handed on through a getitem, so the
     # command's result is the getitem's slot and not the tuple's: an emitter that
     # filled the tuple's would leave the delegate's own output unwritten.

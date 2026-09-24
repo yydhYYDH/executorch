@@ -75,6 +75,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     update_cache_layout,
     vision_attention_is_emittable,
     VISION_ATTENTION_TARGETS,
+    where_is_emittable,
+    WHERE_TARGETS,
 )
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.exir.backend.canonical_partitioners.pattern_op_partitioner import (
@@ -593,8 +595,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if not operand_dtypes_are_readable(node):
             # A bool operand is one byte per element where the kernels read two,
-            # which is a wrong answer rather than an error. No emitter here takes
-            # one, so any node that carries one stays portable.
+            # which is a wrong answer rather than an error. Only SELECT declares
+            # that width, so any other node that carries one stays portable.
+            return False
+        if node.target in WHERE_TARGETS and not where_is_emittable(node):
+            # The condition has to be a bool and all three operands have to be
+            # the output's size or a single element: the command's own guard
+            # admits only those, and the per-channel form needs a channel count
+            # this emitter does not compute.
             return False
         if node.target is DQ_PER_CHANNEL:
             # The weight-only pattern's dequantize. It is delegated only when
@@ -753,10 +761,13 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 return False
             # A weight has to be the width the arena holds, except where the
             # emitter converts it itself because the kernel reads that width:
-            # layer norm's gamma and beta are fp32 on the DSP.
+            # layer norm's gamma and beta are fp32 on the DSP, and a `where`'s
+            # condition is the one bool constant any kernel here reads at its own
+            # width. Every other target is handed two byte elements.
             if (
                 arg.op == "get_attr"
                 and node.target not in FP32_CONSTANT_TARGETS
+                and node.target not in WHERE_TARGETS
                 and _dtype_of(arg) is not torch.float16
             ):
                 return False

@@ -356,19 +356,19 @@ _ROWS = [
         [("aten.erf.default", "unwired")],
     ),
     (
-        "sin has an entry, no emitter",
+        "sin has an entry, and now an emitter",
         lambda a: torch.sin(a),
         (_x(8),),
-        [("aten.sin.default", "unwired")],
+        [("aten.sin.default", "wired")],
     ),
     (
         "cos the same",
         lambda a: torch.cos(a),
         (_x(8),),
-        [("aten.cos.default", "unwired")],
+        [("aten.cos.default", "wired")],
     ),
     (
-        "expm1 the same",
+        "expm1 the same, and the measurement is why it stays unwired",
         lambda a: torch.expm1(a),
         (_x(8),),
         [("aten.expm1.default", "unwired")],
@@ -463,14 +463,14 @@ _ROWS = [
         [("aten.elu.default", "unwired")],
     ),
     (
-        "prelu decomposes, and the where stays put",
+        "prelu decomposes, and both halves of it are wired",
         _PReLU(),
         (_x(2, 4),),
         [
             ("aten.view_copy.default", "wired"),
             ("aten.gt.Scalar", "unwired"),
             ("aten.mul.Tensor", "wired"),
-            ("aten.where.self", "unwired"),
+            ("aten.where.self", "wired"),
         ],
     ),
     # --- softmax family ----------------------------------------------------
@@ -808,13 +808,13 @@ _ROWS = [
         "where over a computed condition",
         lambda a, b: torch.where(a > 0, a, b),
         (_x(8), _x(8)),
-        [("aten.gt.Scalar", "unwired"), ("aten.where.self", "unwired")],
+        [("aten.gt.Scalar", "unwired"), ("aten.where.self", "wired")],
     ),
     (
         "masked_fill is a where with a lifted constant",
         lambda a, m: a.masked_fill(m, 0.0),
         (_x(8), torch.zeros(8, dtype=torch.bool)),
-        [("scalar_tensor.default", "unwired"), ("aten.where.self", "unwired")],
+        [("scalar_tensor.default", "unwired"), ("aten.where.self", "wired")],
     ),
     (
         "a bool operand is refused rather than read two bytes per element",
@@ -886,6 +886,11 @@ def test_each_overload_row_matches_its_recorded_verdict(label, forward, inputs, 
         ("relu6", lambda a: torch.nn.functional.relu6(a), (_x(8),)),
         ("clamp", lambda a: torch.clamp(a, -1.0, 1.0), (_x(8),)),
         ("x squared", lambda a: a**2, (_x(8),)),
+        (
+            "where with a computed condition",
+            lambda a, b: torch.where(a > 0, a, b),
+            (_x(8), _x(8)),
+        ),
         # max.dim moved here in the census batch after this one: its values are
         # the amax the reduction kernel already ran, and the rule that places
         # them is the pool's own.
@@ -909,14 +914,6 @@ def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
         ("amin over one dim", lambda a: torch.amin(a, dim=1), (_x(2, 3, 4),)),
         ("split", lambda a: torch.split(a, 2, dim=0)[0], (_x(6, 3),)),
         ("erf", lambda a: torch.erf(a), (_x(8),)),
-        (
-            "where",
-            lambda a, b: torch.where(a > 0, a, b),
-            (
-                _x(8),
-                _x(8),
-            ),
-        ),
         ("zeros_like", lambda a: torch.zeros_like(a), (_x(8),)),
         (
             "adaptive_avg_pool2d",
