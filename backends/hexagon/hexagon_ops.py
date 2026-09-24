@@ -1896,12 +1896,7 @@ def max_pool_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
     max_pool2d_with_indices returns (values, indices); the kernel produces the
     values, so getitem 0 is the only reader a partition can carry.
     """
-    if node.target is not GETITEM or len(node.args) != 2:
-        return None
-    source, index = node.args
-    if index != 0 or not isinstance(source, torch.fx.Node):
-        return None
-    return source if source.target is MAX_POOL2D_WITH_INDICES else None
+    return _values_getitem(node, MAX_POOL2D_WITH_INDICES)
 
 
 def max_pool_is_emittable(node: torch.fx.Node) -> bool:
@@ -1915,6 +1910,52 @@ def max_pool_is_emittable(node: torch.fx.Node) -> bool:
         return True
     return bool(node.users) and all(
         max_pool_getitem(reader) is node for reader in node.users
+    )
+
+
+def max_dim_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The max-over-a-dim a getitem reads, when it reads the values."""
+    return _values_getitem(node, MAX_DIM)
+
+
+def max_dim_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether every reader of this max takes the values.
+
+    Same shape of node and the same rule as the pool: indices are positions, and
+    the reduction kernel here computes values, so a graph that reads them keeps
+    the whole node -- values reader included -- on the portable kernels.
+    """
+    if node.target is not MAX_DIM:
+        return True
+    return bool(node.users) and all(
+        max_dim_getitem(reader) is node for reader in node.users
+    )
+
+
+def _values_getitem(node: torch.fx.Node, source_target) -> Optional[torch.fx.Node]:
+    """The two-output op a ``getitem 0`` reads, if that is what this node is."""
+    if node.target is not GETITEM or len(node.args) != 2:
+        return None
+    source, index = node.args
+    if index != 0 or not isinstance(source, torch.fx.Node):
+        return None
+    return source if source.target is source_target else None
+
+
+def _values_sink(node: torch.fx.Node) -> torch.fx.Node:
+    """The node whose output slot a two-output op's values end up in.
+
+    max_pool2d_with_indices and max.dim both hand their values on through a
+    getitem, and that getitem is what downstream reads -- so it is the sink the
+    emitter has to fill, not the tuple the kernel cannot describe.
+    """
+    return next(
+        (
+            reader
+            for reader in node.users
+            if max_pool_getitem(reader) is node or max_dim_getitem(reader) is node
+        ),
+        node,
     )
 
 
@@ -2149,10 +2190,7 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     source = ctx.operand(node.args[0])
     # max_pool2d_with_indices hands its values on through a getitem, and that
     # getitem is what downstream reads, so its output slot is the one to fill.
-    sink = next(
-        (reader for reader in node.users if max_pool_getitem(reader) is node),
-        node,
-    )
+    sink = _values_sink(node)
     out = ctx.result_for(sink, _numel(node))
     area = spec.ih * spec.iw
     out_area = spec.oh * spec.ow
@@ -2774,7 +2812,11 @@ def _conv_bias_ref(ctx, bias_node, channels: int, lanes: int, kind: str) -> Tens
 SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
 AMAX = exir_ops.edge.aten.amax.default
 MAX_DEFAULT = exir_ops.edge.aten.max.default
-REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX, MAX_DEFAULT})
+# max.dim is the reduction max.default already runs, with the positions a second
+# output of the same node: the values are emittable exactly when nothing reads
+# those, the same rule max_pool2d_with_indices is placed under.
+MAX_DIM = exir_ops.edge.aten.max.dim
+REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX, MAX_DEFAULT, MAX_DIM})
 SUM_TARGETS = frozenset({SUM_DIM})
 
 # The mean family's two overloads, both of which are this same span rule: .dim
@@ -2831,7 +2873,7 @@ def _emit_reduction(node: torch.fx.Node, ctx, kind: int) -> TensorRef:
     outside = shape[: dims[0]]
     span = shape[dims[0] : dims[-1] + 1]
     inside = shape[dims[-1] + 1 :]
-    out = ctx.result_for(node, _numel(node))
+    out = ctx.result_for(_values_sink(node), _numel(node))
     op_index = ctx.emit(
         node,
         Op(
@@ -2877,6 +2919,18 @@ def _emit_max_default(node: torch.fx.Node, ctx) -> TensorRef:
     seeding that torch.amax reaches through AMAX. Its values are torch.amax's;
     the two differ only in the sign of a zero and in the payload of a NaN,
     which is the byte-level caveat fmod already carries.
+    """
+    return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
+
+
+def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
+    """torch.max(x, dim): the values, one reduction command.
+
+    The node hands out (values, indices) and the kernel computes values, so this
+    is amax over the same span; the support check has already established that
+    nothing reads the indices, and the sink is the getitem that hands the values
+    on. `torch.max(x, dim=1)` and `torch.amax(x, dim=1)` are the same value, with
+    the same signed-zero and NaN caveat max.default carries.
     """
     return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
 
@@ -3843,6 +3897,7 @@ EMITTERS = {
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     MEAN_DEFAULT: _emit_mean_default,
     MAX_DEFAULT: _emit_max_default,
+    MAX_DIM: _emit_max_dim,
     SUM_DIM: _emit_sum_dim,
     AMAX: _emit_amax,
     MAX_POOL2D: _emit_pool2d,

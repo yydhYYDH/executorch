@@ -4,7 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, final, Optional, Set
+import logging
+from typing import Dict, final, FrozenSet, Optional, Set
 
 import torch
 from executorch.backends.hexagon.hexagon_backend import (
@@ -38,6 +39,9 @@ from executorch.backends.hexagon.hexagon_ops import (
     layer_norm_getitem,
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
+    MAX_DIM,
+    max_dim_getitem,
+    max_dim_is_emittable,
     MAX_POOL2D_WITH_INDICES,
     max_pool_getitem,
     max_pool_is_emittable,
@@ -341,6 +345,91 @@ def _alias_keeps_the_same_bytes(node: torch.fx.Node) -> bool:
     )
 
 
+_LOGGER = logging.getLogger(__name__)
+
+# Every node the support check turns away whose target is not in the emitter
+# table but belongs to a family that table does speak for, as
+# {family: {target: count}}.
+#
+# Neither of the two ways an op can be missing from the DSP is otherwise
+# reported. A target with an emitter has a predicate line saying why this shape
+# or this argument is refused, and review sees it. A target that is only *not in
+# the table* has nothing: the node stays on the portable kernels, the model still
+# computes the right answer, and the only symptom is a delegate that is one op
+# shorter than it looks. That is how `torch.mean(x)` kept falling back while
+# `torch.mean(x, dim=1)` was delegated, and how four more of the same kind were
+# found by hand. Counting them here turns the next one into something a test or
+# a log can see.
+#
+# The family is the schema name with the overload dropped: `aten.mean.dim` and
+# `aten.mean.default` are both `aten::mean`. Two names the exporter rewrites from
+# one to the other (`max_pool2d` into `max_pool2d_with_indices`, a per-tensor
+# `dequantize` into a per-channel one) are different families and are not caught
+# here; those are pinned row by row in `test_overload_census2.py` instead.
+_UNWIRED: Dict[str, Dict[str, int]] = {}
+
+# Rebuilt rather than computed at import: the attention overloads register their
+# emitter on first use, after this module has been imported.
+_EMITTED_FAMILIES: Optional[FrozenSet[str]] = None
+_EMITTED_FAMILIES_FOR: int = -1
+
+
+def _schema_name(target) -> Optional[str]:
+    """The family a target belongs to, or None for a target that has no schema."""
+    return getattr(getattr(target, "_schema", None), "name", None)
+
+
+def _emitted_families() -> FrozenSet[str]:
+    """The families the emitter table has at least one overload of."""
+    global _EMITTED_FAMILIES, _EMITTED_FAMILIES_FOR
+    if _EMITTED_FAMILIES is None or _EMITTED_FAMILIES_FOR != len(SUPPORTED_TARGETS):
+        _EMITTED_FAMILIES = frozenset(
+            name for name in map(_schema_name, SUPPORTED_TARGETS) if name is not None
+        )
+        _EMITTED_FAMILIES_FOR = len(SUPPORTED_TARGETS)
+    return _EMITTED_FAMILIES
+
+
+def unwired_overload_census() -> Dict[str, Dict[str, int]]:
+    """The unwired targets counted so far, by family, as a copy.
+
+    A test asserts on this rather than on the log: the log is off by default and
+    the counter is what a census can compare between two runs.
+    """
+    return {family: dict(targets) for family, targets in _UNWIRED.items()}
+
+
+def reset_unwired_overload_census() -> None:
+    """Start the census over, for a caller that counts one model at a time."""
+    _UNWIRED.clear()
+
+
+def _note_unwired_target(node: torch.fx.Node) -> None:
+    """Count and (at debug) report a target the table should perhaps have.
+
+    Called only where the support check has already decided the node stays off
+    the DSP, so nothing here can change what is supported: the return value is
+    the same `False`, no emitter runs, and the command stream is untouched.
+    """
+    family = _schema_name(node.target)
+    if family is None or family not in _emitted_families():
+        return
+    target = getattr(node.target, "__name__", str(node.target))
+    targets = _UNWIRED.setdefault(family, {})
+    targets[target] = targets.get(target, 0) + 1
+    # Guarded, so the default (log at WARNING and above) costs one attribute
+    # read and no formatting: an export must not start paying for diagnostics
+    # nobody asked for. Set the level on this module's logger to see them.
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        _LOGGER.debug(
+            "hexagon: %s has no emitter, though %s is a family the DSP runs; "
+            "node %s stays on the portable kernels",
+            target,
+            family,
+            node.name,
+        )
+
+
 class HexagonOperatorSupport(OperatorSupportBase):
     """Accepts the ops the DSP has a kernel for, at a dtype it can run.
 
@@ -371,6 +460,7 @@ class HexagonOperatorSupport(OperatorSupportBase):
         # extension that defines them loads after this module is imported.
         sdpa = sdpa_targets()
         if node.target not in SUPPORTED_TARGETS:
+            _note_unwired_target(node)
             return False
         dtype = _dtype_of(node)
         if dtype not in (torch.float16, torch.float32):
@@ -425,6 +515,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
             if reduction_dims(node) is None:
                 return False
             if node.target in SUM_TARGETS and not sum_dim_is_emittable(node):
+                return False
+            if node.target is MAX_DIM and not max_dim_is_emittable(node):
+                # The same rule the pool is under: the values are this
+                # reduction, the indices are positions nothing here computes, so
+                # a reader of the indices keeps the values portable too.
                 return False
         if node.target is MAX_POOL2D_WITH_INDICES and not max_pool_is_emittable(node):
             # The indices come out of the same node and no kernel here produces
@@ -488,6 +583,9 @@ class HexagonOperatorSupport(OperatorSupportBase):
             elif max_pool_getitem(node) is not None:
                 # The max pool's values; that node's own check has already
                 # refused a pool whose indices anything else reads.
+                pass
+            elif max_dim_getitem(node) is not None:
+                # The same for torch.max(x, dim)'s values.
                 pass
             else:
                 source = add_rms_norm_getitem(node)

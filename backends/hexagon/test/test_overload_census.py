@@ -257,7 +257,7 @@ _ROWS = [
         "torch.max(x, dim) is two outputs, so it is a getitem rule",
         lambda a: torch.max(a, dim=1).values,
         (_x(2, 3, 4),),
-        [("aten.max.dim", "unwired"), (_GETITEM, "refused")],
+        [("aten.max.dim", "wired"), (_GETITEM, "wired")],
     ),
     (
         "torch.min(x, dim) the same",
@@ -269,20 +269,7 @@ _ROWS = [
         "torch.max(x, dim).indices has no producer",
         lambda a: torch.max(a, dim=1).indices,
         (_x(2, 3, 4),),
-        [("aten.max.dim", "unwired"), (_GETITEM, "refused")],
-    ),
-    (
-        "the whole max(x, dim) tuple at once",
-        lambda a: torch.max(a, dim=1)[0] + torch.max(a, dim=1)[1].to(F16),
-        (_x(2, 3, 4),),
-        [
-            ("aten.max.dim", "unwired"),
-            (_GETITEM, "refused"),
-            ("aten.max.dim", "unwired"),
-            (_GETITEM, "refused"),
-            ("dim_order_ops._to_dim_order_copy.default", "refused"),
-            ("aten.add.Tensor", "wired"),
-        ],
+        [("aten.max.dim", "refused"), (_GETITEM, "refused")],
     ),
     (
         "torch.maximum / minimum are the elementwise pair",
@@ -866,6 +853,10 @@ def test_each_overload_row_matches_its_recorded_verdict(label, forward, inputs, 
         ("relu6", lambda a: torch.nn.functional.relu6(a), (_x(8),)),
         ("clamp", lambda a: torch.clamp(a, -1.0, 1.0), (_x(8),)),
         ("x squared", lambda a: a**2, (_x(8),)),
+        # max.dim moved here in the census batch after this one: its values are
+        # the amax the reduction kernel already ran, and the rule that places
+        # them is the pool's own.
+        ("max.dim values", lambda a: torch.max(a, dim=1).values, (_x(2, 3, 4),)),
     ],
 )
 def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
@@ -883,7 +874,6 @@ def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
     "label,forward,inputs",
     [
         ("amin over one dim", lambda a: torch.amin(a, dim=1), (_x(2, 3, 4),)),
-        ("max.dim values", lambda a: torch.max(a, dim=1).values, (_x(2, 3, 4),)),
         ("split", lambda a: torch.split(a, 2, dim=0)[0], (_x(6, 3),)),
         ("erf", lambda a: torch.erf(a), (_x(8),)),
         (

@@ -292,8 +292,21 @@ SUPPORTED: List[OpSupport] = [
         "same kernel. `torch.max(x)` and `torch.amax(x)` are the same value; they "
         "differ only in which zero a signed-zero input returns and in the payload "
         "of a NaN, which is the byte-level caveat fmod already carries. This is "
-        "the target the reduce-all overload produces, where `torch.max(x, dim)` "
-        "is max.dim and is not covered.",
+        "the target the reduce-all overload produces; `torch.max(x, dim)` is "
+        "max.dim below.",
+    ),
+    OpSupport(
+        "aten.max.dim",
+        REDUCTION,
+        ARENA_FP16,
+        "The values of `torch.max(x, dim)`, which are what amax computes over the "
+        "same span: the overload's dim is a single int, so the span rule always "
+        "holds. The node's second output is indices, which are positions the "
+        "reduction kernel does not compute, so it is placed only when every reader "
+        "takes getitem 0 -- max_dim_is_emittable, the rule max_pool2d is under. A "
+        "reader of the indices keeps the whole node portable, values reader "
+        "included. That getitem 0 is where the values are handed on, and it is the "
+        "sink the command fills.",
     ),
     OpSupport(
         "aten.relu.default",
@@ -577,8 +590,8 @@ SUPPORTED: List[OpSupport] = [
         None,
         ARENA_FP16,
         "Re-points a producer's result. Only the getitem reading a layer norm's "
-        "output 0, a max pool's values, or one of the fused add+norm's outputs "
-        "0/1, is placed.",
+        "output 0, a max pool's values, a max(x, dim)'s values, or one of the "
+        "fused add+norm's outputs 0/1, is placed.",
     ),
     # --- row gathers (DSP_OP_SHARED_GATHER) -------------------------------
     OpSupport(
@@ -682,11 +695,13 @@ NOT_SUPPORTED = [
         "second output is indices, which no reduction kernel here produces.",
     ),
     (
-        "aten.max.dim values-only",
-        "The values are what amax computes, but the node is the two-output form: "
-        "its second output is indices, which need positions rather than values, so "
-        "placing it needs the same all-readers-are-getitem-0 rule max_pool2d has "
-        "(and its own getitem producer). `torch.amax(x, dim)` and `torch.max(x)` "
+        "aten.max.dim reading .indices, and aten.min.dim in either form",
+        "The values are what amax computes, but a reader of the indices puts the "
+        "node out of reach on the values side too: indices are positions and the "
+        "reduction kernel computes values. The two-output shape is the same one "
+        "max_pool2d has, and so is the all-readers-are-getitem-0 rule. min.dim is "
+        "additionally a minimum, which HtpOpsReductionOpType does not have. "
+        "`torch.amax(x, dim)`, `torch.max(x)` and `torch.max(x, dim).values` "
         "reach the covered targets instead.",
     ),
     (
@@ -696,8 +711,9 @@ NOT_SUPPORTED = [
     (
         "aten.split_with_sizes_copy.default, aten.topk.default and aten.sort.default",
         "Multi-output ops with no producer for the extra outputs. Only the getitems "
-        "reading a layer norm's result, a max pool's values or the fused add+norm's "
-        "outputs are placed, so these stay portable together with their getitems.",
+        "reading a layer norm's result, a max pool's values, a max(x, dim)'s values "
+        "or the fused add+norm's outputs are placed, so these stay portable "
+        "together with their getitems.",
     ),
     (
         "aten.eq / ne / gt / lt / ge / le, aten.where.self and masked_fill",
@@ -769,8 +785,8 @@ NOT_SUPPORTED = [
     (
         "aten.split / getitem of a split",
         "No producer for the extra outputs; only the getitems that read a layer "
-        "norm's result, a max pool's values or the fused add+norm's outputs are "
-        "placed.",
+        "norm's result, a max pool's values, a max(x, dim)'s values or the fused "
+        "add+norm's outputs are placed.",
     ),
     (
         "aten.bmm.default with a broadcast batch",
@@ -815,6 +831,7 @@ PREDICATES = [
     "mean_result_width_is_emittable",
     "pow_is_square",
     "max_pool_is_emittable",
+    "max_dim_is_emittable",
 ]
 
 

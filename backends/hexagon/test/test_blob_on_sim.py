@@ -863,6 +863,19 @@ class _AmaxAt(torch.nn.Module):
         return torch.amax(x, dim=0)
 
 
+class _MaxDimAt(torch.nn.Module):
+    """The values of `torch.max(x, dim=0)`, which is the two-output form.
+
+    The node hands out (values, indices) and this graph keeps only the first, so
+    the delegate's result is the getitem's rather than the tuple's: the one thing
+    about this op the amax above cannot check, because an amax has no second
+    output to hand anything on through.
+    """
+
+    def forward(self, x):
+        return torch.max(x, dim=0).values
+
+
 class _RectifiedSum(torch.nn.Module):
     """The pair `FuseAddReluPass` rewrites into the kernel's op type 8."""
 
@@ -1704,6 +1717,15 @@ def _branch_cases():
             blob=blob,
         )
     )
+    # 8. The two-output maximum. `torch.max(x, dim).values` runs the same fold
+    #    the amax above does, but the node hands its values on through a getitem,
+    #    and the command has to fill *that* getitem's slot rather than the tuple's
+    #    -- which is the sink rule this case exists for, and the one thing about
+    #    the op the amax cannot check. A hundred columns is the amax's geometry
+    #    again, tail and all, so the two commands are the same command and any
+    #    difference the simulator reports is the one being tested.
+    max_dim = _small((2, 100))
+    cases.append(_case("CA", _MaxDimAt(), (max_dim,), _bits(_MaxDimAt()(max_dim))))
     return cases
 
 
@@ -1871,6 +1893,14 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     # nothing about the half this bug was in.
     assert kinds["BJ"] == [_REDUCTION], "the amax is not a reduction"
     assert kinds["BJ"] == kinds["V"], "the amax is not the same command as the sum"
+    assert kinds["CA"] == [_REDUCTION], "the max over a dim is not a reduction"
+    assert kinds["CA"] == kinds["BJ"], "the two-output max is not the amax's command"
+    # The values of a two-output node are handed on through a getitem, so the
+    # command's result is the getitem's slot and not the tuple's: an emitter that
+    # filled the tuple's would leave the delegate's own output unwritten.
+    assert (
+        _tagged(cases, "CA").commands[0].outputs[0].space.name == "OUTPUT"
+    ), "the values did not land in the getitem's output slot"
     amax = next(iter(_tagged(cases, "BJ").commands))
     assert list(amax.params[:5]) == [1, 2, 100, 2, 2], f"amax: {list(amax.params)}"
     answer = _from_bits(_tagged(cases, "BJ").expected.view("uint16").tolist())

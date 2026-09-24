@@ -356,7 +356,24 @@ Things that bite:
   exponent 2 (where `aten.clamp.default` and the unary table's clamp and square
   entry points were wired). `test/test_overload_census.py` is the census for the
   rest of them, one row per overload, and it fails in both directions -- when an
-  unwired target gains an emitter and when a wired one starts refusing.
+  unwired target gains an emitter and when a wired one starts refusing --
+  `test/test_overload_census2.py` extends the same shape to the families that
+  census listed as unexamined (the quantized path, `llama.*`, `et_hexagon.*`, the
+  recurrent ops, the remaining getitem producers, `_to_copy` against
+  `_to_dim_order_copy`), and `test/test_unwired_targets.py` checks the reporting
+  below.
+- **The partitioner now counts that case itself.** `is_node_supported` records
+  every target that is absent from the table while *its family* is in it --
+  `unwired_overload_census()` for a test or a script to read, and one `DEBUG`
+  line on `executorch.backends.hexagon.partition.hexagon_partitioner` for a
+  reader. Both run only on the path that was already returning `False`, so a
+  delegated node pays neither, and `test/test_unwired_targets.py` pins that the
+  verdicts are identical with the counting replaced by a no-op. The family is the
+  schema name without the overload, which is exactly the class of gap above, and
+  which is blind by construction to a name the exporter rewrites from one to
+  another: a per-tensor `dequantize` is not the per-channel one the table speaks
+  for, and `aten.amin` is not the `aten.amax` it speaks for, so neither is
+  counted and both are pinned row by row in the second census instead.
 - **Three edge ops are the same clamp entry point, and it carries its bounds in
   params.** `HTP_OPS_UNARY_CLAMP` (`unary_ops.cc:29`) is not a function of the
   op kind alone: params[3] and params[4] are the fp16 bit patterns of its two
@@ -374,11 +391,16 @@ Things that bite:
 - **`torch.max(x)` and `torch.max(x, dim)` are different ops.** The reduce-all
   form is a value and nothing else, and its target is `aten.max.default`; it
   reaches the same REDUCTION command `amax` already reached. The `dim` form is
-  `aten.max.dim`, a two-output node whose second output is indices, so it needs
-  the all-readers-are-getitem-0 rule the pool has before it can be placed, and
-  it is not covered. `torch.max(x)` and `torch.amax(x)` agree in every value and
-  differ only in which zero a signed-zero input returns and in the payload of a
-  NaN, which is the byte-level caveat `fmod` already carries.
+  `aten.max.dim`, a two-output node whose second output is indices: its values
+  are that same command over the same span -- the overload's `dim` is a single
+  int, so the one-span rule always holds -- and it is placed under the rule the
+  pool is under, every reader taking `getitem 0` (`max_dim_is_emittable`), with
+  that getitem as the sink the command fills. A graph that reads the indices
+  keeps the whole node portable, values reader included, because the kernel
+  computes values and not positions. `torch.max(x)` and `torch.amax(x)` agree in
+  every value and differ only in which zero a signed-zero input returns and in
+  the payload of a NaN, which is the byte-level caveat `fmod` already carries and
+  which the `dim` form carries against `torch.amax(x, dim)`.
 - **The reduction enum has no minimum.** `HtpOpsReductionOpType` is `sum = 1,
   maximum = 2, mean = 3` (`eltwise_ops.cc:2441-2445`) and the dispatcher rejects
   every other value, so `aten.amin` is not reachable by writing an emitter: it
@@ -812,12 +834,17 @@ Working and verified without a device:
   `OP_SUPPORT.md` as wired, refused or unwired. `torch.mean(x, dim=())` and
   `torch.sum(x, dim=())` and `torch.amax(x, dim=())` all read an empty dim set
   as every dim, which is what torch computes for them, and all three now
-  delegate. `torch.mean(x, dim=1, dtype=torch.float32)` and `torch.mean(x,
+  delegate. `torch.max(x, dim).values` reaches that same REDUCTION of kind 2
+  through the getitem that hands the values on, and it was the first gap found by
+  the partitioner's own census rather than by hand: before it,
+  `torch.max(x, dim=1).values` was a graph with no delegate at all.
+  `torch.mean(x, dim=1, dtype=torch.float32)` and `torch.mean(x,
   dtype=torch.float32)` are now refused the way `sum` already was: the kernel
   stores fp16, so a mean that requests a width is a different op, and a fp32
   tensor rounded to fp16 was the same defect the sum gate was added for. See
-  `test/test_overload_reductions.py`, `test/test_overload_clamp.py` and
-  `test/test_overload_census.py`.
+  `test/test_overload_reductions.py`, `test/test_overload_clamp.py`,
+  `test/test_overload_census.py`, `test/test_overload_census2.py` and
+  `test/test_unwired_targets.py`.
 - convolutions reach the DSP, and all three of the usual CNN shapes are among
   the cases. A depthwise `groups == C_in == C_out` convolution lowers to a blit,
   one `CONV_DEPTHWISE2D_FP16` (2) command and a blit back, and every other
@@ -843,6 +870,8 @@ Working and verified without a device:
   NaN, on both sides of the kernel's vector boundary and over five lengths; the
   two other kernels whose scalar tail answered a NaN differently from its vector
   loop, `add_relu` and a reduction's maximum, each with a NaN in both halves; the
+  values of `torch.max(x, dim)`, which are the same reduction command reached
+  through a getitem; the
   vision attention on `[1,4,2,64]` and `[2,3,4,64]`; and both quantized GEMV
   entries, whose expectation mentions neither a tile, a group, a nibble nor a
   scale position. Average
