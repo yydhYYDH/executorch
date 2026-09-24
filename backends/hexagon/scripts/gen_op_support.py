@@ -454,8 +454,15 @@ SUPPORTED: List[OpSupport] = [
         f"also emits {ZERO} ahead of the pack, because the fill reads whole 64-lane "
         "vectors and the lanes past the last channel would otherwise hold whatever "
         "the arena last held. A 1x1 spatial extent needs neither blit, since the two "
-        "layouts are then the same bytes. Left portable: transposed convolution, "
-        "non-zero output_padding, a group count between 1 and C_in, a fractional or "
+        "layouts are then the same bytes. A transposed convolution is the same two "
+        "kernels reached through the identity "
+        "`conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), "
+        "flip(w).transpose(ic, oc), k - 1 - p)`: the weight is transposed and "
+        "flipped at export, the transposed padding is remapped onto the "
+        "convolution's, and a stride above 1 makes the input interleaved with zeros "
+        f"by {ZERO} and one raster region ahead of the usual pair. A stride of 1 "
+        "needs no interleave. Left portable: a dilated transposed window, a group "
+        "count other than 1, a fractional or "
         "negative padding, a non-4-D or unbatched operand, symbolic extents, a weight "
         "or bias that is not a constant, and any stride, padding or dilation that "
         "does not reproduce the output extent the graph declares.",
@@ -732,10 +739,20 @@ SUPPORTED: List[OpSupport] = [
 # Exclusions worth naming: each is something a reader might expect to work.
 NOT_SUPPORTED = [
     (
-        "aten.convolution.default with transposed=True, or output_padding != 0",
-        "No transposed-convolution kernel. The im2col kernel walks its window "
-        "forward over the input, which is a scatter read for a transposed "
-        "convolution: a different kernel rather than another parameter set.",
+        "aten.convolution.default with transposed=True and a dilation above 1, or "
+        "with a group count other than 1",
+        "A transposed convolution reaches the im2col kernel through "
+        "`conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), "
+        "flip(w).transpose(ic, oc), k - 1 - p)`, which holds for an undilated "
+        "window and one group. A dilated transposed window is a different "
+        "identity, and the kernel has no channel mapping for a group count "
+        "between 1 and C_in.",
+    ),
+    (
+        "aten.conv3d.default, aten.conv_transpose3d.input",
+        "No 3-D kernel. `Im2ColParameter` carries kernelX, kernelY, iw, ih, ow and "
+        "oh and no depth axis at all, so nothing here walks a volume; the two "
+        "dimensions above cannot be stretched to three by another parameter.",
     ),
     (
         "aten.gather.default",

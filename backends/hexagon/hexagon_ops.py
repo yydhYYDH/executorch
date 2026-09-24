@@ -3093,6 +3093,60 @@ class ConvSpec(NamedTuple):
     dilate_y: int
     dilate_x: int
     depthwise: bool
+    # A transposed convolution reaches the same two commands through the
+    # identity
+    #
+    #   conv_transpose(x, w, s, p, op) ==
+    #       conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc), K - 1 - p)
+    #
+    # so everything above is the *convolution's* geometry: stride and dilation
+    # are 1, pad_y/pad_x are the remapped padding, and in_h/in_w are the
+    # upsampled extents the kernel actually walks. `transposed` says the weight
+    # needs the flip, and the other four describe the zero-insert blit in front
+    # of it: `upsample_*` is the interleave stride and `tail_*` the all-zero
+    # rows and columns output_padding appends at the far edge. All four are the
+    # identity (1, 1, 0, 0) for a plain convolution, which needs no blit.
+    transposed: bool = False
+    upsample_y: int = 1
+    upsample_x: int = 1
+    tail_y: int = 0
+    tail_x: int = 0
+
+
+def _zero_insert_regions(source_shape, spec: ConvSpec) -> List[int]:
+    """The raster region that scatters an input plane into an interleaved one.
+
+    Zero-interleaving is one strided box: the source reads at stride 1 along a
+    row and the destination writes at the interleave factor, with the row and
+    plane strides of each layout. `source_shape` is the tensor's own
+    ``(N, C, H, W)``, which is what the region's extents describe even though the
+    destination is the taller plane.
+
+    `htp_ops_raster_blit` tries its fast paths before its own region walk, and
+    `htp_ops_try_interleave_c64_single_blit` (src/dsp/blit_ops.cc:1551) claims
+    any region with ``size[2] == 16 && srcStride[2] == 1 && dstStride[2] == 4``,
+    which a width of 16 interleaved by 4 is. That is not a hazard here: the
+    guard fixes exactly those three numbers and the body writes ``dst[4 * i] =
+    src[i]`` over the same row and plane grid the walk uses, so on every region
+    it accepts it writes that region's own mapping -- the hardcoded offsets are
+    the strides the guard matched on. test_zero_insert_sim.py measures that on
+    the simulator, and measures a mutant region that comes out wrong.
+    """
+    source_h, source_w = source_shape[2], source_shape[3]
+    return [
+        0,
+        0,
+        0,  # source index and both offsets
+        spec.batch * spec.in_channels,
+        source_h,
+        source_w,
+        source_h * source_w,
+        source_w,
+        1,  # source strides: plane, row, element
+        spec.in_h * spec.in_w,
+        spec.upsample_y * spec.in_w,
+        spec.upsample_x,  # destination: plane, row, interleave
+    ]
 
 
 def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
@@ -3124,12 +3178,14 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     stride = _int_pair(args[3], None)
     padding = _int_pair(args[4], None)
     dilation = _int_pair(args[5], (1, 1))
+    transposed = False
+    tail = (0, 0)
     if convolve:
-        if args[6] is not False:
-            # A transposed convolution is a scatter, not a window walk.
+        if not isinstance(args[6], bool):
             return None
-        output_padding = args[7]
-        if output_padding is not None and any(output_padding):
+        transposed = args[6]
+        tail = _int_pair(args[7], (0, 0))
+        if tail is None:
             return None
     if isinstance(group, bool) or not isinstance(group, int) or group <= 0:
         return None
@@ -3138,6 +3194,8 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     if any(step <= 0 for step in stride) or any(step <= 0 for step in dilation):
         return None
     if any(pad < 0 for pad in padding):
+        return None
+    if any(extra < 0 for extra in tail):
         return None
 
     value = source.meta.get("val")
@@ -3155,16 +3213,45 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     ):
         return None
     batch, in_channels, in_h, in_w = value.shape
-    out_channels, per_group, kernel_y, kernel_x = kernel.shape
-    if per_group * group != in_channels:
-        return None
+    if transposed:
+        # A transposed convolution's weight is indexed the other way round: the
+        # leading axis is the input's channels and the second the output's share
+        # of the group.
+        weight_in, per_group, kernel_y, kernel_x = kernel.shape
+        if weight_in * group != in_channels:
+            return None
+        out_channels = per_group * group
+    else:
+        out_channels, per_group, kernel_y, kernel_x = kernel.shape
+        if per_group * group != in_channels:
+            return None
     extents = (batch, in_channels, in_h, in_w, out_channels, kernel_y, kernel_x)
     if any(extent <= 0 for extent in extents):
         return None
-    # The region stride of a channel block is the plane's element count, and the
-    # DSP holds it in an int32.
-    if in_channels * in_h * in_w >= 1 << 31:
-        return None
+
+    # A plain convolution walks its own stride and has nothing to interleave;
+    # only a transposed one turns its stride into a zero-insert.
+    upsample = stride if transposed else (1, 1)
+    if transposed:
+        # Only the undilated form. The identity holds with a dilated tap too,
+        # but nothing here has measured that one, so the gate keeps the claim to
+        # the case the tests cover.
+        if dilation != (1, 1) or group != 1:
+            return None
+        # The convolution's own padding is what the transposed window's padding
+        # becomes once the input is interleaved, and a transposed padding wider
+        # than its kernel leaves the convolution nothing to walk.
+        conv_pad = (kernel_y - 1 - padding[0], kernel_x - 1 - padding[1])
+        if conv_pad[0] < 0 or conv_pad[1] < 0:
+            return None
+        # The interleaved plane reaches as far as the transposed window does,
+        # plus whatever output_padding asks for at the far edge. The kernel then
+        # walks it the way it walks any other input.
+        in_h = (in_h - 1) * stride[0] + 1 + tail[0]
+        in_w = (in_w - 1) * stride[1] + 1 + tail[1]
+        stride = (1, 1)
+        padding = conv_pad
+        dilation = (1, 1)
 
     out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_y - 1) - 1) // stride[0] + 1
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_x - 1) - 1) // stride[1] + 1
@@ -3172,8 +3259,17 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         return None
     if list(result.shape) != [batch, out_channels, out_h, out_w]:
         return None
+    # The region stride of a channel block is the plane's element count, and the
+    # DSP holds it in an int32. The interleaved plane is the one the kernel and
+    # the blit both address, so it is the one this bounds.
+    if in_channels * in_h * in_w >= 1 << 31:
+        return None
 
-    depthwise = group == in_channels == out_channels and per_group == 1
+    # A transposed convolution is never the depthwise walk: its weight is a
+    # dense (in, out) pair even when both channel counts are one.
+    depthwise = (
+        not transposed and group == in_channels == out_channels and per_group == 1
+    )
     if not depthwise and group != 1:
         # A group count in between is a third kernel: neither walk carries the
         # channel mapping for it, and faking it with blits is not worth the
@@ -3205,7 +3301,28 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         dilate_y=dilation[0],
         dilate_x=dilation[1],
         depthwise=depthwise,
+        transposed=transposed,
+        upsample_y=upsample[0],
+        upsample_x=upsample[1],
+        tail_y=tail[0],
+        tail_x=tail[1],
     )
+
+
+def deconv_weight_as_conv(weight):
+    """The convolution weight a transposed convolution's own weight stands for.
+
+    A transposed convolution is the gradient of a convolution: its weight is
+    indexed ``(in_channels, out_channels / groups, ky, kx)`` and its window runs
+    backwards, so the convolution that reproduces it carries the two channel
+    axes swapped and both spatial axes flipped. With that weight and the padding
+    `conv_spec` remaps, the two are the same arithmetic -- the same products
+    summed in the same order over the same taps, which is what makes this a
+    rereading of the node rather than an approximation of it.
+    """
+    import numpy as np
+
+    return np.ascontiguousarray(weight.transpose(1, 0, 2, 3)[:, :, ::-1, ::-1])
 
 
 def conv_k_units(in_channels: int) -> int:
@@ -3415,11 +3532,44 @@ def _emit_zero(ctx, node: torch.fx.Node, dest: TensorRef) -> None:
     )
 
 
+def _emit_zero_insert(ctx, node: torch.fx.Node, source: TensorRef, spec: ConvSpec):
+    """The zero-interleaved copy a transposed convolution's input needs.
+
+    A transposed convolution scatters each input element across the window it
+    covers, which is not a walk any kernel here makes. Interleaving the input
+    with zeros turns it back into one: every input element is written at a
+    multiple of the stride, and the gaps the kernel then walks over are the
+    zeros that stand for the elements the transposed window never visits.
+
+    Two commands, because the gaps have to be zeros rather than whatever the
+    arena last held: `DSP_OP_ZERO` clears the plane and one raster region
+    scatters the input into it. `_zero_insert_regions` says what that region is.
+    """
+    batch, channels = spec.batch, spec.in_channels
+    regions = _zero_insert_regions(_value_of(node.args[0]).shape, spec)
+    plane = spec.in_h * spec.in_w
+    buffer = ctx.builder.add_activation(batch * channels * plane * FP16_BYTES)
+    _emit_zero(ctx, node, buffer)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[source],
+            outputs=[buffer],
+            # Region count, element bytes, source count, then the regions.
+            params=[len(regions) // BLIT_REGION_INTS, FP16_BYTES, 1] + regions,
+        ),
+    )
+    return buffer
+
+
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     """A convolution as the DSP's depthwise walk or its im2col convolution.
 
     Both take the same blocked activation, so both are three commands: the blit
-    in, the convolution, and the blit out of its result.
+    in, the convolution, and the blit out of its result. A transposed
+    convolution is the same three with an interleaving blit ahead of them and a
+    flipped weight.
     """
     spec = conv_spec(node, lambda operand: ctx.constant_value(operand) is not None)
     if spec is None:
@@ -3428,6 +3578,8 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         )
     _require_arena_dtype(node, "convolution")
     source = ctx.operand(node.args[0])
+    if spec.upsample_y != 1 or spec.upsample_x != 1 or spec.tail_y or spec.tail_x:
+        source = _emit_zero_insert(ctx, node, source, spec)
     weight_node = node.args[1]
     bias_node = node.args[2] if len(node.args) > 2 else None
     out = ctx.result_for(node, _numel(node))
@@ -3510,7 +3662,11 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         )
     else:
         weight = ctx.packed_weights(
-            weight_node, lambda array: pack_conv_weight(array, spec), "im2col"
+            weight_node,
+            lambda array: pack_conv_weight(
+                deconv_weight_as_conv(array) if spec.transposed else array, spec
+            ),
+            "transposed im2col" if spec.transposed else "im2col",
         )
         bias = _conv_bias_ref(
             ctx,
