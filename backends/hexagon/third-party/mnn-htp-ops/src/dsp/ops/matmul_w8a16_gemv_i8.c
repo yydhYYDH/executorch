@@ -60,14 +60,36 @@ static inline HVX_Vector vhf_to_h_round(HVX_Vector s) {
 #endif
 }
 
-// int32 -> fp32 via the magic-number trick (no direct HVX cvt intrinsic).
-// Valid for |x| < 2^22; our per-block accumulator is bounded by
-// 64*127*127 << 2^22.
-static inline HVX_Vector sf_from_w(HVX_Vector v_w) {
+// int32 -> fp32 by the magic-number trick (no direct HVX cvt intrinsic). Exact
+// while |x| <= 2^22, silently wrong past it: the low mantissa bits of 1.5 * 2^23
+// run out and the carry lands in the exponent.
+static inline HVX_Vector sf_magic(HVX_Vector v_w) {
   const HVX_Vector v_magic_bits = Q6_V_vsplat_R(0x4B400000);           // 1.5 * 2^23 = 12582912.0
   const HVX_Vector v_neg_magic  = Q6_V_vsplat_R(0xCB400000);           // -12582912.0 (as fp32)
   HVX_Vector       vbits        = Q6_Vw_vadd_VwVw(v_w, v_magic_bits);  // reinterpret as fp32 = 12582912 + x
   return Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(vbits, v_neg_magic));
+}
+
+// int32 -> fp32 over the whole range.
+//
+// The magic number above is exact only to 2^22, and that is not the range the
+// accumulator has here: the callers pass `scale_block_num == 1`, which makes the
+// scale cover the whole K instead of one block of 64, so with int8 weights K = 512
+// is already past it. Past it the conversion does not round, it returns a wrong
+// number -- an infinity at larger K -- while the kernel still reports success. So
+// split each lane into its high and low 16 bits, convert both with the magic number
+// (each is inside its domain by construction: |hi| <= 32768, 0 <= lo <= 65535), and
+// recombine as `hi * 65536 + lo`. The multiply is an exact power of two and the fp32
+// add is the only rounding, so the result is the correctly rounded fp32 of the
+// original int32 for every int32; and for |x| <= 2^22 it is bit for bit the value
+// the magic number returned alone.
+static inline HVX_Vector sf_from_w(HVX_Vector v_w) {
+  const HVX_Vector v_lo_mask = Q6_V_vsplat_R(0x0000FFFF);
+  const HVX_Vector v_65536   = Q6_V_vsplat_R(0x47800000);  // 65536.0f
+  HVX_Vector       v_hi      = sf_magic(Q6_Vw_vasr_VwR(v_w, 16));
+  HVX_Vector       v_lo      = sf_magic(Q6_V_vand_VV(v_w, v_lo_mask));
+  return Q6_Vsf_equals_Vqf32(
+      Q6_Vqf32_vadd_Vqf32Vsf(Q6_Vqf32_vmpy_VsfVsf(v_hi, v_65536), v_lo));
 }
 
 // Convert 32 fp32 lanes (oc order) -> 32 fp16 in the low 32 lanes (oc order).

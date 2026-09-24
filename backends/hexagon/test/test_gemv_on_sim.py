@@ -50,13 +50,14 @@ _CONFIGS = (
     ("W8B", 128, 64, "w8a16"),
 )
 
-#: Wide-K rungs, where the two kernels' `sf_from_w` bound can be reached. Both
-#: entries are emitted with `scale_block_num == 1`, the configuration that makes
-#: the int32 accumulator span the whole K -- `|w| * 127 * k` for a constant
-#: weight -- and `sf_from_w`'s magic number is documented for `|x| < 2^22`. The
-#: safe rungs are the widest K that still answers exactly; the wide ones are the
-#: narrowest K that does not. The boundary therefore has a measurement on either
-#: side of it instead of a claim.
+#: Wide-K rungs, all of them at K = 256 and above, where the two kernels'
+#: `sf_from_w` bound can be reached. Both entries are emitted with
+#: `scale_block_num == 1`, the configuration that makes the int32 accumulator span
+#: the whole K -- `|w| * 127 * k` for a constant weight -- and `sf_from_w`'s magic
+#: number is exact only to `|x| <= 2^22`. The safe rungs are the widest K that was
+#: exact before the conversion was fixed; the wide ones are the narrowest K that
+#: was not, and they are here because a fix is only a fix if the rungs that
+#: measured the defect still stand in the suite and now pass.
 _WIDE_SAFE = (
     ("W8S", 256, 32, "w8a16"),
     ("Q4S", 4224, 32, "q4a16"),
@@ -65,10 +66,11 @@ _WIDE = (
     ("W8W", 512, 32, "w8a16"),
     ("Q4W", 8192, 32, "q4a16"),
 )
-#: The qualifier, at the same K as the widest failing rung: weights drawn with a
-#: sign, so the per-channel sum cancels (`|sum w| / sum |w|` measures 0.001 here)
-#: and the accumulator stays a factor of two below the bound. These rungs are the
-#: control for "is it wide K, or wide K with a coherently signed column".
+#: The qualifier, at the same K as the widest rung: weights drawn with a sign, so
+#: the per-channel sum cancels (`|sum w| / sum |w|` measures 0.001 here) and the
+#: accumulator stays a factor of two below the bound. These rungs are the control
+#: for "is it wide K, or wide K with a coherently signed column" -- and they are
+#: the reason the fix had to leave every in-domain answer untouched.
 _WIDE_MIXED = (
     ("W8M", 8192, 32, "w8a16"),
     ("Q4M", 8192, 32, "q4a16"),
@@ -319,39 +321,40 @@ def test_a_wide_k_inside_the_accumulator_bound_is_exact(measured, tag, k, n, sch
 
 
 @pytest.mark.parametrize("tag,k,n,scheme", _WIDE)
-@pytest.mark.xfail(
-    strict=True,
-    reason="the int32 accumulator passes sf_from_w's |x| < 2^22 domain and the "
-    "scale it feeds back is wrong: measured, not inferred -- see this module's "
-    "_WIDE ladder and the docstring below",
-)
-def test_a_wide_k_past_the_accumulator_bound_answers_wrongly(
+def test_a_wide_k_past_the_accumulator_bound_is_still_exact(
     measured, tag, k, n, scheme
 ):
-    """The rung above the bound: the kernel answers a wrong number and says 0.
+    """The rung above the old bound: `scale[n] * sum_k w[k, n]`, bit for bit.
 
-    This test asserts the *correct* answer, so it fails today, deliberately, and
-    `strict=True` makes it fail the other way -- as an XPASS -- the day the
-    kernel is fixed, which is the signal to turn this into an ordinary test.
+    Constant weights, one everywhere on the activation, and K wide enough that the
+    accumulator is past 2^22 -- 127 * 512 * 127 = 8 258 048 for W8W, and
+    7 * 8192 * 127 = 7 282 688 for Q4W -- so this is the rung that used to measure
+    the defect and is now the acceptance criterion for the fix. It asserts the same
+    thing the rung below it asserts, and it is the reason `sf_from_w` was changed.
 
-    Measured on hexagon-sim with constant weights (so nothing cancels) and an
-    activation of one everywhere, against `scale[n] * sum_k w[k, n]`:
+    Measured on hexagon-sim before the conversion was fixed, against
+    `scale[n] * sum_k w[k, n]`:
 
       W8W  K =  512, accumulator 8 258 048:  3032 against 2032    (+49%)
       Q4W  K = 8192, accumulator 7 282 688:  2552 against 1792    (+42%)
 
-    and the same kernels answer bit-for-bit one rung below (W8S, Q4S above) as
-    well as at K = 8192 with a random-sign weight, where the sum cancels and the
-    worst channel's accumulator reaches 1.8e6 against the bound of 4.19e6 (that
-    rung is `test_a_wide_k_with_mixed_signs_stays_inside_the_bound`, and it is
-    correct to the rounding, not bit-for-bit). So the defect is not "wide K" but
-    "wide K with a coherently signed weight column", and it is silent: the
-    kernel's return code is 0 in both cases, and at K = 4224 on the w8a16 rung
-    the answer is not merely wrong but infinite.
+    and the return code was 0 in both, so the defect was silent; at K = 4224 on the
+    w8a16 rung the answer was not merely wrong but infinite. The same kernels
+    answered bit-for-bit one rung below (W8S, Q4S above) and at K = 8192 with a
+    random-sign weight, where the sum cancels and the worst channel's accumulator
+    reaches 1.8e6 (that rung is
+    `test_a_wide_k_with_mixed_signs_stays_inside_the_bound`) -- so the defect needed
+    wide K *and* a coherently signed weight column, and those rungs are why the fix
+    had to leave every in-domain answer bit-identical.
 
-    What this does *not* say: which instruction is at fault. The threshold
-    matches 2^22 at both weight scales, which is `sf_from_w`'s documented
-    domain, and nothing else in either translation unit changes there.
+    The mechanism: `sf_from_w` turned the int32 accumulator into fp32 with the
+    `1.5 * 2^23` magic number, exact only to 2^22, and the emitters pass
+    `scale_block_num == 1`, which makes the accumulator span the whole K rather than
+    one block of 64. The conversion now splits each lane and recombines it, so the
+    whole int32 range converts correctly. Isolating the instruction, rather than
+    arguing it: this test asserted the correct answer as a strict xfail and turned
+    into an XPASS when that one function changed and nothing else did. Had it not
+    turned, the defect was somewhere else and the marker said so.
     """
     weights, _, _ = measured
     weight, scale = weights[tag]
