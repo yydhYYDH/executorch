@@ -1898,7 +1898,178 @@ def _branch_cases():
             _bits(fill_expected),
         )
     )
+
+    # 12. The M > 1 quantized prefill entry, in the five shapes that decide
+    #    whether its two blits and its weight layout are right:
+    #
+    #      * CJ, K = 128: the activation pack is a real one -- two 64-k blocks in
+    #        one region -- and the output repack is a single region too;
+    #      * CK, K = 64, N = 96: no pack blit at all, because the blocked layout
+    #        and the row-major one are the same memory at one block, and the
+    #        output's last 64-channel pack holds a 32-channel tail, which is the
+    #        repack's second region;
+    #      * CL, M = 40: the dispatch crosses into the general kernel, a
+    #        different translation unit from the M <= 32 one;
+    #      * CE, N = 32: one output tile, so the emitter's chunk count is one and
+    #        the kernel's store takes its unpaired path;
+    #      * CF: the bias operand, the one thing the kernel adds on its own.
+    #
+    #    All of them are exact rather than a tolerance. The weight is the GEMV
+    #    cases' ±15 pattern, so each channel's scale is exactly 2.0 and the stored
+    #    weight is a whole number; the activation is small integers. Every product
+    #    is then an integer, every partial sum is one, and a sum over 128 k of at
+    #    most 14 is below 2048, so fp16 holds the answer exactly and neither the
+    #    accumulation order nor the rounding is free to disagree.
+    cases.extend(_prefill_cases())
+
     return cases
+
+
+#: The prefill entry: `DSP_OP_MATMUL_Q4A16_FP16`.
+_Q4A16_PREFILL = 22
+
+
+def _prefill_cases():
+    """The M > 1 quantized cases and the two controls that give them teeth."""
+    out = []
+    for tag, m, k, n in (
+        ("CJ", 8, 128, 64),
+        ("CK", 5, 64, 96),
+        ("CL", 40, 64, 64),
+        ("CE", 8, 128, 32),
+        # K = 64 with one 32-channel output tile: the shape the kernel answers
+        # NaNs for at one output chunk, so it is the case that decides whether
+        # the emitter's chunk count is right rather than merely plausible.
+        ("CI", 8, 64, 32),
+    ):
+        blob, weight, activation = _prefill_mm(k, n, m)
+        out.append(
+            _case(
+                tag,
+                None,
+                (activation,),
+                _prefill_answer(weight, activation.numpy()),
+                blob=blob,
+            )
+        )
+    bias = ((torch.arange(64) % 5) - 2).to(torch.float32)
+    blob, weight, activation = _prefill_mm(64, 64, 6, bias=bias)
+    out.append(
+        _case(
+            "CF",
+            None,
+            (activation,),
+            _prefill_answer(weight, activation.numpy(), bias.half().numpy()),
+            blob=blob,
+        )
+    )
+    #    The two controls, both on CJ's shape and both expected to answer
+    #    something else. Each rewrites the weight bytes the blob carries so that a
+    #    reading of the tile order other than the one the packer implements has to
+    #    come out different: the first transposes the table's two strides -- the
+    #    same bytes, every tile still present once, each output channel now
+    #    reading another k -- and the second exchanges the two nibbles of every
+    #    byte, which in this layout are two k values four apart. The sum over k is
+    #    blind to neither.
+    for tag, mutate in (
+        ("CG", _transpose_the_prefill_tiles),
+        ("CH", _swap_the_prefill_nibbles),
+    ):
+        blob, weight, activation = _prefill_mm(128, 64, 8)
+        out.append(
+            _case(
+                tag,
+                None,
+                (activation,),
+                _prefill_answer(weight, activation.numpy()),
+                kind="teeth",
+                blob=blob,
+                mutate=lambda data, mutate=mutate: mutate(data, 128, 64),
+            )
+        )
+    return out
+
+
+def _prefill_generator(m, k):
+    """The activation for one shape, from a seed that names it."""
+    return torch.Generator().manual_seed(20240925 + m * 131 + k)
+
+
+def _prefill_mm(k, n, m, bias=None):
+    """One M > 1 quantized mm through the real pipeline, as a blob.
+
+    The same chain the GEMV cases run -- the annotator, the pattern the emitter
+    matches, the weight packer and the command -- with an activation that is more
+    than one row, which is the whole of what this entry adds.
+    """
+    weight = _gemv_weight("q4a16", k, n)
+    model = _QuantizedMm(weight, bias).eval()
+    activation = torch.randint(-1, 2, (m, k), generator=_prefill_generator(m, k)).to(
+        torch.float32
+    )
+    exported = torch.export.export(model, (activation,))
+    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer("q4a16"))
+    with torch.no_grad():
+        prepared(activation)
+    converted = convert_pt2e(prepared)
+    program = to_edge(torch.export.export(converted, (activation,))).exported_program()
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    # The runtime narrows the fp32 input the graph declares to the fp16 operand
+    # the kernel reads, so what the caller hands the blob is the half tensor.
+    return blob, weight, activation.half()
+
+
+def _prefill_answer(weight, activation, bias=None):
+    """`activation @ (stored * scale)`, which is what the kernel computes.
+
+    The sums are integers and the scale is a power of two, so this is the
+    kernel's own answer bit for bit rather than an approximation of it.
+    """
+    stored, scale = _gemv_stored(weight, "q4a16")
+    answer = activation.astype(np.float64) @ (
+        stored.astype(np.float64) * scale.astype(np.float64)
+    )
+    if bias is not None:
+        answer = answer + bias.astype(np.float64)
+    # Flat, like `_bits` above: the harness reads the answer out of the method
+    # output slot as a one-dimensional run of halfwords.
+    return answer.astype(np.float16).reshape(-1)
+
+
+def _prefill_weight_operand(blob, k, n):
+    """Where the prefill command's weight sits in the weights section."""
+    _, commands = read_blob(blob)
+    command = next(c for c in commands if c.type == _Q4A16_PREFILL)
+    return _weights_base(blob) + command.inputs[1].offset, (k // 32) * (n // 32) * 512
+
+
+def _transpose_the_prefill_tiles(blob, k, n):
+    """The same blob with the 512-byte tile table written column-major.
+
+    The tiles are `icP * ocP` units addressed `(y*icP + x)*512`, so this is what
+    a packer that looped the two strides the other way round would have written:
+    every tile is still there, each output channel now reading another one.
+    """
+    at, length = _prefill_weight_operand(blob, k, n)
+    kp, np_ = k // 32, n // 32
+    body = bytearray(blob)
+    tiles = bytes(body[at : at + length])
+    for y in range(np_):
+        for x in range(kp):
+            source = (y * kp + x) * 512
+            target = at + (x * np_ + y) * 512
+            body[target : target + 512] = tiles[source : source + 512]
+    return bytes(body)
+
+
+def _swap_the_prefill_nibbles(blob, k, n):
+    """The same blob with every packed weight byte's two nibbles exchanged."""
+    at, length = _prefill_weight_operand(blob, k, n)
+    body = bytearray(blob)
+    for offset in range(at, at + length):
+        value = body[offset]
+        body[offset] = (value >> 4) | ((value & 0x0F) << 4)
+    return bytes(body)
 
 
 def _bits(values):
@@ -2079,6 +2250,57 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         next(iter(_tagged(cases, tag).commands)).params[0] >= 64
         for tag in ("X", "Y", "Z")
     ), "a clamp case is short enough to run the scalar tail"
+    # The prefill entry, whose three claims are separately visible in the
+    # command list: the pack blit in front of the matmul (absent at K = 64, where
+    # the blocked and row-major layouts are the same memory), the matmul itself,
+    # and the repack behind it.
+    for tag in ("CJ", "CE", "CG", "CH"):
+        assert kinds[tag] == [3, _Q4A16_PREFILL, 3], f"{tag}: not pack/matmul/repack"
+    for tag in ("CK", "CL", "CF", "CI"):
+        assert kinds[tag] == [_Q4A16_PREFILL, 3], f"{tag}: K = 64 needs no pack blit"
+    for tag in ("CG", "CH"):
+        assert kinds[tag] == kinds["CJ"], f"{tag}: the control is not CJ's commands"
+        assert (
+            _tagged(cases, tag).blob != _tagged(cases, "CJ").blob
+        ), f"{tag}: the control carries the same bytes as the case it controls"
+    # The activation pack is one region and the repack is one for a whole number
+    # of 64-channel packs and two when N is ragged, which is the difference
+    # between CC and the rest.
+    for tag in ("CJ", "CE", "CG", "CH"):
+        regions = [c.params[0] for c in _tagged(cases, tag).commands if c.type == 3]
+        assert regions == [1, 1], f"{tag}: the blits carry {regions} regions"
+    assert _tagged(cases, "CK").commands[-1].params[0] == 2, "the tail is not a region"
+    # N = 32 is one output tile, and the matmul still asks for two chunks: one
+    # chunk at K = 64 is a shape this entry answers NaNs for, measured in
+    # test_prefill_on_sim.py, so the emitter's chunk count is not the tile count.
+    assert (
+        next(
+            c for c in _tagged(cases, "CE").commands if c.type == _Q4A16_PREFILL
+        ).params[6]
+        == 2
+    ), "the one-tile case asks for one chunk"
+    for tag in ("CL", "CF"):
+        assert _tagged(cases, tag).commands[-1].params[0] == 1
+    # The matmul's own parameters: M, K, N, the M and N chunk counts, K/32 tiles
+    # and the one scale block per output channel that says the scales are fp16
+    # per channel rather than anything else.
+    for tag, m, k, n in (
+        ("CJ", 8, 128, 64),
+        ("CK", 5, 64, 96),
+        ("CL", 40, 64, 64),
+        ("CE", 8, 128, 32),
+        ("CF", 6, 64, 64),
+    ):
+        command = next(
+            c for c in _tagged(cases, tag).commands if c.type == _Q4A16_PREFILL
+        )
+        assert list(command.params[:3]) == [m, k, n], f"{tag}: {command.params[:3]}"
+        assert list(command.params[5:9]) == [
+            1,
+            2,
+            k // 32,
+            1,
+        ], f"{tag}: the chunks are {command.params[5:9]}"
     for tag in ("AA", "AB", "AC"):
         # The emitter's two blits around the command are part of the command
         # being what it claims: without them the kernel reads other channels.

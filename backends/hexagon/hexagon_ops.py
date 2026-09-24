@@ -62,18 +62,39 @@ DSP_OP_SOFTMAX = 28
 DSP_OP_REDUCTION = 29
 DSP_OP_BATCH_MATMUL = 38
 DSP_OP_FLASH_ATTN = 18
-# The quantized matmuls, from the DSP's enum (htp_command.h pins both numbers
-# with a static_assert). They take an fp16 activation and a packed low-bit
-# weight, and each kernel quantizes that activation to symmetric per-token int8
-# inside itself: what reaches the multiply is int4/int8, whatever the annotation
-# said. The GEMV entries are the M == 1 (decode) kernels -- they read K
+# The quantized matmuls, from the DSP's enum (htp_command.h pins both GEMV
+# numbers with a static_assert). They take an fp16 activation and a packed
+# low-bit weight. The GEMV entries are the M == 1 (decode) kernels -- they read K
 # contiguous fp16, which for one row is the row-major layout the graph already
 # holds, and write the output linear by output channel, so neither the 64-channel
-# activation blocking nor the output repack the prefill entries need is involved.
-# The prefill entries (Q4A16_FP16, Q4A16_BLOCK_FP16, W8A16_BLOCK_FP16) are not
-# emitted here.
+# activation blocking nor the output repack the prefill entry needs is involved.
+# The q4a16 GEMV additionally quantizes the activation to symmetric per-token
+# int8 inside the kernel, because its multiply is the integer vrmpy one; the
+# prefill entry below multiplies fp16 by the dequantized fp16 weight instead.
+#
+# DSP_OP_MATMUL_Q4A16_FP16 is dispatch 22 of execute_command.cc. It forwards to
+# hmx_matmulq4fp16_mle32 for M <= 32 and to hmx_matmulq4fp16 above that; both read
+# the same weight, and both are reached through this one command. It carries no
+# static_assert of its own, so `test_the_op_ids_are_the_ones_the_dsp_defines`
+# pins the number against htp_command.h.
+DSP_OP_MATMUL_Q4A16_FP16 = 22
 DSP_OP_MATMUL_Q4A16_GEMV_I8 = 41
 DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
+
+# The prefill command's own knobs, and the VTCM budget they are spent out of.
+# mp and np are the chunk sizes the kernel stages: np counts output-channel
+# tiles held in VTCM at once, mp counts 32-row activation bands, and both buy
+# traffic at the cost of the bands themselves. The prefill path passes one
+# activation band and two output-channel tiles -- the pair the kernel's own
+# store walks two at a time -- and PREFILL_VTCM_FIXED covers the small
+# allocations around them (output tile buffers, scales, HMX column scales).
+PREFILL_OUTPUT_CHANNEL_CHUNK = 2
+PREFILL_VTCM_FIXED = 64 * 1024
+#: The VTCM the prefill kernels may reserve. The simulator reports 8 MiB
+#: (`vtcm_manager_get_vtcm_size`) and the kernels' own guard is 8 MiB less
+#: 16 KiB (`matmul_q4fp16.c:946`); this asks for less than either, because what
+#: a device hands the skel is not something this tree can measure.
+PREFILL_VTCM_BYTES = 7 * 1024 * 1024
 # The row gather, from the same enum: one command reads selectSize rows out of
 # an fp16 table the export step laid out as 32x32 tiles.
 DSP_OP_SHARED_GATHER = 23
@@ -1465,6 +1486,57 @@ def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
     return m == 1 and k % 64 == 0 and n % 32 == 0
 
 
+def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
+    """Whether the M > 1 prefill kernel can run this matmul.
+
+    The same two shape guards the GEMV entries carry, and for the same reason:
+    the kernel splits K into 32-element tiles and floors the division, so a K
+    that is not a multiple of 32 would silently drop the tail, and N lands in
+    32-channel tiles. K % 64 is what the activation pack's one-region-per-block
+    form needs and is stricter than the kernel's own K % 32 -- a K that is not a
+    multiple of 64 packs into half a block whose other half is not part of the
+    tensor. N % 64 is not required: the output repack carries the ragged last
+    pack as a second region.
+
+    M > 1 is the whole point -- M == 1 belongs to the GEMV entries, which read a
+    different weight layout and are already wired -- and there is no upper bound
+    here: the kernel chunks M into 32-row groups and walks them, so the value of
+    M only decides how long that walk is.
+
+    What is left out: the w8a16 scheme. The w8a16 prefill kernel is
+    DSP_OP_MATMUL_W8A16_BLOCK_FP16, whose parameters are an im2col struct and
+    whose int8 weight is in a tile order nothing in this backend packs yet, so a
+    w8a16 matmul with M > 1 stays on the portable kernels rather than be fed
+    bytes nothing has checked.
+    """
+    if quantized.bits != 4:
+        return False
+    geometry = quantized_matmul_geometry(activation, quantized)
+    if geometry is None:
+        return False
+    m, k, n = geometry
+    if m <= 1 or k % 64 != 0 or n % 32 != 0:
+        return False
+    return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
+
+
+def _prefill_vtcm_bytes(k: int) -> int:
+    """The VTCM the prefill kernel reserves for a weight K wide.
+
+    Both dispatch targets hold the same three bands: the output channels of one
+    chunk twice over, as fp16 tiles and as their int4 copies, plus the
+    activation bands the walk stages through (`matmul_q4fp16.c:936-964`,
+    `matmul_q4fp16_mle32.c:725-735`). The chunk sizes are the ones the emitter
+    passes, and the activation count is the larger of the two kernels' -- the
+    general one double-buffers M for the async store -- so this bound holds for
+    either.
+    """
+    chunk = PREFILL_OUTPUT_CHANNEL_CHUNK
+    per_output_tile = 32 * k * 2 + 32 * k // 2
+    activation = 2 * 32 * k * 2
+    return chunk * per_output_tile + activation + PREFILL_VTCM_FIXED
+
+
 def quantized_matmul_weight(node) -> Optional[torch.fx.Node]:
     """The operand a matmul's weight-only weight arrives through, if any.
 
@@ -1481,11 +1553,11 @@ def quantized_matmul_weight(node) -> Optional[torch.fx.Node]:
 
 
 def quantized_matmul_is_emittable(node: torch.fx.Node, is_constant) -> bool:
-    """Whether this matmul is one the GEMV emitter can place, in full.
+    """Whether this matmul is one a quantized matmul emitter can place, in full.
 
-    The support check, the dequantize's fusion test and the emitter all call
+    The support check, the dequantize's fusion test and the emitters all call
     this, so the three cannot disagree: a node the partitioner delegates is one
-    the emitter accepts, and a dequantize is only fused away when every matmul
+    an emitter accepts, and a dequantize is only fused away when every matmul
     reading it is one this accepts. The emitter cannot fall back -- it is past
     the partition boundary -- so a condition missing here is an export failure
     or, worse, a command the kernel reads past.
@@ -1500,6 +1572,12 @@ def quantized_matmul_is_emittable(node: torch.fx.Node, is_constant) -> bool:
     from the graph alone, since a parameter and a run-time tensor are both
     placeholders carrying a fake tensor, so the answer has to come from the
     caller that knows the program's signature.
+
+    Two emitters answer to it: the M == 1 GEMV one and the M > 1 prefill one.
+    Which of them a node belongs to is the M it carries, and the two do not
+    overlap -- the prefill entry refuses M <= 1 and the GEMV entries refuse
+    anything else. Both read the same two constants, so the test above covers
+    the two of them at once.
     """
     if node.target in MM_TARGETS:
         if len(node.args) < 2:
@@ -1537,7 +1615,12 @@ def quantized_matmul_is_emittable(node: torch.fx.Node, is_constant) -> bool:
         # strided activation is one no kernel here walks.
         return False
     geometry = quantized_matmul_geometry(activation, quantized)
-    if geometry is None or not _quantized_gemv_fits(activation, quantized):
+    if geometry is None:
+        return False
+    if not (
+        _quantized_gemv_fits(activation, quantized)
+        or _quantized_prefill_fits(activation, quantized)
+    ):
         return False
     if bias is None:
         return True
@@ -1689,36 +1772,84 @@ def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
     return packed.astype(np.uint8).reshape(np_ * kp, 1024).tobytes()
 
 
-def _emit_quantized_matmul(
-    node: torch.fx.Node,
-    ctx,
-    quantized: QuantizedWeight,
-    activation: torch.fx.Node,
-    bias: Optional[torch.fx.Node],
-) -> TensorRef:
-    """A quantized matmul as one M == 1 GEMV command.
+def pack_q4a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
+    """A (k, n) int4 weight in the tile order the prefill kernel reads.
 
-    The weight is packed at export into the layout the kernel reads and stored
-    in the weights section; the activation is the graph's own fp16 row, K
-    contiguous halfs, which the kernel then quantizes to int8 per token. The
-    low-bit weight never goes through `weight_bytes`: that narrows a fp32 tensor
-    to fp16 silently, which is right for a kernel that reads halfs and wrong for
-    one that reads packed int4, so this reads the stored tensor and packs it.
+    The GEMV packer above and this one are different layouts for the same
+    weight: the vrmpy one feeds the integer GEMV kernel, this one feeds the HMX
+    prefill kernel, which dequantizes a 32x32 tile to fp16 and multiplies it by
+    an fp16 activation. The two are not interchangeable, and neither is the
+    other's scales -- the prefill kernel reads one fp16 scale per output channel
+    where the GEMV kernel reads fp32.
+
+    The tile order is not transcribed from a comment. It is a port of
+    `htp_ops_weight_reorder_int4` (`matmul_q4fp16.c:93`), the vendored tree's own
+    reorder into this layout: the raw plane is `[n][k/2]` with the even k in the
+    high nibble and the value offset by 8, each block of 32 output channels by 32
+    k values becomes one 512-byte tile at `(y*kp + x)*512` -- y being the output
+    channel tile and x the k tile -- and the fp16 scales follow the tiles, which
+    is where the kernel's `b_scale` pointer lands (`im2col`-style wrappers set it
+    at `weight + icP*ocP*512`). Inside a tile the block is laid out as
+    `local[64*xi + 2*yi + p]`: the k byte index xi outermost, the output channel
+    yi next and the nibble p innermost; the 1024 bytes are then byte-shuffled in
+    eight 128-byte groups and folded to 512 by packing each byte of the upper
+    half into the high nibble of the matching byte below it.
+
+    What is checked: `test_prefill_on_sim.py` runs that vendored reorder on the
+    simulator and compares its output with this function byte for byte, and the
+    two HVX operations the fold is made of are measured there too rather than
+    read out of a manual. What is not: nothing has run this on a device.
     """
     import numpy as np
 
-    geometry = quantized_matmul_geometry(activation, quantized)
-    if geometry is None:
-        raise RuntimeError("hexagon: quantized matmul has no static geometry")
-    m, k, n = geometry
-    if not quantized_matmul_is_emittable(
-        node, lambda operand: ctx.constant_value(operand) is not None
-    ):
+    w = np.asarray(weight, dtype=np.int32)
+    if w.shape != (k, n):
+        raise RuntimeError(f"hexagon: q4a16 weight is {w.shape}, expected ({k}, {n})")
+    if k % 64 or n % 32:
         raise RuntimeError(
-            f"hexagon: quantized matmul {m}x{k}x{n} is not one the support check "
-            "admits; the partitioner should not have delegated it"
+            f"hexagon: q4a16 prefill needs K a multiple of 64 and N of 32, got {k}x{n}"
         )
+    kp, np_ = k // 32, n // 32
+    scales = np.asarray(scale, dtype=np.float32).reshape(-1)
+    if scales.size != n:
+        raise RuntimeError(f"hexagon: q4a16 has {scales.size} scales, expected {n}")
 
+    # The raw plane the vendored reorder starts from, one byte per two k values.
+    nibbles = np.clip(w.T, -8, 7) + 8
+    raw = np.zeros((np_, 32, kp, 16), dtype=np.uint8)
+    raw[:, :, :, :] = (nibbles[:, 0::2] * 16 + nibbles[:, 1::2]).reshape(
+        np_, 32, kp, 16
+    )
+    # local[64*xi + 2*yi + p]: xi is the k byte, yi the output channel, p the
+    # nibble (0 = the even k, in the high nibble of the byte).
+    local = np.empty((np_, kp, 16, 32, 2), dtype=np.uint8)
+    local[..., 0] = raw.transpose(0, 2, 3, 1) >> 4
+    local[..., 1] = raw.transpose(0, 2, 3, 1) & 0x0F
+    local = local.reshape(np_ * kp, 8, 128)
+    # Q6_Vb_vshuff_Vb: within 128 bytes, out[2i] = in[i] and out[2i+1] = in[64+i].
+    shuffled = np.empty_like(local)
+    shuffled[:, :, 0::2] = local[:, :, :64]
+    shuffled[:, :, 1::2] = local[:, :, 64:]
+    # Q6_Vh_vasl_VhR(high, 4) | low: the shift is a halfword one, so the byte
+    # that ends up in a byte's high nibble is the low nibble of the byte before
+    # it, which is why this cannot be an element-wise shift.
+    pairs = np.ascontiguousarray(shuffled.reshape(np_ * kp, 4, 2, 128)).view("<u2")
+    low = np.ascontiguousarray(pairs[:, :, 0, :])
+    high = np.ascontiguousarray(pairs[:, :, 1, :])
+    shifted = ((high.astype(np.uint32) << 4) & 0xFFFF).astype("<u2")
+    tiles = (
+        (low.view(np.uint8) | shifted.view(np.uint8)).reshape(np_ * kp, 512).tobytes()
+    )
+    return tiles + scales.astype(np.float16).tobytes()
+
+
+def _quantized_weight_values(ctx, quantized: QuantizedWeight, k: int, n: int):
+    """The stored low-bit weight and its per-channel scales, as [k][n] and [n].
+
+    Both emitters read the same two tensors and neither may let them through
+    `weight_bytes`: that narrows a fp32 tensor to fp16 silently, which is right
+    for a kernel that reads halfs and wrong for one that reads packed int4.
+    """
     weight = ctx.constant_value(quantized.weight)
     scale = ctx.constant_value(quantized.scale)
     if weight is None or scale is None:
@@ -1735,9 +1866,167 @@ def _emit_quantized_matmul(
         raise RuntimeError(
             f"hexagon: quantized matmul weight is {weight.shape}, expected ({k}, {n})"
         )
+    return weight, scale
 
+
+def _prefill_activation_ref(node, ctx, activation, m: int, k: int) -> TensorRef:
+    """The activation in the layout the prefill kernel's DMA reads.
+
+    The kernel loads a band of M rows per 32-element k tile out of
+    `[k/64][m][64]`: one descriptor per k tile takes 64 bytes from row m at
+    `(k/2)*m*64 + m*64` (`matmul_q4fp16_mle32.c:528-546`,
+    `matmul_q4fp16.c:182-196`). That layout is one blit region -- the k tile is
+    the outer axis, whose source stride is the 64 elements the tile covers --
+    and for K == 64 it is the row-major tensor itself, so no copy is emitted.
+    """
+    source = ctx.operand(activation)
+    if k == 64:
+        return source
+    packed = ctx.builder.add_activation(m * k * FP16_BYTES)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[source],
+            outputs=[packed],
+            params=[1, FP16_BYTES, 1]
+            + [0, 0, 0, k // 64, m, 64, 64, k, 1, m * 64, 64, 1],
+        ),
+    )
+    return packed
+
+
+def _prefill_output_blit(node, ctx, blocked: TensorRef, out: TensorRef, m: int, n: int):
+    """Move the kernel's `[n/64][m][64]` result back to a `[m][n]` row.
+
+    The kernel writes its output in 64-channel packs, each of which holds M rows
+    of 64 channels (`matmul_q4fp16.c:634`, `matmul_q4fp16_mle32.c:69`), and each
+    row of a pack is what this moves. A ragged last pack -- N % 64 == 32 -- is a
+    second region, and both fit in one command's parameter block.
+    """
+    packs, tail = n // 64, n % 64
+    regions: List[int] = []
+    if packs:
+        regions += [0, 0, 0, packs, m, 64, m * 64, 64, 1, 64, n, 1]
+    if tail:
+        regions += [0, packs * m * 64, packs * 64, 1, m, tail, 1, 64, 1, 1, n, 1]
+    if not regions:
+        return
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[blocked],
+            outputs=[out],
+            params=[len(regions) // BLIT_REGION_INTS, FP16_BYTES, 1] + regions,
+        ),
+    )
+
+
+def _emit_quantized_prefill(
+    node: torch.fx.Node,
+    ctx,
+    activation: torch.fx.Node,
+    weight,
+    scale,
+    bias_ref: TensorRef,
+    out: TensorRef,
+    m: int,
+    k: int,
+    n: int,
+) -> TensorRef:
+    """A quantized matmul with M > 1 as one DSP_OP_MATMUL_Q4A16_FP16 command.
+
+    Three commands: the pack blit that puts the activation in the blocked layout
+    (skipped when K is one block, where the layouts coincide), the matmul, and
+    the repack blit that moves the kernel's 64-channel packs back to rows.
+
+    What the kernel is given, and why: the weight is the tile order
+    `pack_q4a16_prefill_weight` builds, which is what the vendored reorder for
+    this kernel writes, and it carries fp16 per-channel scales where the GEMV
+    weight carries fp32 -- the same quantizer output, two different kernel
+    contracts. params carry M, K and N, the two chunk sizes, K/32 as the tile
+    count the kernel validates, and 1 scale block per output channel, which is
+    the granularity the quantizer produced.
+
+    The output-channel chunk is two even where N is one tile of 32 channels,
+    and that is a measurement rather than a leftover: `test_prefill_on_sim.py`
+    runs this entry at `np_chunk == 1` and finds the kernel answers NaNs for
+    every width at K == 64, while `np_chunk == 2` on the same shapes, walk and
+    allocation order is exact. The vendored entry corrects an odd chunk count
+    above one (`matmul_q4fp16_mle32.c:723`) and leaves one alone. Nothing about
+    this emitter wants a single chunk -- the pool of chunks is what the kernel
+    stages through, and one tile is one chunk of work either way -- so it asks
+    for the pair in every case rather than for the shape the allocator would
+    have picked.
+    """
+    import numpy as np
+
+    packed_weight = pack_q4a16_prefill_weight(weight, scale, k, n)
+    packed_activation = _prefill_activation_ref(node, ctx, activation, m, k)
+    packs = (n + 63) // 64
+    blocked = ctx.builder.add_activation(packs * m * 64 * FP16_BYTES)
+    np_chunk = PREFILL_OUTPUT_CHANNEL_CHUNK
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_MATMUL_Q4A16_FP16,
+            inputs=[
+                packed_activation,
+                ctx.builder.add_weights(packed_weight),
+                bias_ref,
+            ],
+            outputs=[blocked],
+            params=[m, k, n, 0, 1, 1, np_chunk, k // 32, 1, 0],
+        ),
+    )
+    _prefill_output_blit(node, ctx, blocked, out, m, n)
+    return ctx.record(node, out)
+
+
+def _emit_quantized_matmul(
+    node: torch.fx.Node,
+    ctx,
+    quantized: QuantizedWeight,
+    activation: torch.fx.Node,
+    bias: Optional[torch.fx.Node],
+) -> TensorRef:
+    """A quantized matmul as one GEMV command, or as the three a prefill takes.
+
+    The weight is packed at export into the layout the kernel reads and stored
+    in the weights section. The M == 1 entry reads the graph's own fp16 row, K
+    contiguous halfs, and quantizes it to int8 per token itself; the M > 1 entry
+    reads fp16 activation bands in the blocked layout, which is what the extra
+    blits are for.
+
+    The M == 1 branch is unchanged and must stay that way: its commands are what
+    the decode path has been running, and a byte of difference there is a
+    regression even where the numbers agree.
+    """
+    import numpy as np
+
+    geometry = quantized_matmul_geometry(activation, quantized)
+    if geometry is None:
+        raise RuntimeError("hexagon: quantized matmul has no static geometry")
+    m, k, n = geometry
+    if not quantized_matmul_is_emittable(
+        node, lambda operand: ctx.constant_value(operand) is not None
+    ):
+        raise RuntimeError(
+            f"hexagon: quantized matmul {m}x{k}x{n} is not one the support check "
+            "admits; the partitioner should not have delegated it"
+        )
+
+    weight, scale = _quantized_weight_values(ctx, quantized, k, n)
     out = ctx.result_for(node, n)
     bias_ref = ABSENT if bias is None else ctx.operand(bias)
+    if m > 1:
+        # The support check above admits M > 1 only for the 4-bit weight, so
+        # there is no w8a16 fallthrough to get wrong.
+        return _emit_quantized_prefill(
+            node, ctx, activation, weight, scale, bias_ref, out, m, k, n
+        )
+
     # The GEMV dispatch reads K and N out of params[1] and params[2] and the
     # scale block count out of params[8] (execute_command.cc); params[0] is the
     # M the commands that carry one use, and is not read here.

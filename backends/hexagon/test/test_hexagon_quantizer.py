@@ -58,6 +58,8 @@ from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
 
 _Q4A16 = blob_interpreter.MATMUL_Q4A16_GEMV_I8
 _W8A16 = blob_interpreter.MATMUL_W8A16_GEMV_I8
+_PREFILL = blob_interpreter.MATMUL_Q4A16_FP16
+_BLIT = blob_interpreter.RASTER_BLIT
 
 
 class _Live(torch.nn.Module):
@@ -463,18 +465,86 @@ def test_the_quantized_matmul_is_delegated():
     assert support.is_node_supported(None, mm.args[1])
 
 
-def test_a_prefill_quantized_matmul_stays_portable():
-    """M > 1 needs the pack64 activation and output repack, so it is refused.
+def test_a_prefill_quantized_matmul_is_delegated():
+    """M > 1 is the prefill entry, and the dequantize feeding it is fused.
 
-    The GEMV kernels are the M == 1 entries; a prefill matmul has no wired-up
-    kernel, so both the matmul and the dequantize that feeds it have to stay on
-    the portable kernels rather than reach an emitter that cannot place them.
+    The two M ranges are two different kernels with two different weight
+    layouts, and which one a matmul goes to is the M it carries. This is the
+    support half; `test_the_prefill_command_carries_its_shape_and_chunks` below
+    reads the command that comes out.
     """
     program, _, _ = _quantized_program("q4a16", 8, 64, 128)
     support = _support(program)
     mm = _mm_node(program)
+    assert support.is_node_supported(None, mm)
+    assert support.is_node_supported(None, mm.args[1])
+
+
+def test_a_prefill_shape_the_kernels_would_refuse_stays_portable():
+    """The same two guards, asked of the M > 1 entry.
+
+    K % 64 and N % 32 gate it for the prefill kernel's own reasons -- a K that
+    is not a multiple of 64 packs into half a 64-element activation block, and N
+    lands in 32-channel tiles -- and neither is the GEMV path's rule restated:
+    the prefill entry would otherwise take shapes the GEMV entries refuse and
+    the other way round.
+    """
+    for k, n in ((96, 64), (64, 48), (128, 16)):
+        program, _, _ = _quantized_program("q4a16", 4, k, n)
+        support = _support(program)
+        mm = _mm_node(program)
+        assert not support.is_node_supported(None, mm), (k, n)
+        assert not support.is_node_supported(None, mm.args[1]), (k, n)
+    # A row group that does divide, at the same M: without this the loop above
+    # is also what a support object that refuses every quantized matmul says.
+    program, _, _ = _quantized_program("q4a16", 4, 128, 64)
+    support = _support(program)
+    mm = _mm_node(program)
+    assert support.is_node_supported(None, mm)
+    assert support.is_node_supported(None, mm.args[1])
+
+
+def test_a_w8a16_prefill_matmul_stays_portable():
+    """Only the q4a16 prefill entry is wired, and the difference is the weight.
+
+    `DSP_OP_MATMUL_W8A16_BLOCK_FP16` reads int8 in an order nothing here packs
+    and takes its geometry in an im2col struct, so a w8a16 matmul with M > 1
+    stays on the portable kernels: an int8 weight in the int4 tile order would
+    be read, multiplied and answered, and only the answer would be wrong.
+    """
+    program, _, _ = _quantized_program("w8a16", 8, 64, 128)
+    support = _support(program)
+    mm = _mm_node(program)
     assert not support.is_node_supported(None, mm)
     assert not support.is_node_supported(None, mm.args[1])
+    # The same shape one weight type over does reach the kernel, so what
+    # refuses this is the int8 weight and not the M it carries.
+    program, _, _ = _quantized_program("q4a16", 8, 64, 128)
+    support = _support(program)
+    mm = _mm_node(program)
+    assert support.is_node_supported(None, mm)
+    assert support.is_node_supported(None, mm.args[1])
+
+
+def test_a_batched_quantized_matmul_keeps_the_batch_matmul():
+    """A batch axis in front of M stays the fp16 BATCH_MATMUL the graph had.
+
+    `to_edge` folds the batch into rows, so a batch of four of eight rows is a
+    matmul with 32 rows of activation and one weight -- which is exactly the
+    shape the prefill entry reads as prefill rows, and the one a predicate that
+    looked at M alone would take. The command stream is where that shows, so
+    this asks it there rather than of the predicate: the batch matmul the graph
+    already had, and neither quantized entry.
+    """
+    for scheme in ("q4a16", "w8a16"):
+        for shape in ((2, 8, 64), (1, 8, 64)):
+            program, _, _ = _at_program(scheme, shape, 64, 32)
+            blob = HexagonBackend.preprocess(program, []).processed_bytes
+            _, commands = read_blob(blob)
+            types = [c.type for c in commands]
+            assert blob_interpreter.BATCH_MATMUL in types, (scheme, shape, types)
+            for op in (_PREFILL, _Q4A16, _W8A16):
+                assert op not in types, (scheme, shape, types)
 
 
 def test_a_shape_the_kernels_would_refuse_stays_portable():
@@ -555,6 +625,76 @@ def test_the_command_carries_one_scale_block_per_output_channel():
         assert expected is not None and expected.numel() == n
         expected = expected.detach().to(torch.float32).reshape(-1).numpy()
         assert np.array_equal(stored, expected), f"{scheme} scales differ"
+
+
+def test_the_prefill_command_carries_its_shape_and_chunks():
+    """The M > 1 entry: three commands, and the numbers the kernel walks.
+
+    params carry M, K and N, one activation band and two output-channel tiles,
+    K/32 as the tile count the kernel validates, and 1 scale block per output
+    channel. The weight operand is the tiles plus one fp16 scale per channel,
+    which is the length the kernel's own `b_scale` pointer assumes -- an fp32
+    list here would make the kernel read the scales as weight tiles.
+    """
+    m, k, n = 8, 128, 96
+    program, converted, x = _quantized_program("q4a16", m, k, n)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    header, commands = read_blob(blob)
+    assert [c.type for c in commands] == [_BLIT, _PREFILL, _BLIT]
+    params = commands[1].params
+    assert list(params[:10]) == [m, k, n, 0, 1, 1, 2, k // 32, 1, 0]
+    assert commands[1].inputs[1].size == (k // 32) * (n // 32) * 512 + n * 2
+
+    # The activation pack: one region, the 64-k block outermost, whose source
+    # stride is the 64 elements that block covers and whose destination stride
+    # is one row of the blocked layout.
+    pack = commands[0].params
+    assert pack[0] == 1 and pack[1] == 2 and pack[2] == 1
+    assert pack[3:15] == [0, 0, 0, k // 64, m, 64, 64, k, 1, m * 64, 64, 1]
+    # The repack: the kernel's 64-channel packs back to rows, with the ragged
+    # last pack as a second region.
+    unpack = commands[2].params
+    assert unpack[0] == 2
+    assert unpack[3:15] == [0, 0, 0, n // 64, m, 64, m * 64, 64, 1, 64, n, 1]
+    assert unpack[15:27] == [0, m * 64, 64, 1, m, n % 64, 1, 64, 1, 1, n, 1]
+
+    got = np.frombuffer(execute(blob, [x.half().numpy()])[0], dtype=np.float16).reshape(
+        m, n
+    )
+    with torch.no_grad():
+        expected = converted(x).detach().float().numpy().reshape(m, n)
+    worst = _relative_error(got.astype(np.float32), expected)
+    assert worst < 0.02, f"the prefill command differs by {worst} at {m}x{k}x{n}"
+
+
+def test_a_one_block_activation_needs_no_pack_blit():
+    """K == 64: the blocked layout and the row-major one are the same memory.
+
+    The pack blit is skipped rather than emitted with an identity region, and
+    the kernel reads the graph's own tensor: a copy that moved nothing would
+    still cost a command, and the reason it can be skipped is a property of the
+    layout rather than of the emitter.
+    """
+    program, _, _ = _quantized_program("q4a16", 8, 64, 64)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, commands = read_blob(blob)
+    assert [c.type for c in commands] == [_PREFILL, _BLIT]
+    assert commands[0].inputs[0].space == commands[0].inputs[0].space
+    assert commands[0].inputs[0].size == 8 * 64 * 2, "the activation is not the input"
+
+
+def test_the_two_branches_are_two_different_commands():
+    """M decides which kernel, and the two do not overlap.
+
+    The control for everything above: if the emitter sent M > 1 to the GEMV
+    entry, or M == 1 to the prefill one, the weight layout and the parameters
+    would be the other kernel's and the shapes below would still look plausible.
+    """
+    for m, expected in ((1, [_Q4A16]), (2, [_PREFILL, _BLIT]), (64, [_PREFILL, _BLIT])):
+        program, _, _ = _quantized_program("q4a16", m, 64, 64)
+        blob = HexagonBackend.preprocess(program, []).processed_bytes
+        _, commands = read_blob(blob)
+        assert [c.type for c in commands] == expected, (m, [c.type for c in commands])
 
 
 def test_the_dequantize_never_materializes_the_weight_twice():

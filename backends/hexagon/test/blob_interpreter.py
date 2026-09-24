@@ -50,6 +50,7 @@ BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
 FLASH_ATTN = 18
 ROPE = 14
+MATMUL_Q4A16_FP16 = 22
 MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
 SHARED_GATHER = 23
@@ -1481,6 +1482,91 @@ def _unpack_hmx_int8(raw: bytes, k: int, n: int) -> np.ndarray:
     return w
 
 
+def _unpack_hmx_int4(raw: bytes, k: int, n: int) -> np.ndarray:
+    """The inverse of `pack_q4a16_prefill_weight`, back to a signed (n, k) int4.
+
+    Tile (y, x) at `(y*kp + x)*512`, and inside it the local block the vendored
+    reorder builds is `local[64*xi + 2*yi + p]`, holding the nibble of the k
+    byte `16x + xi` for output channel `32y + yi`, the even k in p = 0. The
+    reorder then byte-shuffles eight 128-byte groups of it -- `out[2i] = in[i]`,
+    `out[2i+1] = in[64+i]` -- and folds each pair of 128-byte groups into one by
+    packing the upper group's byte into the high nibble of the lower one's. Both
+    steps are inverted here rather than read back through a second table: the
+    fold is only invertible because the local block holds one nibble per byte
+    (`matmul_q4fp16.c:43-83`).
+    """
+    kp, np_ = k // 32, n // 32
+    blocks = np_ * kp
+    # The 128 bytes each quarter folds into, in the order it writes them.
+    folded = np.frombuffer(raw[: blocks * 512], dtype=np.uint8).reshape(blocks, 4, 128)
+    # Undo the fold: the low nibble is the lower group's byte, the high nibble
+    # the upper group's.
+    groups = np.empty((blocks, 8, 128), dtype=np.uint8)
+    groups[:, 0::2] = folded & 0x0F
+    groups[:, 1::2] = folded >> 4
+    # Undo the shuffle.
+    local = np.empty((blocks, 8, 128), dtype=np.uint8)
+    local[:, :, :64] = groups[:, :, 0::2]
+    local[:, :, 64:] = groups[:, :, 1::2]
+    local = local.reshape(blocks, 16, 32, 2)
+    w = np.zeros((n, k), dtype=np.int32)
+    for y in range(np_):
+        for x in range(kp):
+            block = np.zeros((32, 32), dtype=np.int32)
+            # local is [xi][yi][p], so the tile is its transpose.
+            block[:, 0::2] = local[y * kp + x, :, :, 0].T.astype(np.int32) - 8
+            block[:, 1::2] = local[y * kp + x, :, :, 1].T.astype(np.int32) - 8
+            w[y * 32 : y * 32 + 32, x * 32 : x * 32 + 32] = block
+    return w
+
+
+def _run_matmul_q4a16_prefill(
+    command: Command, params: List[int], arena: Arena
+) -> None:
+    """htp_ops_matmul_q4a16_fp16, the M > 1 prefill kernel.
+
+    The weight is int4 in the HMX tile order with its fp16 per-channel scales
+    appended, the activation is fp16 in the blocked `[k/64][m][64]` layout the
+    emitter's pack blit builds, and the result is written blocked as `[n/64
+    packs][m][64]` for the repack blit behind it. What is modelled is the
+    kernel's arithmetic -- each int4 extended to fp16, multiplied by fp16
+    activation, accumulated in fp32, scaled once per output channel and rounded
+    to fp16 once -- rather than its instruction order: its HMX tiles accumulate
+    in a tree this does not reproduce, so a comparison against it is a
+    tolerance, not an equality.
+    """
+    m, k, n = params[0], params[1], params[2]
+    if k % 64 or n % 32:
+        raise UnsupportedOp(f"blob: a q4a16 prefill of {k}x{n}")
+    scale_blocks = params[8] if len(params) > 8 else 1
+    if scale_blocks != 1:
+        raise UnsupportedOp(f"blob: a q4a16 prefill over {scale_blocks} scale blocks")
+
+    dst = command.outputs[0]
+    raw = bytes(arena.view(command.inputs[1]))
+    w = _unpack_hmx_int4(raw, k, n)
+    tiles_bytes = (k // 32) * (n // 32) * 512
+    scales = np.frombuffer(raw[tiles_bytes:], dtype=np.float16)[:n].astype(np.float32)
+
+    activation = np.frombuffer(
+        bytes(arena.view(command.inputs[0])), dtype=np.float16
+    ).reshape(k // 64, m, 64)
+    rows = activation.transpose(1, 0, 2).reshape(m, k).astype(np.float32)
+    product = rows @ (w.astype(np.float32) * scales[:, None]).T
+    out = product.astype(np.float16)
+    bias = _gemv_bias(command, arena, 2, n)
+    if bias is not None:
+        out = (out.astype(np.float32) + bias).astype(np.float16)
+
+    # The kernel's own store: one 64-channel pack per M rows of the output.
+    packs = -(-n // 64)
+    blocked = np.zeros((packs, m, 64), dtype=np.float16)
+    for pack in range(packs):
+        channels = min(n - pack * 64, 64)
+        blocked[pack, :, :channels] = out[:, pack * 64 : pack * 64 + channels]
+    _store(arena, arena.address(dst), blocked.tobytes())
+
+
 def _quantize_activation_row(a: np.ndarray):
     """Per-token symmetric int8 quantization, as the GEMV kernels do it.
 
@@ -1647,6 +1733,7 @@ _EXECUTORS = {
     ROPE: _run_rope,
     BATCH_MATMUL: _run_batch_matmul,
     FLASH_ATTN: _run_flash_attn,
+    MATMUL_Q4A16_FP16: _run_matmul_q4a16_prefill,
     MATMUL_Q4A16_GEMV_I8: _run_matmul_q4a16_gemv,
     MATMUL_W8A16_GEMV_I8: _run_matmul_w8a16_gemv,
     SHARED_GATHER: _run_shared_gather,

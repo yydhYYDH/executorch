@@ -113,6 +113,13 @@ extern "C" int htp_ops_select(uint8_t *dst, uint8_t *cond, uint8_t *src1,
                               int32_t in1Size, int32_t in2Size, int32_t bytes,
                               int32_t condBytes, int32_t channelSize,
                               int32_t innerSize);
+/* The M > 1 prefill entry. Its two kernels are declared by the vendored
+ * `dsp/ops.h`, which this file includes, so there is no local prototype: the
+ * wrapper `htp_ops_matmul_q4a16_fp16` (`matmul_ops.cc:8`) would be the faithful
+ * call, but it turns the kernel's return code into a FARF line and returns
+ * success, and a kernel that refused writes nothing. This does the wrapper's own
+ * two steps -- pick the kernel by M, and derive the fp16 scale base at
+ * `weight + icP*ocP*512` -- and keeps the code. */
 extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation,
                                             uint8_t *weight, uint8_t *bias, int32_t k,
                                             int32_t n, int32_t scale_block_num,
@@ -153,6 +160,7 @@ enum {
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
+  kQ4A16Prefill = 22,
   kQ4A16Gemv = 41,
   kVisionAttention = 43,
   kW8A16Gemv = 45,
@@ -382,6 +390,24 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                           address(header, op.inputs[0]),
                           address(header, op.inputs[1]), params[0], params[1],
                           params[2], params[3], params[4], 1, 0);
+    return;
+  }
+  if (op.type == kQ4A16Prefill) {
+    const uint8_t *weight = address(header, op.inputs[1]);
+    const uint8_t *b_scale = weight + ((params[1] + 31) / 32) * ((params[2] + 31) / 32) * 32 * 16;
+    uint8_t *bias = absent(op.inputs[2]) ? nullptr : address(header, op.inputs[2]);
+    int ret = params[0] <= 32
+                  ? hmx_matmulq4fp16_mle32(address(header, op.outputs[0]),
+                                           address(header, op.inputs[0]), weight,
+                                           b_scale, bias, params[0], params[1],
+                                           params[2], params[5], params[6],
+                                           params[7], params[8], params[9], 0)
+                  : hmx_matmulq4fp16(address(header, op.outputs[0]),
+                                     address(header, op.inputs[0]), weight, b_scale,
+                                     bias, params[0], params[1], params[2],
+                                     params[5], params[6], params[7], params[8],
+                                     params[9], 0);
+    if (ret != 0) printf("%s q4a16 prefill returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kQ4A16Gemv) {
