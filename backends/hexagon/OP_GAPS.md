@@ -46,7 +46,7 @@ contain the operator, so an emitter would have nothing to call.
 | `aten.leaky_relu.default`, `aten.elu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no `elu` |
 | `aten._log_softmax.default` | Composes a log with a softmax in a way no single command describes |
 | `aten.convolution.default with transposed=True` | The im2col kernel walks its window forward over the input; a transposed convolution is a scatter read |
-| `aten.repeat.default`, `aten.flip.default`, `aten.constant_pad_nd.default` | Each is a different region walk from the blits that exist |
+| `aten.repeat.default`, `aten.flip.default` | Each is a different region walk from the blits that exist. A zero-filling `constant_pad_nd` was listed here and is not of this kind: it is a `DSP_OP_ZERO` memset plus one region, both already emitted for other ops, so it is a supported row now (`constant_pad_region` in `hexagon_ops.py`). A pad on a third axis from the end, a nonzero `value` and a negative pad still stay on the portable kernels -- the region is three levels and `htp_ops_zero` writes zero and nothing else |
 | `aten._adaptive_avg_pool2d.default` | The pool command takes one fixed window and stride; an adaptive output sizes the window per output position |
 | `aten.pow.Tensor_Tensor` | No pow kernel, and the unary table's `SQUARE` is exponent 2 only |
 | `aten.clamp.Tensor` | The clamp entry point carries its bounds as two fp16 params, so an operand bound has nowhere to go |
@@ -79,7 +79,7 @@ kernels the skel links and exports with nothing that can reach them:
 | 34 | `DSP_OP_MATMUL_Q4A16_BLOCK_FP16` | `htp_ops_matmul_q4block_a16_fp16` | quantized prefill, block-scaled form |
 | 36 | `DSP_OP_LSTM` | `htp_ops_lstm` | an LSTM cell. The recurrent models are unrolled before the partitioner, so nothing reaches it |
 | 37 | `DSP_OP_RELU` | `htp_ops_relu` | deliberately unused, as 30 |
-| 39 | `DSP_OP_PRELU` | `htp_ops_prelu` | `prelu`, which decomposes into `gt` + `mul` + `where` before the partitioner sees it (§3) |
+| 39 | `DSP_OP_PRELU` | `htp_ops_prelu` | `prelu`, which decomposes into `view_copy` + `gt` + `mul` + `where` before the partitioner sees it (§3). Note the fourth op: the weight is re-pointed by a `view_copy`, not read directly |
 | 40 | `DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL` | `hmx_conv1x1_direct_w8a16_sym_per_channel` | quantized 1x1 convolution |
 | 42 | `DSP_OP_MATMUL_W8A16_BLOCK_FP16` | `hmx_matmul_w8a16_block_fp16` | quantized prefill, int8 weights |
 | 44 | `DSP_OP_VISION_FLASH_ATTENTION_FP16` | `htp_ops_vision_flash_attention_fp16` | a vision attention variant |
@@ -119,10 +119,13 @@ next two-output kernel will have to decide too.
 - **`aten.where.self`**: see `DSP_OP_SELECT` above. The condition operand would
   have to carry a comparison result, and whether it can is not established.
 - **`aten.prelu`**: `DSP_OP_PRELU`(39) exists and no emitter uses it, because the
-  node does not survive export at all -- `F.prelu` arrives as `gt` + `mul` +
-  `where` (`test_overload_census.py`, row "prelu decomposes, and the where stays
+  node does not survive export at all -- `F.prelu` arrives as `view_copy` (the
+  weight re-pointed, not read) + `gt` + `mul` + `where`
+  (`test_overload_census.py`, row "prelu decomposes, and the where stays
   put"). Reaching the kernel would take a fusion pass of the `mul_silu.py` kind,
-  not an emitter.
+  not an emitter. The decomposition is already numerically exact and the
+  `view_copy` and the `mul` do delegate; `gt.Scalar` and `where.self` are what
+  stay outside, so the gap is that pair rather than this kernel.
 - **`aten.topk.default`**: this was the fourth, and it is done. The kernel
   answers both outputs -- `htp_ops_topkv2_k1_fp16(values, indices, input,
   rowSize, rows)` -- and what it took was the emitter plus the
