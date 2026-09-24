@@ -28,6 +28,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     CAST_TARGETS,
     cat_region,
     CAT_TARGETS,
+    constant_pad_region,
     conv_spec,
     CONV_TARGETS,
     dim_order_keeps_the_bytes,
@@ -51,6 +52,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     MM_TARGETS,
     NATIVE_LAYER_NORM,
     operand_dtypes_are_readable,
+    PAD_TARGETS,
     permute_region,
     PERMUTE_TARGETS,
     pool_spec,
@@ -745,6 +747,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in CAT_TARGETS and cat_region(node) is None:
             return False
         if node.target in PERMUTE_TARGETS and permute_region(node) is None:
+            return False
+        if node.target in PAD_TARGETS and constant_pad_region(node) is None:
+            # A zero-filling pad is a memset plus one region, so it is bounded
+            # twice over: the region's three levels only reach a pad on the last
+            # two axes, and the memset writes zero and nothing else. A pad on a
+            # third axis from the end, a negative pad, a symbolic extent or a
+            # nonzero value all have to stay on a portable kernel rather than
+            # reach a command that would read or write elsewhere.
             return False
         if node.target in DIM_ORDER_TARGETS and not dim_order_keeps_the_bytes(node):
             # A dim-order copy the alias emitter cannot stand in for is one the

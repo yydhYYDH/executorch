@@ -1320,6 +1320,7 @@ def _cases():
         split,
         *([attention] if attention is not None else []),
         *_branch_cases(),
+        *_pad_cases(),
     ]
 
 
@@ -2070,6 +2071,87 @@ def _swap_the_prefill_nibbles(blob, k, n):
         value = body[offset]
         body[offset] = (value >> 4) | ((value & 0x0F) << 4)
     return bytes(body)
+
+#: DSP_OP_RASTER_BLIT and the two param slots of a region that this case moves.
+_RASTER_BLIT_OP = 3
+
+#: type, n_inputs, n_outputs, n_params, then the params.
+_SIM_PARAMS_AT = 16
+
+#: The blit header is three ints (region count, element bytes, source count),
+#: then one region whose third word is the destination offset.
+_SIM_DST_OFFSET_PARAM = 3 + 2
+
+
+def _pad_graph(pads):
+    """`F.pad(x, pads)` as its own module, so the blob is one pad and nothing."""
+
+    class Pad(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.pad(x, pads)
+
+    return Pad()
+
+
+def _with_destination_offset_zero(blob):
+    """The pad blob with the blit's destination offset moved to the start.
+
+    The operand's first element then lands on the result's first element rather
+    than inside it, so the left border is overwritten and every row's last
+    element keeps the arena's fill. The region is the only thing that decides
+    where the copy goes: if the offsets the emitter recorded were not the ones
+    the kernel walked, the real bytes would answer this too and the equality
+    asserted on them would be saying nothing.
+    """
+    _, commands = read_blob(blob)
+    for index, command in enumerate(commands):
+        if command.type != _RASTER_BLIT_OP:
+            continue
+        data = bytearray(blob)
+        struct.pack_into(
+            "<i",
+            data,
+            blob_interpreter.B.HEADER_SIZE
+            + index * blob_interpreter.B.OP_SIZE
+            + _SIM_PARAMS_AT
+            + 4 * _SIM_DST_OFFSET_PARAM,
+            0,
+        )
+        return bytes(data)
+    raise AssertionError("the pad blob has no blit to perturb")
+
+
+def _pad_cases():
+    """The zero-filling pad, on the DSP.
+
+    A pad is a memset plus one region. The shape below is chosen so both halves
+    are load-bearing: the result's row pitch is not the operand's (7 against 4),
+    so a region that did not pad the destination stride walks the rows into each
+    other, and the destination offset is nonzero, so a region that started at
+    zero writes into the border. Padding the second-to-last axis as well is what
+    puts the leading axis on its own level, which is the part of the region a
+    reader is most likely to get wrong.
+    """
+    cases = []
+    operand = _small((2, 3, 4))
+    pad = _pad_graph((1, 1, 2, 0))
+    cases.append(_case("PAD", pad, (operand,), _bits(pad(operand))))
+    cases.append(
+        _case(
+            "PDC",
+            pad,
+            (operand,),
+            _bits(pad(operand)),
+            kind="teeth",
+            mutate=_with_destination_offset_zero,
+        )
+    )
+    # The same operation with the pad on the last axis alone, which is two levels
+    # rather than three and takes the shape most models actually write.
+    flat = _small((3, 5))
+    last = _pad_graph((2, 1))
+    cases.append(_case("PDE", last, (flat,), _bits(last(flat))))
+    return cases
 
 
 def _bits(values):

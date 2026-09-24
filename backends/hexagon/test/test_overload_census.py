@@ -594,10 +594,14 @@ _ROWS = [
         [("aten.flip.default", "unwired")],
     ),
     (
+        # The zero-filling pad was the one entry in the "no kernel at all" list
+        # that was not of that kind: it is a memset plus one region, and the
+        # library has both. What moved is the table entry; the shapes the gate
+        # still turns away are pinned in test_pad.py.
         "pad",
         lambda a: torch.nn.functional.pad(a, (1, 1)),
         (_x(4, 6),),
-        [("aten.constant_pad_nd.default", "unwired")],
+        [("aten.constant_pad_nd.default", "wired")],
     ),
     # --- pooling -----------------------------------------------------------
     (

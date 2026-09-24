@@ -696,6 +696,117 @@ def permute_region(node: torch.fx.Node):
     return [0, 0, 0] + size + src + dst
 
 
+def constant_pad_region(node: torch.fx.Node):
+    """The blit region that places a padded operand inside its result, or None.
+
+    A constant pad is two things this backend already emits for other ops: a
+    memset over the result, which fills the border, and one region that copies
+    the operand into the interior. The region is three nested loops with a stride
+    per side, so what it describes is a copy whose strides are constant per level
+    -- and a pad is exactly that when only the last two axes are padded. Those
+    are the axes whose output pitch differs from the input's; every axis before
+    them has the same extent on both sides, so one step of the leading loop
+    advances by a fixed `out_rows * out_inner` on the destination and the whole
+    leading product is a single level.
+
+    A pad on a third axis from the end needs a fourth level, and a region that
+    dropped it would read the wrong elements rather than fail, so it is refused
+    here and the node stays on a portable kernel.
+
+    The value is the other half of the gate, and its reason is the kernel rather
+    than the region: `htp_ops_zero` is the only command in the library that fills
+    a buffer without reading one, and it writes zero and nothing else. So `value`
+    must be absent or zero. A nonzero fill would need a second region source
+    holding the value, which the border decomposes into three regions or fewer
+    only when the pad is on the last axis alone, or a full-size constant operand,
+    which is a weight as large as the result. Neither is worth its commands for a
+    case torch's own default already covers.
+
+    A negative pad crops, which is a slice rather than a pad and has a stride
+    form of its own; `slice_copy` is the op for it. The memset this emitter
+    depends on is only correct when every pad is non-negative, so the negative
+    form is refused here rather than read as a zero-size region.
+
+    Both the support check and the emitter call this, so they cannot disagree
+    about which pads the DSP can run -- a node the emitter would refuse has to be
+    refused here instead, or the whole export fails rather than falling back.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node) or len(node.args) < 2:
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    if source_value.dtype not in (torch.float16, torch.float32):
+        return None
+
+    pads = node.args[1]
+    # torch gives the pads in reverse axis order, two per padded axis, and
+    # refuses an odd count or one that names more axes than the operand has.
+    if not isinstance(pads, (list, tuple)) or not pads or len(pads) % 2:
+        return None
+    shape = list(source_value.shape)
+    rank = len(shape)
+    if not rank or len(pads) > 2 * rank:
+        return None
+    if any(isinstance(size, torch.SymInt) for size in shape + list(result_value.shape)):
+        # The offsets and the inner pitch are params, so a symbolic extent would
+        # be the traced example at run time: a wrong answer rather than a
+        # failure. The leading product is a plain integer for the same reason.
+        return None
+    if not all(isinstance(size, int) and not isinstance(size, bool) for size in pads):
+        return None
+    if any(size < 0 for size in pads):
+        return None
+
+    value = node.args[2] if len(node.args) > 2 else None
+    if isinstance(value, bool) or value not in (None, 0, 0.0):
+        return None
+
+    if any(pads[index] for index in range(4, len(pads))):
+        return None
+
+    inner = shape[-1]
+    rows = shape[-2] if rank >= 2 else 1
+    outer = 1
+    for size in shape[:-2]:
+        outer *= size
+    before_inner, after_inner = pads[0], pads[1]
+    before_rows, after_rows = (pads[2], pads[3]) if len(pads) > 2 else (0, 0)
+    out_inner = inner + before_inner + after_inner
+    out_rows = rows + before_rows + after_rows
+    if out_inner <= 0 or out_rows <= 0:
+        return None
+    if not any(pads):
+        # Nothing is padded, so the region would be the operand's own bytes at
+        # its own strides, which the kernel drops as a self-write -- leaving the
+        # result unwritten. A no-op pad is left to the portable kernels.
+        return None
+    if result_value.numel() != outer * out_rows * out_inner:
+        # Guards the arithmetic above against the shape it is meant to describe.
+        # They are the same number or the region reads elsewhere.
+        return None
+
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [
+        0,
+        0,
+        before_rows * out_inner + before_inner,
+        outer,
+        rows,
+        inner,
+        rows * inner,
+        inner,
+        1,
+        out_rows * out_inner,
+        out_inner,
+        1,
+    ]
+
+
 def _fold_constant_transpose(node: torch.fx.Node, ctx):
     """Transposes a constant weight at export instead of on the DSP.
 
@@ -738,6 +849,29 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(node.args[0])],
             outputs=[out],
             params=[1, FP16_BYTES, 1] + permute_region(node),
+        ),
+    )
+    return ctx.record(node, out)
+
+
+def _emit_constant_pad(node: torch.fx.Node, ctx) -> TensorRef:
+    """A zero-filling pad as the memset the pad value is and one region.
+
+    The memset covers the whole result and is the only writer of the border; the
+    blit then overwrites the interior with the operand. Two commands write one
+    buffer, in that order, which is the shape the pool's blocked activation is
+    already built from -- the command group runs in order, so the second sees
+    what the first left.
+    """
+    out = ctx.result_for(node, _numel(node))
+    _emit_zero(ctx, node, out)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + constant_pad_region(node),
         ),
     )
     return ctx.record(node, out)
@@ -4490,6 +4624,9 @@ EMITTERS = {
     exir_ops.edge.aten.slice_copy.Tensor: _emit_slice_copy,
     exir_ops.edge.aten.cat.default: _emit_cat,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
+    # A zero-filling constant pad: a memset for the border and one region for the
+    # operand. See constant_pad_region for the shape and the value it takes.
+    exir_ops.edge.aten.constant_pad_nd.default: _emit_constant_pad,
     exir_ops.edge.aten.mul.Scalar: _emit_mul_scalar,
     UPDATE_CACHE: _emit_update_cache,
     RMS_NORM: _emit_rms_norm,
@@ -4551,6 +4688,11 @@ SELECT_TARGETS = frozenset({exir_ops.edge.aten.select_copy.int})
 CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
 
 PERMUTE_TARGETS = frozenset({exir_ops.edge.aten.permute_copy.default})
+
+# The zero-filling pad, whose gate lives in constant_pad_region: an op that is
+# two commands, so the shape it is refused on is a property of the region rather
+# than of an argument list.
+PAD_TARGETS = frozenset({exir_ops.edge.aten.constant_pad_nd.default})
 
 ALIAS_TARGETS = frozenset(
     {

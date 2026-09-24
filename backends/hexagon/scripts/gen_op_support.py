@@ -560,6 +560,21 @@ SUPPORTED: List[OpSupport] = [
         "reads stay on the host.",
     ),
     OpSupport(
+        "aten.constant_pad_nd.default",
+        f"{ZERO} / {BLIT}",
+        ARENA_FP16,
+        "Zero fill only: the border is a DSP_OP_ZERO memset over the whole result, "
+        "so `value` must be absent or 0. Pads on the last two axes only -- a third "
+        "axis from the end would need a fourth level, and a region that dropped it "
+        "reads elsewhere -- each non-negative, all extents static. A pad whose "
+        "entries are all zero is refused rather than emitted: its region is the "
+        "operand's own bytes at its own strides, which the kernel drops as a "
+        "self-write, leaving the result unwritten. `mode` is not an argument of this "
+        "op: torch lowers reflect and replicate to arange/abs/clamp/index programs "
+        "and circular to slice/copy/scatter, so no single pad node reaches the "
+        "partitioner for those.",
+    ),
+    OpSupport(
         "et_hexagon.update_cache.default",
         BLIT,
         ARENA_FP16,
@@ -847,9 +862,12 @@ NOT_SUPPORTED = [
         "which is why `x * torch.full(...)` still delegates its multiply.",
     ),
     (
-        "aten.repeat.default, aten.flip.default, aten.constant_pad_nd.default",
-        "No command describes them: a tile, an axis reversal and a pad are each a "
-        "different region walk from the blits the backend has.",
+        "aten.repeat.default, aten.flip.default",
+        "No command describes them: a tile and an axis reversal are each a "
+        "different region walk from the blits the backend has. A zero-filling pad "
+        "used to be listed here, and it is not that kind of case: it is a memset "
+        "plus one region, both of which the backend already emitted for other ops, "
+        "so it is a supported row.",
     ),
     (
         "aten._adaptive_avg_pool2d.default",
@@ -926,6 +944,7 @@ PREDICATES = [
     "select_region",
     "cat_region",
     "permute_region",
+    "constant_pad_region",
     "dim_order_keeps_the_bytes",
     "update_cache_layout",
     "sdpa_targets",
