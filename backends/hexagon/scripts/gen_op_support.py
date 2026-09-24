@@ -52,6 +52,10 @@ FLASH_ATTN = "DSP_OP_FLASH_ATTN"
 # BATCH_MATMUL, so both matmul rows below name three commands.
 Q4A16_GEMV = "DSP_OP_MATMUL_Q4A16_GEMV_I8"
 W8A16_GEMV = "DSP_OP_MATMUL_W8A16_GEMV_I8"
+# The prefill entry, which the int4 weight also reaches: M > 1 goes to it instead
+# of a GEMV, with a blit either side for the activation and output layouts. The
+# int8 weight has no such entry, so a w8a16 matmul stays portable above one row.
+Q4A16_PREFILL = "DSP_OP_MATMUL_Q4A16_FP16"
 # The row gather. One command reads a run of rows out of a fp16 table whose
 # bytes the export step rearranged into the 32x32 tiles the kernel walks.
 SHARED_GATHER = "DSP_OP_SHARED_GATHER"
@@ -251,15 +255,17 @@ SUPPORTED: List[OpSupport] = [
     # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
     OpSupport(
         "aten.mm.default",
-        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV}",
+        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV} / {Q4A16_PREFILL}",
         ARENA_FP16,
         "Contiguous 2-D operands only; contraction dims must match; all sizes and "
         "steps must fit int32. A visible constant weight with m*k*n >= 32768 is "
         "pre-packed in the HMX tile order at export. A weight that arrives as a "
-        "per-channel dequantize is emitted as one GEMV command instead, which needs "
-        "M == 1, K % 64 == 0 and N % 32 == 0.",
-        "weight-only int4 or int8, per-channel symmetric; the kernel quantizes the "
-        "fp16 activation to int8 per token",
+        "per-channel dequantize is emitted instead: one GEMV command at M == 1, or "
+        "the prefill entry with a pack blit and a repack blit above it. Both need "
+        "K % 64 == 0 and N % 32 == 0, and only the int4 weight has a prefill entry.",
+        "weight-only int4 or int8, per-channel symmetric; the GEMV entries quantize "
+        "the fp16 activation to int8 per token, where the prefill entry multiplies "
+        "fp16 activations against the weight it dequantizes itself",
     ),
     OpSupport(
         "aten.bmm.default",
@@ -270,25 +276,28 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.addmm.default",
-        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV}",
+        f"{MATMUL} / {Q4A16_GEMV} / {W8A16_GEMV} / {Q4A16_PREFILL}",
         ARENA_FP16,
         "alpha must be 1 and beta 0 or 1; 2-D contiguous matmuls; the bias is read "
         "right-aligned against the 2-D result, so at most 2-D and broadcastable. "
-        "Emitted as the matmul plus one broadcast add, or as one GEMV command with "
-        "the bias as its last operand when the weight is quantized (M == 1, "
-        "K % 64 == 0, N % 32 == 0, and the bias exactly n values).",
-        "weight-only int4 or int8, per-channel symmetric; the kernel quantizes the "
-        "fp16 activation to int8 per token",
+        "Emitted as the matmul plus one broadcast add, or as one quantized command "
+        "with the bias as its last operand when the weight is quantized (K % 64 == 0, "
+        "N % 32 == 0, and the bias exactly n values; M == 1 reaches the GEMV entries "
+        "and M > 1 the int4 prefill entry).",
+        "weight-only int4 or int8, per-channel symmetric; the GEMV entries quantize "
+        "the fp16 activation to int8 per token, where the prefill entry multiplies "
+        "fp16 activations against the weight it dequantizes itself",
     ),
     OpSupport(
         "quantized_decomposed.dequantize_per_channel.default",
         None,
-        "the stored int4/int8 weight is read by the GEMV kernel; this node emits no "
+        "the stored int4/int8 weight is read by the quantized matmul entries; this node "
+        "emits no "
         "command of its own",
         "The scaling a weight-only quantized matmul carries. Delegated only when "
-        "every reader is a quantized matmul the GEMV entries admit; the matmul packs "
-        "the stored low-bit weight itself, so this node records an ABSENT operand "
-        "rather than materializing anything.",
+        "every reader is a quantized matmul one of the quantized entries admits; the "
+        "matmul packs the stored low-bit weight itself, so this node records an "
+        "ABSENT operand rather than materializing anything.",
         "weight-only int4 or int8, per-channel symmetric",
     ),
     # --- reductions / softmax --------------------------------------------
@@ -719,10 +728,13 @@ NOT_SUPPORTED = [
         "same bytes back through in_place with nothing gained.",
     ),
     (
-        "prefill (M > 1) with a quantized weight",
-        "The two GEMV entries read one activation row linearly; M > 1 needs the "
-        "pack64 activation and an output repack, so those nodes stay on the "
-        "portable kernels.",
+        "prefill (M > 1) with a quantized int8 weight",
+        "The GEMV entries read one activation row linearly and the prefill entry "
+        "reads the int4 weight's tile order; no kernel reads the int8 weight with "
+        "M > 1 in a layout this backend packs, so those nodes stay on the portable "
+        "kernels. The int4 weight does prefill: the prefill entry takes it, with one "
+        "blit to put the activation in the blocked layout and one to move the "
+        "kernel's 64-channel output packs back to rows.",
     ),
     (
         "w8a8 with a static activation scale",

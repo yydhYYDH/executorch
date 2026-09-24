@@ -527,8 +527,9 @@ Things that bite:
 
 ## Quantized matmuls
 
-Weight-only quantization lands on the two integer GEMV entries, for `M == 1`
-(decode). The AOT side is `quantizer.py`, the pattern and packers are in
+Weight-only quantization lands on the two integer GEMV entries for `M == 1`
+(decode) and, for the int4 weight, on `MATMUL_Q4A16_FP16` (22) for `M > 1`
+(prefill). The AOT side is `quantizer.py`, the pattern and packers are in
 `hexagon_ops.py`:
 
 ```
@@ -574,21 +575,63 @@ describes 64-element group quantization instead, which would be a different
 scale operand; nothing here builds that.
 
 Delegated only when all of these hold, since the emitter is past the partition
-boundary and cannot fall back: `M == 1`; `K % 64 == 0` and `N % 32 == 0` (the
-kernels' own guards, which they answer with an error code); a symmetric
-per-channel dequantize whose every reader is a runnable quantized matmul; and,
-for `addmm`, `alpha == 1`, `beta` in `{0, 1}` and a bias of exactly `n` values
-(the kernel adds `n` contiguous halfs and would otherwise read past the
-operand). Prefill (`M > 1`) needs the pack64 activation and output repack, so it
-stays on the portable kernels.
+boundary and cannot fall back: `K % 64 == 0` and `N % 32 == 0` (the kernels' own
+guards, which they answer with an error code); a symmetric per-channel
+dequantize whose every reader is a runnable quantized matmul; and, for `addmm`,
+`alpha == 1`, `beta` in `{0, 1}` and a bias of exactly `n` values (the kernel
+adds `n` contiguous halfs and would otherwise read past the operand). Which
+entry a matmul reaches is the `M` it carries: `M == 1` is the GEMV pair, `M > 1`
+is the prefill entry, and only the int4 weight has one -- a w8a16 matmul above
+one row stays on the portable kernels, because the int8 prefill kernel reads a
+tile order nothing here packs.
+
+### Prefill
+
+`M > 1` is one command where the GEMV path is one command, and three where the
+layouts differ:
+
+```
+K == 64     [ 22 ] [ 3 ]            # the blocked activation layout is the row-major tensor
+K > 64      [ 3 ] [ 22 ] [ 3 ]      # pack the activation, matmul, repack the output
+```
+
+The kernel reads fp16 activations directly and dequantizes the weight itself, so
+neither the per-token int8 activation nor the `scale_block_num == 1` contract of
+the GEMV entries applies. What it does need is a different weight layout: the
+512-byte int4 tiles of 32 output channels by 32 k values, with the fp16
+per-channel scales after them, which is what `pack_q4a16_prefill_weight` builds
+and what the vendored reorder writes -- the two are compared byte for byte on
+the simulator (`test/test_prefill_on_sim.py`). The activation goes into
+`[k/64][m][64]` and the output comes back out of `[n/64][m][64]`, which is what
+the two blits are for.
+
+Two things about this entry are worth knowing before touching it:
+
+- **The output-channel chunk count is two, never one.** That is not the shape
+  the allocator would have picked for a single 32-channel tile: on the simulator
+  one chunk answers NaNs at `K == 64` (any N), and two answer exactly. The
+  vendored entry corrects an odd chunk count above one and leaves one alone
+  (`matmul_q4fp16_mle32.c:723`).
+- **The dispatch wrapper swallows the kernel's return code.** It logs a FARF and
+  returns 0 (`matmul_ops.cc:27-40`), so a failing prefill looks like a successful
+  command with the output left as it was; the interpreter and the simulator's
+  runner keep the code for that reason.
 
 Verified offline: the pattern is matched, the weight is packed at export, the
 command decodes, and `test/blob_interpreter.py` runs the bytes with the same
-arithmetic the kernels use. Not verified: no DSP has executed either entry, and
-the packers' tile orders are transcriptions -- the int4 one is written down
-twice in the vendored tree and cross-checked against the kernel's read path, the
-int8 one only against the kernel's own permuted activation splat. The speedup,
-the real numbers and the FastRPC/skel deployment all need a device.
+arithmetic the kernels use. The prefill entry goes further than that, because
+its weight layout had an authority to check a packer against: the packer's bytes
+equal the vendored reorder's on the simulator, both kernels answer
+layout-blind expectations bit for bit across both dispatch branches, and a whole
+blob built by the emitter agrees three ways (torch, the host interpreter and the
+simulator) on six shapes. Not verified: no device has executed any of these
+entries, so VTCM as a device sizes it, alignment and the multi-worker DMA
+staging the simulator leaves out are all unmeasured; and of the three packers
+here, two are transcriptions -- the int4 GEMV one is written down twice in the
+vendored tree and cross-checked against the kernel's read path, the int8 one
+only against the kernel's own permuted activation splat -- while the prefill one
+is the byte-for-byte comparison above. The speedup, the real numbers and the
+FastRPC/skel deployment all need a device.
 
 ## Delegating a row gather
 
@@ -822,6 +865,19 @@ Working and verified without a device:
   weights do not fit the VTCM budget) has **never been reached** by any case
   here -- every shape used fits one chunk -- so it is unexercised rather than
   correct; and no case measures the timing, on the simulator or anywhere else;
+- the int4 weight prefill entry (22) does too, at every layer below the device:
+  `test/test_prefill_on_sim.py` compares its packer with the vendored reorder on
+  the simulator byte for byte, measures the two HVX operations that reorder is
+  built on, and runs both dispatch branches against expectations that mention no
+  tile, nibble, scale position or row order, at eight shapes plus five more in
+  the sweep that found the one-chunk behaviour below; `test/test_blob_on_sim.py`
+  runs whole blobs the emitter built through torch, the host interpreter and the
+  simulator and requires all three to agree. One case in
+  `test_prefill_on_sim.py` is a **defect pin rather than a feature test**: one
+  output-channel chunk answers NaNs at `K == 64`, which is why the emitter always
+  asks for two. Not verified: no device, and the multi-worker DMA staging the
+  simulator's missing worker pool leaves unexercised (`qurt_cb_fwk_worker_init
+  returned: -4`) has never run;
 - a vision attention block goes all the way through once `FuseVisionAttention` is
   in the caller's `transform_passes`: a three-projection ViT attention over a
   dynamic patch count partitions into one delegate whose blob carries one
