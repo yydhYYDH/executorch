@@ -504,6 +504,76 @@ def test_a_prefill_shape_the_kernels_would_refuse_stays_portable():
     assert support.is_node_supported(None, mm.args[1])
 
 
+def test_a_prefill_past_the_m_le_32_k_ceiling_stays_portable():
+    """A K the M <= 32 prefill kernel cannot carry has to stay portable.
+
+    The dispatcher sends `M <= 32` down a kernel that holds one 32-byte
+    activation descriptor per K/32 tile in its own stack frame, and that frame
+    stops fitting somewhere around the teens of KB -- see PREFILL_M32_MAX_K for
+    the measurement, and for how much of that attribution is measured as against
+    inferred. Emitting past it is worse than refusing: the failure is
+    `execute_command_group failed: 0x8000040d` with no output at all, not a wrong
+    number a caller could notice.
+
+    The geometries are the measured ones, and the two assertions after the loop
+    are what keep this from being a test of "some wide shape is refused": the
+    same K is admitted one M over the dispatch, and the same M is admitted at the
+    last K measured to work.
+    """
+    for m, k in ((4, 12736), (4, 12800), (2, 12800), (32, 12800)):
+        program, _, _ = _quantized_program("q4a16", m, k, 64)
+        support = _support(program)
+        mm = _mm_node(program)
+        assert not support.is_node_supported(None, mm), (m, k)
+        assert not support.is_node_supported(None, mm.args[1]), (m, k)
+    # One M over the dispatch, same K: that kernel heap-allocates the
+    # descriptors, so nothing about this K is a problem for it.
+    program, _, _ = _quantized_program(
+        "q4a16", hexagon_ops.PREFILL_M32_MAX_M + 1, 12800, 64
+    )
+    assert _support(program).is_node_supported(None, _mm_node(program))
+    # And the widest K that does fit the same branch.
+    program, _, _ = _quantized_program("q4a16", 4, hexagon_ops.PREFILL_M32_MAX_K, 64)
+    assert _support(program).is_node_supported(None, _mm_node(program))
+
+
+def test_the_m_le_32_k_ceiling_is_the_thing_that_refuses(monkeypatch):
+    """Move the ceiling and the verdict follows it, at two different ceilings.
+
+    The control for the test above. A K one tile past the ceiling is refused
+    whatever the constant says only while the guard reads it, so taking the guard
+    out turns this red rather than leaving it green -- which is the difference
+    between testing the shape and testing the rule. The second ceiling is not
+    12672, so a constant that agreed with one hard-coded number by accident would
+    not pass here.
+    """
+    for ceiling in (hexagon_ops.PREFILL_M32_MAX_K, 13056):
+        monkeypatch.setattr(hexagon_ops, "PREFILL_M32_MAX_K", ceiling)
+        program, _, _ = _quantized_program("q4a16", 4, ceiling, 64)
+        assert _support(program).is_node_supported(None, _mm_node(program)), ceiling
+        program, _, _ = _quantized_program("q4a16", 4, ceiling + 64, 64)
+        support = _support(program)
+        assert not support.is_node_supported(None, _mm_node(program)), ceiling
+
+
+def test_the_m_over_32_prefill_still_reaches_its_kernel_at_the_vtcm_ceiling():
+    """The K bound belongs to one branch, so the other keeps its widest shape.
+
+    The top of the VTCM budget is where the M > 32 entry used to stop, and it has
+    to keep being emitted with that geometry in it rather than be closed along
+    with the M <= 32 bound. Asserting the command's parameters rather than the
+    support verdict is what says the prefill entry is still the one that comes
+    out, carrying this M, K and N.
+    """
+    m, k, n = 40, 25216, 64
+    program, _, _ = _quantized_program("q4a16", m, k, n)
+    assert _support(program).is_node_supported(None, _mm_node(program))
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, commands = read_blob(blob)
+    assert [c.type for c in commands] == [_BLIT, _PREFILL, _BLIT]
+    assert list(commands[1].params[:10]) == [m, k, n, 0, 1, 1, 2, k // 32, 1, 0]
+
+
 def test_a_w8a16_prefill_matmul_stays_portable():
     """Only the q4a16 prefill entry is wired, and the difference is the weight.
 

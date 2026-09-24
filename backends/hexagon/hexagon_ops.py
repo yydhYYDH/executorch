@@ -91,6 +91,38 @@ DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 # allocations around them (output tile buffers, scales, HMX column scales).
 PREFILL_OUTPUT_CHANNEL_CHUNK = 2
 PREFILL_VTCM_FIXED = 64 * 1024
+#: The M the dispatcher switches prefill kernels on (`matmul_ops.cc:28`). Below
+#: or at it the kernel keeps its per-tile descriptors on the stack, which is what
+#: makes the K bound below applicable; above it the descriptors are heap
+#: allocated and only the VTCM bound applies.
+PREFILL_M32_MAX_M = 32
+#: The widest K the prefill entry may carry when M <= 32, which is the branch
+#: the dispatcher sends small-M matmuls down. Measured on a phone (OnePlus 13,
+#: SM8750, CDSP v79, the skel this tree ships): M=4 at K=12672 answers correctly
+#: and M=4 at K=12736 aborts the DSP process -- `execute_command_group failed:
+#: 0x8000040d`, no output at all, in under a second -- and no multiple of 64
+#: lies between the two, so the ceiling is a measurement and not a margin.
+#:
+#: The cause, offered as the leading explanation rather than as a measurement:
+#: that branch keeps one 32-byte descriptor per K/32 activation tile in a stack
+#: array (`dma_desc_2d_t act_descs[safe_kp]`, `matmul_q4fp16_mle32.c:528`), so
+#: the frame it builds is K bytes, and `skel/CMakeLists.txt:44-47` records the
+#: same failure for a 14 KB frame, which brackets this one's ~12.7 KB. It is
+#: worded that way because the control that would have decoupled the frame
+#: length from K came back **null**: rewriting the emitter's `kp` (`params[7]`)
+#: moved nothing, since the kernel recomputes `kp = K / 32` for itself and the
+#: parameter only reaches an entry-point validation. What the guard below rests
+#: on is the bracket (M=2/4/32 fail and M=33 passes at the same K) together with
+#: the fact that this path cannot report an error at all -- `matmul_ops.cc:42`
+#: discards the kernel's code and returns 0 -- so a returned `AEE_ENOMEMORY`
+#: from a VTCM overrun would have been silent, not the abort that was seen.
+#:
+#: What the threshold is a property of: one phone, one skel build, one arch. The
+#: bound is stated against the largest K that was seen to work rather than the
+#: first that failed, so it stays conservative if the K % 64 guard above is ever
+#: relaxed. M=2 and M=32 both failed at K=12800 as well, which is what says the
+#: limit belongs to the branch rather than to a particular M.
+PREFILL_M32_MAX_K = 12672
 #: The VTCM the prefill kernels may reserve. The simulator reports 8 MiB
 #: (`vtcm_manager_get_vtcm_size`) and the kernels' own guard is 8 MiB less
 #: 16 KiB (`matmul_q4fp16.c:946`); this asks for less than either, because what
@@ -1958,9 +1990,16 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     pack as a second region.
 
     M > 1 is the whole point -- M == 1 belongs to the GEMV entries, which read a
-    different weight layout and are already wired -- and there is no upper bound
-    here: the kernel chunks M into 32-row groups and walks them, so the value of
-    M only decides how long that walk is.
+    different weight layout and are already wired. M itself has no upper bound
+    and is not what the third guard below is about: the dispatcher picks between
+    two prefill kernels on `M <= 32` (`matmul_ops.cc:28`), and while the M > 32
+    one heap-allocates its per-tile descriptors, the M <= 32 one keeps them in a
+    stack array sized by K. So a small M is what caps K, and the cap is a K
+    bound that only applies below the dispatch: see PREFILL_M32_MAX_K for the
+    measurement and for how far the attribution is proven as against inferred.
+    Before that was measured this guard had no upper bound on M at
+    all, which is exactly how a shape that aborts the DSP process stayed
+    emittable.
 
     What is left out: the w8a16 scheme. The w8a16 prefill kernel is
     DSP_OP_MATMUL_W8A16_BLOCK_FP16, whose parameters are an im2col struct and
@@ -1975,6 +2014,8 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
         return False
     m, k, n = geometry
     if m <= 1 or k % 64 != 0 or n % 32 != 0:
+        return False
+    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
         return False
     return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
 
