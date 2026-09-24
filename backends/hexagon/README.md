@@ -831,19 +831,49 @@ that list):
   all, in under a second and reproducibly across three interleaved repeats. That
   this is structural rather than the contention above is the clock and not the
   code: contention lands at 10.1 s, and this lands in under one;
-- **that boundary is the stack, not the request.** The same `K = 12800` at
-  **`M = 40`** succeeds, and its activation arena is **ten times larger**
-  (`act=1029120` against `act=102912`), so a wider request is not what fails. The
-  `m <= 32` kernel holds its per-K-tile descriptors in a stack VLA
-  (`dma_desc_2d_t act_descs[safe_kp]`, `safe_kp = K/32`,
-  `matmul_q4fp16_mle32.c:513,528`) while the `m > 32` one `memalign`s the same
-  array (`matmul_q4fp16.c:965-966`), which is the one thing that differs, and
-  `0x8000040d` is the signature `skel/CMakeLists.txt` already records for a stack
-  overflow. **The host gate admits up to `K = 25216`; the `m <= 32` path stops at
-  12672 on this phone**, so the gate is about twice as wide as what a device will
-  actually run -- and its failure mode is a loud refusal rather than a wrong
-  number. Tightening the gate or moving that array off the stack are both open,
-  and neither is this section's decision to make.
+- **the boundary belongs to the `m <= 32` branch, and the arena is not what
+  runs out.** Holding `K = 12800` and changing only `M` puts the edge exactly on
+  the dispatcher's own split (`matmul_ops.cc:28`): `M = 2`, `4` and `32` all fail
+  the same way while `M = 33` and `M = 40` answer within 6.7e-4. The arenas run
+  the other way from the outcome -- `M = 2` fails with 51 KB and `M = 40`
+  succeeds at `K = 25216` with 2.0 MB, forty times the failing request -- so the
+  width of the request, the arena and the VTCM budget are all excluded, and what
+  is left is the one branch. Within it, the only stack object on the whole call
+  path that grows with K is `dma_desc_2d_t act_descs[safe_kp]`
+  (`matmul_q4fp16_mle32.c:528`), which is exactly K bytes because `safe_kp` is
+  `K/32` 32-byte descriptors; the boundary is in K (12672 passes, 12736 does
+  not), so whatever overflows is K-sized. `0x8000040d` is the signature
+  `skel/CMakeLists.txt:44-47` already records for a frame that overflows the
+  **DSP RPC thread's stack**, and it is measured there at 14 KB -- against the
+  12.7 KB this boundary sits at.
+- **the failure is a fault and not a returned error, which is a stronger
+  statement than it looks.** `htp_ops_matmul_q4a16_fp16` keeps the kernel's
+  return code in a local, logs it and then `return 0`s (`matmul_ops.cc:27-42`),
+  and the kernel's own out-of-VTCM path is a returned `AEE_ENOMEMORY`
+  (`matmul_q4fp16_mle32.c:739-741`). So a VTCM overrun here would be **silent**:
+  `exit d0: ok` over an output left as it was. What this does instead is abort
+  the process (`rc=134`, `exit d0: failed`, no output at all, in under a second),
+  which is the shape of a fault rather than of a refusal.
+- **the host gate is wrong in its M, not in its K.** `_quantized_prefill_fits`
+  admits `K = 25216` and asks nothing about `M`, yet `q4a16_m40_k25216` **passes**
+  at that K (relative 7.1e-4). So the ceiling itself is sound for the shape the
+  gate was reasoned about, and what is missing is the other dimension: the same K
+  that works at `M = 40` destroys `M <= 32`. Adding a tighter K bound under
+  `m <= 32`, or moving that descriptor array off the stack as the `m > 32` kernel
+  already does, would both answer it, and neither is this section's decision.
+- **a caveat, because a control was attempted here and it did not work.** The
+  obvious way to separate the VLA length from K is to rewrite `params[7]`, which
+  is the `kp` the emitter sends -- but the kernel recomputes `int kp = K / 32`
+  inside the worker (`matmul_q4fp16_mle32.c:447`) and `kp_max` reaches only a
+  validation at entry (`:687`), so `params[7]` never sizes the array. Both
+  directions were run against the phone and neither moved the result (raising it
+  to 420 at `K = 512` still passed with byte-identical output; lowering it to 100
+  at `K = 12800` still aborted). That experiment is therefore **null and not a
+  refutation**: it shows the parameter does not reach the mechanism, so the VLA
+  attribution above rests on the branch comparison and the eliminated silence
+  path rather than on a direct control. Settling it needs a skel change -- the
+  array moved to the heap, as the `m > 32` kernel does -- which this section
+  leaves undone.
 - **the transposed convolution** runs its six commands -- `ZERO`, a weight blit,
   `ZERO` again, the zero-insert interleave, one `IM2COL_CONVOLUTION_FP16` and the
   output repack -- without error, and answers torch within a relative 6.6e-4 on a
