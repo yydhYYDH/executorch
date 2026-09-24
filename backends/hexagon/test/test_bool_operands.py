@@ -153,9 +153,7 @@ class _WhereWithConstant(torch.nn.Module):
         super().__init__()
         self.register_buffer(
             "mask",
-            torch.tensor(
-                [[True, False, True, False], [False, True, False, True]]
-            ),
+            torch.tensor([[True, False, True, False], [False, True, False, True]]),
         )
 
     def forward(self, a, b):
@@ -196,16 +194,19 @@ def test_the_select_takes_its_condition_at_one_byte_per_element():
     blob, command = _select_case(_Where(), (conditions, on, off))
 
     assert list(command.params[:6]) == [10, 10, 10, 10, 2, 1], list(command.params)
-    assert command.inputs[0].size == 10, (
-        f"the condition's slot is {command.inputs[0].size} bytes for ten flags"
-    )
+    assert (
+        command.inputs[0].size == 10
+    ), f"the condition's slot is {command.inputs[0].size} bytes for ten flags"
     assert [ref.size for ref in command.inputs[1:]] == [20, 20]
 
-    got = np.frombuffer(execute(blob, [conditions.numpy(), on.numpy(), off.numpy()])[0], dtype=np.float16)
-    expected = torch.where(conditions, on, off)
-    assert got.tobytes() == expected.numpy().reshape(-1).tobytes(), (
-        f"the select answered {got.tolist()} for {expected.flatten().tolist()}"
+    got = np.frombuffer(
+        execute(blob, [conditions.numpy(), on.numpy(), off.numpy()])[0],
+        dtype=np.float16,
     )
+    expected = torch.where(conditions, on, off)
+    assert (
+        got.tobytes() == expected.numpy().reshape(-1).tobytes()
+    ), f"the select answered {got.tolist()} for {expected.flatten().tolist()}"
 
 
 def test_the_select_reads_a_bool_buffer_at_that_width_too():
@@ -222,9 +223,9 @@ def test_the_select_reads_a_bool_buffer_at_that_width_too():
     blob, command = _select_case(_WhereWithConstant(), (on, off))
 
     assert list(command.params[:6]) == [8, 8, 8, 8, 2, 1], list(command.params)
-    assert command.inputs[0].space == _WEIGHTS, (
-        f"the buffer did not land in the weights section: {command.inputs[0].space}"
-    )
+    assert (
+        command.inputs[0].space == _WEIGHTS
+    ), f"the buffer did not land in the weights section: {command.inputs[0].space}"
     assert command.inputs[0].size == 8, (
         f"the buffer's slot is {command.inputs[0].size} bytes for eight flags, so "
         "the blob holds it at the arena's width rather than its own"
@@ -265,23 +266,23 @@ def test_a_where_the_kernel_cannot_walk_stays_portable():
             return torch.where(cond, a, b)
 
     columns = torch.tensor([[True], [False]])
-    assert _where_support(_BroadcastCondition(), (columns, on, off))[0] == 0, (
-        "a condition the command's own guard rejects reached the delegate"
-    )
+    assert (
+        _where_support(_BroadcastCondition(), (columns, on, off))[0] == 0
+    ), "a condition the command's own guard rejects reached the delegate"
 
     class _BoolResult(torch.nn.Module):
         def forward(self, cond):
             return torch.where(cond, cond, cond)
 
     flags = torch.tensor([[True, False, True, False], [False, True, False, True]])
-    assert _where_support(_BoolResult(), (flags,))[0] == 0, (
-        "a bool result reached a kernel whose arena holds two bytes per element"
-    )
+    assert (
+        _where_support(_BoolResult(), (flags,))[0] == 0
+    ), "a bool result reached a kernel whose arena holds two bytes per element"
 
     assert where_is_emittable(_node_where(torch.bool))
-    assert not where_is_emittable(_node_where(torch.float16)), (
-        "a fp16 condition would be read one byte at a time by the kernel"
-    )
+    assert not where_is_emittable(
+        _node_where(torch.float16)
+    ), "a fp16 condition would be read one byte at a time by the kernel"
 
     # And the control: the shape all three are variations of is taken, so the
     # refusals above are about their own operand and not about `where` in
@@ -293,11 +294,14 @@ def _node_where(cond_dtype):
     """A `where.self` node with a condition of this dtype, built by hand."""
     graph = torch.fx.Graph()
     args = []
-    for name, dtype in (("cond", cond_dtype), ("a", torch.float16), ("b", torch.float16)):
+    for name, dtype in (
+        ("cond", cond_dtype),
+        ("a", torch.float16),
+        ("b", torch.float16),
+    ):
         placeholder = graph.placeholder(name)
         placeholder.meta["val"] = torch.empty(2, 4, dtype=dtype)
         args.append(placeholder)
     node = graph.call_function(exir_ops.edge.aten.where.self, args=tuple(args))
     node.meta["val"] = torch.empty(2, 4, dtype=torch.float16)
     return node
-

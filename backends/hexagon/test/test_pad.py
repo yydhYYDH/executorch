@@ -45,9 +45,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
-    constant_pad_region,
-)
+from executorch.backends.hexagon.hexagon_ops import constant_pad_region  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
 )
@@ -120,7 +118,9 @@ def _edge_targets(model, inputs):
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
     return [
-        str(node.target) for node in program.graph_module.graph.nodes if node.op == "call_function"
+        str(node.target)
+        for node in program.graph_module.graph.nodes
+        if node.op == "call_function"
     ]
 
 
@@ -147,8 +147,12 @@ def _run(blob, inputs, shape):
     checked here rather than by a reshape that would raise on a mismatch and read
     as a wrong value.
     """
-    flat = np.frombuffer(execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16)
-    assert flat.size == int(np.prod(shape)), f"{flat.size} elements, expected {np.prod(shape)}"
+    flat = np.frombuffer(
+        execute(blob, [x.numpy() for x in inputs])[0], dtype=np.float16
+    )
+    assert flat.size == int(
+        np.prod(shape)
+    ), f"{flat.size} elements, expected {np.prod(shape)}"
     return flat.reshape(shape)
 
 

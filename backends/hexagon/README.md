@@ -1033,9 +1033,14 @@ Not done yet:
   graph are `mm` (including the quantized weight-only form), `bmm`, the binary
   and unary families, `custom_sdpa`, `rms_norm`, `mul_silu`, `update_cache`,
   `mean`/`sum`/`amax`, `max_pool2d`/`avg_pool2d`,
-  `embedding`/`index_select`/`index.Tensor`, `vision_attention` and the
-  narrowing and transpose blits. The view, cast, getitem and dequantize emitters
-  have run as well but emit nothing by design;
+  `embedding`/`index_select`/`index.Tensor`, `vision_attention`, the narrowing
+  and transpose blits, and three whose command is not one of those families:
+  `topk`'s values half (`TOPKV2_K1_FP16`), `where` (`SELECT`, whose condition is
+  the one operand here that is not two bytes wide) and a zero-filling
+  `constant_pad_nd` (a `ZERO` memset and one blit region). Each of the three is
+  lowered from a real graph and read back out of the blob in its own test
+  (`test_topk.py`, `test_bool_operands.py`, `test_pad.py`). The view, cast,
+  getitem and dequantize emitters have run as well but emit nothing by design;
 - **the row gather has now run on hexagon-sim** and agrees with torch
   bit-for-bit on the shape that makes its tiling visible: `ic=33`, `oc=35`, so no
   32x32 tile is whole. The tile order is checked by a control rather than by
@@ -1053,10 +1058,12 @@ Not done yet:
   `mean`/`rsqrt`/`sigmoid` chain is fused into an `rms_norm` op and the casts
   around it are absorbed, since the arena holds fp16 and the vendored kernels
   take fp16 in and out;
-- the quantized matmul path is wired up for `M == 1` only. Prefill needs the
-  pack64 activation and the output repack, and neither is built: the GEMV
-  entries wired up here read a single row linearly, which is why they needed no
-  repack at all;
+- the int8 half of the quantized matmul path is wired up for `M == 1` only. Its
+  prefill kernel (`MATMUL_W8A16_BLOCK_FP16`, 42) reads a tile order nothing here
+  packs, so a w8a16 matmul above one row stays on the portable kernels, pack64
+  activation and output repack included. The int4 weight has both of its entries
+  now, and `## Status` records what that entry's prefill half has run on and what
+  it has not;
 - **the vision attention has now run on hexagon-sim**, bit-for-bit against torch
   on `[1,4,2,64]` and `[2,3,4,64]` at `headDim` 64, with the scale passed as the
   fp32 bit pattern in the param slot it is read from, the mask absent and the

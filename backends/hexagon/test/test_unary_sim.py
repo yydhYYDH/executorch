@@ -59,7 +59,13 @@ from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa:
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower  # noqa: E402
+from executorch.exir import (  # noqa: E402
+    EdgeCompileConfig,
+    to_edge,
+    to_edge_transform_and_lower,
+)
+
+from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from test_blob_on_sim import (  # noqa: E402
     _fixture_header,
     _HT_P_OP_SHIM,
@@ -67,11 +73,10 @@ from test_blob_on_sim import (  # noqa: E402
     _SCHEMA,
     _SOURCES,
 )
-
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
 EXPM1 = exir_ops.edge.aten.expm1.default
+
 
 # One node carrying this target, for the support predicate to read.
 def _node_with_op(target):
@@ -81,6 +86,7 @@ def _node_with_op(target):
     node = graph.call_function(target, args=(placeholder,))
     node.meta["val"] = torch.empty(4, 8, dtype=torch.float16)
     return node
+
 
 _DSP_OP_UNARY = 4
 
@@ -156,12 +162,12 @@ def measured():
         blob = _blob_for(name)
         header, commands = read_blob(blob)
         assert len(commands) == 1, f"{name}: {len(commands)} commands"
-        assert commands[0].type == _DSP_OP_UNARY, (
-            f"{name}: the command is type {commands[0].type}, not the unary one"
-        )
-        assert commands[0].params[1] == UNARY_OP_TYPES[name], (
-            f"{name}: the command's subtype is {commands[0].params[1]}"
-        )
+        assert (
+            commands[0].type == _DSP_OP_UNARY
+        ), f"{name}: the command is type {commands[0].type}, not the unary one"
+        assert (
+            commands[0].params[1] == UNARY_OP_TYPES[name]
+        ), f"{name}: the command's subtype is {commands[0].params[1]}"
         assert commands[0].params[0] == example.numel(), (
             f"{name}: the command walks {commands[0].params[0]} elements of "
             f"{example.numel()}"
@@ -192,9 +198,9 @@ def measured():
     got = {}
     for name in ("sin", "cos"):
         key = f"{name.upper()}0"
-        assert key in answers, (
-            f"the simulator answered nothing for {name}: {sorted(answers)}"
-        )
+        assert (
+            key in answers
+        ), f"the simulator answered nothing for {name}: {sorted(answers)}"
         got[name] = np.asarray(answers[key], dtype=np.uint16).view(np.float16)
     return example, got
 
@@ -296,6 +302,6 @@ def test_expm1_stays_on_the_portable_kernel():
         "torch.expm1 reached the delegate, so it is running the kernel measured "
         "at 100% relative error near zero"
     )
-    assert not HexagonOperatorSupport().is_node_supported({}, _node_with_op(EXPM1)), (
-        "the support predicate takes an expm1, which the measurement did not"
-    )
+    assert not HexagonOperatorSupport().is_node_supported(
+        {}, _node_with_op(EXPM1)
+    ), "the support predicate takes an expm1, which the measurement did not"
