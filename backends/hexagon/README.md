@@ -896,13 +896,16 @@ that list):
   `exit d0: ok` over an output left as it was. What this does instead is abort
   the process (`rc=134`, `exit d0: failed`, no output at all, in under a second),
   which is the shape of a fault rather than of a refusal.
-- **the host gate is wrong in its M, not in its K.** `_quantized_prefill_fits`
-  admits `K = 25216` and asks nothing about `M`, yet `q4a16_m40_k25216` **passes**
-  at that K (relative 7.1e-4). So the ceiling itself is sound for the shape the
-  gate was reasoned about, and what is missing is the other dimension: the same K
-  that works at `M = 40` destroys `M <= 32`. Adding a tighter K bound under
-  `m <= 32`, or moving that descriptor array off the stack as the `m > 32` kernel
-  already does, would both answer it, and neither is this section's decision.
+- **the host gate was wrong in its M, not in its K, and now refuses rather than
+  emitting it.** `_quantized_prefill_fits` used to admit `K = 25216` and ask
+  nothing about `M`, yet `q4a16_m40_k25216` **passes** at that K (relative 7.1e-4):
+  the ceiling itself is sound for the shape the gate was reasoned about, and what
+  was missing is the other dimension, since the same K that works at `M = 40`
+  destroys `M <= 32`. The gate now carries that branch's bound
+  (`PREFILL_M32_MAX_M = 32`, `PREFILL_M32_MAX_K = 12672` in `hexagon_ops.py`),
+  stated against the largest K seen to work rather than the first that failed.
+  Moving the descriptor array off the stack, as the `m > 32` kernel already does,
+  is the other fix and is still not in this tree.
 - **a caveat, because a control was attempted here and it did not work.** The
   obvious way to separate the VLA length from K is to rewrite `params[7]`, which
   is the `kp` the emitter sends -- but the kernel recomputes `int kp = K / 32`

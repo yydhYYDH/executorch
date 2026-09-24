@@ -13,10 +13,11 @@ landed -- `topk`'s values half before `b7183d9`, then the element-wise select, t
 quantized prefill entry, the zero-filling pad, the split, the transposed
 convolution and the three norms, and then the second batch: the run-time convolution
 extents, the batch-norm fold, the mask an SDPA node carries, the permutation
-gate and the integer nearest resize. The library inventory below is the vendored tree,
-which none of them changed. Section 2 counts two commands more than `b7183d9` did,
-because two kernels have left its table: `DSP_OP_SELECT`(26) and
-`DSP_OP_MATMUL_Q4A16_FP16`(22). Section 1 lost a row for a different reason:
+gate, the integer nearest resize, and the prefill ceiling the device work measured
+(`K <= 12672` under the dispatcher's `M <= 32` split). The library inventory below is
+the vendored tree, which none of them changed. Section 2 counts two commands more
+than `b7183d9` did, because two kernels have left its table: `DSP_OP_SELECT`(26)
+and `DSP_OP_MATMUL_Q4A16_FP16`(22). Section 1 lost a row for a different reason:
 `_log_softmax` gained no kernel, but it is a composition of commands that already
 exist, which is also why §3's last entry is a composition rather than a kernel.
 
@@ -239,7 +240,7 @@ the same node delegates or does not depending on a shape.
 | Pooling needs `C == 64` and static shapes | `max_pool2d`, `avg_pool2d` | the blocking the pool kernel assumes is one 64-channel block |
 | Convolution needs static extents, a constant weight and `groups == 1` or `groups == C_in == C_out` | `convolution` | the general group count has no kernel; a run-time weight has no command |
 | The gather table is a constant, tiled at export, indexed by int32, along axis 0 | `embedding` (int64 indices are refused by dtype), `index_select` (dim must be 0), `index.Tensor` (one index only) | a run-time table, or an index the command can describe. A `tokens.to(torch.int32)` in the model is enough for the common case |
-| The weight-only quantized matmul needs `K % 64 == 0` and `N % 32 == 0`, and then either a single activation row (the GEMV entries) or an int4 weight (the prefill entry) | a w8a16 matmul above one row, a batch axis, a dynamic (`SymInt`) `M` | a packer for the int8 prefill kernel (42): the kernel is there and the tile order nothing here writes is the whole of the gap |
+| The weight-only quantized matmul needs `K % 64 == 0` and `N % 32 == 0`, and then either a single activation row (the GEMV entries) or an int4 weight (the prefill entry); the prefill entry also needs `K <= 12672` while `M <= 32` (`PREFILL_M32_MAX_M` / `PREFILL_M32_MAX_K` in `hexagon_ops.py`), because the dispatcher's small-M kernel keeps one 32-byte descriptor per `K/32` activation tile in a stack array (`matmul_ops.cc:28`, `matmul_q4fp16_mle32.c:528`) | a w8a16 matmul above one row, a batch axis, a dynamic (`SymInt`) `M`, and an int4 prefill with `M <= 32` at `K > 12672` -- `K = 12736` aborts the DSP process (`0x8000040d`, no output, under a second) while `K = 12672` answers within 3.9e-4 to 6.4e-4, both measured at `M = 4` on one phone and one skel, and `M = 2`/`32` fail the same way at `K = 12800` where `M = 33` passes | a packer for the int8 prefill kernel (42): the kernel is there and the tile order nothing here writes is the whole of the gap. The ceiling is a refusal rather than a repair: moving that descriptor array to the heap, as the `M > 32` kernel already does, is what would lift it |
 | `where`'s three operands are each the result's element count or a single element | a `where` whose condition broadcasts, e.g. `where(cond[2,1,4], a[2,3,4], b)` | the kernel's per-channel value mode, which needs a `plane` / `channel` / `pack` / `batch` this emitter does not compute -- so the same `where` delegates in one model and not in the next |
 | A constant pad fills its border with a `ZERO` memset, so the fill is zero and nothing else, and it needs a three-level region | a nonzero `value`; a pad on a third axis from the end (a fourth level); a negative pad (that is a slice); an all-zero pad, whose region is the operand at its own strides and which the kernel drops as a self-write | a fill other than zero is a kernel that writes a value; anything past the last two axes is a different region form. `mode='reflect'`/`'replicate'`/`'circular'` are not this node at all: torch lowers them to `arange`/`abs`/`clamp`/`index` programs, so no pad node reaches the partitioner |
 | A command holds three 12-int regions | `cat` (at most 3 operands), `permute_copy` (at most 3 groups that advance, no reversal inside one) | a command form with more regions. The permute count is of the groups that spend a loop, not of the axis groups: a batch of one in front of a head split is a fourth group that iterates once and advances nothing, so `[1, tokens, heads, dim] -> [1, heads, tokens, dim]` is three loops and delegates, while the same split on a batch of two is refused -- the difference is an extent, and `permute_region` in `hexagon_ops.py` is where it is decided |
@@ -342,6 +343,9 @@ The two gaps that are not of that shape:
    and the work is a packer for kernel 42's tile order rather than a kernel. The
    shape limit that stays beside it is the one §4 states, `K % 64 == 0` and
    `N % 32 == 0`, which is the granularity the block-scaled form (34) exists for.
+   §4 also carries the ceiling the wired int4 entry now holds (`K <= 12672` below the
+   dispatcher's `M <= 32` split): that one is a refusal past a measured bound, not a
+   missing packer.
    Until the packer exists, a w8a16 model above one row stays on the portable
    kernels.
 2. **`aten.where` via `DSP_OP_SELECT`** -- **done.** This entry used to say the
