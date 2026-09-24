@@ -71,7 +71,7 @@ kernels the skel links and exports with nothing that can reach them:
 | 17 | `DSP_OP_CONV1X1_DIRECT_FP16` | `htp_ops_conv1x1_direct_fp16` | the 1x1 fast path. A 1x1 convolution goes through im2col today |
 | 22 | `DSP_OP_MATMUL_Q4A16_FP16` | `htp_ops_matmul_q4a16_fp16` | **quantized prefill** (`M > 1`) |
 | 25 | `DSP_OP_CAST` | `htp_ops_cast` | deliberately unused, as 7 |
-| 26 | `DSP_OP_SELECT` | `htp_ops_select` | `cond ? a : b`. The only ATen node that maps is `aten.where.self`, refused today for the bool reason below |
+| 26 | `DSP_OP_SELECT` | `htp_ops_select` | `cond ? a : b`. The only ATen node that maps is `aten.where.self`, **unwired** rather than refused: it is absent from `EMITTERS`, so `is_node_supported` returns False before it reads the condition at all. The bool gate below is the second line of defence, not the reason |
 | 30 | `DSP_OP_RELU6` | `htp_ops_relu6` | deliberately unused: `relu6` is `hardtanh(0, 6)` and goes through `UNARY`/`CLAMP`, the entry point that restores a NaN by a bit test |
 | 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | not an emitter: the kernel wants a separate fp16 `[O][R]` predicate operand (`eltwise_ops.cc:2959`) that no ATen node carries, and the graphs that come closest already answer correctly as two commands. A fusion target, not a missing line -- §7 |
 | 32 | `DSP_OP_TMAC_A16W1` | `htp_ops_tmac_a16w1_fp16` | 1-bit weights |
@@ -116,16 +116,34 @@ next two-output kernel will have to decide too.
   the table has no one-byte mode, so a node declaring `torch.bool` cannot be
   handed one without an out-of-bounds write. This is a kernel change, not an
   emitter change. `SQUARED_DIFFERENCE`(11) has no ATen node at all.
-- **`aten.where.self`**: see `DSP_OP_SELECT` above. The condition operand would
-  have to carry a comparison result, and whether it can is not established.
+- **`aten.where.self`**: see `DSP_OP_SELECT` above. This is a **pure emitter gap plus
+  one partitioner predicate**, not a kernel change -- the classification above
+  (`GREATER`/`LESS` writing int32 or fp16, so a bool *output* has no command) is
+  about the comparison, and a comparison's output is what `where` takes as an
+  *input*. The kernel already takes a condition at one byte per element:
+  `htp_ops_select` carries a `condBytes` parameter and `htp_ops_select_cond_at`
+  reads flagwise when it is one (`eltwise_ops.cc:2116-2125`). What was
+  unestablished was the runtime side rather than the kernel side -- whether a
+  `torch.bool` reaches the arena one byte per element -- and it does, because an
+  input's slot is the size the blob declares for it. `hexagon-select` measured
+  this on hexagon-sim (`56c50ea`); this branch does not carry that commit, so
+  `where` is still unwired here.
 - **`aten.prelu`**: `DSP_OP_PRELU`(39) exists and no emitter uses it, because the
   node does not survive export at all -- `F.prelu` arrives as `view_copy` (the
   weight re-pointed, not read) + `gt` + `mul` + `where`
   (`test_overload_census.py`, row "prelu decomposes, and the where stays
   put"). Reaching the kernel would take a fusion pass of the `mul_silu.py` kind,
-  not an emitter. The decomposition is already numerically exact and the
-  `view_copy` and the `mul` do delegate; `gt.Scalar` and `where.self` are what
-  stay outside, so the gap is that pair rather than this kernel.
+  not an emitter. **Two things are missing, not one**, and this entry used to
+  imply the pass alone would do it: the pass builds the node, and the emitter
+  that consumes it needs `plane` / `channel` / `pack` / `batch`
+  (`execute_command.cc:693-699`) -- the channel geometry that
+  `where_is_emittable` deliberately does not compute and that exists nowhere else
+  to borrow. So this is a further step out than the `sin`/`cos`/`expm1` entries
+  in §3, which really are one emitter. The decomposition itself is already exact
+  and its `view_copy` and `mul` do delegate; `hexagon-select`'s `56c50ea` takes
+  the `where` inside too, leaving `mul + select` in one delegate. That is a
+  different route to the DSP from this kernel, and on this branch neither is
+  taken, so `gt.Scalar` and `where.self` are on the host here.
 - **`aten.topk.default`**: this was the fourth, and it is done. The kernel
   answers both outputs -- `htp_ops_topkv2_k1_fp16(values, indices, input,
   rowSize, rows)` -- and what it took was the emitter plus the
@@ -244,9 +262,14 @@ The two gaps that are not of that shape:
    difference between a quantized model that runs and one that only decodes.
 2. **`aten.where` via `DSP_OP_SELECT`** -- `prelu` decomposes into `gt` + `mul` +
    `where`, so this one command is what a fusable prelu (and every masked write)
-   is waiting on. The open question is whether the kernel's condition operand
-   accepts what a comparison writes, since a `torch.bool` node cannot be handed
-   an int32 buffer.
+   is waiting on. This entry used to say the open question was whether the
+   kernel's condition operand accepts what a comparison writes; that question was
+   the wrong way round and is now closed. The kernel side holds -- `htp_ops_select`
+   takes a `condBytes` and reads a one-byte flag per element
+   (`eltwise_ops.cc:2116-2125`) -- and what had to be settled was the runtime's
+   side of it, which `hexagon-select` measured on hexagon-sim in `56c50ea`.
+   Note that closing this does **not** by itself reach `DSP_OP_PRELU`; see the
+   `aten.prelu` entry in §3.
 3. **A masked reduction as a fusion** -- `DSP_OP_MASKED_REDUCTION` is not a node
    that cannot be placed. The shape that comes closest,
    `(a * m.unsqueeze(-1)).sum(-2)`, already lowers to a `mul` and a `sum` that
