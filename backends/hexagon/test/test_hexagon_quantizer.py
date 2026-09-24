@@ -526,6 +526,43 @@ def test_a_w8a16_prefill_matmul_stays_portable():
     assert support.is_node_supported(None, mm.args[1])
 
 
+def test_a_prefill_over_two_run_time_tensors_stays_portable():
+    """The run-time-weight rule above M == 1, where a different kernel decides.
+
+    `annotate` reads the operand's position rather than its provenance, so an
+    `a @ b` over two live tensors gets a per-channel observer for something that
+    is not a weight. The prefill emitter packs that tensor into the tile order
+    and reads the fp16 scale beside it, so a weight the export cannot read is a
+    failure at the emitter rather than a fallback -- which is why the refusal has
+    to happen here, and has to happen for `M > 1` too: the entry that answers
+    above one row is a different kernel from the two the M == 1 rule was written
+    for, and nothing about sharing the predicate for `M == 1` makes it the same
+    question.
+    """
+    k, n = 64, 128
+    x = torch.randn(8, k, dtype=torch.float32)
+    b = torch.randn(k, n, dtype=torch.float32)
+    converted, inputs = _quantize("q4a16", _Live("at").eval(), x, b)
+    program = to_edge_transform_and_lower(
+        torch.export.export(converted, inputs),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    graph = program.graph_module.graph
+    assert not [
+        node
+        for node in graph.nodes
+        if str(node.target).endswith("executorch_call_delegate")
+    ], [node.name for node in graph.nodes]
+    # The same shape with a weight in that position does reach the prefill entry,
+    # so what refuses this is the run-time weight and not the eight rows.
+    program, _, _ = _quantized_program("q4a16", 8, k, n)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, commands = read_blob(blob)
+    # K == 64 needs no activation pack, so this is the kernel and the repack of
+    # its 64-channel output packs.
+    assert [c.type for c in commands] == [_PREFILL, _BLIT]
+
+
 def test_a_batched_quantized_matmul_keeps_the_batch_matmul():
     """A batch axis in front of M stays the fp16 BATCH_MATMUL the graph had.
 
