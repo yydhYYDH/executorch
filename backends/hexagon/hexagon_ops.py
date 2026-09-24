@@ -1370,7 +1370,9 @@ def quantized_matmul_weight(node) -> Optional[torch.fx.Node]:
     """The operand a matmul's weight-only weight arrives through, if any.
 
     mm and addmm both put the weight last, and it is a `dequantize_per_channel`
-    rather than a tensor once PT2E has converted the graph.
+    rather than a tensor once PT2E has converted the graph. `aten.matmul` is not
+    a third spelling to look for: it is not Core ATen, so `to_edge` rewrites the
+    2-D form into the `mm` this reads before the partitioner ever sees the node.
     """
     if node.target in MM_TARGETS and len(node.args) > 1:
         return node.args[1]

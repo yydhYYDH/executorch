@@ -676,6 +676,22 @@ _ROWS = [
         [("aten.mm.default", "wired")],
     ),
     (
+        "2-D @, the spelling mm is a rewrite of",
+        lambda a, b: a @ b,
+        (_x(4, 8), _x(8, 5)),
+        [("aten.mm.default", "wired")],
+    ),
+    (
+        "batched @ against a 2-D weight",
+        lambda a, b: a @ b,
+        (_x(2, 4, 8), _x(8, 5)),
+        [
+            ("aten.view_copy.default", "wired"),
+            ("aten.mm.default", "wired"),
+            ("aten.view_copy.default", "wired"),
+        ],
+    ),
+    (
         "bmm",
         lambda a, b: torch.bmm(a, b),
         (_x(2, 4, 8), (_x(2, 8, 5))),
