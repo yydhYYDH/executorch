@@ -80,20 +80,30 @@ struct ZeroCase {
    * agree -- and only the first reaches that path, which is what makes their
    * agreeing evidence about it. */
   int cut;
+  /* 0: the zero-insert scatter, one region with dstOffset 0. 1: a nearest
+   * upsample, which is s*s phases, each reading the source whole and starting
+   * at its own destination offset. The blit kernel's fast paths are keyed on
+   * sizes and strides and this is where every one of them sees a nonzero
+   * destination offset for the first time, so it is the shape a region walk
+   * that has only ever been run at offset zero has not been shown to carry. */
+  int replicate;
 };
 
 /* Sizes are kept small on purpose: several of the kernel's fast paths require
  * size[2] >= 4096 or a 64-lane geometry, and a case that large would be testing
  * a different question. */
 static const ZeroCase zero_cases[] = {
-    {"ZI_SMALL", 1, 3, 5, 2, 0},
-    {"ZI_OX", 1, 4, 7, 3, 0},
-    {"ZI_PLANES", 3, 3, 5, 2, 0},
-    {"ZI_W16_S4", 1, 2, 16, 4, 0},
-    {"ZI_W16_S4_CUT", 1, 2, 16, 4, 1},
-    {"ZI_W64", 2, 3, 64, 2, 0},
-    {"ZI_S1H", 2, 9, 4, 2, 0},
-    {"ZI_H64", 1, 64, 4, 2, 0},
+    {"ZI_SMALL", 1, 3, 5, 2, 0, 0},
+    {"ZI_OX", 1, 4, 7, 3, 0, 0},
+    {"ZI_PLANES", 3, 3, 5, 2, 0, 0},
+    {"ZI_W16_S4", 1, 2, 16, 4, 0, 0},
+    {"ZI_W16_S4_CUT", 1, 2, 16, 4, 1, 0},
+    {"ZI_W64", 2, 3, 64, 2, 0, 0},
+    {"ZI_S1H", 2, 9, 4, 2, 0, 0},
+    {"ZI_H64", 1, 64, 4, 2, 0, 0},
+    {"ZI_REP_S2", 1, 3, 5, 2, 0, 1},
+    {"ZI_REP_S2_P3", 3, 3, 7, 2, 0, 1},
+    {"ZI_REP_S3", 2, 2, 4, 3, 0, 1},
 };
 
 /* One region: the source reads at stride 1 along a row and the destination
@@ -117,8 +127,36 @@ static void set_region(const ZeroCase &c, int plane, int uw, int offset, int wid
   r->dstStride[2] = c.s;
 }
 
+/* The s*s phases of a nearest upsample: every phase reads the whole source
+ * plane at the same strides and writes it at the interleave factor, differing
+ * only in the destination offset that puts it in its own cells. */
+static int build_replicate_regions(const ZeroCase &c, HtpOpsRasterRegion *out) {
+  const int out_h = c.h * c.s;
+  const int out_w = c.w * c.s;
+  int count = 0;
+  for (int ty = 0; ty < c.s; ++ty)
+    for (int tx = 0; tx < c.s; ++tx) {
+      HtpOpsRasterRegion *r = out + count++;
+      memset(r, 0, sizeof(*r));
+      r->srcIndex = 0;
+      r->srcOffset = 0;
+      r->dstOffset = ty * out_w + tx;
+      r->size[0] = c.planes;
+      r->size[1] = c.h;
+      r->size[2] = c.w;
+      r->srcStride[0] = c.h * c.w;
+      r->srcStride[1] = c.w;
+      r->srcStride[2] = 1;
+      r->dstStride[0] = out_h * out_w;
+      r->dstStride[1] = c.s * out_w;
+      r->dstStride[2] = c.s;
+    }
+  return count;
+}
+
 static int build_regions(const ZeroCase &c, int plane, int uw,
                          HtpOpsRasterRegion *out) {
+  if (c.replicate) return build_replicate_regions(c, out);
   if (!c.cut) {
     set_region(c, plane, uw, 0, c.w, out);
     return 1;
@@ -141,8 +179,8 @@ static uint32_t fnv1a(const void *bytes, size_t count) {
 }
 
 static void run_case(const ZeroCase &c) {
-  const int uh = (c.h - 1) * c.s + 1;
-  const int uw = (c.w - 1) * c.s + 1;
+  const int uh = c.replicate ? c.h * c.s : (c.h - 1) * c.s + 1;
+  const int uw = c.replicate ? c.w * c.s : (c.w - 1) * c.s + 1;
   const long source_plane = (long)c.h * c.w;
   const long dest_plane = (long)uh * uw;
   const long source_count = (long)c.planes * source_plane;
@@ -164,10 +202,14 @@ static void run_case(const ZeroCase &c) {
       }
 
   /* Poisoned, not cleared: the `DSP_OP_ZERO` in front of the blit is half of
-   * what is under test, and a buffer that was already zero would hide it. */
+   * what is under test, and a buffer that was already zero would hide it. A
+   * replication writes every destination cell and so has no zero in front of
+   * it, but it is poisoned all the same: a phase that lands nowhere would
+   * otherwise leave a zero that reads like a source element that is zero. */
   memset(destination, 0xAB, (size_t)dest_count * sizeof(__fp16));
 
-  HtpOpsRasterRegion regions[2];
+  /* Up to s*s regions, which is nine for the factors here. */
+  HtpOpsRasterRegion regions[9];
   const int region_count = build_regions(c, uh * uw, uw, regions);
   if (region_count == 0) {
     printf("%s HASH=00000000 MISMATCH=-2\n", c.tag);
@@ -175,19 +217,40 @@ static void run_case(const ZeroCase &c) {
   }
 
   uint8_t *sources[1] = {(uint8_t *)source};
-  const int zero_ret =
-      htp_ops_zero((uint8_t *)destination, (int32_t)(dest_count * sizeof(__fp16)));
-  const int blit_ret = htp_ops_raster_blit((uint8_t *)destination, sources, 1,
-                                           (uint8_t *)regions, region_count,
-                                           (int32_t)sizeof(__fp16));
+  /* The zero-insert's clear is a command of its own; a replication has no such
+   * command, so its phases are the whole of what runs. */
+  const int zero_ret = c.replicate
+                           ? 0
+                           : htp_ops_zero((uint8_t *)destination,
+                                          (int32_t)(dest_count * sizeof(__fp16)));
+  /* One command carries three regions, which is what the emitter's parameter
+   * block allows, so the phases go in that many calls in the same order. */
+  int blit_ret = 0;
+  for (int start = 0; start < region_count; start += 3) {
+    const int count = region_count - start < 3 ? region_count - start : 3;
+    blit_ret = htp_ops_raster_blit((uint8_t *)destination, sources, 1,
+                                   (uint8_t *)(regions + start), count,
+                                   (int32_t)sizeof(__fp16));
+    if (blit_ret != 0) break;
+  }
 
   /* The intent, built here the way the emitter's strides describe it. */
   memset(intent, 0, sizeof(intent));
   for (int p = 0; p < c.planes; ++p)
     for (int y = 0; y < c.h; ++y)
       for (int x = 0; x < c.w; ++x) {
-        const long index = p * dest_plane + y * (long)c.s * uw + x * (long)c.s;
-        intent[index] = source[p * source_plane + y * (long)c.w + x];
+        const __fp16 value = source[p * source_plane + y * (long)c.w + x];
+        if (c.replicate) {
+          /* Every destination cell of this source element's block. */
+          for (int dy = 0; dy < c.s; ++dy)
+            for (int dx = 0; dx < c.s; ++dx) {
+              const long at = p * dest_plane + (y * (long)c.s + dy) * uw +
+                              x * (long)c.s + dx;
+              intent[at] = value;
+            }
+        } else {
+          intent[p * dest_plane + y * (long)c.s * uw + x * (long)c.s] = value;
+        }
       }
 
   const uint16_t *got = (const uint16_t *)destination;

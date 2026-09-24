@@ -3827,6 +3827,156 @@ def _emit_zero_insert(ctx, node: torch.fx.Node, source: TensorRef, spec: ConvSpe
     return buffer
 
 
+def _nearest_index(scale: float, index: int, extent: int) -> int:
+    """The source index torch's nearest kernel reads, in torch's own arithmetic.
+
+    `nearest_neighbor_compute_source_index` is
+    `min((int64_t)floorf(index * (float)scale), extent - 1)` -- a **float**
+    multiply and a float floor, not exact division. Reproducing that here is what
+    lets the gate check the mapping it is about to emit instead of assuming
+    `index // stride` and hoping the two agree.
+    """
+    import numpy as np
+
+    product = np.float32(index) * np.float32(scale)
+    return min(int(np.floor(product)), extent - 1)
+
+
+def upsample_regions(node: torch.fx.Node):
+    """The blit regions that replicate a plane for a nearest upsample, or None.
+
+    A replication is many-to-one and one affine region cannot express it: a
+    region's destination index is a constant stride times a source index, so
+    every source element reaches exactly one destination cell, and the
+    destination cells that need the *same* source element twice are unreachable.
+    The fix is not a different primitive but a different count: one on each side
+    of that, and a region can express it exactly.
+
+    A *set* of regions does express it, one per phase of the destination index.
+    For an exact integer multiple `s`, destination index `k * s + t` reads source
+    index `k`, so the phase `t` is the affine map `k -> k` in the source and
+    `k -> k * s + t` in the destination. There are `s` phases on each axis and so
+    `s * s` regions, all reading the same input with the same strides and
+    differing only in their destination offset. Nothing is computed, so the
+    result is the input's bytes and is exact rather than merely close.
+
+    **This is the whole of what is supported.** Scale factors that are not exact
+    integer multiples are refused: `nearest` then reads
+    `in[floor(oh * in / out)]`, whose runs of repeated source rows are no longer
+    all the same length, so the phases would need one region per distinct run
+    length instead of `s` of them. `upsample_bilinear2d` is a different shape
+    again and is refused here -- its taps are parity-dependent (an even output
+    row reads the row *below* it, an odd one the row *above*), so it is neither
+    one shift-invariant filter nor the transposed convolution that the
+    zero-interleaving machinery would need.
+    """
+    if len(node.args) < 2:
+        return None
+    source_value = (
+        node.args[0].meta.get("val")
+        if isinstance(node.args[0], torch.fx.Node)
+        else None
+    )
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    if source_value.dtype not in (torch.float16, torch.float32):
+        return None
+    if source_value.dim() != 4 or result_value.dim() != 4:
+        return None
+    if not source_value.is_contiguous() or not result_value.is_contiguous():
+        return None
+    batch, channels, in_h, in_w = source_value.shape
+    out_batch, out_channels, out_h, out_w = result_value.shape
+    if (batch, channels) != (out_batch, out_channels):
+        return None
+    if min(batch, channels, in_h, in_w) <= 0:
+        return None
+    if out_h % in_h or out_w % in_w:
+        return None
+    stride_y, stride_x = out_h // in_h, out_w // in_w
+    if stride_y < 1 or stride_x < 1:
+        return None
+
+    # torch reads the input at `floor(index * scale)`, where `scale` is the
+    # reciprocal of a scale_factor the caller gave, or the ratio of the shapes
+    # when it gave a size instead. Check that against the integer division this
+    # emitter is about to hard-code, over every output index on both axes.
+    scale_factors = node.args[2] if len(node.args) > 2 else None
+    for axis, (in_extent, out_extent, stride) in enumerate(
+        ((in_h, out_h, stride_y), (in_w, out_w, stride_x))
+    ):
+        if scale_factors is not None and len(scale_factors) == 2:
+            factor = scale_factors[axis]
+            scale = 1.0 / float(factor) if float(factor) > 0 else None
+        else:
+            scale = in_extent / out_extent
+        if scale is None:
+            return None
+        if any(
+            _nearest_index(scale, index, in_extent) != index // stride
+            for index in range(out_extent)
+        ):
+            return None
+
+    regions: List[int] = []
+    for phase_y in range(stride_y):
+        for phase_x in range(stride_x):
+            # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz],
+            # dstStride[xyz]: the source is read whole once per phase and the
+            # destination is written at the interleave factor, offset into the
+            # phase.
+            regions += [
+                0,
+                0,
+                phase_y * out_w + phase_x,
+                batch * channels,
+                in_h,
+                in_w,
+                in_h * in_w,
+                in_w,
+                1,
+                out_h * out_w,
+                stride_y * out_w,
+                stride_x,
+            ]
+    return regions
+
+
+def _emit_upsample(node: torch.fx.Node, ctx) -> TensorRef:
+    """A nearest upsample as raster regions, three to a command.
+
+    The params vector holds 40 ints, the blit header takes three and each region
+    twelve, so a command carries three regions and a wider factor takes more than
+    one command. The interpreter applies them in order and the regions do not
+    overlap, so the split is a partitioning of the work rather than a sequence of
+    passes over the same bytes.
+    """
+    regions = upsample_regions(node)
+    if regions is None:
+        raise RuntimeError(
+            f"hexagon: {node.target} is not an integer-multiple nearest upsample"
+        )
+    _require_arena_dtype(node, "upsample")
+    source = ctx.operand(node.args[0])
+    out = ctx.result_for(node, _numel(node))
+    for start in range(0, len(regions), BLIT_BLOCKS_PER_COMMAND * BLIT_REGION_INTS):
+        chunk = regions[start : start + BLIT_BLOCKS_PER_COMMAND * BLIT_REGION_INTS]
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[out],
+                # Region count, element bytes, source count, then the regions.
+                params=[len(chunk) // BLIT_REGION_INTS, FP16_BYTES, 1] + chunk,
+            ),
+        )
+    return ctx.record(node, out)
+
+
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     """A convolution as the DSP's depthwise walk or its im2col convolution.
 
@@ -5905,6 +6055,7 @@ EMITTERS = {
     SPLIT_WITH_SIZES_COPY: _emit_split,
     SPLIT_COPY: _emit_split,
     exir_ops.edge.aten.cat.default: _emit_cat,
+    exir_ops.edge.aten.upsample_nearest2d.vec: _emit_upsample,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
     # A zero-filling constant pad: a memset for the border and one region for the
     # operand. See constant_pad_region for the shape and the value it takes.
@@ -5968,6 +6119,10 @@ SLICE_TARGETS = frozenset({exir_ops.edge.aten.slice_copy.Tensor})
 SELECT_TARGETS = frozenset({exir_ops.edge.aten.select_copy.int})
 
 CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
+
+# Reaches _emit_upsample. Only the integer-multiple nearest form has a region
+# set; upsample_regions says what the others are missing.
+UPSAMPLE_TARGETS = frozenset({exir_ops.edge.aten.upsample_nearest2d.vec})
 
 PERMUTE_TARGETS = frozenset({exir_ops.edge.aten.permute_copy.default})
 

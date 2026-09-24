@@ -25,8 +25,9 @@ mapping rather than about rounding. A stride of 1 needs no interleave at all and
 is the same three commands a plain convolution is.
 
 Also here: why 3-D convolutions are a different question with the same answer
-they always had, and the one geometry whose interleave region has to be cut in
-two because the blit kernel's own fast path would otherwise claim it.
+they always had, and why the interleave region is left whole -- the blit
+kernel's interleave fast path guards on strides that make it write the bytes the
+region walk would, so a region it claims is a region it carries.
 """
 
 import os
@@ -565,16 +566,22 @@ def test_three_dimensional_convolution_is_a_different_target():
         assert _delegates(program) == [], type(module).__name__
 
 
-@pytest.mark.parametrize("mode", ["nearest", "bilinear"])
+@pytest.mark.parametrize("mode", ["bilinear"])
 def test_resize_has_no_emitter_and_stays_portable(mode):
-    """Resize is refused at the operator, not at a geometry.
+    """Bilinear resize is refused at the operator, not at a geometry.
 
     There is no sampling or scaling entry point in the vendored kernels --
     `DSPOpType` (third-party/mnn-htp-ops/include/htp_command.h:32) has no
-    upsample case, and no kernel source mentions interpolation -- and the blit
-    kernel's regions are affine index maps, which cannot express "read element
-    `i / s`" for the replication a nearest upsample is. So both these spellings
-    stay on a portable kernel.
+    upsample case -- and bilinear is arithmetic rather than an index map: its
+    taps alternate with the output row's parity, an even row reading the row
+    below it and an odd row the row above, so it is neither a shift-invariant
+    filter nor the constant-kernel transposed convolution that would let the
+    convolution walk carry it.
+
+    Nearest is the other case and is no longer here: at an integer multiple its
+    replication is a set of affine phase regions, which `test_upsample.py`
+    covers. What stays portable is the ratio that is not an integer multiple,
+    and that case is below.
     """
 
     class Upsample(torch.nn.Module):
@@ -586,4 +593,21 @@ def test_resize_has_no_emitter_and_stays_portable(mode):
             return self.up(x)
 
     program = _lower(Upsample(mode), (torch.randn(1, 64, 8, 8),))
+    assert _delegates(program) == []
+
+
+def test_a_fractional_nearest_resize_stays_portable():
+    """The half of the resize question that is a boundary, not an emitter.
+
+    A non-integer ratio repeats source rows in runs of unequal length, so the
+    destination phases are no longer a constant stride apart and the region set
+    that carries the integer case does not exist. That is a statement about the
+    geometry rather than about the op.
+    """
+
+    class Upsample(torch.nn.Module):
+        def forward(self, x):
+            return torch.nn.functional.interpolate(x, scale_factor=1.5, mode="nearest")
+
+    program = _lower(Upsample(), (torch.randn(1, 64, 8, 8),))
     assert _delegates(program) == []

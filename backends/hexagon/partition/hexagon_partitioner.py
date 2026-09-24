@@ -89,6 +89,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     topk_getitem,
     topk_is_emittable,
     update_cache_layout,
+    upsample_regions,
+    UPSAMPLE_TARGETS,
     vision_attention_is_emittable,
     VISION_ATTENTION_TARGETS,
     where_is_emittable,
@@ -335,6 +337,15 @@ def _cast_stays_in_fp16(node: torch.fx.Node) -> bool:
     if not isinstance(source, torch.fx.Node):
         return False
     return {_dtype_of(source), _dtype_of(node)} <= {torch.float16, torch.float32}
+
+
+def _nearest_upsample_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether an integer-multiple nearest upsample has a region set.
+
+    The same call the emitter makes, so the partitioner cannot admit a node the
+    emitter would refuse; `upsample_regions` is where the geometry is decided.
+    """
+    return upsample_regions(node) is not None
 
 
 def _emits_no_command(node: torch.fx.Node) -> bool:
@@ -683,6 +694,16 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # whole node portable exactly as the pool's reader of its indices
             # does. A k, a dim or an order the one kernel has no argument for is
             # the same verdict, from the same gate.
+            return False
+        if node.target in UPSAMPLE_TARGETS and not _nearest_upsample_is_emittable(node):
+            # A nearest upsample is a region per destination phase, and the
+            # phases are only a constant stride apart when the output extent is
+            # an exact integer multiple of the input's. Anything else -- a
+            # fractional ratio, a downsampling ratio, or a ratio whose float
+            # arithmetic disagrees with the integer division the regions
+            # hard-code -- reads a source index this blit cannot describe, so the
+            # node stays on a portable kernel rather than reaching a blit that
+            # reads the wrong elements.
             return False
         if node.target in SPLIT_TARGETS and not split_is_emittable(node):
             # A split is one blit per piece, and each piece's offset and extent

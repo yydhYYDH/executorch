@@ -699,6 +699,27 @@ SUPPORTED: List[OpSupport] = [
         "a graph output, is copied instead.",
     ),
     OpSupport(
+        "aten.upsample_nearest2d.vec",
+        BLIT,
+        ARENA_FP16,
+        "A 4-D contiguous input whose output extent is an exact integer multiple "
+        "of its input extent on both axes, and whose ratio torch's own index "
+        "arithmetic agrees with. A replication is many-to-one, so one region "
+        "cannot describe it and `s * s` of them do: destination `k * s + t` reads "
+        "source `k`, so each phase `t` is an affine map, and every region reads "
+        "the whole input at the same strides and differs only in its destination "
+        f"offset. Nothing is computed, so the result is the input's bytes. {BLIT} "
+        "carries three regions per command, so a factor of `s` takes "
+        "`ceil(s * s / 3)` of them -- two commands for the 2x an SD up-block "
+        "uses -- and the split is a partition of the work rather than a sequence "
+        "of passes. Left portable: a ratio that is not an exact integer multiple, "
+        "including a shrinking one, because the runs of repeated source elements "
+        "are then of unequal length and the phases stop being a constant stride "
+        "apart. `aten.upsample_bilinear2d.vec` and `aten.upsample_bicubic2d.vec` "
+        "have no region form at all: their taps carry weights that vary with the "
+        "output position, which is arithmetic rather than an index map.",
+    ),
+    OpSupport(
         "aten.unsqueeze_copy.default",
         None,
         ARENA_FP16,

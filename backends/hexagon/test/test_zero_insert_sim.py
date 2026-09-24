@@ -77,9 +77,24 @@ CASES = [
     ("ZI_W64", 2, 3, 64, 2),
     ("ZI_S1H", 2, 9, 4, 2),
     ("ZI_H64", 1, 64, 4, 2),
+    # Replications: not a zero-insert at all, but the same region walk with a
+    # destination offset per phase, which is the one thing the cases above never
+    # put in front of the kernel's fast paths.
+    ("ZI_REP_S2", 1, 3, 5, 2),
+    ("ZI_REP_S2_P3", 3, 3, 7, 2),
+    ("ZI_REP_S3", 2, 2, 4, 3),
 ]
 
+#: The cases the runner builds as a replication rather than as a zero-insert.
+REPLICATE = {"ZI_REP_S2", "ZI_REP_S2_P3", "ZI_REP_S3"}
+
 _IDS = [case[0] for case in CASES]
+
+#: The zero-insert cases, for the expectations that are a zero-insert. The
+#: replication cases share the runner and the parametrization but not that
+#: expectation, and they carry their own test below.
+_ZERO_CASES = [case for case in CASES if not case[0].startswith("ZI_REP")]
+_ZERO_IDS = [case[0] for case in _ZERO_CASES]
 
 _RESULT = re.compile(r"^(ZI_[A-Z0-9_]+) HASH=([0-9a-f]{8}) MISMATCH=(-?\d+)$")
 _SOURCE_DIGEST = re.compile(r"^(ZI_[A-Z0-9_]+)_SRC HASH=([0-9a-f]{8})$")
@@ -186,7 +201,7 @@ def test_the_runner_receives_the_source_both_sides_built(simulated, case):
     assert simulated["source"][tag] == _digest(_source(planes, h, w))
 
 
-@pytest.mark.parametrize("case", CASES, ids=_IDS)
+@pytest.mark.parametrize("case", _ZERO_CASES, ids=_ZERO_IDS)
 def test_the_region_zero_inserts_on_the_dsp(simulated, case):
     """`MISMATCH == 0` and the bytes are the host's own zero-insert.
 
@@ -297,3 +312,27 @@ def test_the_comparisons_can_fail():
     moved[0, 0, 0], moved[0, 2, 4] = moved[0, 2, 4], moved[0, 0, 0]
     assert moved.tobytes() != intent.tobytes()
     assert _digest(moved) != _digest(intent)
+
+
+def _replicated(planes, h, w, s):
+    """What a nearest upsample of the source is: every element repeated s times."""
+    return np.repeat(np.repeat(_source(planes, h, w), s, axis=1), s, axis=2)
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in CASES if c[0] in REPLICATE], ids=lambda c: c[0]
+)
+def test_a_replication_is_the_region_walk_at_an_offset(case, simulated):
+    """The phases the upsample emitter builds, on the DSP.
+
+    Every phase reads the source whole and starts at its own destination offset,
+    which is a shape none of the zero-insert cases reach. The destination is
+    compared against the replication itself, and the two commands are the two
+    the emitter's parameter block splits four regions into.
+    """
+    tag, planes, h, w, s = case
+    digest, mismatches = simulated["result"][tag]
+    assert mismatches == 0, f"{tag}: the destination is not the replication"
+    assert digest == _digest(_replicated(planes, h, w, s)), f"{tag}: wrong bytes"
+    _, blit_ret = simulated["return"][tag]
+    assert blit_ret == 0, f"{tag}: the blit returned {blit_ret}"
