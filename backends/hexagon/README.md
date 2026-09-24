@@ -689,7 +689,8 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   torch -- 4.88e-4 against a reference peaking at 0.57. Only part of that graph
   reached the DSP: the partitioner left the depthwise `conv3x3` and the
   `maxpool` outside the delegates, so what the three command streams contain is
-  two im2col convolutions and one unary rectifier. The whole-graph agreement
+  two im2col convolutions and both rectifiers -- four of the graph's six nodes.
+  The whole-graph agreement
   therefore rests on those ops running on silicon with the other two on the
   portable kernels, which is a different claim from "this graph ran on the DSP";
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
@@ -901,7 +902,11 @@ unchanged, so the two runs are the same bytes and not two exports that happen to
 look alike, agree exactly on the reduction over a run-time-patched span, `amax`
 over a 100-wide fold with a NaN inside it and without, the flat binary add, the
 row gather, the max pool, the depthwise convolution and the 3x3 im2col
-convolution. Three of them say more than "they agree":
+convolution. Note what that list is: nine separate one-delegate models, not the
+graph in the Status list above. The depthwise convolution and the max pool here
+are single-op blobs that *did* delegate, while the same two ops inside that graph
+did not, and why is not established yet -- this file records the two observations
+and not a cause. Three of the nine cases say more than "they agree":
 
 - the reduction agrees with the phone *and the two differ from torch by the same
   5.86e-3*, which is what makes that difference the kernel's own accumulation
@@ -932,7 +937,8 @@ Not done yet:
 - a second device and a second arch. An end-to-end run has now happened, once,
   and it covers the ops and shapes the device list above names. Everything else a
   device would settle is still open: the worker-pool kernels and `flash_attn`
-  among them, the quantized paths, pooling, `fmod`, profiling and timing, every
+  among them, the quantized paths, average pooling and every pool geometry but
+  the single max-pool shape that has run, `fmod`, profiling and timing, every
   arch other than v79, and every dtype other than fp16. A kernel is otherwise
   checked by building a real blob, running it on hexagon-sim and comparing the
   result three ways against torch and a host model of the same command stream; the
@@ -1007,12 +1013,16 @@ Not done yet:
   1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
   keeps that form off the delegate until the kernel is checked;
 - **Convolutions have now run on the device, and the gate the emitter puts in
-  front of them is the gate the device has.** A 3x3 conv, a depthwise conv and a
-  1x1 conv went through one three-delegate run on a OnePlus 13 (SM8750, Android
-  15, CDSP, v79), and a single 3x3 conv through another, each round returning
-  `exit dN: ok` and each matching the fp16 reference computed from the same
-  module instance that produced the `.pte` to one fp16 ULP (worst case 4.88e-4
-  against a reference whose largest element is 0.57). The kernels still agree
+  front of them is the gate the device has.** A 3x3 conv and a 1x1 conv went
+  through one three-delegate run on a OnePlus 13 (SM8750, Android 15, CDSP, v79)
+  -- the depthwise convolution in that graph did not, and the Status list above
+  says why that matters -- and a single 3x3 conv through another, each round
+  returning `exit dN: ok` and each matching the fp16 reference computed from the
+  same module instance that produced the `.pte` to one fp16 ULP (worst case
+  4.88e-4 against a reference whose largest element is 0.57). That 4.88e-4 is the
+  whole graph's output, and the depthwise walk's share of it came out of the
+  portable kernels, so the number is not evidence about that kernel either. The
+  kernels still agree
   with torch bit for bit on every case above; what changed is that the FastRPC
   transport, the skel deployment and the VTCM budget under a real arena are no
   longer part of the question. The VTCM gate is no longer paper arithmetic:
@@ -1052,6 +1062,12 @@ Not done yet:
   span arrives as a run-time patch -- each carrying a NaN in both halves of the
   fold. `fmod` has not: its layout and arithmetic are a second implementation of
   the same source, so the test agrees with the reading and not with the hardware.
+  Since then a max pool has run on a device too: the single-op 64-channel case in
+  the simulator comparison below is one delegate whose 1024 outputs are
+  bit-identical to `hexagon-sim`'s and equal to torch's. The list that follows is
+  about which path the dispatcher takes and what the kernel does at its edges,
+  none of which that one number separates, and about average pooling and every
+  geometry other than that one, which have not run.
   Unverified on device: that the two pool blits really take the DSP's pack-area
   fast path (`try_pack_area_blit` takes the geometry the
   emitter checks for, but the fallback's numbers were never compared against the

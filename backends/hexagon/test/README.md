@@ -38,9 +38,14 @@ blobs, one per kernel family, taken out of the `.pte` the phone ran and handed t
 `hexagon_sim.run` unchanged, agree with the phone bit for bit: the reduction over
 a run-time-patched span, `amax` over a 100-wide fold with a NaN in it and
 without, the flat binary add, the row gather, the max pool, the depthwise
-convolution and the 3x3 im2col convolution. The convolution is the one worth
-naming, because it goes through HMX and `--mhmx=3` is a second implementation of
-that unit rather than a recompilation of it, and because the case was run with
+convolution and the 3x3 im2col convolution. Each of those is its own one-delegate
+model and not a node of the graph `../README.md` ran: the max pool and the
+depthwise convolution there are single-op blobs that did delegate, while the same
+two ops inside that graph did not, and why is not established yet -- the two
+observations are recorded and no cause is claimed. The convolution is the one
+worth naming, because it goes through HMX and `--mhmx=3` is a second
+implementation of that unit rather than a recompilation of it, and because the
+case was run with
 fp16 weights drawn from a normal distribution: it differs from torch at 1152 of
 4096 outputs by up to one ULP and agrees with the phone at all 4096. So on those
 seven paths a green case here is evidence about the DSP, not about a model of it.
