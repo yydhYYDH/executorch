@@ -99,12 +99,13 @@ _WEIGHT_PADDING_VALUE = 1.0
 def simulated():
     try:
         return hexagon_sim.run(_RUNNER, _SOURCES, headers=_HEADERS)
+    except hexagon_sim.BuildFailed as error:
+        # A runner that does not compile is a failure, because every assertion
+        # below is about what the simulator computed and a skip would read as
+        # agreement.
+        pytest.fail(str(error), pytrace=False)
     except hexagon_sim.Unavailable as error:
-        # A machine without the SDK has nothing to say here and skips; a runner
-        # that does not compile is a failure, because every assertion below is
-        # about what the simulator computed and a skip would read as agreement.
-        if str(error).startswith("compiling"):
-            pytest.fail(str(error), pytrace=False)
+        # A machine without the SDK has nothing to say here and skips.
         pytest.skip(str(error))
 
 
