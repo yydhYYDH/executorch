@@ -552,6 +552,23 @@ worth reading twice:
   `absmax/127`, round, clamp to `[-127, 127]`. There is no calibration for it
   and no static activation scale anywhere. The scheme names (`q4a16`, `w8a16`)
   describe the operand widths at the command boundary, not the multiply.
+- **The accumulator's int32-to-fp32 conversion was wrong past `2^22`, and this
+  tree carries the fix.** Both `M == 1` kernels converted the accumulator with
+  the `1.5 * 2^23` magic number, which is exact only while `|x| <= 2^22`. The
+  comment that justified it assumed the accumulator was bounded by one 64-wide
+  block, but both emitters pass `scale_block_num == 1`, so the scale covers the
+  whole `K` -- past `2^22` from `K = 512` at int8 weights and from about
+  `K = 4.7k` at int4 ones. Past it the conversion returned a wrong number, an
+  infinity at larger `K`, while the kernel still returned 0: measured on the
+  simulator with constant weights, `K = 512` at int8 answered 3032 against 2032,
+  and `K = 8192` at int4 answered 2552 against 1792. A random-sign weight
+  cancels, so the rungs in `test_gemv_on_sim.py` need a coherently signed
+  column. The fix splits each lane into its high and low 16 bits and recombines
+  them, which converts every int32 correctly and leaves every answer inside
+  `2^22` bit for bit what it was. This is the `M == 1` GEMV path only -- it says
+  nothing about the prefill entry -- and the defect is pre-existing in the
+  vendored kernels rather than something this work introduced; the upstream
+  paths are in the commit that fixed it.
 - **Both GEMV entries stage their operands in VTCM and refuse with `-1` when
   there is none.** `matmul_q4block_gemv_i8.c:323-325` takes the size-zero path
   out of the kernel before it has written a byte, so the output is left as it
