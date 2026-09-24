@@ -20,7 +20,9 @@ the upstream tree at the revision above, and the attribution required by section
 4 of the license is in `NOTICE`.
 
 Nothing here has been relicensed. The two modifications listed under "Local
-modifications" are build-environment fixes and do not change behavior.
+modifications" are build-environment fixes and do not change behavior. One defect
+was found in this snapshot and is described under "Defects found in this
+snapshot"; it is not fixed here and nothing in this directory was changed for it.
 
 ## Why the DSP side is kept verbatim
 
@@ -76,6 +78,68 @@ instrumentation that only runs when the host asks for it:
    upstream. It now also records each command's kernel microseconds in the last
    int of its probe record and marks the header with a version, which is what
    the host-side profiler reads to attribute time to individual ops.
+
+## Defects found in this snapshot
+
+One, and it is not fixed here: the sources in this directory are byte-identical to
+the revision above except for the three items under "Local modifications".
+
+### `store_output_tile_fp16` puts the wrong channel tile's bias in a ragged position tile
+
+| | |
+|---|---|
+| Where | `src/dsp/im2col_convolution_fp16.cc:15`, called from the single-tile path at `:1748` |
+| Also reached by | `htp_ops_conv1x1_direct_fp16` (`:1840`), which is this same entry point |
+| Trigger | `mp` and `np` in the command's params are zero, or one: one position tile and one channel tile per pass, **and** the position count is not a multiple of 32, **and** the tensor has more than one channel tile |
+| Expected | every output channel gets its own bias |
+| Actual | the last position's upper 32 channels come back off by exactly `bias[l] - bias[32 + l]` for `l` in 0..31: they carry the bias of the channel tile 32 lanes up instead of their own |
+
+The reproduction is in this repository and needs no device:
+
+    pytest backends/hexagon/test/test_conv_sim.py -k single_tile
+
+It runs a 3x3 stride-1 pad-1 convolution with 64 input and 64 output channels over
+a 5x5 input -- 25 positions, so the position tiles are ragged -- once with
+`mp = np = 1` and once with `mp = 1, np = 2`, and asserts which elements of the
+first differ from torch and by how much. The criterion is worth more than the
+mismatch on its own: the difference is *exactly* `bias[l] - bias[32 + l]`, which
+says the accumulator was right and the bias that reached the second half came from
+the neighbouring channel tile. A bare "the numbers disagree" does not distinguish
+a store bug from a staging or layout bug; this does.
+
+The values pin down which tile's bias arrives. Which line applies it was not
+instrumented, because finding it means changing files in this directory; the
+leftover branch of the single-tile store adds its bias before the vector is
+rotated (`:105`-`:124`), and both the loop above it and
+`store_output_tile_pair_fp16` (`:147`, whose leftover branch is at `:180`)
+post-process both halves of a vector, so the two paths are not written the same
+way. The pair store is the reference: it is exact on every geometry
+`test/sim/conv_runner.cpp` runs.
+
+### What this costs the caller, and how it is avoided here
+
+The emitters pass `mp = 1, np = 2` on every im2col command, so no tile reaches the
+single-tile store. The price is VTCM: the kernel asks for `np * kp * 2048` bytes
+of weight staging and `mp * kp * 2048` of activation staging
+(`:1783`-`:1786`), where `kp` is `kernelY * kernelX * ceil(ic / 32)`. Two channel
+tiles is three kp-sized staging tiles where one would be two, and that is what
+bounds the widest reduction that fits: `kp <= 1364`, which for a 3x3 window is
+4832 input channels. The backend refuses convolutions past that bound instead of
+emitting a command whose buffers do not exist, and the bound is arithmetic on the
+allocations above and on the 8192 KiB a manager hands out -- it has not been
+measured against a device's real budget.
+
+Beyond that bound, no measured cost. The pair store is the path the kernel takes
+when it is asked for two channel tiles, and every geometry in
+`test/sim/conv_runner.cpp` and every convolution blob in
+`test/test_blob_on_sim.py` is bit-exact through it.
+
+### A fix upstream could make
+
+Make the single-tile store's leftover branch apply the current channel tile's bias
+to both halves of the vector it writes, the way the pair store's leftover branch
+does; nothing here changes if it does, because this checkout uses the pair either
+way.
 
 ## Build
 

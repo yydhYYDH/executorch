@@ -881,7 +881,13 @@ Not done yet:
   with torch bit for bit on every case above, but that says what the kernels
   compute and not that the device path works: the FastRPC transport, the skel
   deployment, the VTCM budget under a real arena and the `DSP_OP_ZERO` command's
-  behaviour on hardware are all unverified. The im2col kernel's other entry
+  behaviour on hardware are all unverified. The VTCM gate is paper arithmetic:
+  `conv_vtcm_bytes` adds up the four allocations the kernel makes
+  (`im2col_convolution_fp16.cc:1783`-`:1786`) and compares the total with the
+  8192 KiB the simulator's manager reports, which refuses a reduction wider than
+  `kp = 1364` -- 4832 input channels over a 3x3 window. Whether a device hands
+  out that much VTCM, and whether the two fixed blocks really cost what the
+  arithmetic assumes, is exactly what has not been measured. The im2col kernel's other entry
   points (`CONV1X1_DIRECT_FP16`, the weight-only quantized convolutions), its
   scale-block parameters (`scaleBlockNum`, `scaleAsymmetric`) and the
   `outputBytes` bound check, which this emitter turns off by passing 0, are

@@ -1011,7 +1011,9 @@ def _cases():
     )
 
     # The two convolution kernels, one case per form: a depthwise walk with a
-    # blit either side, and a pointwise layer through the HMX unit.
+    # blit either side, a pointwise layer through the HMX unit, and a reduction
+    # wide enough that the pack blit needs more than one command -- 256 channels
+    # is four 64-channel blocks, which the parameter block splits three and one.
     depth_model = _whole_conv(64, 64, 3, 1, 64, seed=11)
     depth_x = _whole(1, 64, 8, 8, seed=12)
     depthwise = _case(
@@ -1027,6 +1029,17 @@ def _cases():
     point_x = _whole(1, 64, 8, 8, seed=14)
     pointwise = _case(
         "M", point_model, (point_x,), _bits(_conv_reference(point_model, point_x))
+    )
+
+    # "V" is the other letter this case cannot have: the dynamic sum in
+    # `_branch_cases` below is the case the run-time patch is asserted against,
+    # and it has held "V" since the simulator work. Two fixtures sharing a tag
+    # would mean one DSP answer read as two cases' -- and `_tagged` returns the
+    # first, so the sum would have been checked against the convolution's bytes.
+    split_model = _whole_conv(256, 64, 3, 1, 1, seed=15)
+    split_x = _whole(1, 256, 6, 6, seed=16)
+    split = _case(
+        "T", split_model, (split_x,), _bits(_conv_reference(split_model, split_x))
     )
 
     x = _small((2, 3, 8))
@@ -1167,6 +1180,7 @@ def _cases():
         pinned,
         depthwise,
         pointwise,
+        split,
         *([attention] if attention is not None else []),
         *_branch_cases(),
     ]
@@ -1618,6 +1632,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["C"] == [8], "the fused norm is not a layer norm"
     assert kinds["O"] == [3, 2, 3], "the depthwise walk is not between two blits"
     assert kinds["M"] == [3, 12, 3], "the pointwise layer is not the im2col kernel"
+    assert kinds["T"] == [3, 3, 12, 3], "the wide pack blit is not split in two"
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
     assert kinds["E"] == [19], "the scale is not an element-wise op"

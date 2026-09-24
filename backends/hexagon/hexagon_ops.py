@@ -43,6 +43,14 @@ DSP_OP_UNARY = 4
 # A memset over one operand, which is the only way to clear the padding lanes a
 # ragged channel count leaves in a blocked activation (blit_ops.cc:1724).
 DSP_OP_ZERO = 24
+
+# One command's parameters live in a fixed-size block of 40 ints
+# (serialization/hexagon_schema.h:44). The raster blit spends three of them on its
+# header and twelve per region, which is what caps how many 64-channel blocks one
+# command can move.
+MAX_OP_PARAMS = 40
+BLIT_REGION_INTS = 12
+BLIT_BLOCKS_PER_COMMAND = (MAX_OP_PARAMS - 3) // BLIT_REGION_INTS
 DSP_OP_LAYER_NORM = 8
 DSP_OP_ROPE = 14
 DSP_OP_ADD_FUSE_LAYERNORM = 16
@@ -2226,6 +2234,17 @@ CONV2D = exir_ops.edge.aten.conv2d.default
 CONVOLUTION = exir_ops.edge.aten.convolution.default
 CONV_TARGETS = frozenset({CONV2D, CONVOLUTION})
 
+# What the im2col kernel asks VTCM for before it runs anything
+# (im2col_convolution_fp16.cc:1783-1786): one weight staging buffer per channel
+# tile, one activation staging buffer per position tile, an accumulator block and
+# a scale block. The emitter pins mp = 1 and np = 2, so the staging request is
+# three tiles' worth of kp 1024-element planes, and the fixed part is the
+# accumulator plus the scales. vtcm_seq_alloc rounds each of the four up to 128
+# bytes, which is what the slack covers.
+CONV_VTCM_BYTES = 8192 * 1024
+CONV_VTCM_STAGING_TILES = 3
+CONV_VTCM_FIXED_BYTES = 4096 + 256 + 4 * 128
+
 
 class ConvSpec(NamedTuple):
     """Everything a convolution command carries, once the node is known to fit."""
@@ -2332,6 +2351,15 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         # channel mapping for it, and faking it with blits is not worth the
         # commands.
         return None
+    if (
+        not depthwise
+        and conv_vtcm_bytes(kernel_y, kernel_x, in_channels) > CONV_VTCM_BYTES
+    ):
+        # The staging buffers are sized from kp, so a wide enough window has
+        # nowhere to put them. The budget is the one the simulator reports and
+        # the arithmetic is the kernel's own; a device that has less VTCM than
+        # its manager hands out is not something this can see from here.
+        return None
     return ConvSpec(
         batch=batch,
         in_channels=in_channels,
@@ -2350,6 +2378,23 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         dilate_x=dilation[1],
         depthwise=depthwise,
     )
+
+
+def conv_k_units(in_channels: int) -> int:
+    """The kernel's k-block count over the reduction: 32-element slices."""
+    return -(-in_channels // 32)
+
+
+def conv_vtcm_bytes(kernel_y: int, kernel_x: int, in_channels: int) -> int:
+    """The VTCM the im2col kernel requests for a window this wide.
+
+    The kernel takes `kp` from the command when it is positive and computes it
+    the same way otherwise (`im2col_convolution_fp16.cc:1767`), so this is the
+    value the emitter puts on the wire, and the staging buffers are sized from
+    it.
+    """
+    kp = kernel_y * kernel_x * conv_k_units(in_channels)
+    return CONV_VTCM_STAGING_TILES * kp * 2048 + CONV_VTCM_FIXED_BYTES
 
 
 def _channel_blocks(channels: int) -> int:
@@ -2498,16 +2543,31 @@ def _emit_channel_block_blit(
     channels: int,
     packing: bool,
 ) -> None:
-    ctx.emit(
-        node,
-        Op(
-            type=DSP_OP_RASTER_BLIT,
-            inputs=[source],
-            outputs=[dest],
-            params=[_channel_blocks(channels), FP16_BYTES, 1]
-            + _channel_block_regions(batch, area, channels, packing),
-        ),
-    )
+    """Move every 64-channel block, in as many commands as the parameter block allows.
+
+    One command carries its regions in a fixed 40-int parameter block
+    (serialization/hexagon_schema.h:44) and each region takes twelve of them after
+    the three-int header, so a command moves at most three blocks and a wide
+    enough tensor needs several commands. The count each command carries is its
+    own chunk's, so the kernel still sees well-formed commands.
+    """
+    regions = _channel_block_regions(batch, area, channels, packing)
+    for start in range(0, _channel_blocks(channels), BLIT_BLOCKS_PER_COMMAND):
+        chunk = _channel_blocks(channels) - start
+        if chunk > BLIT_BLOCKS_PER_COMMAND:
+            chunk = BLIT_BLOCKS_PER_COMMAND
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[dest],
+                params=[chunk, FP16_BYTES, 1]
+                + regions[
+                    start * BLIT_REGION_INTS : (start + chunk) * BLIT_REGION_INTS
+                ],
+            ),
+        )
 
 
 def _emit_zero(ctx, node: torch.fx.Node, dest: TensorRef) -> None:
@@ -2621,7 +2681,6 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             ),
         )
     else:
-        k_units = -(-spec.in_channels // 32)
         weight = ctx.packed_weights(
             weight_node, lambda array: pack_conv_weight(array, spec), "im2col"
         )
@@ -2650,7 +2709,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
                     # icDiv4 and icup4 belong to the int4 entry points; the fp16
                     # path reads neither.
                     spec.in_channels // 4,
-                    spec.kernel_y * spec.kernel_x * k_units,
+                    spec.kernel_y * spec.kernel_x * conv_k_units(spec.in_channels),
                     spec.in_w,
                     spec.in_h,
                     spec.out_w,

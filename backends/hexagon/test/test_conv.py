@@ -35,7 +35,11 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+    CONV_VTCM_BYTES,
+    CONV_VTCM_FIXED_BYTES,
+    CONV_VTCM_STAGING_TILES,
     conv_spec,
+    conv_vtcm_bytes,
     pack_conv_bias,
     pack_conv_weight,
     pack_depthwise_weight,
@@ -668,6 +672,16 @@ def test_conv_spec_reads_the_command_out_of_a_node_that_fits():
             (1, 64, 8, 8),
             False,
         ),
+        # A reduction so wide the kernel's staging buffers outgrow VTCM: 4864
+        # channels over a 3x3 window is kp = 1368, and the kernel asks for three
+        # kp-sized staging tiles before it runs anything.
+        (
+            (None, [1, 1], [1, 1], [1, 1], 1),
+            (1, 4864, 4, 4),
+            (32, 4864, 3, 3),
+            (1, 32, 4, 4),
+            False,
+        ),
     ],
 )
 def test_conv_spec_refuses_what_the_commands_cannot_describe(
@@ -677,6 +691,70 @@ def test_conv_spec_refuses_what_the_commands_cannot_describe(
     target = exir_ops.edge.aten.convolution.default if transposed else None
     node = _conv_node(args, source_shape, weight_shape, result_shape, target)
     assert conv_spec(node, _constant) is None
+
+
+def test_the_vtcm_gate_refuses_one_step_over_what_the_kernel_asks_for():
+    """The gate is arithmetic on the kernel's own allocation, not a hunch.
+
+    The buffer sizes are in im2col_convolution_fp16.cc:1783-1786 and the tiles
+    are the mp = 1, np = 2 the emitter pins, so the widest reduction that fits is
+    the one this computes -- 4832 channels over a 3x3 window, and one 32-channel
+    k-slice more does not.
+    """
+    assert CONV_VTCM_STAGING_TILES == 3, "mp = 1 and np = 2 are what is emitted"
+    assert (CONV_VTCM_BYTES - CONV_VTCM_FIXED_BYTES) // 6144 == 1364, "the bound moved"
+    fitting = _conv_node(
+        (None, [1, 1], [1, 1], [1, 1], 1),
+        (1, 4832, 4, 4),
+        (32, 4832, 3, 3),
+        (1, 32, 4, 4),
+    )
+    assert conv_spec(fitting, _constant) is not None, "refused one step inside the gate"
+    assert (
+        conv_vtcm_bytes(3, 3, 4832) <= CONV_VTCM_BYTES
+    ), "the accepted side does not fit"
+    assert conv_vtcm_bytes(3, 3, 4864) > CONV_VTCM_BYTES, "the refused side does fit"
+
+
+def test_a_convolution_over_the_vtcm_gate_is_left_on_the_host():
+    """The refusal at the level the graph sees it, on the smallest such window.
+
+    4864 channels over a 3x3 window is one 32-channel k-slice past the widest
+    reduction that fits, and the exporter keeps it rather than emitting a command
+    whose staging buffers do not exist. 4832 is the same graph one slice inside
+    the gate, and that one is delegated.
+    """
+    fits = _Conv(4832, 32, 3, padding=1).half()
+    assert len(_delegates(_lower(fits, (_exact((1, 4832, 4, 4), 3, -1, 1),)))) == 1
+    over = _Conv(4864, 32, 3, padding=1).half()
+    assert _delegates(_lower(over, (_exact((1, 4864, 4, 4), 3, -1, 1),))) == []
+
+
+def test_a_wide_tensor_moves_its_channel_blocks_in_several_commands():
+    """A command carries at most three 64-channel blocks, and no more than forty ints.
+
+    The parameter block is a fixed 40 ints and a region takes twelve of them, so
+    448 channels -- seven blocks -- take three commands and the last of them
+    carries one. Each command's count is its own chunk's, and the chunks add up to
+    the blocks the tensor has, which is what the kernel reads.
+    """
+    model = _Conv(448, 32, 3, padding=1).half()
+    _whole(model, 25)
+    data, commands = _blob(_lower(model, (_exact((1, 448, 4, 4), 3, -1, 1),)))
+    assert [command.type for command in commands] == [
+        _BLIT,
+        _BLIT,
+        _BLIT,
+        _IM2COL,
+        _BLIT,
+    ]
+    assert [command.params[0] for command in commands if command.type == _BLIT] == [
+        3,
+        3,
+        1,
+        1,
+    ]
+    assert all(len(command.params) <= 40 for command in commands)
 
 
 def test_conv_spec_refuses_a_weight_it_cannot_read():
