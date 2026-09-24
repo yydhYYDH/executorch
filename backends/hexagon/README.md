@@ -654,6 +654,45 @@ below.
 
 ## Status
 
+Working and verified on a device. The whole of this list is one OnePlus 13
+(SM8750, Android 15, CDSP, v79), `executor_runner` built from this branch at
+`10ab195` and the matching `libhex-htp-skel-v79.so`, in fp16, with every
+reference recomputed from the same module instance that produced the `.pte` it is
+compared against -- a separate script that re-creates the module draws different
+weights after `torch.manual_seed(0)`, which cost this work two rounds of a
+"wrong" device answer that was a wrong reference:
+
+- a three-delegate convolution graph (`conv3x3`, a depthwise `conv3x3`, `relu`,
+  `maxpool`, `conv1x1`) runs all three rounds and lands within one fp16 ULP of
+  torch -- 4.88e-4 against a reference peaking at 0.57;
+- `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
+  (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
+  1.56e-2 against a reference of 16.9. The `embedding` on its own is not
+  delegated at all and lands on the portable kernels;
+- single-op `add`, `amax` and `sum` graphs each reach one delegate; `add` and
+  `amax` answer bit-for-bit, and `sum` is 5.86e-3 out, one and a half ULP of its
+  largest element;
+- the FP16 convolution at `in_channels` 64, 512, 2048 and 4832, and the VTCM gate
+  measured from both sides: the widest window the emitter delegates answers within
+  half an ULP and the first one it refuses fails with `0x8000040d` in under
+  0.2 s;
+- `relu`, `relu6` and `hardtanh(-1, 1)` on sign-clear and sign-set NaNs, and the
+  fused rectifier on the same -- see the clamp and `add_relu` paragraphs, where
+  silicon keeps the NaN the simulator loses on one path and loses the one it loses
+  on the other;
+- the reductions' NaN contract, which turns out to depend on the width of the
+  fold -- see the reduction paragraph;
+- `DSP_OP_ZERO` (24), in the command stream of the widest convolution, executed
+  without error;
+- the transport and the deployment: `[hexagon] rpc timeout NOT armed ...
+  0x80000414` is the first line of every run and changes nothing, every answer is
+  byte-identical across repeats, and 430 runs of the convolution graph in three
+  batches came back `exit d0: ok` in all but one. That one, and two others
+  outside those batches, are the CDSP contention the RUNBOOK describes, not a
+  wrong number: the round fails with `0x00000012` after 10.1 s
+  when another process on the phone holds the VTCM, which is a shared device's
+  problem rather than this backend's answer.
+
 Working and verified without a device:
 
 - the vendored DSP library cross-compiles for v79 through the CMake build,
@@ -809,11 +848,15 @@ Working and verified without a device:
 
 Not done yet:
 
-- an end-to-end run on a device. A kernel is checked by building a real blob,
-  running it on hexagon-sim and comparing the result three ways against torch and
-  a host model of the same command stream. The simulator is a functional model,
-  so it says what the kernels compute and nothing about what the DSP costs or
-  whether the FastRPC path and the skeleton deployment work;
+- a second device and a second arch. An end-to-end run has now happened, once,
+  and it covers the ops and shapes the device list above names. Everything else a
+  device would settle is still open: the worker-pool kernels and `flash_attn`
+  among them, the quantized paths, pooling, `fmod`, profiling and timing, every
+  arch other than v79, and every dtype other than fp16. A kernel is otherwise
+  checked by building a real blob, running it on hexagon-sim and comparing the
+  result three ways against torch and a host model of the same command stream; the
+  simulator is a functional model, so it says what the kernels compute and nothing
+  about what the DSP costs;
 - the external-weight copy at `init()` and the tile-budget override run only
   inside the delegate, so they are code-only here. The `.pte`/`.ptd` pair is
   checked on disk instead: `test_external_weights.py` writes a real `.pte`, reads
@@ -882,17 +925,37 @@ Not done yet:
   reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
   1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
   keeps that form off the delegate until the kernel is checked;
-- **Convolutions have run on the simulator and nowhere else.** The kernels agree
-  with torch bit for bit on every case above, but that says what the kernels
-  compute and not that the device path works: the FastRPC transport, the skel
-  deployment, the VTCM budget under a real arena and the `DSP_OP_ZERO` command's
-  behaviour on hardware are all unverified. The VTCM gate is paper arithmetic:
+- **Convolutions have now run on the device, and the gate the emitter puts in
+  front of them is the gate the device has.** A 3x3 conv, a depthwise conv and a
+  1x1 conv went through one three-delegate run on a OnePlus 13 (SM8750, Android
+  15, CDSP, v79), and a single 3x3 conv through another, each round returning
+  `exit dN: ok` and each matching the fp16 reference computed from the same
+  module instance that produced the `.pte` to one fp16 ULP (worst case 4.88e-4
+  against a reference whose largest element is 0.57). The kernels still agree
+  with torch bit for bit on every case above; what changed is that the FastRPC
+  transport, the skel deployment and the VTCM budget under a real arena are no
+  longer part of the question. The VTCM gate is no longer paper arithmetic:
   `conv_vtcm_bytes` adds up the four allocations the kernel makes
   (`im2col_convolution_fp16.cc:1783`-`:1786`) and compares the total with the
   8192 KiB the simulator's manager reports, which refuses a reduction wider than
-  `kp = 1364` -- 4832 input channels over a 3x3 window. Whether a device hands
-  out that much VTCM, and whether the two fixed blocks really cost what the
-  arithmetic assumes, is exactly what has not been measured. The im2col kernel's
+  `kp = 1364` -- 4832 input channels over a 3x3 window. Run on the phone with
+  `oc = 64`, so that `np` reaches 2 and `np_chunk` really is 2: `ic` of 64, 512,
+  2048 and 4832 answer within half an ULP of their largest reference element
+  (9.77e-4 at `ic = 4832`, against 3.08), and `ic` of 4864, 5120 and 8192 --
+  which the emitter refuses, so the AOT gate was raised to ship them -- fail in
+  0.09-0.18 s with `execute_command_group failed: 0x8000040d`, write no output,
+  and leave the DSP healthy enough that the `ic = 64` case passes immediately
+  afterwards. So a device hands out the 8,354,560 bytes the widest delegated
+  window asks for and not the 8,409,856 the next one asks for, which is the
+  boundary the arithmetic draws. Note the code: `0x8000040d` is the one the
+  RUNBOOK attributes to a skel built without `-O2`, and this is a second,
+  unrelated way to earn it. `DSP_OP_ZERO` (`hexagon_ops.py:2618`-`:2625`, in
+  front of any convolution whose `in_channels % 64` is non-zero) is now in a
+  stream a device has executed -- the `ic = 4832` blob opens with one,
+  `params=[155648]` bytes -- but that is not a check of the zeroing itself: the
+  lanes it clears are multiplied by the zero weights the tiles carry for them,
+  so an input with no NaN in those lanes cannot tell a cleared lane from a stale
+  one. The im2col kernel's
   other entry points (`CONV1X1_DIRECT_FP16`, the weight-only quantized
   convolutions), its scale-block parameters (`scaleBlockNum`, `scaleAsymmetric`)
   and the `outputBytes` bound check, which this emitter turns off by passing 0,
@@ -915,12 +978,37 @@ Not done yet:
   `hvx_pool2d_fp16`'s window origin and its out-of-range handling beyond the two
   cases above, and its `countType` divisor, are what the tests model, including
   its rounding of the fp16 reciprocal and its fp16 accumulation; `amax`'s signed
-  zero and NaN tie-break; that `HTP_OPS_BINARY_MOD`'s int32 truncation and its
+  zero and NaN tie-break, which is now measured on the device for the one shape
+  this checkout emits most -- see the reduction paragraph below -- while the
+  signed zero and the tie-break between two NaNs are still unread; that
+  `HTP_OPS_BINARY_MOD`'s int32 truncation and its
   zero-divisor guard agree with the host model, and which of the two paths
   (`htp_ops_binary_elementwise`'s scalar `apply_fp16` or the fp16 vector tail) the
   dispatcher takes for subtype 12; and that the reduction's accumulator really is
   fp32 with an fp16 store, which the `bytes` param asserts and no test can
   observe;
+- **the reduction's NaN contract is now measured on the device, and it is a
+  function of how wide the fold is.** Take the shape this backend emits most, a
+  reduction over the innermost axis, so the wire command is
+  `params=[outside, reduce, 1, kind, ...]` with `inside = 1` and the kernel takes
+  `htp_ops_reduce_max_fp16_inside1_hvx`: a NaN in the fold comes back as the NaN
+  when `reduce` is a multiple of 64, and as the largest of the *other* elements
+  when it is not. A `(2, 32)` fold answered `0x3c00`, which is `1.0`, for a
+  sign-clear NaN at its first element and for one at its last, where torch
+  answers `0x7e00` at the same position; `(2, 64)`, `(2, 128)`, `(2, 192)` and
+  `(2, 256)` answered the NaN; `(2, 96)` and `(2, 100)` answered `1.0` again.
+  Where the NaN sits does not matter -- a NaN at column 3 and a NaN at column 95
+  of the same 96-wide fold both came back as `1.0`, so it is the presence of a
+  scalar tail and not the tail's contents that decides. The sum over the same
+  `(2, 100)` shape answers `0x7c00`, `+inf`, where torch answers the NaN. Read
+  the simulator's half of this with care, because it is about a different
+  function: `test_blob_on_sim.py`'s NaN reductions (`_AmaxAt`, cases `BJ` and
+  `BL`) reduce the *other* axis, so `inside = 100 >= 64` and the kernel takes
+  `htp_ops_reduce_fp16_inside_vector_range`; those pass on `hexagon-sim` and say
+  nothing about `inside = 1`, which is what a `torch.amax(x, dim=<last>)` on a
+  multi-dimensional tensor produces. Neither half covers the other. The signed
+  zero, and the tie-break between two NaNs of different payloads, are still
+  unread on a device;
 - **the fused rectified sum (`add_relu`, subtype 8) reaches the DSP through a pass
   rather than through an ATen op**, because no ATen op produces `max(a + b, 0)`:
   `relu(x + y)` reaches the graph as an add and a relu, and `FuseAddReluPass` in
@@ -936,11 +1024,16 @@ Not done yet:
   sign bit already set is still a wrong number at a vector lane: driven that way
   on the simulator, the lane answers `0.0` where torch answers the NaN, because
   `Q6_Vhf_vmax_VhfVhf` sends a sign-bit NaN to the other operand, and that
-  instruction is behind the rectifier as well as behind the reduction.
-  Unverified on device: what silicon does with the NaN this suite feeds, whose
-  sign bit is clear, and whether the sign-bit lane above behaves any differently
-  there; and that an add whose sum has another reader still gets the command,
-  which is a partition question rather than a kernel one.
+  instruction is behind the rectifier as well as behind the reduction. **That
+  sign-bit lane is now answered, and it is the same on silicon as on the
+  simulator.** Driven on the phone with a 128-element input -- every lane inside
+  the vector loop, no tail -- the fused `relu(x + y)` answered `0x0000`, which is
+  `+0.0`, at the three lanes whose sum was a sign-set NaN, where torch answered
+  the NaN; the two lanes whose sum was a sign-clear NaN came back `0x7fff`, a NaN
+  with a different payload, so the instruction keeps a NaN it can see and sends
+  a sign-bit one to the other operand on hardware exactly as `hexagon-sim` does.
+  What is left unverified on a device is that an add whose sum has another reader
+  still gets the command, which is a partition question rather than a kernel one.
 - **the clamp entry point has run on hexagon-sim, and the NaN path it was feared
   for is not one path but two.** The kernel walks `size & -64` elements a vector
   at a time and the rest one at a time, and until this branch the two halves
@@ -956,11 +1049,22 @@ Not done yet:
   `test_blob_on_sim.py` asserts it on 32, 64, 100, 127 and 129 elements, all three
   bounds, bit for bit against torch, rather than reporting it as an `xfail`
   (`test_the_clamp_tail_answers_a_nan_with_the_nan`). The two bounds are read as
-  fp16 bit patterns out of params[3] and params[4] in that order. What is left for
-  a device run is the vector half: it restores a NaN through
-  `Q6_Q_vcmp_gt_VhfVhf`, whose unordered behaviour has no documented NaN result
-  here, so whether silicon's compare keeps the NaN where the simulator's does is
-  still open before `relu` is trusted on data that can be NaN;
+  fp16 bit patterns out of params[3] and params[4] in that order. **The vector
+  half has now run on the device, and silicon keeps the NaN.** Driven on the
+  phone at 128 elements -- two whole vectors, no tail -- and at 100 -- 64 vector
+  lanes and 36 tail lanes -- on an input carrying `0x7e00` and `0xfe00` in both
+  halves and an `0x7c01` and an `0xfc01`, all three bounds returned the NaN at
+  every lane torch returned one, sign bit and all: `relu`, `relu6` and
+  `hardtanh(-1, 1)` each answered `0xfe00` for `0xfe00` and `0x7e00` for
+  `0x7e00`, which is the case the simulator gets wrong and the one this paragraph
+  was waiting on. The signaling forms are where the two part company on payload,
+  and in both directions: `0x7c01` came back as `0x7c01` from the device and as
+  `0x7e01` from torch at index 2 of the 128-element input, and as `0xfe01` from
+  the device and as `0xfc01` from torch at index 99 of the 100-element one. Every
+  one of those is a NaN on both sides, so it is a payload that differs and not a
+  number. So `relu` is now trustworthy on
+  data that can be NaN, subject to the silhouette of every device result here:
+  one phone, one commit, fp16.
 - **`torch.mean(x)` / `torch.max(x)` / `x ** 2` have never run anywhere but on
   the host either**, in the same sense as the other reductions: the span
   `[1][numel][1]` and the unary square are transcriptions. The mean's span is

@@ -17,6 +17,20 @@ pytest backends/hexagon/test
 They skip, with a reason, when the Hexagon SDK and `hexagon-sim` are not on the
 machine; a skip is not a pass.
 
+**That "never on silicon" clause still holds, and it is worth keeping explicit
+rather than letting it be read as stale.** The device run `../README.md` now
+records was made with `executor_runner` and a `.pte`; no case in this directory
+ran on a phone, and `pytest` still has no path that touches one. A device result
+elsewhere is not a substitute for a case here, because the two do not look at the
+same thing. Where the same command has now been seen both ways, the rectifier
+agreed -- a sign-bit NaN is answered `0.0` on silicon exactly as `hexagon-sim`
+answers it -- and the reduction did not: this directory's `amax` NaN cases
+(`_AmaxAt`, tags `BJ` and `BL`) reduce the axis that leaves `inside = 100 >= 64`,
+so the kernel takes `htp_ops_reduce_fp16_inside_vector_range`, where a device run
+of a `torch.amax(x, dim=1)` on a two-dimensional tensor has `inside = 1` and takes
+`htp_ops_reduce_max_fp16_inside1_hvx` instead. Read a green case here as a
+statement about the function it happens to reach.
+
 ## Simulator buffers must be 128-byte aligned, explicitly
 
 The runners hand the kernels raw byte arenas. An HVX vector load or store wants

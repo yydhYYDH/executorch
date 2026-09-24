@@ -100,10 +100,38 @@ libraries, the second is how the DSP's loader locates the skel.
 
 ```bash
 cd /data/data/com.termux/files/home/csm/qwen3run
-export LD_LIBRARY_PATH=$PWD/libs:/system/lib64:/vendor/lib64
+export LD_LIBRARY_PATH=/system/lib64:/vendor/lib64
 export ADSP_LIBRARY_PATH=$PWD/skel
 ./executor_runner --model_path model.pte --num_executions 1
 ```
+
+**Do not ship the SDK's `libcdsprpc.so`, and do not put the `libs` directory
+first.** The runner's only non-system `NEEDED` entry is `libcdsprpc.so` (check
+with `readelf -d`), and the phone's own copy under `/vendor/lib64` is the one
+that works. The SDK ships a 30,920-byte `libcdsprpc.so` at
+`ipc/fastrpc/remote/ship/android_aarch64/`; when that copy wins the search,
+FastRPC fails before it can start a single DSP round:
+
+```
+[hexagon] get_hex_arch_ver failed: 0xffffffff capability=0x0
+```
+
+Measured on the phone, four ways, with `cnn.pte`:
+
+| `LD_LIBRARY_PATH` | result |
+|---|---|
+| `/system/lib64:/vendor/lib64` | runs |
+| `/system/lib64:/vendor/lib64:$PWD/libs` (SDK copy in `libs`) | runs |
+| `$PWD/libs:/system/lib64:/vendor/lib64` (SDK copy in `libs`) | `get_hex_arch_ver failed` |
+| `$PWD/libs` (SDK copy in `libs`) | `get_hex_arch_ver failed` |
+| `/vendor/lib64` without `/system/lib64` | will not link: `cannot locate symbol "...openDeclaredPassthroughHal..." referenced by /system/lib64/libbinder_ndk.so` |
+
+So `/system/lib64` has to be on the path, `/vendor/lib64` has to come before
+anything holding an SDK copy of the driver, and a `libs` directory holding a
+*copy of the device's own* `libcdsprpc.so` -- 530,752 bytes, the size
+`/vendor/lib64/libcdsprpc.so` has -- is harmless wherever it sits, which is what
+the `qwen3run/libs` above is. `libc++_shared.so` is not needed by the runner at
+all.
 
 Useful flags: `--print_output none|summary|full`, `--output_file <base>` (writes
 `<base>-0.bin`, raw tensor bytes), `--inputs <a,b,c>`.
@@ -131,12 +159,39 @@ adb logcat -s ExecuTorch:* adsprpc:*
 |---|---|
 | `Backend HexagonBackend is not registered` | runner linked without `--whole-archive` |
 | `0x8000040d` from `execute_command_group` | skel built without `-O2`; check `flags.make` |
+| `0x8000040d` back in under 0.2 s, on a model that used to run | a convolution whose VTCM request is wider than the device's; see below |
+| `0x00000012` from `execute_command_group` after a 10.1 s pause | the CDSP is busy; see below |
 | `0x8000040d` persisting after a rebuild | stale `.so` on the phone, or `ADSP_LIBRARY_PATH` wrong |
 | numbers wrong but no error | op params are positional and unchecked; see the contract table in the README |
 | `.pte` will not load | blob format changed; re-export, old blobs are not compatible |
 | run prints nothing after `enter d0` and hangs for minutes | FastRPC's default is no RPC timeout, so a DSP-side hang never returns an error; the driver arms a 10 s timeout now — see `RPC_TIMEOUT_EXPERIMENT.md` |
 | `0x0000000c` (`0x8000040c` from the DSP) | the RPC call exceeded the armed timeout (`AEE_EEXPIRED`); on a known-good model this means the timeout is too small |
 | `rpc timeout NOT armed: ... failed: 0x80000414` | kernel does not implement the v2 notification struct (the SDK gates it to "after Kaanapali"); the run is otherwise unaffected |
+
+The two rows above that point here are both measured, and both are new:
+
+**`0x8000040d` from a VTCM request that is too wide.** The emitter's gate is
+`conv_vtcm_bytes(3, 3, ic) <= 8192 * 1024`, and `conv_vtcm_bytes` is
+`3 * (9 * ceil(ic / 32)) * 2048 + 4864`, so for a 3x3 window it delegates up to
+`ic = 4832` and refuses `ic = 4864`. With the gate raised to ship the refused
+blobs anyway, the device runs the `ic` of 64, 512, 2048 and 4832 cases and fails
+the 4864, 5120 and 8192 ones in 0.09-0.18 s with this code. Nothing is written,
+and the failure is contained: the `ic = 4832` blob runs again immediately after
+each one. `oc = 64` there is not incidental -- `np = ceil(oc / 32)` has to reach 2
+for `np_chunk` to be 2, which is what makes the kernel's staging request the three
+tiles the emitter's arithmetic assumes.
+
+**`0x00000012` after a 10.1 s pause.** The skel's first command group takes the
+**whole** VTCM and the HMX unit -- `vtcm_mgr.cc:61` asks for
+`set_vtcm_param_v2(total, total, total)` and `set_hmx_param(1)` -- and waits
+`HAP_compute_res_acquire_cached(ctx, 10000000)`, the only 10-second constant in
+the DSP path (`vtcm_mgr.cc:93`, and the 10.1 s is that wait expiring). So any
+other VTCM or HMX client on the phone is enough to lose every round: on this
+phone a `llama-bench` process left running was enough, and the same model
+returned `exit d0: ok` the moment it exited. This is a shared device's problem
+rather than a model's, so check `ps -A | grep -iE 'llama|qnn|htp'` before
+believing a failure, and treat a retry that succeeds as evidence for contention
+rather than flakiness.
 
 ## 7. Hangs, timeouts, and the 5 s SSR fallback
 
