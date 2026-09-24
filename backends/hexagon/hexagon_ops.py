@@ -5172,18 +5172,138 @@ def _scalar_source(arg):
     return arg
 
 
+def sdpa_mask_fits_dsp_limits(node: torch.fx.Node) -> bool:
+    """Whether an attention mask is one the FLASH_ATTN kernel will apply.
+
+    The kernel takes the mask as `[qo_len, mask_stride]` two-byte rows
+    (`attention_entry.cc:72-88,237-242`), where the stride is a command word and
+    the row count is the query extent, so every one of these clauses is a
+    condition on a number the command carries rather than a preference.
+
+    * The stride is `intParams[7]`, and a param is written once at export: a
+      symbolic last extent has no value to write, so it is refused rather than
+      patched, because the kernel reads the row at that stride for every query
+      row (`preprocess_mask_to_fp32` walks `qo_len` rows of it).
+    * The row count is the query extent. A mask with a different count is read
+      past or short (the same function, silently), and nothing in the command
+      says which.
+    * The query extent has to be static and at least two rows. With a positive
+      stride the kernel's first-token shortcut is still reachable --
+      `flash_attn_try_single_token_output` returns `pV` when `qo_len == 1 &&
+      seq_current == 0 && seq_add == 1` before any mask code runs
+      (`attention_entry.cc:215-218,364-367`) -- so a graph whose run-time query
+      length can be one is a graph whose mask can be silently ignored. A static
+      extent of one is that graph; a symbolic extent can become it at run time.
+    * The query extent also has to stay at or below `ATTN_PREFILL_SEGMENT_Q`
+      (64). The kernel segments a long causal prefill into 64-row blocks
+      (`attention_sync_setup.cc:263-265`) but does that *only* while the stride
+      is negative; with a mask `task_rows` is the whole query length (`:266`),
+      and the per-worker scratch the emitter reserves is sized for 64 rows
+      (`_attention_workspace_bytes`). Past 64 the reservation would be short.
+    * The width the mask is indexed by is the cache's row count or more, which is
+      what makes column `k` the mask of absolute key `k`
+      (`attention_sync_process.cc:55-58`: a row's columns are placed at the end
+      of the keys, so a wider stride leaves the columns past the cache unread and
+      a narrower one masks only the last `stride` keys and leaves the ones before
+      them attendable). The cache's own row count bounds the sequence a call can
+      attend -- the same invariant the unmasked path rests on -- so covering it
+      is what keeps a later, longer call from quietly attending unmasked keys.
+      A stride below one is the "no mask" encoding and never a mask.
+    """
+    if len(node.args) < 4:
+        return False
+    mask = node.args[4] if len(node.args) > 4 else None
+    if mask is None:
+        return True
+    if not isinstance(mask, torch.fx.Node):
+        return False
+    nodes = (node.args[0], node.args[1])
+    if not all(isinstance(arg, torch.fx.Node) for arg in nodes):
+        return False
+    value, query, key = (
+        mask.meta.get("val"),
+        nodes[0].meta.get("val"),
+        nodes[1].meta.get("val"),
+    )
+    if value is None or query is None or key is None:
+        return False
+    if value.dtype not in (torch.float16, torch.float32):
+        # The kernel reads the operand as two-byte elements whatever the graph
+        # says, and the runtime narrows an fp32 one on the way in; any other
+        # width would be read as half floats.
+        return False
+    if value.dim() < 2 or query.dim() != 4 or key.dim() != 4:
+        return False
+    rows, stride, query_rows = value.shape[-2], value.shape[-1], query.shape[1]
+    if not isinstance(stride, int) or isinstance(stride, bool) or stride < 1:
+        return False
+    if not isinstance(query_rows, int) or isinstance(query_rows, bool):
+        return False
+    if query_rows < 2 or query_rows > MASK_QUERY_ROWS_MAX:
+        return False
+    if int(rows) != query_rows:
+        return False
+    # The kernel places a row's mask columns at the *end* of the keys
+    # (`sync_attention_mask_start_pos = N - mask_stride`, clamped at zero,
+    # `attention_sync_process.cc:55-58`), so a stride wider than N leaves the
+    # columns past the cache unread and a stride narrower than N leaves the keys
+    # before it with nothing added. The row count the cache operand holds bounds
+    # N -- that is the same invariant the unmasked path already rests on -- so
+    # requiring the stride to cover the cache is what makes column `k` the mask
+    # of absolute key `k` for every key this call can attend. A narrower mask is
+    # a sliding window rather than a wrong answer, but it is indistinguishable
+    # from a mask that was built against the wrong length, so it stays portable.
+    cache_rows = key.shape[1]
+    if not isinstance(cache_rows, int) or isinstance(cache_rows, bool):
+        return False
+    return stride >= cache_rows
+
+
 def _attention_workspace_bytes(qo_len, seq_len, n_slots):
     """The per-worker FLASH_ATTN scratch, matching MNN's block scheduler.
 
-    The DSP caps the query block at 64 rows. Allocating the full query length
-    here turns a 2048-token prefill into an unnecessarily enormous buffer and
-    can make the command fail before the kernel starts.
+    The DSP caps the query block at 64 rows, which is `ATTN_PREFILL_SEGMENT_Q`
+    and the row count the kernel segments a causal prefill into; it takes that
+    cap only while `mask_stride < 0` (`attention_sync_setup.cc:263-266`), so a
+    masked call has to keep its query length at or below 64 rather than expect
+    the kernel to segment it. Allocating the full query length here turns a
+    2048-token prefill into an unnecessarily enormous buffer and can make the
+    command fail before the kernel starts.
+
+    The per-slot size is `sync_attention_head_workspace_bytes(qo_len, seq_len)`
+    (`attention_sync_setup.cc:187-196`): a fp32 score row and a fp16
+    probability row, each rounded up to 128 bytes. This is that expression
+    grouped differently, and the two agree because the first rounding the kernel
+    does is of an already 128-aligned number.
     """
     qo_len = min(qo_len, 64)
     padded = (seq_len + 31) // 32 * 32
     scores = (qo_len * padded * 4 + 127) // 128 * 128
     probabilities = (qo_len * padded * 2 + 127) // 128 * 128
     return (scores + probabilities) * max(1, n_slots)
+
+
+#: The query rows the kernel segments a masked call into, and the widest mask
+#: row it will build: `ATTN_PREFILL_SEGMENT_Q` is 64 in the vendored headers and
+#: the mask region is the whole query block in fp32.
+MASK_QUERY_ROWS_MAX = 64
+
+
+def _attention_mask_bytes(qo_len, mask_stride):
+    """The fp32 mask copy `htp_ops_flash_attn` places after its worker rows.
+
+    The kernel writes `preprocess_mask_to_fp32`'s output at
+    `worker_slots * worker_workspace_bytes` inside the caller's workspace
+    (`attention_entry.cc:237-242`) and never checks the size of that buffer, so
+    the region is the emitter's to size. It is `qo_len` rows of `mask_stride`
+    fp32 numbers, which is exactly `qo_len * mask_stride * 4` bytes.
+
+    The paged entry with online pages narrows nothing and reads the operand's
+    fp16 rows where they lie (`attention_entry.cc:389-399`), so this region is
+    then unused; it is still reserved, because which of the two the kernel picks
+    depends on the run-time sequence length.
+    """
+    return qo_len * mask_stride * 4
 
 
 def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
@@ -5199,18 +5319,17 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     """
     args = node.args
     query, key = args[0], args[1]
-    if len(args) > 4 and args[4] is not None:
-        # The mask slot has no stride this emitter can fill in: the kernel reads
-        # the mask as fp16 rows of `mask_stride` columns and copies them into a
-        # fp32 region it places after the per-task rows, out of a workspace this
-        # backend sizes for the unmasked shape. A command with mask_stride = -1
-        # binds a mask the kernel then ignores, which is a wrong answer rather
-        # than a failure, so a masked node is refused where it is delegated and
-        # again here, for a graph that reaches preprocess without the
-        # partitioner (the tests call it that way).
+    mask = args[4] if len(args) > 4 else None
+    if mask is not None and not sdpa_mask_fits_dsp_limits(node):
+        # The mask's row is read as `mask_stride` two-byte elements, so the
+        # stride is a command param and the shape is the whole contract; a
+        # geometry the gate refuses is refused here too, for a graph that
+        # reaches preprocess without the partitioner (the tests call it that
+        # way). The two doors have to agree or the second one hides the first.
         raise RuntimeError(
-            "hexagon: sdpa with an attention mask is not emittable: the mask "
-            "stride and the fp32 workspace it is copied into are unsized"
+            "hexagon: sdpa with this attention mask is not emittable: the mask "
+            "has to be [query rows, stride] over a static query extent of at "
+            "most 64 rows, with a static stride"
         )
     # Unlike the other ops, attention accepts fp32: the runtime narrows those
     # operands to fp16 as they enter the arena, so the DSP still sees fp16.
@@ -5242,6 +5361,16 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     # head-major transposes it into that layout before the op.
     n_kv_heads, max_kv_len = kv_shape[2], kv_shape[1]
     q_len = ctx.upper_bound(q_shape[1])
+    if q_shape[0] != 1:
+        # The command has no batch field: qo_len is the only row count, the
+        # kernel walks `query + q * heads * headDim` for q below it
+        # (`attention_entry.cc:164-166`) and writes the same rows back, so a
+        # batch of two is one batch computed and one batch left as the arena
+        # found it. Refused here as well as at the gate.
+        raise RuntimeError(
+            f"hexagon: sdpa query batch {q_shape[0]} is not emittable: the "
+            "command carries one row count and no batch axis"
+        )
     if not 0 < n_kv_heads <= q_shape[2] or q_shape[2] % n_kv_heads:
         raise RuntimeError(
             "hexagon: sdpa cache operand is not [batch, seq, heads, dim]"
@@ -5260,9 +5389,13 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
         ctx.operand(args[0]),
         ctx.operand(args[1]),
         ctx.operand(args[2]),
-        # Slot three carries no mask: the dispatcher maps an absent ref to a
-        # null pointer, which is the "no mask" the command below asks for.
-        ABSENT,
+        # Slot three is the mask. An absent ref is fd = -1, which the
+        # dispatcher turns into a null pointer (`execute_command.cc:514`) and
+        # the kernel reads as "no mask" -- but only because mask_stride is then
+        # -1 as well. The two travel together: a positive stride with a null
+        # pointer is non-causal attention over the whole cache, and a null
+        # pointer's stride alone cannot say which was meant.
+        ABSENT if mask is None else ctx.operand(mask),
         ctx.builder.add_activation(packed_bytes),
         ctx.builder.add_activation(packed_bytes),
     ]
@@ -5285,8 +5418,20 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
     # the run-time position. The cache length bounds it: the position can never
     # pass the rows that exist, so this asks for the longest sequence the cache
     # could hold rather than the one this call happens to use.
-    workspace_max_bytes = _attention_workspace_bytes(
-        q_len, q_len + max_kv_len, q_shape[2]
+    #
+    # A mask adds one more region to that scratch -- the fp32 copy the kernel
+    # makes of it -- and the kernel computes where it goes rather than being
+    # told, so the whole reservation has to cover both. The mask's own rows
+    # scale with the query extent, which is why the dynamic form below carries
+    # the mask term too and not just the worker rows.
+    mask_stride = -1
+    mask_region_bytes = 0
+    if mask is not None:
+        mask_stride = int(mask.meta["val"].shape[-1])
+        mask_region_bytes = _attention_mask_bytes(q_len, mask_stride)
+    workspace_max_bytes = (
+        _attention_workspace_bytes(q_len, q_len + max_kv_len, q_shape[2])
+        + mask_region_bytes
     )
     workspace = ctx.builder.add_activation(
         workspace_max_bytes,
@@ -5294,7 +5439,8 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
             workspace_max_bytes,
             lambda length: _attention_workspace_bytes(
                 length, length + max_kv_len, q_shape[2]
-            ),
+            )
+            + _attention_mask_bytes(length, mask_stride),
         ),
     )
 
@@ -5324,7 +5470,14 @@ def _emit_sdpa(node: torch.fx.Node, ctx) -> TensorRef:
                 _float_bits(
                     scale if isinstance(scale, (int, float)) else q_shape[3] ** -0.5
                 ),
-                -1,  # mask_stride: no mask, which is also the causal mode
+                # The mask's row stride: its last extent. -1 is not "no stride"
+                # but the other mode -- a negative stride makes the kernel
+                # generate the causal clamp itself and ignore slot three
+                # (`attention_sync_process.cc:55-58,466-496`), which is what an
+                # unmasked sdpa asks for. With a mask the kernel attends all N
+                # keys and the mask is the only thing that says otherwise, so a
+                # positive stride and a bound operand always travel together.
+                mask_stride,  # mask_stride
                 # push_kv only reads this as the capacity its writes must stay
                 # inside, so it is the operand's length, not the cache's.
                 cache_capacity,  # max_kv_len

@@ -720,8 +720,10 @@ def test_attention_has_no_emitter_until_the_extension_registers_one():
     and the only `llama` op present is `llama.fallback` -- which is a marker the
     exporter writes for a node it deliberately kept on the host, not an op with
     a command. The mask decision that *is* checkable without hardware is pinned
-    in `test_sdpa_mask.py`, which drives the predicate and the emitter with a
-    node built by hand.
+    in `test_sdpa_mask.py`, which lowers graphs carrying a stand-in of the same
+    schema through the emitter table and reads the command, the numbers and the
+    refusals back out. That stand-in lives in a namespace of its own, so the
+    census above does not move when that file has run.
     """
     assert hexagon_ops.sdpa_targets() == frozenset()
     assert [key for key in hexagon_ops.EMITTERS if "llama" in str(key)] == []

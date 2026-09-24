@@ -1312,15 +1312,51 @@ def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     applies that causally by clamping the row length, not by filling a mask with
     -inf, which is the same thing up to the softmax. Query head h reads key and
     value head h // gqa_factor. The cache arrives twice, as the new keys and as
-    the past ones, because update_cache has already written the new rows by the
-    time attention runs, so the kernel's push copies each row onto itself and
-    this models the result rather than the copy.
+    the past ones: the graph's update_cache has already written the new rows into
+    the packed slots by the time attention runs, and the op pushes the key and
+    value operands into those same rows itself, so the push below is the copy the
+    kernel makes rather than one this model invents.
+
+    A positive `mask_stride` (params[7]) is the other mode, and it changes all
+    three of those things: the row length is no longer clamped, every one of the
+    N keys is attended, and slot three's fp16 rows are added to the fp32 scores
+    (`attention_entry.cc:74,237-242`, `attention_sync_process.cc:508-522`).
+    Mask column j belongs to key `max(0, N - mask_stride) + j`
+    (`attention_sync_process.cc:55-58`), so a stride at least as wide as N puts
+    column k on absolute key k, and a narrower one masks only the last
+    `mask_stride` keys -- the keys before that get nothing added and stay
+    attendable. Rows are read at the stride, one per query row, and shared by
+    every head and every batch: the kernel has no batch loop and indexes the
+    mask with the query row alone (`attention_entry.cc:241`).
+
+    This is the only place in the suite that reads a mask out of a command at
+    all, so a command whose stride and operand disagree is refused rather than
+    run: modelling it as unmasked is the silent wrong answer the stride exists
+    to prevent.
     """
     qo_len, seq_current, seq_add, n_heads, n_kv_heads, head_dim = params[:6]
     scale = struct.unpack("<f", struct.pack("<i", params[6]))[0]
+    mask_stride = params[7]
     positions = seq_current + seq_add
     if n_kv_heads <= 0 or n_heads % n_kv_heads != 0:
         raise UnsupportedOp(f"blob: {n_heads} heads over {n_kv_heads} kv heads")
+    if mask_stride == 0:
+        raise UnsupportedOp("blob: mask_stride 0 is not the no-mask encoding")
+
+    mask = None
+    if mask_stride > 0:
+        ref = command.inputs[3]
+        if arena.view(ref).nbytes < qo_len * mask_stride * FP16_BYTES:
+            raise UnsupportedOp(
+                f"blob: a mask of {qo_len} rows of {mask_stride} has no operand"
+            )
+        mask = (
+            np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)
+            .astype(np.float32)
+            .reshape(-1, mask_stride)
+        )
+        if mask.shape[0] < qo_len:
+            raise UnsupportedOp(f"blob: {mask.shape[0]} mask rows of {qo_len}")
 
     def rows(ref, heads):
         values = np.frombuffer(bytes(arena.view(ref)), dtype=np.float16)
@@ -1329,19 +1365,51 @@ def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     query = rows(command.inputs[0], n_heads)
     key = rows(command.inputs[4], n_kv_heads)
     value = rows(command.inputs[5], n_kv_heads)
-    if query.shape[0] != qo_len or key.shape[0] < positions:
+
+    # The op pushes before it attends. `htp_ops_flash_attn` copies the rows of
+    # the key and value operands at `[seq_current, seq_current + seq_add)` into
+    # the packed cache and then attends the first `positions` rows of that
+    # (`attention_entry.cc:200-214`, `:227`, `:245`), so the cache slots four and
+    # five hold are scratch the kernel fills from slots one and two rather than
+    # the cache itself. A row below `seq_current` is whatever the arena already
+    # held -- an earlier call's push, or the update_cache the graph ran before
+    # this op -- so a fresh arena attends zeros there exactly as the kernel does,
+    # and the rows past `positions` are never attended at all.
+    if seq_add > 0:
+        source_k = rows(command.inputs[1], n_kv_heads)
+        source_v = rows(command.inputs[2], n_kv_heads)
+        if (
+            source_k.shape[0] < positions
+            or source_v.shape[0] < positions
+            or key.shape[0] < seq_current
+            or value.shape[0] < seq_current
+        ):
+            raise UnsupportedOp(
+                f"blob: a push of {seq_add} rows at {seq_current} does not fit "
+                f"a cache operand of {source_k.shape[0]} rows"
+            )
+        key = np.concatenate([key[:seq_current], source_k[seq_current:positions]])
+        value = np.concatenate([value[:seq_current], source_v[seq_current:positions]])
+    if key.shape[0] < positions:
         raise UnsupportedOp(
-            f"blob: {query.shape[0]} queries and a cache of {key.shape[0]} rows "
-            f"do not cover {qo_len} over {positions}"
+            f"blob: the cache holds {key.shape[0]} rows and this call reads "
+            f"{positions}"
         )
 
     group = n_heads // n_kv_heads
     out = np.zeros((qo_len, n_heads, head_dim), dtype=np.float32)
     for row in range(qo_len):
-        valid = min(seq_current + row + 1, positions)
         for head in range(n_heads):
             kv_head = head // group
+            if mask is None:
+                valid = min(seq_current + row + 1, positions)
+            else:
+                valid = positions
             scores = (query[row, head] @ key[:valid, kv_head].T) * scale
+            if mask is not None:
+                start = max(positions - mask_stride, 0)
+                covered = positions - start
+                scores[start:] += mask[row][:covered]
             weights = np.exp(scores - scores.max())
             weights /= weights.sum()
             out[row, head] = weights @ value[:valid, kv_head]

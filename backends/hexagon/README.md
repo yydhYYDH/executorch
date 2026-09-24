@@ -954,10 +954,12 @@ Working and verified without a device:
 - on Qwen3-0.6B the partitioner takes 1967 nodes into 29 subgraphs -- one per
   layer, with all 28 attention nodes among them -- and leaves 825 on the
   portable kernels, 711 of which are shape guards. This count predates the mask
-  refusal in `_sdpa_fits_dsp_limits`: an attention node that carries a mask is
-  no longer taken, so an export that has them delegates fewer than 28. With the
-  fusion passes switched off the export splits into 169 subgraphs and leaves
-  2121 nodes behind;
+  handling in `_sdpa_fits_dsp_limits`: an attention node now carries its mask
+  into the delegate where the kernel applies it, and stays portable wherever the
+  kernel would drop it (a query extent of one, a run-time query length or
+  stride, more than 64 rows), so an export with masks delegates a count that
+  follows those geometries. With the fusion passes switched off the export
+  splits into 169 subgraphs and leaves 2121 nodes behind;
 - the compile-spec check is exercised on the host over real blobs, from both
   sides: the writer's side in `test/test_compile_specs.py` and the runtime's in
   the ET-free `hexagon_compat.h`, which the same test compiles and drives. That
@@ -1095,10 +1097,16 @@ Working and verified without a device:
   `llama.custom_sdpa`, submits work to a worker pool, and the simulated QuRT
   refuses to start one -- `qurt_cb_fwk_worker_init` returns -4 and the runtime
   aborts, taking the whole run with it, so the fixture cannot even be built. The
-  defensive rejections that protect that emitter (a mask, a causal bias, the
-  non-square case, the all-`-inf` row) are checked by the host tests and by
-  reading, never by a simulator run, and no simulator result in this README
-  should be read as covering them. Every other attention path here -- the vision
+  geometries whose mask the kernel would drop (a query extent of one, a run-time
+  query length or stride, more than 64 rows) and the rest of the defensive
+  rejections that protect that emitter (a causal bias, the non-square case, the
+  all-`-inf` row) are checked by the host tests and by reading, never by a
+  simulator run, and no simulator result in this README should be read as
+  covering them. The mask that is handed over is checked on the host and nowhere
+  else: `test/test_sdpa_mask.py` asserts the operand, the stride and the
+  reservation out of the blob, and then runs the host interpreter -- which walks
+  the kernel's addressing -- against a reference for a mask that has to move the
+  answer and for one that has to reproduce the unmasked one. Every other attention path here -- the vision
   kernel and the decomposed `scaled_dot_product_attention` -- is a plain loop and
   does run.
 
@@ -1215,7 +1223,10 @@ Not done yet:
   starts a worker pool, which the simulated QuRT cannot (`qurt_cb_fwk_worker_init`
   returns -4), and that entry point stays out of the suite; the vision kernel is
   a plain loop over the head, so it runs. Still unverified on
-  device: the masked path, which no emitter reaches here; whether the workspace
+  device: the masked path, which an emitter now reaches and which has run on the
+  host alone -- the command, its operands and the workspace in one test and the
+  kernel's arithmetic against a reference in another, with no tier above that;
+  whether the workspace
   size the emitter reserves holds for every `tokens` the kernel's own 128-byte
   alignment asks for, since the simulator does not enforce the allocation; and
   the timing of a real tower;

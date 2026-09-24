@@ -71,6 +71,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     quantized_matmul_is_refused,
     reduction_dims,
     REDUCTION_TARGETS,
+    sdpa_mask_fits_dsp_limits,
     sdpa_targets,
     select_region,
     SELECT_TARGETS,
@@ -134,17 +135,13 @@ def _sdpa_fits_dsp_limits(node: torch.fx.Node) -> bool:
     # required; the rest carry defaults and may be omitted.
     if len(node.args) < 4:
         return False
-    if len(node.args) > 4 and node.args[4] is not None:
-        # A mask is the one operand the kernel cannot be handed. It reads the
-        # mask as rows of `mask_stride` two-byte elements right-aligned to the
-        # keys and copies them into a fp32 region of the workspace it places
-        # after the per-task rows -- a region this backend sizes for the
-        # unmasked shape, out of a buffer `htp_ops_flash_attn` does not
-        # bounds-check. The emitter can only say mask_stride = -1, which the
-        # kernel reads as "no mask", so delegating one is silently computing
-        # something else. (The exporter builds this form for
-        # `use_custom_sdpa_with_attention_mask`.) Refused until the stride, the
-        # dtype and the workspace are validated on hardware.
+    if not sdpa_mask_fits_dsp_limits(node):
+        # A mask this backend cannot hand the kernel stays on the portable
+        # kernels rather than being bound and ignored: the kernel applies an
+        # additive mask to the scores and, with a positive stride, stops
+        # generating the causal clamp, so a mask the emitter got wrong is not a
+        # no-op -- it is a different function. See the predicate for which
+        # geometries those are.
         return False
     for arg in (node.args[0], node.args[1], node.args[2]):
         if not isinstance(arg, torch.fx.Node):
@@ -155,6 +152,11 @@ def _sdpa_fits_dsp_limits(node: torch.fx.Node) -> bool:
         if val is None or val.dtype not in (torch.float16, torch.float32):
             return False
         if val.dim() != 4:
+            return False
+        if val.shape[0] != 1:
+            # The command carries one row count and no batch axis, so a batched
+            # query would have its first batch computed and the rest left alone.
+            # Refused rather than delegated into an uninitialized output.
             return False
     # Either a run-time read the runtime patches, or a constant we bake in.
     source = _scalar_source(node.args[3])

@@ -656,11 +656,18 @@ SUPPORTED: List[OpSupport] = [
         "fp16; fp32 narrowed on entry",
         "Registered lazily, once the LLM extension defines llama.custom_sdpa, and "
         "only while SDPA_DELEGATION is true. Four-dimensional q/k/v, matching "
-        "head_dim, n_kv_heads dividing the query heads; start_pos must be a "
-        "constant or a run-time tensor read; no attention mask (the emitter "
-        "has no stride to hand the kernel, and the fp32 workspace the mask would "
-        "be copied into is sized for the unmasked shape, so a masked node stays "
-        "portable). One non-paged FLASH_ATTN.",
+        "head_dim, n_kv_heads dividing the query heads, and a batch of one: the "
+        "command carries a row count and no batch axis, so a second batch would "
+        "have its first batch computed and the rest left alone. start_pos must be "
+        "a constant or a run-time tensor read. An attention mask is handed over "
+        "where the kernel applies it: `[query rows, stride]` in fp16 or fp32, a "
+        "static stride that covers the cache, and a static query extent of at "
+        "least two rows and at most 64 (the kernel segments a longer query only "
+        "while it generates the causal clamp itself, which a mask replaces). The "
+        "stride is a command param and the mask's fp32 copy is a region reserved "
+        "past the worker rows; any other geometry stays portable, including a "
+        "query extent of one, where the kernel's first-token shortcut returns V "
+        "before it reads a mask. One non-paged FLASH_ATTN.",
     ),
     OpSupport(
         "llama.custom_sdpa.out",
@@ -1004,8 +1011,17 @@ NOT_SUPPORTED = [
     ),
     (
         "llama.custom_sdpa shapes other than the one FLASH_ATTN form",
-        "Non-4-D operands, a head_dim mismatch, or n_kv_heads that does not divide "
-        "the query heads stay portable.",
+        "Non-4-D operands, a head_dim mismatch, n_kv_heads that does not divide "
+        "the query heads, and a batch above one stay portable.",
+    ),
+    (
+        "an attention mask outside the geometry the kernel applies one in",
+        "The kernel reads the mask as `[qo_len, mask_stride]` rows at a stride "
+        "the command carries, and its first-token shortcut returns V before it "
+        "reads any mask, so a run-time query extent, a query extent of one, more "
+        "than 64 query rows, a run-time mask stride, a stride narrower than the "
+        "cache, a row count that is not the query's, and any dtype that is not "
+        "two bytes wide all stay on the portable kernels.",
     ),
     (
         "a vision attention the fusion pass did not state as one op",
