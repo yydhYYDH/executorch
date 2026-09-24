@@ -2579,7 +2579,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         ), f"{tag}: the control carries the same bytes as the case it controls"
     # The activation pack is one region and the repack is one for a whole number
     # of 64-channel packs and two when N is ragged, which is the difference
-    # between CC and the rest.
+    # between CK and the rest.
     for tag in ("CJ", "CE", "CG", "CH"):
         regions = [c.params[0] for c in _tagged(cases, tag).commands if c.type == 3]
         assert regions == [1, 1], f"{tag}: the blits carry {regions} regions"

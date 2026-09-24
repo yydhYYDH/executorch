@@ -30,13 +30,13 @@ The distinction matters because only the last one is a gap that hides. A refused
 node costs speed; an unwired op costs speed and leaves nothing to grep for.
 `unwired_overload_census()` (`partition/hexagon_partitioner.py`) records every
 target absent from the table while its family is present, and
-`test_overload_census.py` + `test_overload_census2.py` pin 125 census rows whose
-186 op verdicts are 106 wired, 38 refused and 42 unwired. That count is one
+`test_overload_census.py` + `test_overload_census2.py` pin 126 census rows whose
+187 op verdicts are 111 wired, 37 refused and 39 unwired. That count is one
 verdict per op listed in the row tables those two files are parametrized over --
 the rule the appendix writes out, so the numbers can be re-derived rather than
-believed; the same two files collect 148 tests, because 23 of them assert inside
+believed; the same two files collect 149 tests, because 23 of them assert inside
 a body instead of once per row. The row figure is the one that rule yields --
-102 + 17 + 6, the two `_ROWS` tables and `_QUANTIZED_ROWS` -- and the sentence it
+103 + 17 + 6, the two `_ROWS` tables and `_QUANTIZED_ROWS` -- and the sentence it
 replaces read 127, which is three more rows than those tables hold at any revision
 measured: 122 at `7dc3368` and 124 at `b7183d9`, the two counting the same way.
 
@@ -374,8 +374,8 @@ PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py
 
 # the census counts in the header: one verdict per op listed in the row tables
 # these two files are parametrized over (_ROWS, _QUANTIZED_ROWS), not per
-# collected test -- 125 rows and 186 verdicts against 148 collected, where the
-# 125 is len(_ROWS) in each file plus _QUANTIZED_ROWS: 102 + 17 + 6
+# collected test -- 126 rows and 187 verdicts against 149 collected, where the
+# 126 is len(_ROWS) in each file plus _QUANTIZED_ROWS: 103 + 17 + 6
 PYTHONPATH=src python -m pytest \
   backends/hexagon/test/test_overload_census.py \
   backends/hexagon/test/test_overload_census2.py
