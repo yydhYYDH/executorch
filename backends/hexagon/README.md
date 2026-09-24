@@ -902,11 +902,13 @@ Not done yet:
   and average pooling within 1.95e-3, the fp16 `1/count` divisor, on both
   `countType` forms -- and `sum` has run through the run-time patch above. A
   control asserts that the packed layout matters: exchanging the two inner axes
-  of the same buffer answers differently on these operands. `amax` and `fmod`
-  have never run anywhere but on the host. Their layouts and arithmetic are
-  second implementations of the same sources, so the tests agree with the reading
-  and not with the hardware. Unverified on device: that the two pool blits really
-  take the DSP's pack-area fast path (`try_pack_area_blit` takes the geometry the
+  of the same buffer answers differently on these operands. `amax` has run there
+  too, in two cases -- one whose span is a compile-time constant and one whose
+  span arrives as a run-time patch -- each carrying a NaN in both halves of the
+  fold. `fmod` has not: its layout and arithmetic are a second implementation of
+  the same source, so the test agrees with the reading and not with the hardware.
+  Unverified on device: that the two pool blits really take the DSP's pack-area
+  fast path (`try_pack_area_blit` takes the geometry the
   emitter checks for, but the fallback's numbers were never compared against the
   fast path on hardware, and this suite models the fallback deliberately); that
   `hvx_pool2d_fp16`'s window origin and its out-of-range handling beyond the two
@@ -918,13 +920,13 @@ Not done yet:
   dispatcher takes for subtype 12; and that the reduction's accumulator really is
   fp32 with an fp16 store, which the `bytes` param asserts and no test can
   observe;
-- **the fused rectified sum (`add_relu`, subtype 8) has never run anywhere but on
-  the host**, because no ATen op produces `max(a + b, 0)`: `relu(x + y)` reaches
-  the graph as an add and a relu, and `FuseAddReluPass` in the caller's
-  `transform_passes` is what rewrites them into the node the emitter table has the
-  subtype for. Without the pass the pair still reaches the DSP, as a binary add
-  and a unary clamp, so the pass buys a command rather than a round trip -- a
-  smaller claim than it made before `aten.relu.default` had an emitter.
+- **the fused rectified sum (`add_relu`, subtype 8) reaches the DSP through a pass
+  rather than through an ATen op**, because no ATen op produces `max(a + b, 0)`:
+  `relu(x + y)` reaches the graph as an add and a relu, and `FuseAddReluPass` in
+  the caller's `transform_passes` is what rewrites them into the node the emitter
+  table has the subtype for. Without the pass the pair still reaches the DSP, as
+  a binary add and a unary clamp, so the pass buys a command rather than a round
+  trip -- a smaller claim than it made before `aten.relu.default` had an emitter.
   `test/test_add_relu.py` pins the rewrite, the command and its numbers, and
   `test_blob_on_sim.py` now runs the command itself through the kernel on a NaN
   that lands on both sides of its vector boundary. Unverified on device: that the

@@ -1,10 +1,11 @@
 # Hexagon Backend Tests
 
-Two things live here beyond the ordinary pytest files. `test_blob_on_sim.py` and
-`test_hexagon_sim.py` build a real blob, compile the vendored `mnn-htp-ops` DSP
-sources for v79 with `hexagon_sim.py`, and run them under `hexagon-sim` against
-the same fixtures. `blob_interpreter.py` is a host model of the same command
-stream, so every case is compared three ways: torch, the host model, the DSP.
+Three things live here beyond the ordinary pytest files. `test_blob_on_sim.py`,
+`test_hexagon_sim.py`, `test_conv_sim.py` and `test_gemv_on_sim.py` build a real
+blob, compile the vendored `mnn-htp-ops` DSP sources for v79 with `hexagon_sim.py`,
+and run them under `hexagon-sim` against the same fixtures. `blob_interpreter.py`
+is a host model of the same command stream, so every case is compared three ways:
+torch, the host model, the DSP.
 
 Run them the way the rest of the backend is run:
 
@@ -17,11 +18,11 @@ machine; a skip is not a pass.
 
 ## Simulator buffers must be 128-byte aligned, explicitly
 
-Both runners hand the kernels raw byte arenas. An HVX vector load or store wants
+The runners hand the kernels raw byte arenas. An HVX vector load or store wants
 a 128-byte-aligned address, and the kernels address their operands that way, so
 an unaligned buffer is not a performance problem -- **it is wrong data**. Keep
-this in mind whenever you touch `sim/blob_runner.cpp` or `sim/ops_runner.cpp`, or
-add a fixture:
+this in mind whenever you touch a runner in `sim/` -- `blob_runner.cpp`,
+`ops_runner.cpp`, `conv_runner.cpp` or `gemv_runner.cpp` -- or add a fixture:
 
 - **The symptom is a wrong number, not a crash.** Reads and writes land at the
   wrong addresses, so a case comes back with plausible-looking garbage: a
@@ -37,10 +38,12 @@ add a fixture:
   about memory. That is the dangerous part: a case could pass today, fail
   tomorrow, and the change that moved it was a test someone added elsewhere in
   the file.
-- **So it is declared, and enforced at compile time.** `blob_runner.cpp` and
-  `ops_runner.cpp` both write `__attribute__((aligned(128)))` on the arena and on
-  every operand buffer a kernel reads or writes, and each declaration is
-  followed by `static_assert(__alignof__(buffer) == 128, ...)` naming it. Delete
+- **So it is declared, and enforced at compile time.** All four runners write
+  `__attribute__((aligned(128)))` on the arena and on every operand buffer a
+  kernel reads or writes, and each declaration is followed by a `static_assert`
+  on `__alignof__(buffer) == 128` that names the buffer -- spelled out in
+  `blob_runner.cpp`, `ops_runner.cpp` and `gemv_runner.cpp`, and wrapped in
+  `VECTOR_ALIGNED` and `REQUIRE_VECTOR_ALIGNMENT` in `conv_runner.cpp`. Delete
   the attribute and the build stops -- the compiler reports `expression evaluates
   to '1 == 128'` -- instead of a suite that quietly goes back to depending on
   link layout. The assertion has to be written that way: a `static_assert` on the
