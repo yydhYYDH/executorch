@@ -97,6 +97,14 @@ extern "C" int htp_ops_shared_gather(uint8_t *dst, uint8_t *indices, uint8_t *we
                                      int32_t selectSize, int32_t ic, int32_t oc,
                                      int32_t bytes, int32_t isInt4,
                                      int32_t scaleBlockNum, int32_t scaleAsymmetric);
+/* The element-wise select. Its condition is the one operand this backend hands a
+ * kernel that is not two bytes wide: condBytes is a parameter of its own, and the
+ * kernel reads the condition at that width (eltwise_ops.cc:2116). */
+extern "C" int htp_ops_select(uint8_t *dst, uint8_t *cond, uint8_t *src1,
+                              uint8_t *src2, int32_t outSize, int32_t condSize,
+                              int32_t in1Size, int32_t in2Size, int32_t bytes,
+                              int32_t condBytes, int32_t channelSize,
+                              int32_t innerSize);
 extern "C" int htp_ops_matmul_q4a16_gemv_i8(uint8_t *output, uint8_t *activation,
                                             uint8_t *weight, uint8_t *bias, int32_t k,
                                             int32_t n, int32_t scale_block_num,
@@ -132,6 +140,7 @@ enum {
   kBinaryElementwise = 19,
   kSharedGather = 23,
   kZero = 24,
+  kSelect = 26,
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
@@ -301,6 +310,15 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
   }
   if (op.type == kZero) {
     htp_ops_zero(address(header, op.outputs[0]), params[0]);
+    return;
+  }
+  if (op.type == kSelect) {
+    /* The condition is read at the width params[5] names, which is why this is
+     * the one command in the blob whose operand is not two bytes per element. */
+    htp_ops_select(address(header, op.outputs[0]), address(header, op.inputs[0]),
+                   address(header, op.inputs[1]), address(header, op.inputs[2]),
+                   params[0], params[1], params[2], params[3], params[4],
+                   params[5], params[6], params[7]);
     return;
   }
   if (op.type == kUnary) {

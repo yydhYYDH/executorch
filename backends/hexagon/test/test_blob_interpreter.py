@@ -777,8 +777,8 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
     hole in the interpreter's coverage."""
     # 1 pool2d, 2 depthwise convolution, 3 blit, 4 unary, 8 layer norm, 12 im2col
     # convolution, 14 rope, 16 add+fused norm, 18 flash attention, 19 element-wise,
-    # 23 shared gather, 24 zero, 28 softmax, 29 reduction, 38 batch matmul, 41
-    # q4a16 GEMV, 43 vision attention, 45 w8a16 GEMV.
+    # 23 shared gather, 24 zero, 26 select, 28 softmax, 29 reduction, 38 batch
+    # matmul, 41 q4a16 GEMV, 43 vision attention, 45 w8a16 GEMV.
     # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
     assert _emitted_op_types() == {
         1,
@@ -793,6 +793,7 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
         19,
         23,
         24,
+        26,
         28,
         29,
         38,

@@ -35,6 +35,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
     operand_dtypes_are_readable,
+    where_is_emittable,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonOperatorSupport,
@@ -43,6 +44,10 @@ from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa:
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
+
+#: DSP_OP_SELECT, and the tensor space a get_attr lands in.
+_DSP_OP_SELECT = 26
+_WEIGHTS = 0
 
 
 class _Comparison(torch.nn.Module):
@@ -134,3 +139,165 @@ def test_a_bool_operand_is_refused_at_the_gate():
         {}, _node_with_operand(torch.bool)
     )
     assert operand_dtypes_are_readable(_node_with_operand(torch.float16))
+
+
+class _Where(torch.nn.Module):
+    def forward(self, cond, a, b):
+        return torch.where(cond, a, b)
+
+
+class _WhereWithConstant(torch.nn.Module):
+    """The condition as a buffer rather than an argument."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer(
+            "mask",
+            torch.tensor(
+                [[True, False, True, False], [False, True, False, True]]
+            ),
+        )
+
+    def forward(self, a, b):
+        return torch.where(self.mask, a, b)
+
+
+def _select_case(model, args):
+    """The one delegate's blob, its command, and the interpreter's answer."""
+    program = _program(model, tuple(args))
+    calls = _delegates(program)
+    assert len(calls) == 1, f"the select did not reach the delegate: {calls}"
+    lowered = program.graph_module.get_submodule(calls[0].args[0].target)
+    blob = bytes(lowered._processed_bytes)
+    _, commands = read_blob(blob)
+    assert [command.type for command in commands] == [
+        _DSP_OP_SELECT
+    ], f"the delegate is not one select: {[command.type for command in commands]}"
+    return blob, commands[0]
+
+
+def test_the_select_takes_its_condition_at_one_byte_per_element():
+    """The chain the kernel's guard was the open question about.
+
+    A comparison's result is bool and no kernel here writes one, so the condition
+    reaches the delegate as an argument and is the only operand in the blob that
+    is one byte per element. Three separate things have to hold for that to be
+    right, and the blob states all three: the command declares condBytes 1, the
+    condition's slot is one byte per element rather than the two the runtime
+    would otherwise copy, and the kernel reads the flag and not its neighbour's
+    low half. The last is what running it settles, and `test_blob_on_sim.py`'s
+    teeth case is where the encoding is falsified.
+    """
+    conditions = torch.tensor(
+        [[True, False, True, False, True], [False, True, False, True, False]]
+    )
+    on = torch.arange(1, 11, dtype=torch.float16).reshape(2, 5)
+    off = -on
+    blob, command = _select_case(_Where(), (conditions, on, off))
+
+    assert list(command.params[:6]) == [10, 10, 10, 10, 2, 1], list(command.params)
+    assert command.inputs[0].size == 10, (
+        f"the condition's slot is {command.inputs[0].size} bytes for ten flags"
+    )
+    assert [ref.size for ref in command.inputs[1:]] == [20, 20]
+
+    got = np.frombuffer(execute(blob, [conditions.numpy(), on.numpy(), off.numpy()])[0], dtype=np.float16)
+    expected = torch.where(conditions, on, off)
+    assert got.tobytes() == expected.numpy().reshape(-1).tobytes(), (
+        f"the select answered {got.tolist()} for {expected.flatten().tolist()}"
+    )
+
+
+def test_the_select_reads_a_bool_buffer_at_that_width_too():
+    """A condition that is a weight, which is the other way one arrives.
+
+    A registered buffer is a get_attr and lands in the weights section, so its
+    width is the emitter's rather than the runtime's -- and the blanket rule that
+    a weight is fp16 would refuse it for being one byte. The exemption is the
+    same one the operand gate makes and is on the same target, so this is where
+    the two are held together: an fp16 constant on the same node stays refused.
+    """
+    on = torch.arange(1, 9, dtype=torch.float16).reshape(2, 4)
+    off = -on
+    blob, command = _select_case(_WhereWithConstant(), (on, off))
+
+    assert list(command.params[:6]) == [8, 8, 8, 8, 2, 1], list(command.params)
+    assert command.inputs[0].space == _WEIGHTS, (
+        f"the buffer did not land in the weights section: {command.inputs[0].space}"
+    )
+    assert command.inputs[0].size == 8, (
+        f"the buffer's slot is {command.inputs[0].size} bytes for eight flags, so "
+        "the blob holds it at the arena's width rather than its own"
+    )
+    got = np.frombuffer(execute(blob, [on.numpy(), off.numpy()])[0], dtype=np.float16)
+    expected = torch.where(_WhereWithConstant().mask, on, off)
+    assert got.tobytes() == expected.numpy().reshape(-1).tobytes()
+
+
+def _where_support(model, args):
+    program = _program(model, tuple(args))
+    return len(_delegates(program)), program
+
+
+def test_a_where_the_kernel_cannot_walk_stays_portable():
+    """The refusals, each of which would otherwise be a wrong number.
+
+    Two of them are shapes the command cannot describe, and both have a
+    kernel-side reason rather than a policy one: the command's own guard admits a
+    condition that is the whole output or a single element, so a broadcast
+    condition is out, and a bool *result* has no writer here at all because the
+    arena holds two bytes per element. In both cases the node stays on the
+    portable kernels, which is the whole graph and not an error.
+
+    The third is the condition's dtype, and it is unreachable through `export`:
+    `aten.where.self`'s own schema requires a bool predicate, so no graph the
+    exporter produces can carry anything else. The gate still reads it, because
+    a hand-built graph can, and because the kernel would not make torch's `!= 0`
+    test over a two-byte flag in the first place.
+    """
+    on = torch.arange(1, 9, dtype=torch.float16).reshape(2, 4)
+    off = -on
+
+    class _BroadcastCondition(torch.nn.Module):
+        """The condition is (2, 1) and the values are (2, 4)."""
+
+        def forward(self, cond, a, b):
+            return torch.where(cond, a, b)
+
+    columns = torch.tensor([[True], [False]])
+    assert _where_support(_BroadcastCondition(), (columns, on, off))[0] == 0, (
+        "a condition the command's own guard rejects reached the delegate"
+    )
+
+    class _BoolResult(torch.nn.Module):
+        def forward(self, cond):
+            return torch.where(cond, cond, cond)
+
+    flags = torch.tensor([[True, False, True, False], [False, True, False, True]])
+    assert _where_support(_BoolResult(), (flags,))[0] == 0, (
+        "a bool result reached a kernel whose arena holds two bytes per element"
+    )
+
+    assert where_is_emittable(_node_where(torch.bool))
+    assert not where_is_emittable(_node_where(torch.float16)), (
+        "a fp16 condition would be read one byte at a time by the kernel"
+    )
+
+    # And the control: the shape all three are variations of is taken, so the
+    # refusals above are about their own operand and not about `where` in
+    # general.
+    assert _where_support(_Where(), (flags, on, off))[0] == 1
+
+
+def _node_where(cond_dtype):
+    """A `where.self` node with a condition of this dtype, built by hand."""
+    graph = torch.fx.Graph()
+    args = []
+    for name, dtype in (("cond", cond_dtype), ("a", torch.float16), ("b", torch.float16)):
+        placeholder = graph.placeholder(name)
+        placeholder.meta["val"] = torch.empty(2, 4, dtype=dtype)
+        args.append(placeholder)
+    node = graph.call_function(exir_ops.edge.aten.where.self, args=tuple(args))
+    node.meta["val"] = torch.empty(2, 4, dtype=torch.float16)
+    return node
+
