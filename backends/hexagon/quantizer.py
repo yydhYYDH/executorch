@@ -86,6 +86,44 @@ _WEIGHT_ONLY_TARGETS: Dict[Callable, int] = {
 }
 
 
+def _matmul_is_two_dimensional(node: Node) -> bool:
+    """Whether both of an `aten.matmul`'s operands are 2-D.
+
+    `matmul` is the whole family: 1-D operands, and any number of batch axes
+    leading the two the multiply contracts over. The GEMV kernels have neither a
+    batch axis nor an M > 1 -- `to_edge` folds a batch into M, which is the
+    dimension `hexagon_ops` refuses -- and `2d @ 1d` is a sum of products rather
+    than a matmul at all. Only two 2-D operands form the tile these kernels
+    read, and that spelling is `mm`. Anything else is left unannotated so it
+    keeps the path it has rather than being moved onto a kernel that cannot
+    carry it.
+    """
+    if len(node.args) < 2:
+        return False
+    operands = (node.args[0], node.args[1])
+    if not all(isinstance(operand, Node) for operand in operands):
+        return False
+    values = [operand.meta.get("val") for operand in operands]
+    return all(isinstance(value, torch.Tensor) and value.dim() == 2 for value in values)
+
+
+def _weight_index(node: Node) -> Optional[int]:
+    """The argument a weight-only matmul keeps its weight in, or None.
+
+    `mm` and `addmm` put it last, and so does the 2-D `matmul` they are the
+    lowering of; for that one the weight's last axis is the output-feature axis
+    the per-channel scale is indexed by, exactly as it is for `mm`.
+    """
+    index = _WEIGHT_ONLY_TARGETS.get(node.target)
+    if index is not None:
+        return index
+    if node.target is torch.ops.aten.matmul.default and _matmul_is_two_dimensional(
+        node
+    ):
+        return 1
+    return None
+
+
 def _weight_qspec(bits: int, ch_axis: int) -> QuantizationSpec:
     """A per-output-channel symmetric spec for a `bits`-wide weight.
 
@@ -198,7 +236,7 @@ class HexagonQuantizer(Quantizer):
         for node in model.graph.nodes:
             if node.op != "call_function":
                 continue
-            weight_index = _WEIGHT_ONLY_TARGETS.get(node.target)
+            weight_index = _weight_index(node)
             if weight_index is None or len(node.args) <= weight_index:
                 continue
             if self.filter_fn is not None and not self.filter_fn(node):

@@ -70,6 +70,23 @@ class _Mm(torch.nn.Module):
         return torch.mm(x, self.weight)
 
 
+class _At(torch.nn.Module):
+    """The same multiply written `@`, which exports as a different op.
+
+    `torch.mm` is `aten.mm`; `x @ w` is `aten.matmul`, and for two 2-D operands
+    `to_edge` rewrites that one back into `mm`. The annotation stage sees only
+    the matmul, so the weight has to be annotated there for either spelling to
+    reach a GEMV.
+    """
+
+    def __init__(self, k: int, n: int) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(k, n) * 0.3)
+
+    def forward(self, x):
+        return x @ self.weight
+
+
 class _Bias(torch.nn.Module):
     """The same matmul with a bias of a caller-chosen shape."""
 
@@ -93,15 +110,48 @@ def _quantized_program(scheme, m, k, n):
     return program, converted, x
 
 
-def _converted(scheme, m, k, n):
+def _at_program(scheme, x_shape, k, n):
+    """The same program with the multiply written `@`.
+
+    `x_shape` is the activation's whole shape, since its rank is what decides
+    whether this `@` is the 2-D `mm` spelling or one with a batch axis in front
+    of it.
+    """
+    x = torch.randn(*x_shape, dtype=torch.float32)
+    converted, _ = _quantize(scheme, _At(k, n).eval(), x)
+    program = to_edge(torch.export.export(converted, (x,))).exported_program()
+    return program, converted, x
+
+
+def _converted(scheme, m, k, n, module=_Mm):
     """The PT2E-converted module and its input, before any lowering."""
-    model = _Mm(k, n).eval()
     x = torch.randn(m, k, dtype=torch.float32)
+    return _quantize(scheme, module(k, n).eval(), x)
+
+
+def _quantize(scheme, model, x):
+    """One PT2E trip over `model`: annotate, calibrate, convert."""
     exported = torch.export.export(model, (x,))
     prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
     with torch.no_grad():
         prepared(x)
     return convert_pt2e(prepared), x
+
+
+def _annotated(model, x, scheme="q4a16"):
+    """The targets `annotate` gave a weight annotation to.
+
+    `annotate` is called on its own: the question here is what it decided about
+    the node, and a lowering afterwards would answer a different one.
+    """
+    exported = torch.export.export(model, (x,))
+    annotated = get_hexagon_quantizer(scheme).annotate(exported.module())
+    return {
+        node.target
+        for node in annotated.graph.nodes
+        if node.meta.get("quantization_annotation") is not None
+        and node.meta["quantization_annotation"].input_qspec_map
+    }
 
 
 def _quantized_addmm_program(scheme, k, n, bias_shape):
@@ -183,6 +233,91 @@ def test_w8a16_gemv_matches_the_dequantized_reference():
         assert len(commands[0].inputs) == 4, commands[0].inputs
         worst = _relative_error(got, expected)
         assert worst < 0.03, f"w8a16 differs by {worst} at {k}x{n}"
+
+
+def test_the_at_spelling_reaches_the_same_gemv():
+    """`x @ w` is `aten.matmul`, a target the annotation table has to name.
+
+    The two spellings are different ops in the exported graph even though the
+    multiply is the same one, and neither is the other's target: the annotation
+    has to be placed on the matmul, because the dequantize it produces is what
+    `to_edge`'s rewrite to `mm` carries into the emitter's pattern. Annotating
+    only `mm` leaves the weight a plain fp16 tensor and the command the fp16
+    `BATCH_MATMUL` -- a quantizer that silently did nothing.
+    """
+    for scheme, op, tolerance in (("q4a16", _Q4A16, 0.06), ("w8a16", _W8A16, 0.03)):
+        for k, n in ((64, 32), (128, 96)):
+            program, converted, x = _at_program(scheme, (1, k), k, n)
+            # Both halves of the path are pinned: the converted graph is the
+            # matmul with its dequantize, and the edge graph it lowers to is the
+            # `mm` the emitter reads. Either one moving changes what this means.
+            targets = {
+                node.target
+                for node in converted.graph.nodes
+                if node.op == "call_function"
+            }
+            assert torch.ops.aten.matmul.default in targets, (scheme, k, n)
+            assert targets == {
+                torch.ops.aten.matmul.default,
+                torch.ops.quantized_decomposed.dequantize_per_channel.default,
+            }
+            mm = _node_of(program, exir_ops.edge.aten.mm.default)
+            assert mm.args[1].target is hexagon_ops.DQ_PER_CHANNEL, (scheme, k, n)
+
+            blob = HexagonBackend.preprocess(program, []).processed_bytes
+            _, commands = read_blob(blob)
+            assert [c.type for c in commands] == [op], (scheme, k, n)
+            assert commands[0].params[1:3] == [k, n] and commands[0].params[8] == 1
+            got = np.frombuffer(
+                execute(blob, [x.half().numpy()])[0], dtype=np.float16
+            ).astype(np.float32)
+            with torch.no_grad():
+                expected = converted(x).detach().float().numpy().reshape(-1)
+            worst = _relative_error(got, expected)
+            assert worst < tolerance, f"{scheme} differs by {worst} at {k}x{n}"
+
+
+def test_a_batched_at_matmul_is_not_annotated():
+    """The 2-D rule, from the annotator itself.
+
+    `aten.matmul` is the batched spelling too, and the GEMV kernels have no
+    batch axis: `to_edge` folds a batch into M, which is the dimension the
+    emitter refuses. A batch of one is the sharp row -- flattened it is the
+    M == 1 tile the GEMV path takes, so the rule has to be about the operands'
+    ranks and not about the M they fold to. The 2-D row comes last, so the
+    negative rows cannot pass by annotating nothing at all.
+    """
+    model = _At(64, 32).eval()
+    for label, shape in (
+        ("one batch axis", (2, 1, 64)),
+        ("two batch axes", (2, 3, 64)),
+        ("a batch of one", (1, 1, 64)),
+        ("a 1-D activation", (64,)),
+    ):
+        assert _annotated(model, torch.randn(*shape)) == set(), label
+    assert _annotated(model, torch.randn(1, 64)) == {torch.ops.aten.matmul.default}
+
+
+def test_a_batched_at_matmul_keeps_the_fp16_batch_matmul():
+    """The same rule where a reader sees it: the command stream.
+
+    `_at_program` runs the real quantizer over the batched spelling, so this is
+    the whole chain and not the predicate alone -- nothing annotated, no
+    dequantize, and the fp16 BATCH_MATMUL the graph used before.
+    """
+    for scheme, op in (("q4a16", _Q4A16), ("w8a16", _W8A16)):
+        for shape in ((2, 1, 64), (1, 1, 64)):
+            program, _, _ = _at_program(scheme, shape, 64, 32)
+            assert not [
+                node
+                for node in program.graph_module.graph.nodes
+                if node.target is hexagon_ops.DQ_PER_CHANNEL
+            ], (scheme, shape)
+            blob = HexagonBackend.preprocess(program, []).processed_bytes
+            _, commands = read_blob(blob)
+            types = [c.type for c in commands]
+            assert blob_interpreter.BATCH_MATMUL in types, (scheme, shape, types)
+            assert op not in types, (scheme, shape, types)
 
 
 def test_q4a16_weight_bytes_are_the_kernel_layout():
