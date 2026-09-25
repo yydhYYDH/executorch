@@ -3629,7 +3629,10 @@ MAX_POOL2D = exir_ops.edge.aten.max_pool2d.default
 # only a getitem 0 reader can be placed.
 MAX_POOL2D_WITH_INDICES = exir_ops.edge.aten.max_pool2d_with_indices.default
 AVG_POOL2D = exir_ops.edge.aten.avg_pool2d.default
-POOL_TARGETS = frozenset({MAX_POOL2D, MAX_POOL2D_WITH_INDICES, AVG_POOL2D})
+ADAPTIVE_AVG_POOL2D = exir_ops.edge.aten._adaptive_avg_pool2d.default
+POOL_TARGETS = frozenset(
+    {MAX_POOL2D, MAX_POOL2D_WITH_INDICES, AVG_POOL2D, ADAPTIVE_AVG_POOL2D}
+)
 MAX_POOL_TARGETS = frozenset({MAX_POOL2D, MAX_POOL2D_WITH_INDICES})
 
 
@@ -3850,6 +3853,34 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
     if channels != POOL_CHANNEL_BLOCK:
         return None
 
+    if node.target is ADAPTIVE_AVG_POOL2D:
+        output = _int_pair(_pool_arg(node, "output_size", 1, None), None)
+        if output is None or any(extent <= 0 for extent in output):
+            return None
+        oh, ow = result.shape[-2], result.shape[-1]
+        if output != (oh, ow) or ih % oh or iw % ow:
+            # An adaptive window is fixed exactly when both input extents are
+            # integer multiples of the output extents. Otherwise its window
+            # changes, or clamps, from output position to output position and
+            # one pool command cannot describe it.
+            return None
+        kernel = (ih // oh, iw // ow)
+        return PoolSpec(
+            batch=batch,
+            ih=ih,
+            iw=iw,
+            oh=oh,
+            ow=ow,
+            kernel_y=kernel[0],
+            kernel_x=kernel[1],
+            stride_y=kernel[0],
+            stride_x=kernel[1],
+            pad_y=0,
+            pad_x=0,
+            count_type=POOL_COUNT_KERNEL,
+            pool_type=POOL_AVERAGE,
+        )
+
     kernel = _int_pair(_pool_arg(node, "kernel_size", 1, None), None)
     if kernel is None or kernel[0] <= 0 or kernel[1] <= 0:
         return None
@@ -3935,7 +3966,7 @@ def _channel_block_region(batch: int, area: int, channels: int, packing: bool) -
 
 
 def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
-    """max_pool2d / avg_pool2d as one POOL2D_FP16, blocked either side.
+    """Fixed-window max, average, and adaptive average as one POOL2D_FP16.
 
     The kernel reads and writes its activation in the DSP's 64-channel blocked
     layout, so the row-major buffer the arena holds has to be rearranged into it
@@ -7788,6 +7819,7 @@ EMITTERS = {
     MAX_POOL2D: _emit_pool2d,
     MAX_POOL2D_WITH_INDICES: _emit_pool2d,
     AVG_POOL2D: _emit_pool2d,
+    ADAPTIVE_AVG_POOL2D: _emit_pool2d,
     # k == 1 over the last axis; the positions the kernel also writes go to
     # scratch, because they are not the positions torch writes (see TOPK).
     TOPK: _emit_topk,
