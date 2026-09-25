@@ -341,9 +341,14 @@ Things that bite:
   The arena holds row-major NCHW, so the emitter brackets the command with two
   `RASTER_BLIT`s, one into that layout and one back out; both are the geometry
   the DSP's own pack-area fast paths take (`blit_ops.cc:843-857`). They are free
-  only when the spatial extent is one, where the two layouts agree element for
-  element. A channel count that is not exactly one block is refused rather than
-  emitted with padded lanes.
+  only when the spatial extent is one over whole blocks and a batch of one,
+  where the two layouts agree element for element; from a second block on the
+  batch has to be one as well, because the blocked layout puts the channel
+  block outside the batch and the row-major one puts it inside. Each block is
+  one blit region, three to a command against `kMaxOpParams`, so a width costs
+  regions and never parameters. A channel count that is not a multiple of 64
+  gets a narrower last region and a `ZERO` before the pack, because the kernel
+  loads whole vectors out of lanes the pack does not write.
 - **A target with no emitter is not a refusal, and looks like one.**
   `SUPPORTED_TARGETS` is `EMITTERS`, and the partitioner only ever sees a node
   whose target is in it. An op that is missing from the table is therefore never

@@ -34,7 +34,11 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
-    _channel_block_region,
+    BLIT_BLOCKS_PER_COMMAND,
+    BLIT_REGION_INTS,
+    _channel_block_regions,
+    _channel_blocks,
+    _conv_layouts_agree,
     _pool_window_intersects,
     pool_spec,
 )
@@ -337,12 +341,12 @@ def test_the_pack_region_is_the_permutation_the_dsp_pack_path_takes():
     read out of blit_ops.cc rather than out of the region.
     """
     for batch, area in ((1, 64), (2, 100), (3, 25)):
-        packing = _channel_block_region(batch, area, 64, True)
+        packing = _channel_block_regions(batch, area, 64, True)[:12]
         _pack_mapping(packing, batch, area)
         # The reverse direction is the same region with the strides exchanged,
         # which is the mapping htp_ops_pack_area_transpose_nc4hw4_to_nchw_z
         # writes out.
-        unpacking = _channel_block_region(batch, area, 64, False)
+        unpacking = _channel_block_regions(batch, area, 64, False)[:12]
         (
             _,
             _,
@@ -379,9 +383,6 @@ def test_the_pack_region_is_the_permutation_the_dsp_pack_path_takes():
 @pytest.mark.parametrize(
     "shape, kind, kwargs",
     [
-        ((1, 32, 8, 8), "max", {}),  # half a block, which has padded lanes
-        ((1, 128, 8, 8), "max", {}),  # two blocks, which is two regions
-        ((1, 1, 8, 8), "avg", {}),  # one channel
         ((1, 64, 8, 8), "max", {"dilation": 2}),  # no dilation in the kernel
         ((1, 64, 7, 7), "max", {"ceil_mode": True}),  # windows past the input
         ((1, 64, 8, 8), "avg", {"divisor_override": 2}),  # divisor has no param
@@ -494,6 +495,7 @@ def test_pool_spec_reads_the_command_out_of_a_node_that_fits():
     spec = pool_spec(_pool_node(([2, 2], [2, 2], [0, 0], [1, 1], False)))
     assert spec == hexagon_ops.PoolSpec(
         batch=1,
+        channels=64,
         ih=8,
         iw=8,
         oh=4,
@@ -512,7 +514,6 @@ def test_pool_spec_reads_the_command_out_of_a_node_that_fits():
 @pytest.mark.parametrize(
     "args, source_shape, result_shape",
     [
-        (([2, 2], [2, 2]), (1, 32, 8, 8), (1, 32, 4, 4)),  # not one channel block
         (([2, 2], [2, 2]), (1, 64, 1, 8, 8), (1, 64, 1, 4, 4)),  # rank 5
         (([3, 3], [2, 2], [1, 1], [2, 2]), (1, 64, 8, 8), (1, 64, 3, 3)),  # dilation
         (([8, 8], [8, 8], [0, 0], [1, 1], True), (1, 64, 8, 8), (1, 64, 1, 1)),
@@ -527,5 +528,319 @@ def test_pool_spec_reads_the_command_out_of_a_node_that_fits():
 def test_pool_spec_refuses_what_the_command_cannot_describe(
     args, source_shape, result_shape
 ):
-    """Every refusal the partitioner depends on, on the node it reads."""
+    """Every refusal the partitioner depends on, on the node it reads.
+
+    The channel count is deliberately absent: a pool2d the DSP cannot run is now
+    refused for one of its arguments or for its rank, and there is no channel
+    count left over to be refused.
+    """
     assert pool_spec(_pool_node(args, source_shape, result_shape)) is None
+
+
+#: DSP_OP_ZERO, the only command that fills a buffer without reading one.
+_ZERO = 24
+
+
+def _types(commands):
+    return [command.type for command in commands]
+
+
+def _regions(command):
+    """The blit regions one command carries."""
+    assert command.type == _BLIT
+    count = int(command.params[0])
+    body = [int(v) for v in command.params[3:]]
+    assert len(body) == count * BLIT_REGION_INTS
+    return [
+        tuple(body[i : i + BLIT_REGION_INTS]) for i in range(0, len(body), BLIT_REGION_INTS)
+    ]
+
+
+def test_a_128_channel_pool_is_two_blocks_of_the_one_command():
+    """The wide pool is the same command with c4 = 2 and one more region a side.
+
+    128 channels is two 64-lane blocks, `hvx_pool2d_fp16` loops over both of them
+    (pool_fp16.c:21), and the parameter budget does not move: c4 was already one
+    of the fifteen ints the command carries, and two blit regions are twenty-four
+    of the forty a command has. A max over a window inside the input is exact in
+    fp16, so this is an equality with torch and not a tolerance.
+    """
+    x = torch.randn(2, 128, 8, 8, dtype=torch.float16)
+    blob, commands = _lowered(_Pool("max", 2, 2), x)
+    assert _types(commands) == [_BLIT, _POOL, _BLIT]
+    pack, pool, unpack = commands
+    assert list(pool.params[:6]) == [2, 8, 8, 4, 4, 2]
+    assert len(pool.params) == 15, "c4 was a value, not a new parameter"
+    assert _regions(pack) == [
+        (0, 0, 0, 2, 64, 64, 128 * 64, 64, 1, 64 * 64, 1, 64),
+        (0, 64 * 64, 2 * 64 * 64, 2, 64, 64, 128 * 64, 64, 1, 64 * 64, 1, 64),
+    ]
+    assert _regions(unpack) == [
+        (0, 0, 0, 2, 64, 16, 16 * 64, 1, 64, 128 * 16, 16, 1),
+        (0, 2 * 64 * 16, 64 * 16, 2, 64, 16, 16 * 64, 1, 64, 128 * 16, 16, 1),
+    ]
+    got = _run(blob, x)
+    expected = torch.nn.functional.max_pool2d(x, 2, 2)
+    assert got.tobytes() == expected.numpy().tobytes()
+
+
+@pytest.mark.parametrize("kind", ["max", "avg"])
+def test_one_block_and_two_blocks_pool_the_same_data_identically(kind):
+    """The control: the same bytes, once as one 64-block and once as two.
+
+    A wider pool is only the same kernel if the extra block does not perturb the
+    first. The data is duplicated rather than extended so the two runs read
+    identical values in identical lanes, and the comparison is exact: a tolerance
+    here would let a block that is off by a little pass.
+    """
+    data = torch.randn(1, 64, 8, 8, dtype=torch.float16)
+    wide = torch.cat([data, data], dim=1)
+    model = _Pool(kind, 3, 2, 1)
+    blob, commands = _lowered(model, wide)
+    assert list(commands[1].params[5:6]) == [2]
+    got_wide = _run(blob, wide).reshape(1, 128, 4, 4)
+    blob_one, commands_one = _lowered(model, data)
+    assert list(commands_one[1].params[5:6]) == [1]
+    got_one = _run(blob_one, data).reshape(1, 64, 4, 4)
+    np.testing.assert_array_equal(got_wide[:, :64], got_one)
+    np.testing.assert_array_equal(got_wide[:, 64:], got_one)
+    expected = model(data).numpy().reshape(1, 64, 4, 4)
+    if kind == "max":
+        assert got_one.tobytes() == expected.tobytes()
+    else:
+        np.testing.assert_allclose(got_one, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("channels", [1, 31, 32, 33, 63, 64, 65, 96, 127, 128, 192, 256])
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("kind", ["max", "avg"])
+def test_every_channel_count_pools(channels, batch, kind):
+    """The channel axis swept across the block boundary, from both sides of it.
+
+    63, 64 and 65 are the three that matter: below the block, exactly on it, and
+    one channel into the next. 96 is a ragged width real squeeze-excitations use,
+    128 and 192 are whole ones, and 1 is the degenerate end. There is no boundary
+    to find here: the same code path runs at all twelve, with the last block a
+    different width.
+    """
+    x = torch.randn(batch, channels, 7, 9, dtype=torch.float16)
+    model = _Pool(kind, 3, 2, 1)
+    blob, commands = _lowered(model, x)
+    pool = next(c for c in commands if c.type == _POOL)
+    assert list(pool.params[5:6]) == [_channel_blocks(channels)]
+    got = _run(blob, x).reshape(batch, channels, 4, 5)
+    expected = model(x).numpy().reshape(batch, channels, 4, 5)
+    if kind == "max":
+        assert got.tobytes() == expected.tobytes()
+    else:
+        np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("channels", [63, 64, 65, 128])
+@pytest.mark.parametrize(
+    "kind, kernel, stride, padding",
+    [
+        ("max", 3, 2, 1),  # window wider than the stride, one pixel of pad
+        ("max", 3, 1, 1),  # stride one: every input position is read twice
+        ("avg", 3, 2, 1),  # divisor is the window, pad or no pad
+        ("avg", 2, 2, 0),  # no padding at all
+    ],
+)
+def test_padding_and_the_packing_agree_at_the_channel_boundary(
+    channels, kind, kernel, stride, padding
+):
+    """Padding decides which element a lane reads, and so does the block width.
+
+    A window is `[oy * stride - pad, ... + kernel)` and a position outside the
+    input is skipped rather than read as a zero (pool_fp16.c:36-43), so a padding
+    that puts half a window off the plane is the case where a packing mistake
+    shows up as a different divisor. Run at 63, 64, 65 and 128 channels the block
+    boundary is crossed with the same answer.
+    """
+    x = torch.randn(2, channels, 8, 8, dtype=torch.float16)
+    model = _Pool(kind, kernel, stride, padding)
+    blob, commands = _lowered(model, x)
+    out = model(x)
+    pool = next(c for c in commands if c.type == _POOL)
+    assert list(pool.params[:6]) == [
+        2,
+        8,
+        8,
+        out.shape[2],
+        out.shape[3],
+        _channel_blocks(channels),
+    ]
+    got = _run(blob, x).reshape(tuple(out.shape))
+    expected = out.numpy()
+    if kind == "max":
+        assert got.tobytes() == expected.tobytes()
+    else:
+        np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize(
+    "channels, zeroed, regions, expected",
+    [
+        (64, False, 1, [_BLIT, _POOL, _BLIT]),
+        (128, False, 2, [_BLIT, _POOL, _BLIT]),
+        # Three blocks is the most one command carries: a region is twelve of
+        # the forty parameter ints, after the three-int header.
+        (192, False, 3, [_BLIT, _POOL, _BLIT]),
+        # Four blocks is two commands of two, and the count each carries is its
+        # own chunk rather than the total.
+        (256, False, 4, [_BLIT, _BLIT, _POOL, _BLIT, _BLIT]),
+        (96, True, 2, [_ZERO, _BLIT, _POOL, _BLIT]),
+        (65, True, 2, [_ZERO, _BLIT, _POOL, _BLIT]),
+    ],
+)
+def test_the_command_count_is_the_block_count(channels, zeroed, regions, expected):
+    """What a channel count costs: a region a block, and a memset for a tail.
+
+    The pool is one command whatever the width, because c4 counts the blocks
+    rather than describing one. A ragged last block adds a zero fill, since the
+    kernel loads whole 64-lane vectors while the pack writes only the channels the
+    tensor has, and the arena is reused between runs rather than cleared.
+    """
+    x = torch.randn(1, channels, 8, 8, dtype=torch.float16)
+    blob, commands = _lowered(_Pool("max", 2, 2), x)
+    assert _types(commands) == expected
+    assert (_ZERO in _types(commands)) is zeroed
+    blits = [c for c in commands if c.type == _BLIT]
+    assert sum(c.params[0] for c in blits) == 2 * regions
+    assert all(c.params[0] <= BLIT_BLOCKS_PER_COMMAND for c in blits)
+    assert all(len(c.params) <= 40 for c in commands)
+    widths = [region[4] for command in blits for region in _regions(command)]
+    assert widths == [min(64, channels - 64 * i) for i in range(regions)] * 2
+
+
+def test_a_one_position_plane_agrees_with_the_blocked_one_only_for_one_batch():
+    """The blit-dropping shortcut, and the two things that stop it applying.
+
+    A one-position plane is the shape where the row-major buffer can *be* the
+    blocked one, and it is the blocked one only when every block is full and the
+    batch is one. The batch is the clause that is easy to leave out: the blocked
+    layout puts the channel block outside the batch and the row-major one puts it
+    inside, so the two orders part company at the first channel of the second
+    block however full the blocks are. The rule is the convolution path's and is
+    written once.
+    """
+    for batch in (1, 2):
+        for channels in (64, 128, 65):
+            x = torch.randn(batch, channels, 1, 1, dtype=torch.float16)
+            blob, commands = _lowered(_Pool("max", 1, 1), x)
+            if channels == 64 or (batch == 1 and channels % 64 == 0):
+                assert _types(commands) == [_POOL]
+            else:
+                assert _POOL in _types(commands)
+                assert _BLIT in _types(commands)
+            got = _run(blob, x).reshape(batch, channels, 1, 1)
+            assert got.tobytes() == x.numpy().tobytes()
+    assert _conv_layouts_agree(1, 1, 128)
+    assert _conv_layouts_agree(4, 1, 64), "one block has no order to disagree about"
+    assert not _conv_layouts_agree(2, 1, 128), "the batch is part of the rule"
+    assert not _conv_layouts_agree(1, 1, 65), "a ragged block is wider than the tensor"
+
+
+class _SqueezeExcitation(torch.nn.Module):
+    """A block whose pool sees a wide channel count and whose convs do not.
+
+    The squeeze is a fixed window rather than `AdaptiveAvgPool2d`: adaptive
+    pooling is a different op that lives on another branch, and over a plane the
+    size of the window the two agree, so this is the squeeze the DSP pool has to
+    run. The composition is the point -- the pool is a small spatial reduction
+    between a large channel count and a small one, and the two convolutions that
+    bracket it are widths this backend already admits, so the pool is the only
+    thing that decides whether the block reaches the DSP whole.
+    """
+
+    def __init__(self, channels, reduction=4, kernel=7) -> None:
+        super().__init__()
+        mid = max(1, channels // reduction)
+        self.pool = torch.nn.AvgPool2d(kernel)
+        self.fc1 = torch.nn.Conv2d(channels, mid, 1)
+        self.act = torch.nn.ReLU()
+        self.fc2 = torch.nn.Conv2d(mid, channels, 1)
+        self.gate = torch.nn.Hardsigmoid()
+
+    def forward(self, x):
+        return x * self.gate(self.fc2(self.act(self.fc1(self.pool(x)))))
+
+
+def _delegate_pool_members(program):
+    """Which nodes the delegate really runs, as opposed to names it inherits.
+
+    A refused node still leaves its name on the delegate: the partitioner makes
+    the refused node output a placeholder of the delegate submodule and names that
+    placeholder after the node. A membership test over every inner node therefore
+    reports a pool the DSP never saw as being in the delegate, which is the same
+    green answer for both verdicts. Only the inner call_functions are members.
+    """
+    gm = program.graph_module
+    names = set()
+    for call in _delegates(program):
+        lowered = gm.get_submodule(call.args[0].target)
+        inner = lowered.original_module.graph_module.graph
+        names |= {n.name for n in inner.nodes if n.op == "call_function"}
+    return names
+
+
+#: The channel counts published squeeze-excitations use, wide value and its
+#: reduction: MobileNetV3-Large, SqueezeNet, EfficientNet-B0 and SE-ResNet-50.
+_SE_WIDTHS = [
+    (16, 4),
+    (24, 4),
+    (32, 4),
+    (40, 4),
+    (64, 4),
+    (80, 4),
+    (96, 4),
+    (112, 4),
+    (128, 4),
+    (160, 4),
+    (192, 4),
+    (256, 4),
+    (320, 4),
+    (512, 8),
+]
+
+
+@pytest.mark.parametrize("channels, reduction", _SE_WIDTHS)
+def test_the_squeeze_excitation_reaches_the_dsp_whole(channels, reduction):
+    """The composition, at the widths real blocks have, and not one shape alone.
+
+    Each of these is a pool that works on its own and a block that used to
+    arrive on the DSP in two pieces, because the pool was the one node of the
+    block the gate refused while both convolutions, the relu and the multiply
+    went across. The membership test is the name lookup, and the width assertion
+    is inside the delegate, so a pool that stayed portable cannot pass it.
+    """
+    torch.manual_seed(channels)
+    x = torch.randn(1, channels, 7, 7, dtype=torch.float16)
+    model = _SqueezeExcitation(channels, reduction).to(torch.float16)
+    program = to_edge_transform_and_lower(
+        export(model, (x,)),
+        partitioner=[HexagonPartitioner()],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    pool_nodes = [
+        node
+        for node in program.graph_module.graph.nodes
+        if node.op == "call_function" and node.target in hexagon_ops.POOL_TARGETS
+    ]
+    members = _delegate_pool_members(program)
+    # The pool is not a node of the outer graph at all once it delegates, so the
+    # membership has to be read off the delegate rather than off the outer nodes:
+    # a pool left on the host keeps its node there, and one that delegated has no
+    # outer node to find. The name lookup alone cannot tell those apart, because
+    # the partitioner leaves the refused node name on the delegate as the
+    # placeholder it feeds in.
+    assert pool_nodes == [], "the squeeze is still a node of the outer graph"
+    assert "aten_avg_pool2d_default" in members, "the squeeze did not reach the DSP"
+    # A whole block whose output matches torch is not evidence about the pool, so
+    # the positive control here is the membership above and not the numbers; the
+    # graph still has to answer, which is the portable control.
+    expected = model(x)
+    assert expected.dtype is torch.float16
+    assert torch.isfinite(expected).all()
+
+

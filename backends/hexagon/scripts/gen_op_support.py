@@ -415,12 +415,16 @@ SUPPORTED: List[OpSupport] = [
         "aten.max_pool2d.default",
         POOL,
         "fp16 (arena); fp32 narrowed on entry",
-        "C == 64 only, which is the one channel count whose DSP activation "
-        "blocking coincides with a single 64-channel block; 3-D or 4-D operand; "
-        "static shapes; dilation 1, ceil_mode false, and every window holding at "
-        "least one input element. Three commands: one blit into the blocked "
-        "layout, the pool, one blit back out (a 1x1 spatial extent needs neither "
-        "blit, the layouts already agree).",
+        "any channel count: the DSP activation blocking is a count of 64-lane "
+        "blocks rather than a shape, c4 carries ceil(C/64) and the kernel walks "
+        "every one of them, so a wider pool is the same command with a larger c4. "
+        "Also 3-D or 4-D operand; static shapes; dilation 1, ceil_mode false, and "
+        "every window holding at least one input element. Three commands per "
+        "three blocks: one blit carrying a region per block into the blocked "
+        "layout, the pool, one blit back out (a 1x1 spatial extent over whole "
+        "blocks and a batch of one needs neither, the layouts already agree), "
+        "plus a ZERO before the pack when C is not a multiple of 64, because the "
+        "kernel loads whole vectors out of lanes the pack does not write.",
     ),
     OpSupport(
         "aten.max_pool2d_with_indices.default",
