@@ -223,6 +223,21 @@ emitter: a one-byte bool output for the comparisons.
   `test/test_log_softmax.py` measures against torch's finite answer on a row
   that saturates. The shift also bounds what the sum holds at the row length,
   which is why a span past 65504 elements is refused rather than saturated.
+- **`aten.glu`**: it is in neither the support table nor the refusal table because it
+  needs neither: `F.glu` does not survive export, and what the partitioner sees is
+  two `slice_copy` nodes, a `sigmoid` and a `mul` -- all three already wired. A
+  GLU is therefore **supported by composition**, in five DSP commands: a blit for
+  each of the two halves the channel axis is split at, the sigmoid over the gated
+  half, the elementwise multiply, and the blit that writes the answer out. The
+  Conformer convolution module is the geometry that needs it, and the whole block
+  -- LayerNorm, two pointwise convolutions each followed by a GLU, a depthwise
+  convolution, LayerNorm, residual -- lowers to one delegate with both GLUs
+  inside it (`test/test_glu.py`). The numerics the model sees are the sigmoid's
+  PWL band scaled by the values in the half the multiply is fed: the sigmoid's
+  own band is 2.4e-3 and the product's is 4.0e-3 at one seed and 6.8e-3 across
+  eight, on a `[1, 64, 1, 48]` input with a normal tail. That is a property of the
+  sigmoid, not of the GLU, and it is why no emitter of its own is wanted: a fused
+  kernel would have to match the PWL rather than improve on it.
 
 ## 4. Shape and parameter limits of the ops that are supported
 
