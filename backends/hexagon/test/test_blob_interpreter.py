@@ -46,6 +46,20 @@ from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
 
+# The outputs are fp16, so the granularity of the comparison is the step of that type at the
+# largest value the answer holds -- and a fixed absolute tolerance cannot be both tight for a
+# small answer and possible for a large one: at `|v| >= 16` one step is `1.56e-2`. Over 20 000
+# free draws of `addmm(8, 64, 128)` the largest disagreement with torch was two steps; four
+# leaves a factor of two on that measurement and is far below what a wrong stride moves.
+
+
+def _fp16_step(expected):
+    return float(np.spacing(np.float16(np.max(np.abs(expected.astype(np.float32))))))
+
+
+_FP16_STEPS = 4
+
+
 def _program(graph_module):
     """Wrap a hand-built graph module the way preprocess expects a program.
 
@@ -388,7 +402,9 @@ def test_matmul_matches_torch():
         worst = float(
             np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
         )
-        assert worst < 1e-2, f"matmul differs by {worst} at {m}x{k}x{n}"
+        assert worst <= _FP16_STEPS * _fp16_step(
+            expected
+        ), f"matmul differs by {worst} at {m}x{k}x{n}"
 
 
 def test_a_broken_contraction_is_caught():
@@ -401,7 +417,7 @@ def test_a_broken_contraction_is_caught():
     m, k, n = 4, 8, 3
     blob, a, b, got, expected = _run_mm(m, k, n)
     worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
-    assert worst < 1e-2
+    assert worst <= _FP16_STEPS * _fp16_step(expected)
 
     data = bytearray(blob)
     _, commands = read_blob(blob)
@@ -452,7 +468,9 @@ def test_batched_matmul_matches_torch():
         worst = float(
             np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
         )
-        assert worst < 1e-2, f"bmm differs by {worst} at {batches}x{m}x{k}x{n}"
+        assert worst <= _FP16_STEPS * _fp16_step(
+            expected
+        ), f"bmm differs by {worst} at {batches}x{m}x{k}x{n}"
 
 
 def test_a_batch_step_of_zero_is_caught():
@@ -464,7 +482,7 @@ def test_a_batch_step_of_zero_is_caught():
     batches, m, k, n = 4, 16, 24, 32
     blob, a, b, got, expected = _run_bmm(batches, m, k, n)
     worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
-    assert worst < 1e-2
+    assert worst <= _FP16_STEPS * _fp16_step(expected)
 
     data = bytearray(blob)
     _, commands = read_blob(blob)
@@ -530,7 +548,9 @@ def test_addmm_matches_torch():
         worst = float(
             np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
         )
-        assert worst < 1e-2, f"addmm differs by {worst} at {m}x{k}x{n}"
+        assert worst <= _FP16_STEPS * _fp16_step(
+            expected
+        ), f"addmm differs by {worst} at {m}x{k}x{n}"
 
 
 def test_the_bias_broadcast_strides_are_the_ones_read():
@@ -542,16 +562,16 @@ def test_the_bias_broadcast_strides_are_the_ones_read():
     """
     m, k, n = 8, 64, 128
     blob, operands, got, expected = _run_addmm(m, k, n)
-    # The same shape is asserted at `1e-2` by `test_addmm_matches_torch` above: an
-    # accumulation's order is not the reference's, so the two disagree on the
-    # elements a rounding step from a boundary. Over 1000 draws the largest such
-    # disagreement is 3.9e-3 -- one fp16 step, at values below the largest -- and
-    # none came near the tolerance.
+    # The same shape is asserted by `test_addmm_matches_torch` above, at the step of
+    # the fp16 it holds: an accumulation's order is not the reference's, so the two
+    # disagree on the elements a rounding step from a boundary. Over 20 000 free
+    # draws the largest disagreement was 1.56e-2, two steps at `|v| >= 16`, which the
+    # fixed `1e-2` this file used to carry would have called a failure.
     assert got.shape == expected.shape, f"{got.shape} != {expected.shape}"
-    worst = float(
-        np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
-    )
-    assert worst < 1e-2, f"addmm differs by {worst} at {m}x{k}x{n}"
+    worst = float(np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32))))
+    assert worst <= _FP16_STEPS * _fp16_step(
+        expected
+    ), f"addmm differs by {worst} at {m}x{k}x{n}"
 
     data = bytearray(blob)
     _, commands = read_blob(blob)
