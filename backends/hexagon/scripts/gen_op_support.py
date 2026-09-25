@@ -486,6 +486,39 @@ SUPPORTED: List[OpSupport] = [
         "divisor_override has no command form and keeps the node portable.",
     ),
     OpSupport(
+        "aten.conv2d.default",
+        f"{DEPTHWISE} / {IM2COL}",
+        "fp16 (arena); fp32 narrowed on entry",
+        "The same kernels and the same geometry rules as "
+        "`aten.convolution.default` with transposed=False; this is the spelled "
+        "two-dimensional target `to_edge` produces for an `nn.Conv2d`.",
+    ),
+    OpSupport(
+        "aten.conv1d.default",
+        IM2COL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "A rank-3 input is a rank-4 convolution whose height is 1 and whose "
+        "kernel is 1xK, so it runs the im2col walk with no zero insert and no "
+        "height padding. Static extents throughout and a constant weight and "
+        "bias; transposed is not a form this target has. Left portable: a "
+        "grouped or depthwise form, a symbolic extent, and a stride, padding or "
+        "dilation that does not reproduce the declared output.",
+    ),
+    OpSupport(
+        "aten.conv3d.default",
+        IM2COL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "A rank-5 input reaches the two-dimensional kernel only when exactly one "
+        "spatial kernel axis is 1 and that axis is also 1 in the input and the "
+        "output with stride 1, padding 0 and dilation 1; conv_spec drops that "
+        "axis and the rest has to satisfy the rank-4 rules. The two leading "
+        "kernel axes both 1 is the same reduction written another way. Static "
+        "extents throughout and a constant weight and bias. Left portable: a "
+        "transposed form, a genuinely three-dimensional window, a grouped or "
+        "depthwise form, a symbolic extent, and any stride, padding or dilation "
+        "on the dropped axis that is not the identity.",
+    ),
+    OpSupport(
         "aten.convolution.default",
         f"{DEPTHWISE} / {IM2COL}",
         "fp16 (arena); fp32 narrowed on entry",
