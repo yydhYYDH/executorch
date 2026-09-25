@@ -51,6 +51,7 @@ from torch.export import export  # noqa: E402
 _REDUCTION = 29
 _MAXIMUM = 2
 _MEAN = 3
+_MINIMUM = 4
 _FP16_BYTES = 2
 
 _MEAN_DEFAULT = exir_ops.edge.aten.mean.default
@@ -90,7 +91,11 @@ class _Whole(torch.nn.Module):
         self.kind = kind
 
     def forward(self, x):
-        return torch.mean(x) if self.kind == "mean" else torch.max(x)
+        if self.kind == "mean":
+            return torch.mean(x)
+        if self.kind == "max":
+            return torch.max(x)
+        return torch.amin(x)
 
 
 class _MeanDim(torch.nn.Module):

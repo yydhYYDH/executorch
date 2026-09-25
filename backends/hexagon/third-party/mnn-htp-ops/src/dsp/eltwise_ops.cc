@@ -2456,6 +2456,7 @@ typedef enum {
   HTP_OPS_REDUCTION_SUM = 1,
   HTP_OPS_REDUCTION_MAXIMUM = 2,
   HTP_OPS_REDUCTION_MEAN = 3,
+  HTP_OPS_REDUCTION_MINIMUM = 4,
 } HtpOpsReductionOpType;
 
 typedef struct {
@@ -2490,10 +2491,12 @@ static inline void htp_ops_reduce_int32(int32_t* dst, const int32_t* src, int ou
     const int i = index - o * inside;
     const int32_t* srcBase = src + ((int64_t)o * reduce * inside + i);
     int32_t value = srcBase[0];
-    if (opType == HTP_OPS_REDUCTION_MAXIMUM) {
+    if (opType == HTP_OPS_REDUCTION_MAXIMUM || opType == HTP_OPS_REDUCTION_MINIMUM) {
       for (int r = 1; r < reduce; ++r) {
         const int32_t current = srcBase[(int64_t)r * inside];
-        value = current > value ? current : value;
+        value = opType == HTP_OPS_REDUCTION_MAXIMUM
+                    ? (current > value ? current : value)
+                    : (current < value ? current : value);
       }
     } else {
       value = 0;
@@ -2517,7 +2520,7 @@ static inline void htp_ops_reduce_fp16_scalar_range(HtpOpsReductionTaskState* st
     const int o = index / inside;
     const int i = index - o * inside;
     const __fp16* src_base = src + (o * reduce * inside + i);
-    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM) {
+    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM || state->opType == HTP_OPS_REDUCTION_MINIMUM) {
       __fp16 best = src_base[0];
       for (int r = 1; r < reduce; ++r) {
         const __fp16 value = src_base[r * inside];
@@ -2531,7 +2534,9 @@ static inline void htp_ops_reduce_fp16_scalar_range(HtpOpsReductionTaskState* st
         if (htp_ops_fp16_bits_are_nan(value_bits)) {
           best = value;
         } else if (!htp_ops_fp16_bits_are_nan(best_bits)) {
-          best = value > best ? value : best;
+          best = state->opType == HTP_OPS_REDUCTION_MAXIMUM
+                     ? (value > best ? value : best)
+                     : (value < best ? value : best);
         }
       }
       dst[index] = best;
@@ -2591,7 +2596,7 @@ static inline float htp_ops_reduce_sum_inside1_fp32(const __fp16* src, int reduc
   return sum;
 }
 
-static inline uint16_t htp_ops_reduce_max_fp16_inside1_hvx(const __fp16* src, int reduce) {
+static inline uint16_t htp_ops_reduce_minmax_fp16_inside1_hvx(const __fp16* src, int reduce, int opType) {
   const int vec_len = 128 / (int)sizeof(__fp16);
   const int vec_end = reduce & -vec_len;
   __fp16 bestScalar = src[0];
@@ -2599,20 +2604,36 @@ static inline uint16_t htp_ops_reduce_max_fp16_inside1_hvx(const __fp16* src, in
   int r = 0;
   for (; r < vec_end; r += vec_len) {
     HVX_Vector v = vmemu((const HVX_Vector*)(src + r));
-    best = Q6_Vhf_vmax_VhfVhf(best, v);
+    best = opType == HTP_OPS_REDUCTION_MAXIMUM
+               ? Q6_Vhf_vmax_VhfVhf(best, v)
+               : Q6_Vhf_vmin_VhfVhf(best, v);
   }
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 64));
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 32));
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 16));
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 8));
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 4));
-  best = Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 2));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 64))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 64));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 32))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 32));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 16))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 16));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 8))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 8));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 4))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 4));
+  best = opType == HTP_OPS_REDUCTION_MAXIMUM
+             ? Q6_Vhf_vmax_VhfVhf(best, Q6_V_vror_VR(best, 2))
+             : Q6_Vhf_vmin_VhfVhf(best, Q6_V_vror_VR(best, 2));
   uint16_t tmp[vec_len] __attribute__((aligned(128)));
   vmemu((HVX_Vector*)tmp) = best;
   bestScalar = *(__fp16*)&tmp[0];
   for (; r < reduce; ++r) {
     const __fp16 value = src[r];
-    bestScalar = value > bestScalar ? value : bestScalar;
+    bestScalar = opType == HTP_OPS_REDUCTION_MAXIMUM
+                    ? (value > bestScalar ? value : bestScalar)
+                    : (value < bestScalar ? value : bestScalar);
   }
   return *(uint16_t*)&bestScalar;
 }
@@ -2624,8 +2645,8 @@ static inline void htp_ops_reduce_fp16_inside1_range(HtpOpsReductionTaskState* s
   __fp16* dst = state->dst;
   for (int o = outsideStart; o < outsideEnd; ++o) {
     const __fp16* src_outer = src + (size_t)o * reduce;
-    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM) {
-      const uint16_t bits = htp_ops_reduce_max_fp16_inside1_hvx(src_outer, reduce);
+    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM || state->opType == HTP_OPS_REDUCTION_MINIMUM) {
+      const uint16_t bits = htp_ops_reduce_minmax_fp16_inside1_hvx(src_outer, reduce, state->opType);
       dst[o] = *(__fp16*)&bits;
     } else {
       float value = htp_ops_reduce_sum_inside1_fp32(src_outer, reduce);
@@ -2660,7 +2681,7 @@ static inline void htp_ops_reduce_fp16_inside_vector_range(HtpOpsReductionTaskSt
     int i = 0;
     for (; i < vec_end; i += vec_len) {
 #if MNN_REDUCTION_FP32_ACC
-      if (state->opType != HTP_OPS_REDUCTION_MAXIMUM) {
+      if (state->opType != HTP_OPS_REDUCTION_MAXIMUM && state->opType != HTP_OPS_REDUCTION_MINIMUM) {
         HVX_VectorPair first = Q6_Wsf_vcvt_Vhf(vmemu((const HVX_Vector*)(src_outer + i)));
         HVX_Vector acc0 = Q6_V_lo_W(first);
         HVX_Vector acc1 = Q6_V_hi_W(first);
@@ -2685,6 +2706,8 @@ static inline void htp_ops_reduce_fp16_inside_vector_range(HtpOpsReductionTaskSt
         HVX_Vector v = vmemu((const HVX_Vector*)(src_outer + r * inside + i));
         if (state->opType == HTP_OPS_REDUCTION_MAXIMUM) {
           acc = Q6_Vhf_vmax_VhfVhf(acc, v);
+        } else if (state->opType == HTP_OPS_REDUCTION_MINIMUM) {
+          acc = Q6_Vhf_vmin_VhfVhf(acc, v);
         } else {
           acc = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(acc, v));
         }
@@ -2714,18 +2737,23 @@ static inline void htp_ops_reduce_fp16_inside_small_vector_range(HtpOpsReduction
   const int rowBytes = inside * (int)sizeof(__fp16);
   const HVX_VectorPred qTail = Q6_Q_vsetq_R(rowBytes);
   const HVX_Vector zero = Q6_V_vzero();
+  const HVX_Vector identity = state->opType == HTP_OPS_REDUCTION_MINIMUM
+                                   ? Q6_Vh_vsplat_R(0x7c00)
+                                   : Q6_Vh_vsplat_R(0xfc00);
   const __fp16* src = state->src;
   __fp16* dst = state->dst;
   for (int o = outsideStart; o < outsideEnd; ++o) {
     __fp16 tmp[64] __attribute__((aligned(128)));
     const __fp16* src_outer = src + o * reduce * inside;
     __fp16* dst_outer = dst + o * inside;
-    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM) {
+    if (state->opType == HTP_OPS_REDUCTION_MAXIMUM || state->opType == HTP_OPS_REDUCTION_MINIMUM) {
       HVX_Vector acc = zero;
       for (int r = 0; r < reduce; ++r) {
         memcpy(tmp, src_outer + r * inside, rowBytes);
-        HVX_Vector v = Q6_V_vmux_QVV(qTail, vmem((const HVX_Vector*)tmp), zero);
-        acc = r == 0 ? v : Q6_Vhf_vmax_VhfVhf(acc, v);
+        HVX_Vector v = Q6_V_vmux_QVV(qTail, vmem((const HVX_Vector*)tmp), identity);
+        acc = r == 0 ? v : (state->opType == HTP_OPS_REDUCTION_MAXIMUM
+                                  ? Q6_Vhf_vmax_VhfVhf(acc, v)
+                                  : Q6_Vhf_vmin_VhfVhf(acc, v));
       }
       vstu_variable(dst_outer, (uint32_t)rowBytes, acc);
     } else {
@@ -2733,7 +2761,7 @@ static inline void htp_ops_reduce_fp16_inside_small_vector_range(HtpOpsReduction
       HVX_Vector acc1 = zero;
       for (int r = 0; r < reduce; ++r) {
         memcpy(tmp, src_outer + r * inside, rowBytes);
-        HVX_Vector v = Q6_V_vmux_QVV(qTail, vmem((const HVX_Vector*)tmp), zero);
+        HVX_Vector v = Q6_V_vmux_QVV(qTail, vmem((const HVX_Vector*)tmp), identity);
         HVX_VectorPair sf = hvx_my_vhf_to_wsf(v);
         acc0 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc0, Q6_V_lo_W(sf)));
         acc1 = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(acc1, Q6_V_hi_W(sf)));
@@ -2841,7 +2869,7 @@ AEEResult htp_ops_reduction(uint8_t* dst, const uint8_t* src, int32_t outside, i
   }
   if ((bytes != 2 && bytes != 4) ||
       (opType != HTP_OPS_REDUCTION_SUM && opType != HTP_OPS_REDUCTION_MAXIMUM &&
-       opType != HTP_OPS_REDUCTION_MEAN)) {
+       opType != HTP_OPS_REDUCTION_MEAN && opType != HTP_OPS_REDUCTION_MINIMUM)) {
     return AEE_EBADPARM;
   }
   if (reduce == 1) {

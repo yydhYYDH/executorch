@@ -146,11 +146,11 @@ DSP_OP_VISION_ATTENTION_FP16 = 43
 # the only one that asks for it that way.
 DSP_OP_SELECT = 26
 
-# HtpOpsReductionType, from the DSP's eltwise_ops.cc (the whole enum: there is
-# no minimum, so `amin` has no kernel behind it and stays on the host).
+# HtpOpsReductionType, from the DSP's eltwise_ops.cc.
 REDUCTION_SUM = 1
 REDUCTION_MAXIMUM = 2
 REDUCTION_MEAN = 3
+REDUCTION_MINIMUM = 4
 
 # The DSP's pool kernel selects on two ints rather than on op types
 # (pool_fp16.c:18-19 and :46): poolType picks max or the sum, and countType
@@ -2830,6 +2830,16 @@ def max_dim_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
     return _values_getitem(node, MAX_DIM)
 
 
+def min_dim_getitem(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    return _values_getitem(node, MIN_DIM)
+
+
+def min_dim_is_emittable(node: torch.fx.Node) -> bool:
+    if node.target is not MIN_DIM:
+        return True
+    return bool(node.users) and all(min_dim_getitem(reader) is node for reader in node.users)
+
+
 def max_dim_is_emittable(node: torch.fx.Node) -> bool:
     """Whether every reader of this max takes the values.
 
@@ -2867,6 +2877,7 @@ def _values_sink(node: torch.fx.Node) -> torch.fx.Node:
             for reader in node.users
             if max_pool_getitem(reader) is node
             or max_dim_getitem(reader) is node
+            or min_dim_getitem(reader) is node
             or topk_getitem(reader) is node
         ),
         node,
@@ -4247,11 +4258,14 @@ def _conv_bias_ref(ctx, bias_node, channels: int, lanes: int, kind: str) -> Tens
 SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
 AMAX = exir_ops.edge.aten.amax.default
 MAX_DEFAULT = exir_ops.edge.aten.max.default
+MIN_DEFAULT = exir_ops.edge.aten.min.default
 # max.dim is the reduction max.default already runs, with the positions a second
 # output of the same node: the values are emittable exactly when nothing reads
 # those, the same rule max_pool2d_with_indices is placed under.
 MAX_DIM = exir_ops.edge.aten.max.dim
-REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX, MAX_DEFAULT, MAX_DIM})
+AMIN = exir_ops.edge.aten.amin.default
+MIN_DIM = exir_ops.edge.aten.min.dim
+REDUCTION_TARGETS = frozenset({SUM_DIM, AMAX, MAX_DEFAULT, MAX_DIM, AMIN, MIN_DIM})
 SUM_TARGETS = frozenset({SUM_DIM})
 
 # The mean family's two overloads, both of which are this same span rule: .dim
@@ -4346,6 +4360,10 @@ def _emit_amax(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
 
 
+def _emit_amin(node: torch.fx.Node, ctx) -> TensorRef:
+    return _emit_reduction(node, ctx, REDUCTION_MINIMUM)
+
+
 def _emit_max_default(node: torch.fx.Node, ctx) -> TensorRef:
     """torch.max(x): every element, as the single span amax already takes.
 
@@ -4356,6 +4374,16 @@ def _emit_max_default(node: torch.fx.Node, ctx) -> TensorRef:
     which is the byte-level caveat fmod already carries.
     """
     return _emit_reduction(node, ctx, REDUCTION_MAXIMUM)
+
+
+def _emit_min_default(node: torch.fx.Node, ctx) -> TensorRef:
+    if len(node.args) == 2:
+        return _binary("min")(node, ctx)
+    return _emit_reduction(node, ctx, REDUCTION_MINIMUM)
+
+
+def _emit_min_dim(node: torch.fx.Node, ctx) -> TensorRef:
+    return _emit_reduction(node, ctx, REDUCTION_MINIMUM)
 
 
 def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
@@ -6037,6 +6065,7 @@ EMITTERS = {
     # nothing of the value expm1 exists to compute.
     exir_ops.edge.aten.sin.default: _unary("sin"),
     exir_ops.edge.aten.cos.default: _unary("cos"),
+    MIN_DEFAULT: _emit_min_default,
     exir_ops.edge.aten.add.Tensor: _binary("add"),
     exir_ops.edge.aten.sub.Tensor: _binary("sub"),
     exir_ops.edge.aten.mul.Tensor: _binary("mul"),
@@ -6072,6 +6101,8 @@ EMITTERS = {
     MAX_DIM: _emit_max_dim,
     SUM_DIM: _emit_sum_dim,
     AMAX: _emit_amax,
+    AMIN: _emit_amin,
+    MIN_DIM: _emit_min_dim,
     MAX_POOL2D: _emit_pool2d,
     MAX_POOL2D_WITH_INDICES: _emit_pool2d,
     AVG_POOL2D: _emit_pool2d,
@@ -6120,6 +6151,7 @@ EMITTERS = {
 # instead of reaching an emitter that refuses it and failing the whole export.
 BINARY_TARGETS = frozenset(
     {
+        MIN_DEFAULT,
         exir_ops.edge.aten.add.Tensor,
         exir_ops.edge.aten.sub.Tensor,
         exir_ops.edge.aten.mul.Tensor,

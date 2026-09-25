@@ -53,6 +53,9 @@ from executorch.backends.hexagon.hexagon_ops import (
     LOG_SOFTMAX_TARGETS,
     log_softmax_shifts_within_the_arena,
     MAX_DIM,
+    MIN_DIM,
+    min_dim_getitem,
+    min_dim_is_emittable,
     max_dim_getitem,
     max_dim_is_emittable,
     MAX_POOL2D_WITH_INDICES,
@@ -681,9 +684,8 @@ class HexagonOperatorSupport(OperatorSupportBase):
             if node.target in SUM_TARGETS and not sum_dim_is_emittable(node):
                 return False
             if node.target is MAX_DIM and not max_dim_is_emittable(node):
-                # The same rule the pool is under: the values are this
-                # reduction, the indices are positions nothing here computes, so
-                # a reader of the indices keeps the values portable too.
+                return False
+            if node.target is MIN_DIM and not min_dim_is_emittable(node):
                 return False
         if node.target is MAX_POOL2D_WITH_INDICES and not max_pool_is_emittable(node):
             # The indices come out of the same node and no kernel here produces
@@ -805,8 +807,8 @@ class HexagonOperatorSupport(OperatorSupportBase):
                     # The max pool's values; that node's own check has already
                     # refused a pool whose indices anything else reads.
                     pass
-                elif max_dim_getitem(node) is not None:
-                    # The same for torch.max(x, dim)'s values.
+                elif max_dim_getitem(node) is not None or min_dim_getitem(node) is not None:
+                    # The same for torch.max/min(x, dim)'s values.
                     pass
                 elif topk_getitem(node) is not None:
                     # The same for torch.topk's values; that node's own check has
