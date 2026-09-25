@@ -1446,15 +1446,27 @@ def _shape_of(operand) -> tuple:
 
 
 def _broadcast_strides(shape, out_shape, ctx):
-    """Row-major strides of an operand of this shape, zero on broadcast dims.
+    """Row-major strides for a singleton-broadcast operand.
 
-    The DSP walks the output linearly and computes each operand's offset as
-    sum(coord[d] * stride[d]), so a dimension of extent 1 contributes nothing.
+    The DSP computes sum(coord[d] * stride[d]) without an operand extent or a
+    modulo, so only extent-one axes can repeat. Every other axis has to cover
+    the output; a non-singleton smaller extent is a tile the descriptor cannot
+    address and is refused instead of walking past the operand.
     """
     shape = ctx.upper_shape(shape)
     out_shape = ctx.upper_shape(out_shape)
     rank = len(out_shape)
+    if len(shape) > rank:
+        raise ValueError("hexagon: broadcast operand has more axes than its output")
     padded = (1,) * (rank - len(shape)) + tuple(shape)
+    mismatches = sum(
+        extent != 1 and extent != out_extent
+        for extent, out_extent in zip(padded, out_shape)
+    )
+    if mismatches:
+        raise ValueError(
+            "hexagon: broadcast operand is neither singleton nor output-sized"
+        )
     strides = [0] * rank
     acc = 1
     for d in range(rank - 1, -1, -1):
