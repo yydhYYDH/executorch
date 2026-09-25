@@ -509,23 +509,26 @@ def test_a_convolution_over_a_ragged_channel_count_clears_the_padding():
         (64, 3, 8),
     ],
 )
-def test_a_convolution_the_kernels_cannot_run_stays_on_the_host(
+def test_a_grouped_convolution_reaches_the_dsp_as_one_walk_per_group(
     in_channels, kernel, groups
 ):
-    """A refusal, and the numbers the portable kernel still has to produce.
+    """A group count in between is no longer a refusal, and no longer one walk.
 
-    A group count in between is a third kernel: neither walk carries the channel
-    mapping for it, so the node stays portable rather than reaching a command
-    that would read it wrong.
+    Neither kernel carries a channel mapping, so the host supplies it: the group
+    count is emitted as one dense im2col command per group. These shapes moved
+    from the host to the DSP with the per-group partition, which is what the
+    older version of this test asserted as a refusal.
     """
     model = _Conv(in_channels, in_channels, kernel, padding=1, groups=groups).half()
+    _whole(model, 5)
     area = 8
     x = _exact((1, in_channels, area, area), 5, -3, 4)
-    program = _lower(model, (x,))
-    assert _delegates(program) == [], f"{groups} groups reached the delegate"
-    expected = model(x)
-    assert expected.dtype is torch.float16
-    assert torch.isfinite(expected).all()
+    data, commands = _blob(_lower(model, (x,)))
+    walks = [command for command in commands if command.type == _IM2COL]
+    assert len(walks) == groups, f"{groups} groups, {len(walks)} walks"
+    assert len(walks) > 1, "a group count in between is not one walk"
+    expected = model(x).detach().numpy().reshape(-1)
+    assert _run(data, [x.numpy()]).tobytes() == expected.tobytes()
 
 
 def test_an_unbatched_convolution_is_one_batch():
@@ -601,6 +604,7 @@ def test_conv_spec_reads_the_command_out_of_a_node_that_fits():
         dilate_y=1,
         dilate_x=1,
         depthwise=True,
+        groups=64,
     )
 
 
