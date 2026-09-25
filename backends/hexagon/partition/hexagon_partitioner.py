@@ -18,6 +18,7 @@ from executorch.backends.hexagon.hexagon_backend import (
     SUPPORTED_TARGETS,
 )
 from executorch.backends.hexagon.hexagon_ops import (
+    _broadcast_strides,
     CLONE_DIM_ORDER,
     _dequantize_is_fused,
     _scalar_arg,
@@ -181,18 +182,29 @@ def _sdpa_fits_dsp_limits(node: torch.fx.Node) -> bool:
 def _broadcast_fits_dsp_limits(node: torch.fx.Node) -> bool:
     """Whether the operand broadcast is one the DSP can walk.
 
-    The DSP's broadcast path takes at most 8 dims and right-aligns each operand
-    against the output, which is what torch's own broadcasting does; anything
-    wider has to stay off the delegate.
+    The descriptor has output extents and two stride tables, but no per-operand
+    extents. It can therefore repeat singleton axes and address an output-sized
+    operand, not a smaller non-singleton tile.
     """
     out = node.meta.get("val")
     if out is None or out.dim() > 8:
         return False
+
+    class UpperShape:
+        @staticmethod
+        def upper_shape(shape):
+            return tuple(eval_shape_upper_bound((extent,))[0] for extent in shape)
+
+    out_shape = tuple(out.shape)
     for arg in node.args[:2]:
         if not isinstance(arg, torch.fx.Node):
             continue
         val = arg.meta.get("val")
         if val is None or val.dim() > 8:
+            return False
+        try:
+            _broadcast_strides(tuple(val.shape), out_shape, UpperShape())
+        except ValueError:
             return False
     return True
 

@@ -1360,6 +1360,22 @@ def _cases():
         _bits(x.float() * _small((1, 1, 8)).float()),
     )
 
+    # The binary fast path's structural boundary: 63 is scalar, 64 is one whole
+    # vector, and 65 is that vector plus one scalar element. The operands are
+    # output-sized on purpose, so this measures the walk itself rather than a
+    # broadcast descriptor.
+    boundaries = []
+    for tag, width in (("T63", 63), ("T64", 64), ("T65", 65)):
+        lhs, rhs = _small((1, 1, 1, width)), _small((1, 1, 1, width))
+        boundaries.append(
+            _case(
+                tag,
+                _Scale(),
+                (lhs, rhs),
+                _bits(lhs.double() * rhs.double()),
+            )
+        )
+
     wide = _small((2, 6, 4))
     softmax = _case(
         "H",
@@ -1533,6 +1549,7 @@ def _cases():
         norm,
         *advances,
         scale,
+        *boundaries,
         softmax,
         mean,
         narrowed,
@@ -2807,6 +2824,9 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
     assert kinds["E"] == [19], "the scale is not an element-wise op"
+    for tag, width in (("T63", 63), ("T64", 64), ("T65", 65)):
+        assert kinds[tag] == [_BINARY]
+        assert next(iter(_tagged(cases, tag).commands)).params[0] == width
     assert kinds["H"] == [28], "the softmax is not a softmax"
     assert kinds["I"] == [29], "the mean is not a reduction"
     assert kinds["J"] == [3], "the narrowing select is not a blit"
@@ -3179,6 +3199,13 @@ def test_every_blob_agrees_three_ways(cases, simulated):
                     np.max(np.abs(got.astype(np.float32) - expected.astype(np.float32)))
                 )
                 assert worst < case.tolerance, f"{case.tag}: {name} differs by {worst}"
+
+
+def test_tile_boundary_results_are_nonempty_and_exact(cases, simulated):
+    for tag, width in (("T63", 63), ("T64", 64), ("T65", 65)):
+        result = simulated[f"{tag}0"]
+        assert len(result) == width
+        assert result == _tagged(cases, tag).expected.view("uint16").tolist()
 
 
 def test_the_gemv_control_can_tell_the_two_nibble_orders_apart(cases):
