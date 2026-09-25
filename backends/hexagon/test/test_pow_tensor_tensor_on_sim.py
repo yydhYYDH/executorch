@@ -89,13 +89,20 @@ def test_tensor_tensor_power_runs_on_hexagon_sim():
     )
     assert "Main() returned 0" in hexagon_sim.LAST_STDOUT
     mapping = {v: k for k, v in vars(hexagon_ops).items() if k.startswith("DSP_OP_")}
+    # Two raster blits open every one of these streams, and they are not the
+    # power. The base is a 65-element constant plus a scalar constant, and
+    # once that construction lowered instead of staying folded on the host each
+    # operand is placed by a blit before the exponent runs. The power commands
+    # below are unchanged: W1 is a copy, W2 the square, W3 and W4 a chain, W0
+    # and the negative exponent one elementwise each.
+    leading = [hexagon_ops.DSP_OP_RASTER_BLIT] * 2
     expected_types = {
-        "W1": [hexagon_ops.DSP_OP_RASTER_BLIT],
-        "W2": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
-        "W3": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 2,
-        "W4": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 3,
-        "W0": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
-        "WM": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
+        "W1": leading + [hexagon_ops.DSP_OP_RASTER_BLIT],
+        "W2": leading + [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
+        "W3": leading + [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 2,
+        "W4": leading + [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 3,
+        "W0": leading + [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
+        "WM": leading + [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
     }
     reference_base = torch.tensor(base, dtype=torch.float64)
     for tag, _, commands in cases:
