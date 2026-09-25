@@ -1534,6 +1534,43 @@ def _binary(op_name: str):
     return emit
 
 
+def _emit_binary_refs(
+    node: torch.fx.Node,
+    ctx,
+    lhs: TensorRef,
+    rhs: TensorRef,
+    lhs_numel: int,
+    rhs_numel: int,
+    lhs_shape: Tuple[int, ...],
+    rhs_shape: Tuple[int, ...],
+    out_shape: Tuple[int, ...],
+    op_name: str,
+    out: Optional[TensorRef] = None,
+) -> TensorRef:
+    if out is None:
+        out = ctx.result_for(node, _upper_product(out_shape, ctx))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_BINARY_ELEMENTWISE,
+            inputs=[lhs, rhs],
+            outputs=[out],
+            params=[
+                _upper_product(out_shape, ctx),
+                lhs_numel,
+                rhs_numel,
+                BINARY_OP_TYPES[op_name],
+                FP16_BYTES,
+                FP16_BYTES,
+                0,
+                0,
+                *_broadcast_tail(lhs_shape, rhs_shape, out_shape, ctx),
+            ],
+        ),
+    )
+    return out
+
+
 # HtpOpsLoopParam, from the DSP's region_ops.h. The struct is packed, so its
 # three int64 tails sit at byte offsets 76/84/92 with no padding: "<19i3q2i"
 # reproduces that layout, including the two int32 fields the host plan lives in,
@@ -4263,7 +4300,210 @@ MEAN_TARGETS = frozenset({MEAN_DIM, MEAN_DEFAULT})
 # The unary kernel's square entry point, reached as x ** 2. to_edge emits no
 # aten.square.default at all, so pow.Tensor_Scalar is the form that exists.
 POW_TENSOR_SCALAR = exir_ops.edge.aten.pow.Tensor_Scalar
+POW_TENSOR_TENSOR = exir_ops.edge.aten.pow.Tensor_Tensor
 SQUARE_POW_TARGETS = frozenset({POW_TENSOR_SCALAR})
+POW_TENSOR_TENSOR_TARGETS = frozenset({POW_TENSOR_TENSOR})
+# The exponent values for which repeated multiply/divide is a complete,
+# domain-checked fp16 operation. Larger values are refused before lowering.
+POW_TENSOR_TENSOR_EXPONENTS = frozenset({-1, 0, 1, 2, 3, 4})
+
+
+def _pow_static_value(node, values):
+    if not isinstance(node, torch.fx.Node):
+        return None
+    value = values.get(node) if values is not None else None
+    if value is not None:
+        return value.detach() if isinstance(value, torch.Tensor) else None
+    if node.op == "get_attr":
+        value = node.meta.get("val")
+        return value.detach() if isinstance(value, torch.Tensor) and type(value).__name__ != "FakeTensor" else None
+    if node.op == "call_function" and node.args:
+        target_name = getattr(node.target, "__name__", "")
+        if any(
+            marker in target_name
+            for marker in (
+                "clone_dim_order",
+                "to_dim_order",
+                "alias_copy",
+                "detach_",
+                "lift_fresh_copy",
+            )
+        ):
+            return _pow_static_value(node.args[0], values)
+    return None
+
+
+def pow_tensor_tensor_exponent(node, values=None):
+    if node.target is not POW_TENSOR_TENSOR or len(node.args) < 2:
+        return None
+    exponent = _pow_static_value(node.args[1], values)
+    if exponent is None or exponent.numel() == 0:
+        return None
+    if type(exponent).__name__ == "FakeTensor":
+        return None
+    if exponent.dtype not in (torch.float16, torch.float32):
+        return None
+    if not torch.isfinite(exponent).all():
+        return None
+    if not torch.equal(exponent, exponent.round()):
+        return None
+    flat = exponent.reshape(-1)
+    first = flat[0]
+    if not torch.equal(flat, first.expand_as(flat)):
+        return None
+    value = int(first.item())
+    return value if value in POW_TENSOR_TENSOR_EXPONENTS else None
+
+
+def pow_tensor_tensor_is_emittable(node, values=None):
+    if node.target is not POW_TENSOR_TENSOR:
+        return False
+    exponent = pow_tensor_tensor_exponent(node, values)
+    if exponent is None:
+        return False
+    if len(node.args) < 2 or not all(isinstance(arg, torch.fx.Node) for arg in node.args[:2]):
+        return False
+    output = node.meta.get("val")
+    if not isinstance(output, torch.Tensor) or output.dtype not in (torch.float16, torch.float32):
+        return False
+    base = _pow_static_value(node.args[0], values)
+    exponent_value = _pow_static_value(node.args[1], values)
+    if exponent_value is None:
+        return False
+    if type(exponent_value).__name__ == "FakeTensor":
+        return False
+    if not isinstance(node.args[0], torch.fx.Node) or not isinstance(node.args[1], torch.fx.Node):
+        return False
+    base_value = node.args[0].meta.get("val")
+    exponent_meta = node.args[1].meta.get("val")
+    if not isinstance(base_value, torch.Tensor) or not isinstance(exponent_meta, torch.Tensor):
+        return False
+    base_shape = tuple(base_value.shape)
+    exponent_shape = tuple(exponent_meta.shape)
+    if base_value.dtype not in (torch.float16, torch.float32) or exponent_meta.dtype not in (torch.float16, torch.float32):
+        return False
+    if any(
+        isinstance(dim, torch.SymInt)
+        for dim in (*base_shape, *exponent_shape, *tuple(output.shape))
+    ):
+        return False
+    try:
+        broadcast = torch.broadcast_shapes(base_shape, exponent_shape)
+    except RuntimeError:
+        return False
+    if tuple(output.shape) != broadcast or len(broadcast) > 8:
+        return False
+    if exponent == 1:
+        return True
+    if base is None or type(base).__name__ == "FakeTensor":
+        return False
+    if base.dtype not in (torch.float16, torch.float32):
+        return False
+    if not torch.isfinite(base).all() or not torch.isfinite(exponent_value).all():
+        return False
+    if exponent <= 0 and torch.any(base == 0):
+        return False
+    result = torch.pow(base.detach().to(torch.float64), exponent)
+    if not torch.isfinite(result).all() or not torch.isfinite(result.to(torch.float16)).all():
+        return False
+    if torch.any((result != 0) & (result.to(torch.float16) == 0)):
+        return False
+    return True
+
+
+def _emit_tensor_pow(node: torch.fx.Node, ctx) -> TensorRef:
+    values = {}
+    for arg in node.all_input_nodes:
+        current = arg
+        while isinstance(current, torch.fx.Node):
+            value = ctx.constant_value(current)
+            if value is not None:
+                values[arg] = value
+                break
+            if current.op == "call_function" and current.args:
+                current = current.args[0]
+            else:
+                break
+    if not pow_tensor_tensor_is_emittable(node, values):
+        raise RuntimeError(f"hexagon: unsupported tensor power for {node.name}")
+    base, _ = node.args[:2]
+    exponent = pow_tensor_tensor_exponent(node, values)
+    base_ref = ctx.operand(base)
+    base_shape = tuple(node.args[0].meta["val"].shape)
+    if any(isinstance(dim, torch.SymInt) for dim in base_shape):
+        raise RuntimeError("hexagon: tensor power requires static dimensions")
+    out_shape = tuple(node.meta["val"].shape)
+    out_numel = _upper_product(out_shape, ctx)
+    if exponent == 1:
+        out = ctx.result_for(node, out_numel)
+        if ctx.is_method_output(node):
+            ctx.emit(
+                node,
+                Op(
+                    type=DSP_OP_RASTER_BLIT,
+                    inputs=[base_ref],
+                    outputs=[out],
+                    params=[1, FP16_BYTES, 1, 0, 0, 0, 1, 1, out_numel, 0, 0, 1, 0, 0, 1],
+                ),
+            )
+        else:
+            out = base_ref
+        return ctx.record(node, out)
+    if exponent == 0:
+        out = ctx.result_for(node, out_numel)
+        one = ctx.scalar(1.0)
+        _emit_binary_refs(node, ctx, one, one, 1, 1, (), (), out_shape, "div", out)
+        return ctx.record(node, out)
+    if exponent < 0:
+        one = ctx.scalar(1.0)
+        current = one
+        current_shape = ()
+        for step in range(-exponent):
+            out = (
+                ctx.result_for(node, out_numel)
+                if step == -exponent - 1
+                else ctx.activation_for_shape(out_shape)
+            )
+            _emit_binary_refs(
+                node,
+                ctx,
+                current,
+                base_ref,
+                _upper_product(current_shape, ctx),
+                _upper_product(base_shape, ctx),
+                current_shape,
+                base_shape,
+                out_shape,
+                "div",
+                out,
+            )
+            current = out
+            current_shape = out_shape
+    else:
+        current = base_ref
+        current_shape = base_shape
+        for step in range(1, exponent):
+            out = (
+                ctx.result_for(node, out_numel)
+                if step == exponent - 1
+                else ctx.activation_for_shape(out_shape)
+            )
+            _emit_binary_refs(
+                node,
+                ctx,
+                current,
+                base_ref,
+                _upper_product(current_shape, ctx),
+                _upper_product(base_shape, ctx),
+                current_shape,
+                base_shape,
+                out_shape,
+                "mul",
+                out,
+            )
+            current = out
+            current_shape = out_shape
+    return ctx.record(node, current)
 
 
 def reduction_dims(node: torch.fx.Node) -> Optional[list]:
@@ -6023,6 +6263,7 @@ EMITTERS = {
     exir_ops.edge.aten.relu.default: _emit_relu,
     # x ** 2 and torch.square both arrive as pow.Tensor_Scalar.
     POW_TENSOR_SCALAR: _emit_square_pow,
+    POW_TENSOR_TENSOR: _emit_tensor_pow,
     ROW_GUARD: _emit_row_guard,
     # One ATen op, two kernels: the depthwise walk and the im2col convolution
     # (see conv_spec for which geometry each takes).
