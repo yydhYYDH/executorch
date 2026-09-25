@@ -726,9 +726,11 @@ SUPPORTED: List[OpSupport] = [
         "aten.cat.default",
         BLIT,
         ARENA_FP16,
-        "One to three inputs (a region is 12 ints and only 3 fit in a command); all "
-        "contiguous fp16; only the concatenated axis differs and the lengths add "
-        "up. Every length must be known when the command is built.",
+        "Any number of inputs: a region is 12 ints and 3 fit in a command, so a "
+        "longer list is split over as many blits as it needs, every input still "
+        "writing its own disjoint slice (four inputs is two commands, seven is "
+        "three). All contiguous fp16; only the concatenated axis differs and the "
+        "lengths add up. Every length must be known when the commands are built.",
     ),
     OpSupport(
         "aten.permute_copy.default",
@@ -1152,10 +1154,6 @@ NOT_SUPPORTED = [
         "tolerance. Any other finite integral exponent, a non-integral or "
         "non-uniform one, and a non-finite base have no command and stay "
         "portable; see the supported row for the forms that do.",
-    ),
-    (
-        "aten.cat.default with more than three operands",
-        "A command holds at most three 12-int regions.",
     ),
     (
         "aten.permute_copy.default reversing axes inside a group, or needing more "

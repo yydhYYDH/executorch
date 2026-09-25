@@ -510,10 +510,14 @@ _ROWS = [
         [("aten.cat.default", "wired")],
     ),
     (
-        "cat of four has one region too many",
+        # The row used to be refused: a blit command holds three regions, and
+        # four inputs needed one more than that. cat_region now splits the inputs
+        # over as many commands as the region budget needs, so four is two blits
+        # and seven is three, every input still writing its own disjoint slice.
+        "cat of four spans two blit commands",
         lambda a, b, c, d: torch.cat([a, b, c, d], dim=0),
         (_x(2), _x(2), _x(2), _x(2)),
-        [("aten.cat.default", "refused")],
+        [("aten.cat.default", "wired")],
     ),
     (
         "stack is a cat plus a view",

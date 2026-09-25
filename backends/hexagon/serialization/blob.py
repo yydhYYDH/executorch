@@ -273,6 +273,7 @@ class BlobBuilder:
         self._activations_bytes = 0
         self._activation_sizes: Dict[int, int] = {}
         self._activation_offsets: Dict[int, int] = {}
+        self._activation_virtual: Dict[int, int] = {}
         self._next_activation_id = 0
         self._virtual_activation_bytes = 0
         self._input_slots: Dict[int, TensorRef] = {}
@@ -370,6 +371,7 @@ class BlobBuilder:
             )
         virtual_offset = _align_up(self._virtual_activation_bytes, alignment)
         self._virtual_activation_bytes = virtual_offset + nbytes
+        self._activation_virtual[index] = virtual_offset
         return TensorRef(TensorSpace.ACTIVATION, virtual_offset, nbytes, index)
 
     def _pack_activations(self) -> None:
@@ -550,9 +552,15 @@ class BlobBuilder:
                 ref.index,
             )
         if ref.space == TensorSpace.ACTIVATION:
+            # A ref that points into part of its allocation -- one slice of a
+            # result an emitter fills in several commands -- keeps the offset
+            # it was handed relative to the block the packer assigns. Replacing
+            # the offset outright would fold every slice onto the block start.
+            virtual = self._activation_virtual.get(ref.index)
+            within = 0 if virtual is None else ref.offset - virtual
             return TensorRef(
                 TensorSpace.ACTIVATION,
-                self._activation_offsets[ref.index],
+                self._activation_offsets[ref.index] + within,
                 ref.size,
                 ref.index,
             )
