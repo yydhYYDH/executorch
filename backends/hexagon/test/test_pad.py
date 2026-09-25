@@ -46,6 +46,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import constant_pad_region  # noqa: E402
+from executorch.backends.hexagon.reflect_pad import PreserveReflectPad  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
 )
@@ -114,7 +115,7 @@ def _program(model, inputs):
 
 def _edge_targets(model, inputs):
     program = to_edge(
-        export(model, inputs),
+        PreserveReflectPad()(export(model, inputs)).exported_program,
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
     return [
@@ -370,5 +371,7 @@ def test_the_other_modes_are_a_program_rather_than_a_pad_node(mode):
     reason belongs on the record rather than in a TODO."""
     x = torch.randn(4, 6, dtype=F16)
     targets = _edge_targets(_Pad((1, 1), mode=mode), (x,))
-    assert not any("pad" in target for target in targets)
-    assert any("aten.index.Tensor" in target for target in targets)
+    if mode == "replicate":
+        assert any("aten.index.Tensor" in target for target in targets)
+    else:
+        assert any("et_hexagon.reflect_pad" in target for target in targets)

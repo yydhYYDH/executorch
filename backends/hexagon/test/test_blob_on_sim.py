@@ -53,10 +53,13 @@ from blob_interpreter import (  # noqa: E402
     UnsupportedOp,
 )
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
+from executorch.backends.hexagon.prelu import PreservePRelu  # noqa: E402
+from executorch.backends.hexagon.reflect_pad import PreserveReflectPad  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
-from executorch.exir import to_edge  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import HexagonPartitioner  # noqa: E402
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import Dim, export  # noqa: E402
 from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
@@ -1546,6 +1549,7 @@ def _cases():
         *([attention] if attention is not None else []),
         *_branch_cases(),
         *_pad_cases(),
+        *_elemwise_cases(),
     ]
 
 
@@ -2348,6 +2352,50 @@ def _with_destination_offset_zero(blob):
     raise AssertionError("the pad blob has no blit to perturb")
 
 
+def _elemwise_cases():
+    """Leaky ReLU, PReLU, clone, and reflect pad on the DSP."""
+    def lowered(module, args):
+        return _lowered_blob(
+            module,
+            args,
+            dynamic_shapes=None,
+            passes=(PreservePRelu(), PreserveReflectPad()),
+        )
+    cases = []
+    for tag, length in (("LR63", 63), ("LR64", 64), ("LR65", 65)):
+        x = (torch.arange(length, dtype=torch.float32) - length / 2).half()
+        module = torch.nn.LeakyReLU(negative_slope=0.125).eval()
+        with torch.no_grad():
+            cases.append(_case(tag, module, (x,), _bits(module(x)), blob=lowered(module, (x,))))
+    for tag, weight in (
+        ("PS", torch.tensor([0.125], dtype=torch.float16)),
+        ("PC", torch.tensor([0.125, 0.25, 0.5, 1.0], dtype=torch.float16)),
+    ):
+        x = (torch.arange(8, dtype=torch.float32).reshape(2, 4) - 4).half()
+        module = torch.nn.PReLU(weight.numel()).eval().half()
+        with torch.no_grad():
+            module.weight.copy_(weight.reshape_as(module.weight))
+        with torch.no_grad():
+            cases.append(_case(tag, module, (x,), _bits(module(x)), blob=lowered(module, (x,))))
+
+    class Clone(torch.nn.Module):
+        def forward(self, value):
+            return value.clone()
+
+    x = torch.arange(120, dtype=torch.float32).reshape(2, 3, 4, 5).half() - 3
+    clone = Clone().eval()
+    cases.append(_case("CLN", clone, (x,), _bits(clone(x)), blob=lowered(clone, (x,))))
+
+    class Reflect(torch.nn.Module):
+        def forward(self, value):
+            return torch.nn.functional.pad(value, (1, 1), mode="reflect")
+
+    flat = torch.arange(24, dtype=torch.float32).reshape(4, 6).half() - 3
+    reflect = Reflect().eval()
+    cases.append(_case("RP", reflect, (flat,), _bits(reflect(flat)), blob=lowered(reflect, (flat,))))
+    return cases
+
+
 def _pad_cases():
     """The zero-filling pad, on the DSP.
 
@@ -2493,6 +2541,10 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["J"] == [3], "the narrowing select is not a blit"
     assert kinds["K"] == [19], "the gated activation is not a binary op"
     assert kinds["L"] == [4], "the fp32 round trip left a command behind"
+    assert kinds["LR63"] == [37] and kinds["LR64"] == [37] and kinds["LR65"] == [37]
+    assert kinds["PS"] == [39] and kinds["PC"] == [39]
+    assert kinds["CLN"] == [3]
+    assert kinds["RP"] == [3]
     assert kinds["N"] == [3, 4], "the dynamic slice is not a blit"
     assert kinds["BQ"] == [3, 3, 19], (
         "the split is not one blit per piece it reads followed by the add: the "

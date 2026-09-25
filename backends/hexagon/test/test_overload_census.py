@@ -454,7 +454,7 @@ _ROWS = [
         "leaky_relu",
         lambda a: torch.nn.functional.leaky_relu(a),
         (_x(8),),
-        [("aten.leaky_relu.default", "unwired")],
+        [("aten.leaky_relu.default", "wired")],
     ),
     (
         "elu",

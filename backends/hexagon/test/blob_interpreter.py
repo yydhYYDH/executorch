@@ -48,6 +48,8 @@ ADD_FUSE_LAYERNORM = 16
 UNARY = 4
 BINARY_ELEMENTWISE = 19
 BATCH_MATMUL = 38
+RELU = 37
+PRELU = 39
 FLASH_ATTN = 18
 ROPE = 14
 MATMUL_Q4A16_FP16 = 22
@@ -481,7 +483,8 @@ def _run_raster_blit(command: Command, params: List[int], arena: Arena) -> None:
                 a = src_base + (z * ss0 + y * ss1) * unit
                 b = dst_base + (z * ds0 + y * ds1) * unit
                 if not element_wise:
-                    _copy(arena, b, a, s2 * unit)
+                    for x in range(s2):
+                        _copy(arena, b + x * ds2 * unit, a + x * ss2 * unit, unit)
                     continue
                 for x in range(s2):
                     _copy(arena, b + x * ds2 * unit, a + x * ss2 * unit, unit)
@@ -887,6 +890,32 @@ def _run_softmax(command: Command, params: List[int], arena: Arena) -> None:
     rows = src.reshape(outside, channel, inside).astype(np.float32)
     shifted = np.exp(rows - rows.max(axis=1, keepdims=True))
     out = (shifted / shifted.sum(axis=1, keepdims=True)).astype(np.float16)
+    _store(arena, arena.address(command.outputs[0]), out.tobytes())
+
+
+def _run_relu(command: Command, params: List[int], arena: Arena) -> None:
+    size, unit, slope_bits = params[:3]
+    if unit != FP16_BYTES:
+        raise UnsupportedOp(f"blob: relu over {unit}-byte values is not modelled")
+    source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)[:size]
+    slope = np.array([slope_bits], dtype=np.int32).view(np.float32)[0]
+    out = np.where(source < 0, source.astype(np.float32) * slope, source.astype(np.float32)).astype(np.float16)
+    _store(arena, arena.address(command.outputs[0]), out.tobytes())
+
+
+def _run_prelu(command: Command, params: List[int], arena: Arena) -> None:
+    size, unit, plane, channel, slope_count, pack, batch = params[:7]
+    if unit != FP16_BYTES or pack != 1 or slope_count not in (1, channel):
+        raise UnsupportedOp("blob: this PReLU layout is not modelled")
+    source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)[:size]
+    slope = np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16)[:slope_count]
+    if source.size != batch * channel * plane:
+        raise UnsupportedOp("blob: PReLU source size does not match its layout")
+    if slope_count == 1:
+        selected = np.full(source.size, slope[0], dtype=np.float16)
+    else:
+        selected = np.broadcast_to(slope.reshape(1, channel, 1), (batch, channel, plane)).reshape(-1)
+    out = np.where(source < 0, source.astype(np.float32) * selected.astype(np.float32), source.astype(np.float32)).astype(np.float16)
     _store(arena, arena.address(command.outputs[0]), out.tobytes())
 
 
@@ -1828,6 +1857,8 @@ _EXECUTORS = {
     CONV_DEPTHWISE2D_FP16: _run_conv_depthwise2d,
     IM2COL_CONVOLUTION_FP16: _run_im2col_convolution,
     ZERO: _run_zero,
+    RELU: _run_relu,
+    PRELU: _run_prelu,
     SELECT: _run_select,
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
