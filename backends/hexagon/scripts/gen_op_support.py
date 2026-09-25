@@ -607,8 +607,9 @@ SUPPORTED: List[OpSupport] = [
         BLIT,
         ARENA_FP16,
         "One to three inputs (a region is 12 ints and only 3 fit in a command); all "
-        "contiguous fp16; only the concatenated axis differs and the lengths add "
-        "up. Every length must be known when the command is built.",
+        "contiguous and homogeneously fp16 or fp32; only the concatenated axis "
+        "differs and the lengths add up. Every length must be known when the "
+        "command is built.",
     ),
     OpSupport(
         "aten.permute_copy.default",

@@ -887,7 +887,9 @@ def cat_region(node: torch.fx.Node):
         return None
     if not result.is_contiguous() or not all(value.is_contiguous() for value in values):
         return None
-    if any(value.dtype is not torch.float16 for value in values):
+    if result.dtype not in (torch.float16, torch.float32) or any(
+        value.dtype is not result.dtype for value in values
+    ):
         return None
 
     shape = list(result.shape)
