@@ -196,45 +196,57 @@ SUPPORTED: List[OpSupport] = [
         "aten.add.Tensor",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; the DSP's broadcast path "
-        "is unreachable (it needs 25 more params than a command carries). Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "aten.sub.Tensor",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "aten.mul.Tensor",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "aten.div.Tensor",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "aten.maximum.default",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "aten.minimum.default",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar; broadcast unreachable. Rank <= 8.",
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation.",
     ),
     OpSupport(
         "et_hexagon.mul_silu.default",
         BINARY,
         ARENA_FP16,
         "Fused gated activation `a * silu(b)`; produced by mul_silu.py from "
-        "`mul(sigmoid(x), x)`. Same shape/scalar operand rule as the binary family.",
+        "`mul(sigmoid(x), x)`. The fusion pass matches equal-shaped fp16 "
+        "operands; the command itself supports broadcast through rank 8.",
     ),
     # --- the element-wise select (DSP_OP_SELECT) -------------------------
     OpSupport(
@@ -481,8 +493,10 @@ SUPPORTED: List[OpSupport] = [
         "aten.fmod.Tensor",
         BINARY,
         ARENA_FP16,
-        "Operands must be the result's shape or a scalar, as the other binary ops. "
-        "The kernel computes the truncated remainder (a - trunc(a/b)*b), which is "
+        "Broadcasting works through rank 8: the 25-entry tail plus the 9-int "
+        "command head uses 33 or 34 of the 40-int budget. Rank 9 has no "
+        "representation. The kernel computes the truncated remainder "
+        "(a - trunc(a/b)*b), which is "
         "fmod and not torch's floored remainder; a zero divisor answers 0 where "
         "torch gives NaN.",
     ),
@@ -866,9 +880,10 @@ NOT_SUPPORTED = [
         "The kernel's strided reduction path disagrees with torch on hardware.",
     ),
     (
-        "broadcasting binary ops",
-        "The DSP's broadcast path needs 25 more params than a command carries, so "
-        "only same-shape and scalar operands work.",
+        "binary broadcasting at rank 9",
+        "The broadcast table has no rank-9 representation. Its 25-entry tail plus "
+        "the 9-int command head uses 33 or 34 of the 40-int budget, so ranks "
+        "through 8 fit but rank 9 does not.",
     ),
     (
         "aten.addmm.default with alpha != 1 or beta not in {0, 1}",
