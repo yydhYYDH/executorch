@@ -2156,6 +2156,7 @@ def _branch_cases():
 
 #: The prefill entry: `DSP_OP_MATMUL_Q4A16_FP16`.
 _Q4A16_PREFILL = 22
+_W8A16_PREFILL = 42
 
 
 def _prefill_cases():
@@ -2216,6 +2217,34 @@ def _prefill_cases():
                 mutate=lambda data, mutate=mutate: mutate(data, 128, 64),
             )
         )
+    for tag, m, k, n in (
+        ("CR", 2, 64, 64),
+        ("CS", 2, 128, 64),
+        ("CT", 33, 128, 64),
+    ):
+        blob, weight, activation = _prefill_mm(k, n, m, scheme="w8a16")
+        out.append(
+            _case(
+                tag,
+                None,
+                (activation,),
+                _prefill_answer(weight, activation.numpy(), scheme="w8a16"),
+                blob=blob,
+            )
+        )
+
+    blob, weight, activation = _prefill_mm(128, 64, 2, scheme="w8a16")
+    out.append(
+        _case(
+            "CU",
+            None,
+            (activation,),
+            _prefill_answer(weight, activation.numpy(), scheme="w8a16"),
+            kind="teeth",
+            blob=blob,
+            mutate=lambda data: _perturb_w8a16_scale(data, 128, 64),
+        )
+    )
     return out
 
 
@@ -2224,20 +2253,20 @@ def _prefill_generator(m, k):
     return torch.Generator().manual_seed(20240925 + m * 131 + k)
 
 
-def _prefill_mm(k, n, m, bias=None):
+def _prefill_mm(k, n, m, bias=None, scheme="q4a16"):
     """One M > 1 quantized mm through the real pipeline, as a blob.
 
     The same chain the GEMV cases run -- the annotator, the pattern the emitter
     matches, the weight packer and the command -- with an activation that is more
     than one row, which is the whole of what this entry adds.
     """
-    weight = _gemv_weight("q4a16", k, n)
+    weight = _gemv_weight(scheme, k, n)
     model = _QuantizedMm(weight, bias).eval()
     activation = torch.randint(-1, 2, (m, k), generator=_prefill_generator(m, k)).to(
         torch.float32
     )
     exported = torch.export.export(model, (activation,))
-    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer("q4a16"))
+    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
     with torch.no_grad():
         prepared(activation)
     converted = convert_pt2e(prepared)
@@ -2248,13 +2277,13 @@ def _prefill_mm(k, n, m, bias=None):
     return blob, weight, activation.half()
 
 
-def _prefill_answer(weight, activation, bias=None):
+def _prefill_answer(weight, activation, bias=None, scheme="q4a16"):
     """`activation @ (stored * scale)`, which is what the kernel computes.
 
     The sums are integers and the scale is a power of two, so this is the
     kernel's own answer bit for bit rather than an approximation of it.
     """
-    stored, scale = _gemv_stored(weight, "q4a16")
+    stored, scale = _gemv_stored(weight, scheme)
     answer = activation.astype(np.float64) @ (
         stored.astype(np.float64) * scale.astype(np.float64)
     )
@@ -2265,12 +2294,24 @@ def _prefill_answer(weight, activation, bias=None):
     return answer.astype(np.float16).reshape(-1)
 
 
-def _prefill_weight_operand(blob, k, n):
+def _prefill_weight_operand(blob, k, n, scheme="q4a16"):
     """Where the prefill command's weight sits in the weights section."""
     _, commands = read_blob(blob)
-    command = next(c for c in commands if c.type == _Q4A16_PREFILL)
-    return _weights_base(blob) + command.inputs[1].offset, (k // 32) * (n // 32) * 512
+    command = next(
+        c
+        for c in commands
+        if c.type == (_W8A16_PREFILL if scheme == "w8a16" else _Q4A16_PREFILL)
+    )
+    tile_bytes = 1024 if scheme == "w8a16" else 512
+    return _weights_base(blob) + command.inputs[1].offset, (k // 32) * (n // 32) * tile_bytes
 
+
+def _perturb_w8a16_scale(blob, k, n):
+    """Change one fp16 scale after the W8 tile table without changing geometry."""
+    at, tile_bytes = _prefill_weight_operand(blob, k, n, "w8a16")
+    body = bytearray(blob)
+    struct.pack_into("<e", body, at + tile_bytes, 1.0)
+    return bytes(body)
 
 def _transpose_the_prefill_tiles(blob, k, n):
     """The same blob with the 512-byte tile table written column-major.
@@ -2616,6 +2657,24 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
             k // 32,
             1,
         ], f"{tag}: the chunks are {command.params[5:9]}"
+
+    for tag, m, k, n in (
+        ("CR", 2, 64, 64),
+        ("CS", 2, 128, 64),
+        ("CT", 33, 128, 64),
+        ("CU", 2, 128, 64),
+    ):
+        command = next(
+            c for c in _tagged(cases, tag).commands if c.type == _W8A16_PREFILL
+        )
+        assert len(command.params) == 29, f"{tag}: {len(command.params)} parameters"
+        assert list(command.params[18:21]) == [k, k, n]
+        assert command.params[12] == m
+        assert command.params[27] == 1 and command.params[28] == 0
+        expected_kinds = [_W8A16_PREFILL, 3] if k == 64 else [3, _W8A16_PREFILL, 3]
+        assert kinds[tag] == expected_kinds
+    assert kinds["CU"] == kinds["CS"], "the scale control changed the plan"
+
     for tag in ("AA", "AB", "AC"):
         # The emitter's two blits around the command are part of the command
         # being what it claims: without them the kernel reads other channels.
