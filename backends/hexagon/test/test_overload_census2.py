@@ -446,6 +446,58 @@ _QUANTIZED_ROWS = [
             ("aten.mm.default", "refused"),
         ],
     ),
+    # The prefill K ceiling is a hole in the middle, not a boundary, and these
+    # four rows are the shape of it. At this K the quantized path is admitted at
+    # M == 1 (the GEMV entries, which return before the ceiling is consulted),
+    # refused for M == 2 through M == 32 (the stack-array kernel the ceiling
+    # exists for), and admitted again from M == 33 (the kernel that
+    # heap-allocates its descriptors). Nothing about the band is a bug in the
+    # gate: the gate is correct, and these rows exist so the refusal is a
+    # recorded fact rather than a gap someone has to notice later.
+    (
+        "q4a16 past the small-M K ceiling at M=1",
+        "q4a16",
+        1,
+        14336,
+        4096,
+        [
+            ("quantized_decomposed.dequantize_per_channel.default", "wired"),
+            ("aten.mm.default", "wired"),
+        ],
+    ),
+    (
+        "q4a16 past the small-M K ceiling at the band edge",
+        "q4a16",
+        2,
+        14336,
+        4096,
+        [
+            ("quantized_decomposed.dequantize_per_channel.default", "refused"),
+            ("aten.mm.default", "refused"),
+        ],
+    ),
+    (
+        "q4a16 past the small-M K ceiling at the top of the band",
+        "q4a16",
+        hexagon_ops.PREFILL_M32_MAX_M,
+        14336,
+        4096,
+        [
+            ("quantized_decomposed.dequantize_per_channel.default", "refused"),
+            ("aten.mm.default", "refused"),
+        ],
+    ),
+    (
+        "q4a16 past the small-M K ceiling above the band",
+        "q4a16",
+        hexagon_ops.PREFILL_M32_MAX_M + 1,
+        14336,
+        4096,
+        [
+            ("quantized_decomposed.dequantize_per_channel.default", "wired"),
+            ("aten.mm.default", "wired"),
+        ],
+    ),
     (
         "q4a16 with N not a multiple of 32",
         "q4a16",
