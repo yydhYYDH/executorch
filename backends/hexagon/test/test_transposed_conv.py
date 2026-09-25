@@ -10,7 +10,8 @@ There is no transposed-convolution kernel here and this backend adds none. What
 it does instead is use the identity
 
     conv_transpose(x, w, s, p, op) ==
-        conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc), K - 1 - p)
+        conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc),
+                d * (K - 1) - p, dilation=d)
 
 so that the two kernels that already carry convolution carry this too: the
 weight is transposed and flipped at export time, the transposed window's padding
@@ -128,7 +129,11 @@ def _exact(shape, seed):
 
 def _transposed(model, channels, kernel, stride, padding, output_padding):
     """Whether this node and no other reached the delegate."""
-    return len(_delegates(_lower(model, (torch.randn(1, channels, 8, 8),)))) == 1
+    return len(
+        _delegates(
+            _lower(model, (torch.randn(1, channels, 8, 8),))
+        )
+    ) == 1
 
 
 def test_transposed_convolution_of_stride_one_is_three_commands():
@@ -144,7 +149,8 @@ def test_transposed_convolution_of_stride_one_is_three_commands():
     x = _exact((1, 8, 8, 8), 6)
     data, commands = _blob(_lower(model, (x,)))
     assert [command.type for command in commands] == [_ZERO, _BLIT, _IM2COL, _BLIT]
-    # The convolution walks the input as it stands and pads it by K - 1 - p,
+    # The convolution walks the input as it stands and pads it by
+    # d * (K - 1) - p,
     # which for k=3, p=1 is 1: params[0:2] are padX and padY.
     assert list(commands[2].params[:8]) == [
         1,
@@ -210,6 +216,55 @@ def test_transposed_convolution_of_stride_two_interleaves_first():
     assert list(walk.params[:8]) == [1, 1, 1, 1, 1, 1, 3, 3]
     assert list(walk.params[11:13]) == [16, 16]
 
+    expected = model(x).detach().half().numpy().reshape(-1)
+    assert _run(data, [x.numpy()]).tobytes() == expected.tobytes()
+
+
+def test_dilated_transposed_convolution_keeps_dilation_on_the_kernel():
+    """The remapped padding changes, while the DSP walk remains dilated."""
+    model = _Transposed(4, 6, 3, stride=2, padding=2, dilation=2, output_padding=1).half()
+    _whole(model, 17)
+    x = _exact((1, 4, 8, 8), 18)
+    data, commands = _blob(_lower(model, (x,)))
+    walk = next(command for command in commands if command.type == _IM2COL)
+    assert list(walk.params[:8]) == [2, 2, 2, 2, 1, 1, 3, 3]
+    assert list(walk.params[10:14]) == [16, 16, 16, 16]
+    expected = model(x).detach().half().numpy().reshape(-1)
+    assert _run(data, [x.numpy()]).tobytes() == expected.tobytes()
+
+
+def test_grouped_transposed_convolution_partitions_channels_before_each_walk():
+    """Each group gets its own input slice, weight tile, and output slice."""
+    model = _Transposed(8, 12, 3, stride=2, padding=1, groups=4).half()
+    _whole(model, 19)
+    x = _exact((1, 8, 8, 8), 20)
+    data, commands = _blob(_lower(model, (x,)))
+    walks = [command for command in commands if command.type == _IM2COL]
+    assert len(walks) == 4
+    assert [command.params[18] for command in walks] == [2, 2, 2, 2]
+    assert [command.params[20] for command in walks] == [3, 3, 3, 3]
+    assert [command.type for command in commands] == [_ZERO, _BLIT] + [
+        _BLIT, _ZERO, _BLIT, _IM2COL, _BLIT, _BLIT
+    ] * 4
+    expected = model(x).detach().half().numpy().reshape(-1)
+    assert _run(data, [x.numpy()]).tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("channels_per_group", [63, 64, 65])
+def test_grouped_transposed_convolution_preserves_the_64_channel_boundary(
+    channels_per_group,
+):
+    """Each group packs its own tail, rather than inheriting the whole tensor's."""
+    groups = 3
+    channels = groups * channels_per_group
+    model = _Transposed(
+        channels, channels, 3, stride=1, padding=1, groups=groups
+    ).half()
+    _whole(model, 30 + channels_per_group)
+    x = _exact((1, channels, 4, 4), 40 + channels_per_group)
+    data, commands = _blob(_lower(model, (x,)))
+    walks = [command for command in commands if command.type == _IM2COL]
+    assert [command.params[18] for command in walks] == [channels_per_group] * groups
     expected = model(x).detach().half().numpy().reshape(-1)
     assert _run(data, [x.numpy()]).tobytes() == expected.tobytes()
 
@@ -492,7 +547,7 @@ def test_conv_spec_describes_the_convolution_the_commands_carry():
     assert spec is not None
     assert (spec.in_h, spec.in_w) == (16, 16), "the interleaved extent"
     assert (spec.stride_y, spec.stride_x) == (1, 1)
-    assert (spec.pad_y, spec.pad_x) == (1, 1), "k - 1 - p"
+    assert (spec.pad_y, spec.pad_x) == (1, 1), "d * (K - 1) - p"
     assert (spec.out_h, spec.out_w) == (16, 16)
     assert spec.transposed
     assert (spec.upsample_y, spec.upsample_x) == (2, 2)
@@ -502,9 +557,7 @@ def test_conv_spec_describes_the_convolution_the_commands_carry():
 @pytest.mark.parametrize(
     "in_channels,out_channels,kernel,kwargs,why",
     [
-        (4, 6, 3, dict(stride=2, padding=2, dilation=2), "a dilated window"),
-        (8, 8, 3, dict(padding=1, groups=4), "a group count in between"),
-        (4, 6, 2, dict(stride=1, padding=2), "a padding wider than the kernel"),
+        (4, 6, 3, dict(stride=1, padding=5, dilation=2), "padding wider than the effective kernel"),
     ],
 )
 def test_what_the_identity_cannot_carry_stays_portable(
@@ -512,10 +565,9 @@ def test_what_the_identity_cannot_carry_stays_portable(
 ):
     """Each refusal named, because each is a different reason.
 
-    A dilated transposed window is a different identity from the one measured
-    here; a group count in between is a channel mapping neither convolution
-    kernel carries; and a padding wider than the kernel leaves the remapped
-    convolution a negative padding to walk.
+    Dilation and groups are host lowering concerns now. A padding wider than
+    the effective dilated kernel still leaves the remapped convolution a
+    negative padding to walk, so that nearest refusal remains pinned.
     """
     assert not _transposed(
         _Transposed(in_channels, out_channels, kernel, **kwargs),

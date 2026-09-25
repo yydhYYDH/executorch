@@ -273,18 +273,13 @@ def test_the_plan_the_pass_leaves_alone_is_still_correct_without_it():
     ], "the fold did not reach the DSP"
 
 
-def test_a_grouped_fir_weight_is_folded_but_its_convolution_stays_portable():
-    """The boundary next to the case above, and not the shape SDXL exports.
+def test_a_grouped_fir_weight_is_folded_and_its_transposed_groups_reach_the_dsp():
+    """The grouped boundary now runs as one dense walk per group.
 
-    `FirUpsample2D._upsample_2d` passes no `groups` to `conv_transpose2d`, so its
-    weight is `[C, C, 3, 3]` and the convolution is ungrouped -- that is the case
-    the test below measures. A depthwise variant (`groups == C`, weight
-    `[C, 1, 3, 3]`) prepares its weight the same way and the fold still runs, but
-    the transposed path admits only `groups == 1`: its weight is a dense in/out
-    pair even at one channel each, so the depthwise walk is not the right one for
-    it. The convolution therefore stays portable while the fold itself does not,
-    which is the pair worth pinning -- it separates "the fold did not fire" from
-    "the geometry is not this walk's".
+    A depthwise-shaped transposed weight is still not the depthwise DSP walk: the
+    transposed weight is indexed as input channels by output share. The host
+    partitions those channels and emits one im2col command for each group after
+    the fold has made the weight a constant.
     """
     module = _FirUpsample(8, grouped=True).half()
     module.conv.weight.data = _weight_of(module.conv.weight.shape, 26)
@@ -294,7 +289,9 @@ def test_a_grouped_fir_weight_is_folded_but_its_convolution_stays_portable():
     assert FoldConstantTransposes()(exported).modified, "the chain was not folded"
 
     program = _lower(module, (x,))
-    assert any("conv" in name for name in _portable(program)), _portable(program)
+    assert not any("conv" in name for name in _portable(program)), _portable(program)
+    _, commands = _commands(program)
+    assert [command.type for command in commands].count(_IM2COL) == 8
 
 
 def test_the_fir_upsampler_reaches_the_dsp_and_keeps_its_numbers():

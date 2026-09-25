@@ -448,7 +448,7 @@ SUPPORTED: List[OpSupport] = [
         "constants at export. Two forms, chosen by the group count. A group per "
         "channel (weight `[C, 1, ky, kx]`, `groups == C_in == C_out`) runs the "
         "depthwise walk: blit in, the walk, blit out. Every other supported "
-        "convolution has `groups == 1` and runs the im2col convolution the same way, "
+        "plain convolution has `groups == 1` and runs the im2col convolution the same way, "
         "where the pack and the unpack convert between the row-major tensor and the "
         f"64-channel blocked layout; a channel count that is not a multiple of 64 "
         f"also emits {ZERO} ahead of the pack, because the fill reads whole 64-lane "
@@ -457,15 +457,18 @@ SUPPORTED: List[OpSupport] = [
         "layouts are then the same bytes. A transposed convolution is the same two "
         "kernels reached through the identity "
         "`conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), "
-        "flip(w).transpose(ic, oc), k - 1 - p)`: the weight is transposed and "
-        "flipped at export, the transposed padding is remapped onto the "
-        "convolution's, and a stride above 1 makes the input interleaved with zeros "
-        f"by {ZERO} and one raster region ahead of the usual pair. A stride of 1 "
-        "needs no interleave. Left portable: a dilated transposed window, a group "
-        "count other than 1, a fractional or "
-        "negative padding, a non-4-D or unbatched operand, symbolic extents, a weight "
-        "or bias that is not a constant, and any stride, padding or dilation that "
-        "does not reproduce the output extent the graph declares.",
+        "flip(w).transpose(ic, oc), d * (k - 1) - p, dilation=d)`: the weight is "
+        "transposed and flipped at export, the transposed padding is remapped onto "
+        "the convolution's, and a stride above 1 makes the input interleaved with "
+        f"zeros by {ZERO} and one raster region ahead of the usual pair. The DSP "
+        "im2col walk consumes the dilation fields directly. A grouped transposed "
+        "convolution is partitioned on the host and emits one dense im2col walk "
+        "per group. A stride of 1 needs no interleave. Left portable: a plain "
+        "grouped convolution with a group count other than 1, except the genuine "
+        "depthwise form; a fractional or negative padding, a non-4-D or unbatched "
+        "operand, symbolic extents, a weight or bias that is not a constant, and "
+        "any stride, padding or dilation that does not reproduce the output extent "
+        "the graph declares.",
     ),
     OpSupport(
         "et_hexagon.add_relu.default",
@@ -807,14 +810,14 @@ SUPPORTED: List[OpSupport] = [
 # Exclusions worth naming: each is something a reader might expect to work.
 NOT_SUPPORTED = [
     (
-        "aten.convolution.default with transposed=True and a dilation above 1, or "
-        "with a group count other than 1",
-        "A transposed convolution reaches the im2col kernel through "
-        "`conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), "
-        "flip(w).transpose(ic, oc), k - 1 - p)`, which holds for an undilated "
-        "window and one group. A dilated transposed window is a different "
-        "identity, and the kernel has no channel mapping for a group count "
-        "between 1 and C_in.",
+        "aten.convolution.default with transposed=False and a group count "
+        "other than 1, except the genuine depthwise form",
+        "The dense im2col and depthwise kernels do not carry a channel mapping "
+        "for an intermediate group count. A grouped transposed convolution is "
+        "different: the host partitions its input, weight, bias and output and "
+        "emits one dense im2col walk per group. A dilated transposed window is "
+        "also supported because the generic im2col kernel reads its dilation "
+        "fields directly.",
     ),
     (
         "aten.conv3d.default, aten.conv_transpose3d.input",
