@@ -50,9 +50,9 @@ contain the operator, so an emitter would have nothing to call.
 
 | op | why there is no kernel |
 |---|---|
-| `aten.amin.default`, `aten.min.default`, `aten.min.dim` | `HtpOpsReductionOpType` is `SUM`(1), `MAXIMUM`(2), `MEAN`(3) -- `eltwise_ops.cc:2456-2459`. There is no minimum to select, and the dispatcher rejects anything else (`eltwise_ops.cc:2441-2445`) |
+| `aten.min.dim` reading `.indices` | The values are the minimum reduction, but a reader of the indices puts the node out of reach on the values side too: the reduction kernel computes values, not positions. Same all-readers-are-getitem-0 rule as `aten.max.dim` and `max_pool2d`. The value-only form is covered -- see `OP_SUPPORT.md` |
 | `aten.argmax.default`, `aten.argmin.default` | Every reduction here walks values; `argmax`'s output is positions. `topk` is the one kernel that writes both, and its positions are refused on purpose -- §3 |
-| `aten.prod.default`, `aten.var.correction`, `aten.cumsum.default` | A running product, a second moment and a prefix scan are each a different walk from the three reductions that exist |
+| `aten.prod.default`, `aten.var.correction`, `aten.cumsum.default` | A running product, a second moment and a prefix scan are each a different walk from the four reductions that exist |
 | `aten.erf.default` | No `HtpOpsUnaryOpType` entry: the enum is 1..17 (`unary_ops.cc:14-31`) |
 | `aten.leaky_relu.default`, `aten.elu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no `elu` |
 | `aten.convolution.default with transposed=False` and a group count other than 1, except the depthwise form | A transposed convolution *is* a window walk once its input is interleaved with zeros: `conv_transpose(x, w, s, p, op) == conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc), d * (k - 1) - p, dilation=d)`, which `conv_spec` emits on the same two kernels. The host now partitions a grouped transposed input and weight into one dense im2col command per group, while the DSP kernel reads dilation directly. A plain grouped convolution still has no channel mapping in either kernel, apart from the existing depthwise walk |

@@ -384,8 +384,9 @@ SUPPORTED: List[OpSupport] = [
         "aten.amax.default",
         REDUCTION,
         ARENA_FP16,
-        "Same single-span rule as mean.dim. There is no minimum in "
-        "HtpOpsReductionOpType (sum, maximum, mean), so amin stays portable.",
+        "Same single-span rule as mean.dim. The minimum is reduction op 4 in "
+        "HtpOpsReductionOpType, over the same [1][numel][1] span, so amin reduces "
+        "through the same command amax uses with op 4 instead of op 2.",
     ),
     OpSupport(
         "aten.max.default",
@@ -397,6 +398,34 @@ SUPPORTED: List[OpSupport] = [
         "of a NaN, which is the byte-level caveat fmod already carries. This is "
         "the target the reduce-all overload produces; `torch.max(x, dim)` is "
         "max.dim below.",
+    ),
+    OpSupport(
+        "aten.min.default",
+        REDUCTION,
+        ARENA_FP16,
+        "Every element, the minimum of them: the same single-span reduction amax "
+        "performs, with op 4 rather than op 2 in the command's reduction type. "
+        "`torch.min(x)` and `torch.amin(x)` are the same value and reach the same "
+        "command; they differ only in the signed-zero and NaN payload caveats that "
+        "amax already carries.",
+    ),
+    OpSupport(
+        "aten.amin.default",
+        REDUCTION,
+        ARENA_FP16,
+        "`torch.amin(x)`, the keepdim-free spelling of the same reduce-all minimum; "
+        "the span rule is the one amax and mean.dim already use.",
+    ),
+    OpSupport(
+        "aten.min.dim",
+        REDUCTION,
+        ARENA_FP16,
+        "The values of `torch.min(x, dim)`, which is the minimum over the same "
+        "single span amax reduces: dim is a single int, so the span rule always "
+        "holds. The node's second output is indices, positions the reduction "
+        "kernel does not compute, so the node is placed only when every reader "
+        "takes getitem 0 -- min_dim_is_emittable, exactly the rule max.dim is "
+        "under. A reader of the indices keeps the values portable too.",
     ),
     OpSupport(
         "aten.max.dim",
@@ -1003,19 +1032,20 @@ NOT_SUPPORTED = [
         "REDUCTION collapses one contiguous span only.",
     ),
     (
-        "aten.amin.default, aten.min.default and aten.min.dim",
-        "HtpOpsReductionOpType is sum, maximum and mean (eltwise_ops.cc:2441-2445) "
-        "and the dispatcher rejects anything else, so there is no minimum to select "
-        "-- this needs a kernel, not an emitter. min.dim is a two-output node whose "
-        "second output is indices, which no reduction kernel here produces.",
+        "aten.min.dim reading .indices",
+        "The values are the minimum amax-shaped reduction computes, but a reader of "
+        "the indices puts the node out of reach on the values side too: indices "
+        "are positions and the reduction kernel computes values. The two-output "
+        "shape is the same one max_pool2d and max.dim have, and so is the "
+        "all-readers-are-getitem-0 rule -- min_dim_is_emittable. "
+        "`torch.min(x, dim).values` reaches the covered target instead.",
     ),
     (
-        "aten.max.dim reading .indices, and aten.min.dim in either form",
+        "aten.max.dim reading .indices",
         "The values are what amax computes, but a reader of the indices puts the "
         "node out of reach on the values side too: indices are positions and the "
         "reduction kernel computes values. The two-output shape is the same one "
-        "max_pool2d has, and so is the all-readers-are-getitem-0 rule. min.dim is "
-        "additionally a minimum, which HtpOpsReductionOpType does not have. "
+        "max_pool2d has, and so is the all-readers-are-getitem-0 rule. "
         "`torch.amax(x, dim)`, `torch.max(x)` and `torch.max(x, dim).values` "
         "reach the covered targets instead.",
     ),

@@ -230,16 +230,16 @@ _ROWS = [
     ),
     # --- amax's siblings: the ones with no op type in the reduction enum -----
     (
-        "amin has no reduction op type",
+        "amin selects the minimum reduction kind",
         lambda a: torch.amin(a),
         (_x(2, 3, 4),),
-        [("aten.amin.default", "unwired")],
+        [("aten.amin.default", "wired")],
     ),
     (
-        "amin along one dim has none either",
+        "amin along one dim uses the same reduction kind",
         lambda a: torch.amin(a, dim=1),
         (_x(2, 3, 4),),
-        [("aten.amin.default", "unwired")],
+        [("aten.amin.default", "wired")],
     ),
     # --- the whole-tensor reduce-all overloads -------------------------------
     (
@@ -249,10 +249,10 @@ _ROWS = [
         [("aten.max.default", "wired")],
     ),
     (
-        "torch.min(x) has no kernel to reach",
+        "torch.min(x) uses the minimum reduction kernel",
         lambda a: torch.min(a),
         (_x(2, 3, 4),),
-        [("aten.min.default", "unwired")],
+        [("aten.min.default", "wired")],
     ),
     (
         "torch.max(x, dim) is two outputs, so it is a getitem rule",
@@ -261,10 +261,10 @@ _ROWS = [
         [("aten.max.dim", "wired"), (_GETITEM, "wired")],
     ),
     (
-        "torch.min(x, dim) the same",
+        "torch.min(x, dim) values use the reduction kernel",
         lambda a: torch.min(a, dim=1).values,
         (_x(2, 3, 4),),
-        [("aten.min.dim", "unwired"), (_GETITEM, "refused")],
+        [("aten.min.dim", "wired"), (_GETITEM, "wired")],
     ),
     (
         "torch.max(x, dim).indices has no producer",
@@ -937,7 +937,6 @@ def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
 @pytest.mark.parametrize(
     "label,forward,inputs",
     [
-        ("amin over one dim", lambda a: torch.amin(a, dim=1), (_x(2, 3, 4),)),
         # `split` stood here while it was an unwired multi-output op; it is now
         # the first row of the closed-gap list below, and `sort` takes its place
         # here because it is the same shape of gap with no command behind it.

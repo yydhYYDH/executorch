@@ -1394,6 +1394,8 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
         out = rows.max(axis=1)
     elif op_type == REDUCTION_MEAN:
         out = rows.sum(axis=1) / reduce
+    elif op_type == 4:
+        out = rows.min(axis=1)
     else:
         raise UnsupportedOp(f"blob: reduction kind {op_type} is not modelled")
     _store(

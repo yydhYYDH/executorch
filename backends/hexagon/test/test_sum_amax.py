@@ -4,14 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Sum and amax on the DSP, and the two reductions that have no kernel.
+"""Sum, amax, and amin on the DSP.
 
 `htp_ops_reduction` collapses one contiguous span of the buffer and selects on
-`HtpOpsReductionOpType`, which is `sum = 1, maximum = 2, mean = 3`
-(eltwise_ops.cc:2441-2445) and nothing else. That enum is the whole set of
-reductions this backend can reach: `mean` was already wired, these tests pin
-`sum` and `amax`, and they pin the absence of `amin` -- a minimum has no op type
-to select, so it cannot be delegated by naming the right emitter.
+`HtpOpsReductionOpType`. The minimum kind is now a structural sibling of maximum:
+all scalar, vector, and padded-lane paths use the first element as the initial
+value, with a different comparison and identity.
 """
 
 
@@ -180,17 +178,15 @@ def test_a_sum_into_another_width_stays_on_the_host():
     assert model(x).dtype is torch.float32
 
 
-def test_amin_has_no_kernel_to_reach():
-    """The correction to "amin is free": there is no minimum op type.
+def test_amin_reuses_the_reduction_kernel_with_its_own_kind():
+    """Amin delegates through the same reduction command as amax.
 
-    `HtpOpsReductionOpType` is sum, maximum, mean, and the dispatcher rejects
-    anything else, so `amin` cannot be delegated by writing another emitter --
-    it needs a new kernel, and it stays on the portable one until one exists.
-    This test is the executable form of that claim: amax delegates, amin does
-    not, on the same node and the same dims.
+    `HtpOpsReductionOpType` now includes the minimum kind, and this test is the
+    executable form of the new kernel: amax and amin delegate on the same node
+    and the same dims.
     """
     x = torch.randn(2, 3, 4, dtype=torch.float16)
     assert len(_delegates(_program(_Reduce("amax", dim=1), x))) == 1
-    assert _delegates(_program(_Reduce("amin", dim=1), x)) == []
+    assert len(_delegates(_program(_Reduce("amin", dim=1), x))) == 1
     assert torch.amin(x, dim=1).shape == (2, 4)
     assert _MEAN == 3 and _MAXIMUM == 2 and _SUM == 1
