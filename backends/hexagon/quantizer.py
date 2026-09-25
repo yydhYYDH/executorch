@@ -48,12 +48,23 @@ Usage follows the usual PT2E flow:
     prepared = prepare_pt2e(exported.module(), quantizer)
     prepared(*calibration_inputs)
     quantized = convert_pt2e(prepared)
+
+Which matmuls it annotates, and what a caller should expect of the ones it does
+not: `mm`, `addmm`, the two-dimensional `matmul` they are the lowering of, and
+`nn.Linear`/`F.linear`, which is rewritten into the `addmm` spelling because its
+own lowers to a permuted weight no quantized emitter matches. An annotation is
+made only where the quantized emitters can run the matmul, so a projection
+outside their gates keeps the fp16 path it would have had without a quantizer
+rather than leaving a `dequantize_per_channel` in the graph for a runtime that
+has no kernel for it.
 """
 
 from __future__ import annotations
 
 import functools
-from typing import Callable, Dict, Optional
+import logging
+import re
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch.fx import Node
@@ -63,6 +74,12 @@ from torchao.quantization.pt2e.quantizer import (
     QuantizationConfig,
     QuantizationSpec,
     Quantizer,
+)
+
+from executorch.backends.hexagon.hexagon_ops import (
+    _bias_is_one_value_per_channel,
+    _scalar_arg,
+    weight_only_matmul_fits,
 )
 
 __all__ = [
@@ -84,6 +101,225 @@ _WEIGHT_ONLY_TARGETS: Dict[Callable, int] = {
     torch.ops.aten.mm.default: 1,
     torch.ops.aten.addmm.default: 2,
 }
+
+#: `nn.Linear` and `F.linear`: the spelling every transformer's projections are
+#: written in, and not one the table above holds. Its weight is stored `[out, in]`
+#: and `to_edge` lowers it to `addmm(b, x, permute_copy(w, [1, 0]))`, so a
+#: dequantize on that weight would sit behind a permute `hexagon_ops` does not
+#: match. `transform_for_annotation` rewrites an admissible one into the `addmm`
+#: the table does hold, over a materialized `[in, out]` constant.
+_LINEAR_TARGET = torch.ops.aten.linear.default
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _static_shape(value) -> Optional[Tuple[int, ...]]:
+    """A tensor's shape as ints, or None.
+
+    None covers both "not a tensor" and "an axis whose extent is dynamic": a
+    dynamic axis has no geometry to compare against the kernels' guards, and the
+    emitters refuse one for the same reason.
+    """
+    if not isinstance(value, torch.Tensor):
+        return None
+    shape = []
+    for axis in value.shape:
+        if isinstance(axis, torch.SymInt):
+            return None
+        shape.append(int(axis))
+    return tuple(shape)
+
+
+def _operand(node: Node, index: int) -> Optional[Node]:
+    """The node at `index`, if there is one and it is a node."""
+    if len(node.args) > index and isinstance(node.args[index], Node):
+        return node.args[index]
+    return None
+
+
+def _constant_weight(node: Node, index: int) -> Optional[Node]:
+    """The weight operand at `index`, if the program owns it rather than the graph.
+
+    A parameter, buffer or lifted constant is a `get_attr`. That is the same
+    question the emitters ask through `HexagonPartitioner`'s
+    `is_data_placeholder`, and it is the one that has to be asked *before* the
+    annotation: PT2E freezes a constant weight into the stored low-bit tensor
+    the emitters pack, but an operand the caller hands in is quantized at run
+    time instead, which leaves a `quantize_per_channel` in the graph beside the
+    dequantize and no kernel for either.
+    """
+    weight = _operand(node, index)
+    if weight is None or weight.op != "get_attr":
+        return None
+    return weight
+
+
+def _matmul_facts(node: Node):
+    """(activation, bias, m, k, n) of a matmul the table holds, or None.
+
+    The weight is last in both spellings, so the activation is the operand
+    before it -- `mm` is `(activation, weight)` and `addmm` is `(bias,
+    activation, weight)`. `alpha` and `beta` are the two arguments the plain path
+    already checks: alpha has no kernel here, and beta decides whether the bias
+    is one the kernel's own bias operand carries.
+    """
+    index = _weight_index(node)
+    if index is None:
+        return None
+    weight = _constant_weight(node, index)
+    activation = _operand(node, index - 1)
+    if weight is None or activation is None:
+        return None
+    bias = None
+    if node.target is torch.ops.aten.addmm.default:
+        if _scalar_arg(node, "alpha", 4, 1.0) != 1.0:
+            return None
+        beta = _scalar_arg(node, "beta", 3, 1.0)
+        if beta not in (0.0, 1.0):
+            return None
+        if beta != 0.0:
+            bias = _operand(node, 0)
+    activation_shape = _static_shape(activation.meta.get("val"))
+    weight_shape = _static_shape(weight.meta.get("val"))
+    if activation_shape is None or weight_shape is None:
+        return None
+    if len(activation_shape) != 2 or len(weight_shape) != 2:
+        return None
+    if activation_shape[1] != weight_shape[0]:
+        return None
+    return activation, bias, activation_shape[0], weight_shape[0], weight_shape[1]
+
+
+def _linear_facts(model: torch.fx.GraphModule, node: Node):
+    """(activation, bias, weight, source, m, k, n) of an `aten.linear`, or None.
+
+    The weight is stored `[out, in]`, the other way round from every spelling in
+    the table, so `k` is its second axis and `n` its first. `source` is the
+    tensor itself, which is what the rewrite transposes.
+    """
+    activation = _operand(node, 0)
+    weight = _constant_weight(node, 1)
+    if activation is None or weight is None:
+        return None
+    if len(node.args) > 2 and node.args[2] is not None and _operand(node, 2) is None:
+        return None
+    bias = _operand(node, 2)
+    source = _owned_tensor(model, str(weight.target))
+    activation_shape = _static_shape(activation.meta.get("val"))
+    weight_shape = _static_shape(weight.meta.get("val"))
+    if source is None or activation_shape is None or weight_shape is None:
+        return None
+    if len(activation_shape) != 2 or len(weight_shape) != 2:
+        return None
+    n, k = weight_shape
+    if activation_shape[1] != k:
+        return None
+    return activation, bias, weight, source, activation_shape[0], k, n
+
+
+def _admits_the_emitters(activation: Node, bias, m, k, n, bits: int) -> bool:
+    """Whether the quantized emitters will run this matmul once it is annotated.
+
+    `hexagon_ops.quantized_matmul_is_emittable` answers the same questions of a
+    graph that already carries the `dequantize_per_channel` this is deciding
+    whether to create; this asks them of the operands, before it exists. Two of
+    the answers are shared outright -- `weight_only_matmul_fits` for the shape
+    and `_bias_is_one_value_per_channel` for the bias -- so the two cannot drift
+    apart on the conditions the kernels' own guards decide. What is left is the
+    activation's own: a strided one is read wrong by a kernel that walks K
+    contiguously.
+
+    Erring strict is deliberate. A matmul this turns away keeps the fp16 path it
+    already had; a matmul it admitted that the emitters then refused would leave
+    its dequantize in the graph, and `to_executorch` cannot serialize that.
+    """
+    value = activation.meta.get("val")
+    if not isinstance(value, torch.Tensor) or not value.is_contiguous():
+        return False
+    if not weight_only_matmul_fits(m, k, n, bits):
+        return False
+    return bias is None or _bias_is_one_value_per_channel(bias, n)
+
+
+def _log_unannotated(node: Node, reason: str) -> None:
+    """Say why a matmul was left unquantized, when anyone is listening.
+
+    Debug rather than warning, and guarded like the partitioner's own
+    diagnostics: a graph that keeps a projection on the portable kernels is the
+    answer the backend gives to every gate it does not pass, and an export must
+    not start paying for messages nobody asked for.
+    """
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        _LOGGER.debug(
+            "hexagon: %s stays unquantized: %s, so it keeps the path it has",
+            node.name,
+            reason,
+        )
+
+
+def _owned_tensor(model: torch.fx.GraphModule, path: str) -> Optional[torch.Tensor]:
+    """The tensor a `get_attr` path names, or None if nothing here holds it.
+
+    A parameter or a buffer is what a weight usually is. Anything else is one the
+    rewrite cannot transpose, and None leaves that `nn.Linear` exactly as it is
+    rather than failing the whole quantization.
+    """
+    for getter in (model.get_parameter, model.get_buffer):
+        try:
+            return getter(path)
+        except AttributeError:
+            continue
+    return None
+
+
+def _transposed_name(weight: Node) -> str:
+    """A module attribute name for the transposed copy of `weight`.
+
+    Keyed by the weight it comes from rather than by the node that reads it: two
+    `nn.Linear`s over one parameter are one projection stored once, and tied
+    weights are common enough in a transformer to be worth the shared constant.
+    """
+    return "_hexagon_weight_t_" + re.sub(r"\W", "_", str(weight.target))
+
+
+def _linear_as_addmm(
+    model: torch.fx.GraphModule,
+    node: Node,
+    weight: Node,
+    source: torch.Tensor,
+    bias,
+) -> None:
+    """Replace `linear(x, w, b)` with `addmm(b, x, w_t)` over a [in, out] constant.
+
+    A transpose of a constant is a permutation, not arithmetic: the transposed
+    weight is the same numbers and `torch.export` drops the original once
+    nothing reads it. What it buys is the pattern -- the dequantize lands
+    directly on the matmul's weight operand, which is what the emitters match,
+    instead of behind the `permute_copy` `to_edge` would have put between them.
+    `addmm` reaches the kernel's own bias operand, so a biased projection is one
+    command rather than a matmul and an add.
+    """
+    with torch.no_grad():
+        transposed_value = source.detach().t().contiguous()
+    name = _transposed_name(weight)
+    if not hasattr(model, name):
+        model.register_parameter(
+            name,
+            torch.nn.Parameter(transposed_value.clone(), requires_grad=False),
+        )
+    graph = model.graph
+    with graph.inserting_before(node):
+        transposed = graph.create_node("get_attr", name)
+        transposed.meta["val"] = weight.meta["val"].t().contiguous()
+        if bias is None:
+            target, args = torch.ops.aten.mm.default, (node.args[0], transposed)
+        else:
+            target = torch.ops.aten.addmm.default
+            args = (bias, node.args[0], transposed)
+        replacement = graph.create_node("call_function", target, args)
+        replacement.meta.update(node.meta)
+    node.replace_all_uses_with(replacement)
+    graph.erase_node(node)
 
 
 def _matmul_is_two_dimensional(node: Node) -> bool:
@@ -224,8 +460,36 @@ class HexagonQuantizer(Quantizer):
     def transform_for_annotation(
         self, model: torch.fx.GraphModule
     ) -> torch.fx.GraphModule:
-        # mm and addmm carry no scalar that has to become a tensor attribute, so
-        # there is nothing to rewrite before the observers go in.
+        """Rewrite an admissible `linear` into the `addmm` spelling.
+
+        Everything else the table holds is already the spelling the emitters
+        match and needs no rewrite. A `linear` the emitters would refuse is left
+        exactly as it is, permute and all: that is the fp16 graph the caller
+        would have exported without a quantizer, and the alternative is a graph
+        carrying a dequantize no kernel here can run.
+        """
+        config = self.global_config
+        if config is None:
+            return model
+        bits = _bits_of(config)
+        for node in list(model.graph.nodes):
+            if node.target is not _LINEAR_TARGET:
+                continue
+            if self.filter_fn is not None and not self.filter_fn(node):
+                continue
+            facts = _linear_facts(model, node)
+            if facts is None:
+                _log_unannotated(node, "its weight is not one the export owns")
+                continue
+            activation, bias, weight, source, m, k, n = facts
+            if not _admits_the_emitters(activation, bias, m, k, n, bits):
+                _log_unannotated(
+                    node,
+                    f"the quantized matmul emitters do not take m={m} k={k} n={n} "
+                    f"with {bits}-bit weights",
+                )
+                continue
+            _linear_as_addmm(model, node, weight, source, bias)
         return model
 
     def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -241,15 +505,22 @@ class HexagonQuantizer(Quantizer):
                 continue
             if self.filter_fn is not None and not self.filter_fn(node):
                 continue
+            facts = _matmul_facts(node)
+            if facts is None:
+                _log_unannotated(node, "its weight is not one the export owns")
+                continue
+            activation, bias, m, k, n = facts
+            if not _admits_the_emitters(activation, bias, m, k, n, bits):
+                _log_unannotated(
+                    node,
+                    f"the quantized matmul emitters do not take m={m} k={k} n={n} "
+                    f"with {bits}-bit weights",
+                )
+                continue
             weight = node.args[weight_index]
-            if not isinstance(weight, torch.fx.Node):
-                continue
-            value = weight.meta.get("val")
-            if not isinstance(value, torch.Tensor) or value.dim() == 0:
-                continue
             # The weight's last axis is the output-feature axis the per-channel
             # scale is indexed by, for both [k, n] and [n, k] spellings.
-            spec = _weight_qspec(bits, ch_axis=value.dim() - 1)
+            spec = _weight_qspec(bits, ch_axis=weight.meta["val"].dim() - 1)
             node.meta["quantization_annotation"] = QuantizationAnnotation(
                 input_qspec_map={weight: spec},
                 output_qspec=None,

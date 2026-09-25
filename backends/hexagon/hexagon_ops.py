@@ -1963,6 +1963,37 @@ def quantized_matmul_geometry(activation, quantized: QuantizedWeight):
         return None
 
 
+def weight_only_matmul_fits(m: int, k: int, n: int, bits: int) -> bool:
+    """Whether one of the two quantized matmul emitters can run this geometry.
+
+    The shape half of `quantized_matmul_is_emittable`, asked of the four numbers
+    rather than of a graph. The quantizer needs this answer *before* the
+    dequantize it would create exists, so it cannot read the pattern those
+    predicates read; it calls this instead, which is also what the two `fits`
+    predicates below call, so a shape one caller admits is a shape the other
+    admits.
+
+    The guards are the kernels' own: `K % 64` is what the activation pack's
+    one-region-per-block form needs and is stricter than the kernel's own
+    `K % 32` -- the kernel floors the division, so a K that is not a multiple of
+    32 would silently drop a tile's tail -- and `N % 32` is the output-channel
+    tile. `N % 64` is not required: the output repack carries the ragged last
+    pack as a second region. The prefill entry adds the `M <= 32` K ceiling and
+    its VTCM budget, and `M == 1` belongs to the GEMV entries whatever the width
+    of the stored weight, which is why a `w8a16` matmul above one row answers
+    False: every other M is the int4 prefill entry's.
+    """
+    if k % 64 or n % 32:
+        return False
+    if m == 1:
+        return True
+    if bits != 4:
+        return False
+    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
+        return False
+    return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
+
+
 def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
     """Whether the M == 1 GEMV kernels can run this matmul.
 
@@ -1974,24 +2005,20 @@ def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
     if geometry is None:
         return False
     m, k, n = geometry
-    return m == 1 and k % 64 == 0 and n % 32 == 0
+    return m == 1 and weight_only_matmul_fits(m, k, n, quantized.bits)
 
 
 def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     """Whether the M > 1 prefill kernel can run this matmul.
 
-    The same two shape guards the GEMV entries carry, and for the same reason:
-    the kernel splits K into 32-element tiles and floors the division, so a K
-    that is not a multiple of 32 would silently drop the tail, and N lands in
-    32-channel tiles. K % 64 is what the activation pack's one-region-per-block
-    form needs and is stricter than the kernel's own K % 32 -- a K that is not a
-    multiple of 64 packs into half a block whose other half is not part of the
-    tensor. N % 64 is not required: the output repack carries the ragged last
-    pack as a second region.
+    The guards themselves are `weight_only_matmul_fits`, which the quantizer also
+    calls before it annotates anything: this predicate owns the `M > 1` half and
+    that function owns the shape and budget half, so neither spelling of the
+    question can move the guards without the other seeing it.
 
     M > 1 is the whole point -- M == 1 belongs to the GEMV entries, which read a
     different weight layout and are already wired. M itself has no upper bound
-    and is not what the third guard below is about: the dispatcher picks between
+    and is not what the third guard is about: the dispatcher picks between
     two prefill kernels on `M <= 32` (`matmul_ops.cc:28`), and while the M > 32
     one heap-allocates its per-tile descriptors, the M <= 32 one keeps them in a
     stack array sized by K. So a small M is what caps K, and the cap is a K
@@ -2007,17 +2034,11 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     w8a16 matmul with M > 1 stays on the portable kernels rather than be fed
     bytes nothing has checked.
     """
-    if quantized.bits != 4:
-        return False
     geometry = quantized_matmul_geometry(activation, quantized)
     if geometry is None:
         return False
     m, k, n = geometry
-    if m <= 1 or k % 64 != 0 or n % 32 != 0:
-        return False
-    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
-        return False
-    return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
+    return m > 1 and weight_only_matmul_fits(m, k, n, quantized.bits)
 
 
 def _prefill_vtcm_bytes(k: int) -> int:
