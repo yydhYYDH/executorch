@@ -91,6 +91,17 @@ DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 # allocations around them (output tile buffers, scales, HMX column scales).
 PREFILL_OUTPUT_CHANNEL_CHUNK = 2
 PREFILL_VTCM_FIXED = 64 * 1024
+#: The M the dispatcher switches prefill kernels on (`matmul_ops.cc:28`). The
+#: M <= 32 kernel now uses heap-backed descriptors, and the corrected skel has
+#: answered M=4, K=12800 on the OnePlus 13. The bound below remains conservative
+#: for the host path until a broader device matrix justifies widening it.
+PREFILL_M32_MAX_M = 32
+#: The largest K measured to work at M <= 32 on the OnePlus 13 before the heap
+#: fix: K=12672 answers and K=12800 aborts the DSP process with
+#: `execute_command_group failed: 0x8000040d`. The corrected heap-backed skel
+#: also answered K=12800, but this gate remains in place because that is one
+#: device and one skel result, not a basis for removing the host safety refusal.
+PREFILL_M32_MAX_K = 12672
 #: The VTCM the prefill kernels may reserve. The simulator reports 8 MiB
 #: (`vtcm_manager_get_vtcm_size`) and the kernels' own guard is 8 MiB less
 #: 16 KiB (`matmul_q4fp16.c:946`); this asks for less than either, because what
@@ -1907,9 +1918,11 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     pack as a second region.
 
     M > 1 is the whole point -- M == 1 belongs to the GEMV entries, which read a
-    different weight layout and are already wired -- and there is no upper bound
-    here: the kernel chunks M into 32-row groups and walks them, so the value of
-    M only decides how long that walk is.
+    different weight layout and are already wired. The M <= 32 dispatcher branch
+    previously put a K-byte descriptor array on its stack. The corrected phone skel
+    clears the measured boundary, but the host keeps the conservative safety refusal
+    until a broader device matrix justifies widening it. The M > 32 branch
+    heap-allocated the same descriptors and has no equivalent K ceiling.
 
     The int4 and int8 prefill entries share this geometry. Their weights are
     different packed layouts, but each has a host packer for the layout its
@@ -1922,6 +1935,8 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
         return False
     m, k, n = geometry
     if m <= 1 or k % 64 != 0 or n % 32 != 0:
+        return False
+    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
         return False
     return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
 
