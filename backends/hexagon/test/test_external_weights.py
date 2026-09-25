@@ -19,36 +19,31 @@ copy of it, not the rpcmem transfer.
 """
 
 import os
-import pathlib
-import sys
+
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
+from executorch.backends.hexagon.hexagon_backend import (
     HexagonCompileOptions,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
-from executorch.backends.hexagon.test.blob_interpreter import (  # noqa: E402
+from executorch.backends.hexagon.serialization import blob as B
+from executorch.backends.hexagon.test.blob_interpreter import (
     execute,
     read_blob,
     read_external_weights,
 )
-from executorch.exir import to_edge_transform_and_lower  # noqa: E402
-from executorch.exir._serialize.data_serializer import DataPayload  # noqa: E402
-from executorch.extension.flat_tensor.serialize.serialize import (  # noqa: E402
+from executorch.exir import to_edge_transform_and_lower
+from executorch.exir._serialize.data_serializer import DataPayload
+from executorch.extension.flat_tensor.serialize.serialize import (
     FlatTensorSerializer,
 )
-from torch.export import export  # noqa: E402
+from torch.export import export
 
 #: One command, one weight: small enough to export in a second, big enough that
 #: the byte count either side of the boundary is worth counting.

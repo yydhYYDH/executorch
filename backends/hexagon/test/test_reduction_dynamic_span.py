@@ -17,29 +17,19 @@ patch, so what is pinned here is the record the runtime applies, the way
 `test_dynamic_blob.py` pins the matmul's.
 """
 
-import os
-import pathlib
 import struct
-import sys
 
 import numpy as np
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-from blob_interpreter import read_blob  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import read_blob
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from torch.export import Dim, export  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from torch.export import Dim, export
 
 #: DSP_OP_REDUCTION, and the kind each case below selects.
 _REDUCTION = 29

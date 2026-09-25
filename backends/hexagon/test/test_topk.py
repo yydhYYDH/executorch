@@ -16,41 +16,31 @@ tests pin that measurement, the rule it justifies, and every argument combinatio
 that must therefore stay on the portable kernels.
 """
 
-import os
 import operator
-import pathlib
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-from blob_interpreter import Arena, execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import Arena, execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     TopkSpec,
     topk_spec,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
-from executorch.exir import (  # noqa: E402
+from executorch.exir import (
     EdgeCompileConfig,
     to_edge,
     to_edge_transform_and_lower,
 )
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import Dim, export  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import Dim, export
 
 F16 = torch.float16
 

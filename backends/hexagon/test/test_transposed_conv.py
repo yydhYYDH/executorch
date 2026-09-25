@@ -30,36 +30,27 @@ kernel's interleave fast path guards on strides that make it write the bytes the
 region walk would, so a region it claims is a region it carries.
 """
 
-import os
-import pathlib
-import sys
+
 
 import blob_interpreter
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     conv_spec,
     ConvSpec,
     deconv_weight_as_conv,
     pack_conv_weight,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from torch.export import export
 
 #: The four commands a transposed convolution lowers to, before the channel
 #: blocking adds a pair of its own: DSP_OP_ZERO, DSP_OP_RASTER_BLIT, the im2col

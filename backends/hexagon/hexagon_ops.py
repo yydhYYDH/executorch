@@ -3190,9 +3190,11 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
 # uses, so both are wrapped in the same pair of blits, and the general path
 # wants its weight in the HMX unit's 32x32 tiles, which is an export-time
 # rearrange of the same kind pack_hmx_weight does for a matmul.
+CONV1D = exir_ops.edge.aten.conv1d.default
 CONV2D = exir_ops.edge.aten.conv2d.default
+CONV3D = exir_ops.edge.aten.conv3d.default
 CONVOLUTION = exir_ops.edge.aten.convolution.default
-CONV_TARGETS = frozenset({CONV2D, CONVOLUTION})
+CONV_TARGETS = frozenset({CONV1D, CONV2D, CONV3D, CONVOLUTION})
 
 # What the im2col kernel asks VTCM for before it runs anything
 # (im2col_convolution_fp16.cc:1783-1786): one weight staging buffer per channel
@@ -3285,6 +3287,28 @@ def _zero_insert_regions(source_shape, spec: ConvSpec) -> List[int]:
     ]
 
 
+def _conv_spatial_pair(value, rank: int, default: tuple) -> Optional[tuple]:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        return None
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in values):
+        return None
+    if rank == 3:
+        return (1, values[0]) if len(values) == 1 else None
+    if rank == 4:
+        return (values[0], values[1]) if len(values) == 2 else None
+    if rank == 5 and len(values) == 3:
+        return values
+    return None
+
+
 def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     """The convolution's geometry, or None when neither kernel here can run it.
 
@@ -3327,39 +3351,50 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     bias = args[2] if len(args) > 2 else None
     if bias is not None and not (isinstance(bias, torch.fx.Node) and is_constant(bias)):
         return None
+    value = source.meta.get("val")
+    kernel = weight.meta.get("val")
+    result = node.meta.get("val")
+    if not all(isinstance(item, torch.Tensor) for item in (value, kernel, result)):
+        return None
+    rank = value.dim()
+    if rank != kernel.dim() or rank != result.dim():
+        return None
     group = args[8] if convolve else args[6]
-    stride = _int_pair(args[3], None)
-    padding = _int_pair(args[4], None)
-    dilation = _int_pair(args[5], (1, 1))
+    stride_3d = _conv_spatial_pair(args[3], rank, (1, 1, 1))
+    padding_3d = _conv_spatial_pair(args[4], rank, (0, 0, 0))
+    dilation_3d = _conv_spatial_pair(args[5], rank, (1, 1, 1))
     transposed = False
     tail = (0, 0)
     if convolve:
         if not isinstance(args[6], bool):
             return None
         transposed = args[6]
-        tail = _int_pair(args[7], (0, 0))
+        tail = (
+            _int_pair(args[7], (0, 0))
+            if rank in (3, 4)
+            else (0, 0, 0)
+            if rank == 5 and args[7] == [0, 0, 0]
+            else None
+        )
         if tail is None:
             return None
     if isinstance(group, bool) or not isinstance(group, int) or group <= 0:
         return None
-    if stride is None or padding is None or dilation is None:
+    if stride_3d is None or padding_3d is None or dilation_3d is None:
         return None
-    if any(step <= 0 for step in stride) or any(step <= 0 for step in dilation):
+    if any(step <= 0 for step in stride_3d) or any(step <= 0 for step in dilation_3d):
         return None
-    if any(pad < 0 for pad in padding):
+    if any(pad < 0 for pad in padding_3d):
         return None
     if any(extra < 0 for extra in tail):
         return None
 
-    value = source.meta.get("val")
-    kernel = weight.meta.get("val")
-    result = node.meta.get("val")
-    if not all(isinstance(item, torch.Tensor) for item in (value, kernel, result)):
-        return None
     if value.dtype not in (torch.float16, torch.float32):
         return None
-    if value.dim() != 4 or kernel.dim() != 4 or result.dim() != 4:
+    if rank not in (3, 4, 5) or kernel.dim() != rank or result.dim() != rank:
         return None
+    if rank == 4:
+        stride, padding, dilation = stride_3d, padding_3d, dilation_3d
     # Only the operand's height may hold the run-time length. A batch, a channel
     # count or the window's width that moved would each need its own patch over
     # the arena's own geometry, and the weight is a constant whose extents are
@@ -3371,11 +3406,18 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     result_kinds = [extent_kind(dim) for dim in result.shape]
     if any(kind == DERIVED_DIM for kind in value_kinds + result_kinds):
         return None
-    if any(kind != STATIC_DIM for kind in value_kinds[0:2] + value_kinds[3:]):
-        return None
-    if any(kind != STATIC_DIM for kind in result_kinds[0:2] + result_kinds[3:]):
-        return None
-    dynamic_h = value_kinds[2] in (RUNTIME_DIM, SPECIALIZED_DIM)
+    if rank in (3, 5):
+        if any(kind != STATIC_DIM for kind in value_kinds + result_kinds):
+            return None
+        if transposed:
+            return None
+        dynamic_h = False
+    else:
+        if any(kind != STATIC_DIM for kind in value_kinds[0:2] + value_kinds[3:]):
+            return None
+        if any(kind != STATIC_DIM for kind in result_kinds[0:2] + result_kinds[3:]):
+            return None
+        dynamic_h = value_kinds[2] in (RUNTIME_DIM, SPECIALIZED_DIM)
     if value_kinds[2] == SPECIALIZED_DIM and result_kinds[2] != SPECIALIZED_DIM:
         return None
     if dynamic_h and transposed:
@@ -3384,7 +3426,60 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         # height has to the run length. Neither of the two was measured against
         # the other, so the combination stays on the portable kernels.
         return None
-    batch, in_channels, in_h, in_w = (int(dim) for dim in value.shape)
+    if rank == 3:
+        batch, in_channels, in_w = (int(dim) for dim in value.shape)
+        in_h = 1
+        kernel_y, kernel_x = 1, int(kernel.shape[2])
+        stride, padding, dilation = stride_3d, padding_3d, dilation_3d
+        stride, padding, dilation = (1, stride[0]), (0, padding[0]), (1, dilation[0])
+    elif rank == 5:
+        spatial_in = [int(dim) for dim in value.shape[2:]]
+        spatial_result = [int(dim) for dim in result.shape[2:]]
+        spatial_kernel = [int(dim) for dim in kernel.shape[2:]]
+        if spatial_kernel[0] == spatial_kernel[1] == 1:
+            if (
+                spatial_in[0] != spatial_result[0]
+                or spatial_in[1] != spatial_result[1]
+                or spatial_in[0] != 1
+                or spatial_in[1] != 1
+                or stride_3d[0] != 1
+                or stride_3d[1] != 1
+                or padding_3d[0] != 0
+                or padding_3d[1] != 0
+                or dilation_3d[0] != 1
+                or dilation_3d[1] != 1
+            ):
+                return None
+            in_h, in_w = 1, spatial_in[2]
+            kernel_y, kernel_x = 1, spatial_kernel[2]
+            stride, padding, dilation = stride_3d[2], padding_3d[2], dilation_3d[2]
+        else:
+            singleton_axes = [
+                axis for axis, size in enumerate(spatial_kernel) if size == 1
+            ]
+            dropped_axis = next(
+                (
+                    axis
+                    for axis in singleton_axes
+                    if spatial_in[axis] == spatial_result[axis] == 1
+                    and stride_3d[axis] == 1
+                    and padding_3d[axis] == 0
+                    and dilation_3d[axis] == 1
+                ),
+                None,
+            )
+            if dropped_axis is None:
+                return None
+            keep_axes = [axis for axis in range(3) if axis != dropped_axis]
+            in_h, in_w = (spatial_in[axis] for axis in keep_axes)
+            kernel_y, kernel_x = (spatial_kernel[axis] for axis in keep_axes)
+            stride = tuple(stride_3d[axis] for axis in keep_axes)
+            padding = tuple(padding_3d[axis] for axis in keep_axes)
+            dilation = tuple(dilation_3d[axis] for axis in keep_axes)
+        stride, padding, dilation = (1, stride), (0, padding), (1, dilation)
+        batch, in_channels = (int(dim) for dim in value.shape[:2])
+    else:
+        batch, in_channels, in_h, in_w = (int(dim) for dim in value.shape)
     if transposed:
         # A transposed convolution's weight is indexed the other way round: the
         # leading axis is the input's channels and the second the output's share
@@ -3394,9 +3489,9 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
             return None
         out_channels = per_group * group
     else:
-        out_channels, per_group, kernel_y, kernel_x = (
-            int(dim) for dim in kernel.shape
-        )
+        out_channels, per_group = (int(dim) for dim in kernel.shape[:2])
+        if rank == 4:
+            kernel_y, kernel_x = (int(dim) for dim in kernel.shape[2:])
         if per_group * group != in_channels:
             return None
     extents = (batch, in_channels, in_h, in_w, out_channels, kernel_y, kernel_x)
@@ -3431,7 +3526,14 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_x - 1) - 1) // stride[1] + 1
     if out_h <= 0 or out_w <= 0:
         return None
-    if [int(dim) for dim in result.shape] != [batch, out_channels, out_h, out_w]:
+    expected_result = (
+        [batch, out_channels, out_w]
+        if rank == 3
+        else [batch, out_channels, 1, out_h, out_w]
+        if rank == 5
+        else [batch, out_channels, out_h, out_w]
+    )
+    if [int(dim) for dim in result.shape] != expected_result:
         return None
     if dynamic_h and (
         stride[0] != 1 or 2 * padding[0] != dilation[0] * (kernel_y - 1)
@@ -4099,7 +4201,10 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         weight = ctx.packed_weights(
             weight_node,
             lambda array: pack_depthwise_weight(
-                array, spec.in_channels, spec.kernel_y, spec.kernel_x
+                array.reshape(spec.in_channels, 1, spec.kernel_y, spec.kernel_x),
+                spec.in_channels,
+                spec.kernel_y,
+                spec.kernel_x,
             ),
             "depthwise",
         )
@@ -4141,11 +4246,29 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         )
         _patch_conv_extents(ctx, op_index, spec, im2col=False)
     else:
+        def _pack(array):
+            if spec.transposed:
+                array = deconv_weight_as_conv(array)
+            elif array.ndim == 3:
+                array = array.reshape(
+                    spec.out_channels, spec.in_channels, spec.kernel_y, spec.kernel_x
+                )
+            elif array.ndim == 5:
+                spatial = [int(size) for size in array.shape[2:]]
+                if spatial[0] == spatial[1] == 1:
+                    array = array[:, :, 0, 0, :]
+                else:
+                    singleton = next(axis for axis, size in enumerate(spatial) if size == 1)
+                    axes = [0, 1] + [axis + 2 for axis in range(3) if axis != singleton]
+                    array = array[(slice(None), slice(None)) + tuple(axes)]
+                array = array.reshape(
+                    spec.out_channels, spec.in_channels, spec.kernel_y, spec.kernel_x
+                )
+            return pack_conv_weight(array, spec)
+
         weight = ctx.packed_weights(
             weight_node,
-            lambda array: pack_conv_weight(
-                deconv_weight_as_conv(array) if spec.transposed else array, spec
-            ),
+            _pack,
             "transposed im2col" if spec.transposed else "im2col",
         )
         bias = _conv_bias_ref(
@@ -6026,6 +6149,9 @@ EMITTERS = {
     ROW_GUARD: _emit_row_guard,
     # One ATen op, two kernels: the depthwise walk and the im2col convolution
     # (see conv_spec for which geometry each takes).
+    CONV1D: _emit_convolution,
+    CONV2D: _emit_convolution,
+    CONV3D: _emit_convolution,
     CONVOLUTION: _emit_convolution,
     exir_ops.edge.aten.tanh.default: _unary("tanh"),
     exir_ops.edge.aten.sqrt.default: _unary("sqrt"),

@@ -18,21 +18,15 @@ emitter's own packers: the numbers below are therefore about the bytes this
 backend would hand the kernel rather than about a layout written down twice.
 """
 
-import os
 import pathlib
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(
-    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
 
-import hexagon_sim  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import hexagon_sim
+from executorch.backends.hexagon.hexagon_ops import (
     ConvSpec,
     pack_conv_weight,
     pack_depthwise_weight,

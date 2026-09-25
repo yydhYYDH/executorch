@@ -29,28 +29,23 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-
-from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
+from executorch.backends.hexagon.hexagon_backend import (
     ATTN_PAGED_SPEC,
     EXTERNAL_WEIGHTS_MAX_BYTES_SPEC,
     HexagonBackend,
     HexagonCompileOptions,
     HMX_PREPACK_SPEC,
 )
-from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
-from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
-from executorch.backends.hexagon.test.blob_interpreter import (  # noqa: E402
+from executorch.backends.hexagon.hexagon_ops import sdpa_targets
+from executorch.backends.hexagon.serialization import blob as B
+from executorch.backends.hexagon.test.blob_interpreter import (
     read_blob,
     read_external_weights,
 )
-from executorch.exir import to_edge  # noqa: E402
-from executorch.exir.backend.compile_spec_schema import CompileSpec  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import to_edge
+from executorch.exir.backend.compile_spec_schema import CompileSpec
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 _HEXAGON_DIR = pathlib.Path(__file__).resolve().parents[1]
 _CHECKER_SRC = pathlib.Path(__file__).resolve().parent / "compile_spec_checker.cpp"

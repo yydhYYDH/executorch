@@ -21,20 +21,16 @@ permutation of k can leave in place. The scales are powers of two and the
 weights are small integers, so every expected value is exact in fp16.
 """
 
-import os
 import pathlib
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import hexagon_sim  # noqa: E402
-import test_blob_on_sim as blob_sim  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import hexagon_sim
+import test_blob_on_sim as blob_sim
+from executorch.backends.hexagon.hexagon_ops import (
     pack_q4a16_gemv_weight,
     pack_w8a16_gemv_weight,
 )

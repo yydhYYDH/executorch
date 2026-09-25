@@ -15,17 +15,12 @@ import os
 import pathlib
 import shutil
 import subprocess
-import sys
+
 from dataclasses import replace
 
 import pytest
 
 _HEXAGON_DIR = pathlib.Path(__file__).resolve().parents[1]
-# .../src, the directory holding the executorch package, so the worktree is
-# tested rather than whatever happens to be installed.
-_SRC_DIR = pathlib.Path(__file__).resolve().parents[4]
-sys.path.insert(0, os.fspath(_SRC_DIR))
-
 from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
 
 _READER_SRC = pathlib.Path(__file__).resolve().parent / "blob_reader.cpp"

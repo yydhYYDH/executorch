@@ -29,11 +29,6 @@ import tempfile
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-
 _HEXAGON_DIR = pathlib.Path(__file__).resolve().parents[1]
 _PROBE_SRC = pathlib.Path(__file__).resolve().parent / "runtime_options_probe.cpp"
 

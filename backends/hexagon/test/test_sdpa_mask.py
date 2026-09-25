@@ -39,38 +39,30 @@ neither whether the suite thinks the llama op is registered nor the size of the
 """
 
 import contextlib
-import os
-import pathlib
 import struct
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on the
-# path makes `import executorch` resolve to this tree. This environment has an
-# editable install that points at a second checkout with an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     _attention_mask_bytes,
     _attention_workspace_bytes,
     _emit_sdpa,
     DSP_OP_FLASH_ATTN,
     sdpa_mask_fits_dsp_limits,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     _sdpa_fits_dsp_limits,
     HexagonPartitioner,
 )
-from executorch.exir import to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import Dim, export  # noqa: E402
+from executorch.exir import to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import Dim, export
 
 #: [batch, seq, heads, dim] over a cache whose head count divides the query's,
 #: which is the GQA shape the kernel and the emitter both carry.

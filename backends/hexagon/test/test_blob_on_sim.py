@@ -27,39 +27,32 @@ the fixtures or the runner.
 """
 
 import operator
-import os
 import pathlib
 import struct
-import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-import hexagon_sim  # noqa: E402
-from blob_interpreter import (  # noqa: E402
+import blob_interpreter
+import hexagon_sim
+from blob_interpreter import (
     ABSENT,
     Arena,
     execute,
     read_blob,
     UnsupportedOp,
 )
-from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
-from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
-from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
-from executorch.exir import to_edge  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import Dim, export  # noqa: E402
-from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
+from executorch.backends.hexagon.hexagon_backend import HexagonBackend
+from executorch.backends.hexagon.serialization import blob as _blob
+from executorch.backends.hexagon.hexagon_ops import sdpa_targets
+from executorch.backends.hexagon.quantizer import get_hexagon_quantizer
+from executorch.exir import to_edge
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import Dim, export
+from torchao.quantization.pt2e.quantize_pt2e import (
     convert_pt2e,
     prepare_pt2e,
 )

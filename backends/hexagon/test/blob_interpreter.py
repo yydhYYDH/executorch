@@ -743,17 +743,104 @@ def _fast_logf(x):
     return out
 
 
+#: The companded16 sigmoid chords, from htp_ops_unary_pwl_fp16_vec. The
+#: slope and bias are the fp16 bit patterns the kernel's vlut16 hands back, not
+#: decimal coefficients: the table is a lookup, and reading the hex as a number
+#: would silently model a different function.
+_SIGMOID_SLOPE = np.array(
+    [0x33F5, 0x33B7, 0x3343, 0x32A4, 0x31EB, 0x3128, 0x3067, 0x2F62,
+     0x2D8C, 0x2B47, 0x28A3, 0x25CD, 0x21C8, 0x1C52, 0x1665, 0x10B7],
+    dtype=np.uint16,
+).view(np.float16)
+_SIGMOID_BIAS = np.array(
+    [0x3800, 0x3804, 0x3812, 0x3830, 0x385E, 0x389B, 0x38E4, 0x3933,
+     0x39A9, 0x3A42, 0x3AC0, 0x3B22, 0x3B7F, 0x3BC7, 0x3BE8, 0x3BF6],
+    dtype=np.uint16,
+).view(np.float16)
+
+
+def _pwl_index16(x: np.ndarray, scale: float) -> np.ndarray:
+    """htp_ops_pwl_index16: scale, clamp, offset by 16, then shift the bits.
+
+    The index is not a float. The kernel multiplies into fp16, clamps at 15.0
+    because a value just under 16 can round to exactly 16, adds 16.0 and then
+    shifts the fp16 bit pattern right by six; the low four bits of that are
+    what the vlut16 consumes.
+    """
+    scaled = (x * scale).astype(np.float16)
+    scaled = np.minimum(scaled, np.float16(15.0)).astype(np.float16)
+    scaled = (scaled + np.float16(16.0)).astype(np.float16)
+    return np.ascontiguousarray(scaled).view(np.uint16).astype(np.int64) >> 6
+
+
+def _sigmoid_pwl_vector(x: np.ndarray) -> np.ndarray:
+    """htp_ops_unary_pwl_fp16_vec for HTP_OPS_UNARY_SIGMOID, chord for chord.
+
+    abs_v selects the chord, the chord is an fp16 multiply accumulated into an
+    fp16 add, and the negative half is recovered as 1 - y rather than evaluated
+    a second time.
+
+    Past 8 in magnitude the kernel replaces the chord with the saturated limit,
+    and that clamp is the vector path's alone. eight_v is 0x4800, which is 8.0
+    (unary_ops.cc:266); range_is_eight is true for sigmoid alone (unary_ops.cc:
+    269-270); and the saturated predicate is "not 8.0 greater than |x|" selecting
+    between that limit and the chord (unary_ops.cc:327-329). The scalar path has
+    no such test: its sigmoid is three lines with no comparison in them
+    (unary_ops.cc:174-177), so it returns the true sigmoid at -9, which is
+    1.2341e-4, where the chords here return exactly 0. The two disagree because
+    the kernel contains two sigmoid implementations, not because either is
+    approximating the other.
+    """
+    negative = x < np.float16(0.0)
+    abs_v = np.where(negative, -x, x).astype(np.float16)
+    # Below 2 the chords are 0.25 wide; above it the exponent bit and the top
+    # two mantissa bits name the eight wider ones directly (pwl.h:58-71).
+    index_low = _pwl_index16(abs_v, np.float16(4.0))
+    index_wide = ((np.ascontiguousarray(abs_v).view(np.uint16).astype(np.int64) >> 8) & 7) + 8
+    index = np.where(abs_v >= np.float16(2.0), index_wide, index_low) & 15
+    slope = _SIGMOID_SLOPE[index]
+    bias = _SIGMOID_BIAS[index]
+    positive = (abs_v.astype(np.float32) * slope.astype(np.float32) + bias.astype(np.float32)).astype(
+        np.float16
+    )
+    result = np.where(negative, (np.float32(1.0) - positive.astype(np.float32)).astype(np.float16), positive)
+    saturated = np.abs(x.astype(np.float32)) >= np.float32(8.0)
+    limit = np.where(negative, np.float16(0.0), np.float16(1.0))
+    return np.where(saturated, limit, result).astype(np.float16)
+
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Sigmoid as the kernel computes it, which is two different functions.
+
+    htp_ops_unary_compute_fp16_chunk walks 64 fp16 at a time down to
+    vec_end = size & -64 and then finishes element by element through
+    htp_ops_unary_apply_fp16, where sigmoid is the exact 1/(1+expf(-x)) in fp32
+    (unary_ops.cc:174-177). So a tensor of 64 takes the chords and a tensor of
+    65 takes the chords for 64 elements and the exact form for one, and the two
+    disagree with each other by design. One tolerance across the boundary would
+    hide that, which is why the split is reproduced rather than smoothed.
+    """
+    values = np.asarray(x, dtype=np.float32)
+    vec_end = values.size & ~63
+    out = np.empty(values.shape, dtype=np.float16)
+    out[:vec_end] = _sigmoid_pwl_vector(values[:vec_end].astype(np.float16))
+    out[vec_end:] = (np.float32(1.0) / (np.float32(1.0) + np.exp(-values[vec_end:]))).astype(np.float16)
+    return out.astype(np.float32)
+
+
 #: The unary ops the kernel computes elementwise and exactly. log is here
 #: because the transcription above is the kernel's own arithmetic; the ones left
 #: out -- rsqrt, expm1, cos and sin -- have fast approximations this file has not
-#: transcribed, and a host model of them would be guessing.
+#: transcribed, and a host model of them would be guessing. sigmoid is the one
+#: entry that is not exact, because above 64 elements the kernel stops computing
+#: it and evaluates chords instead.
 _UNARY = {
     1: lambda x: np.where(x < 0, -x, x),  # abs
     2: lambda x: -x,  # neg
     3: lambda x: (  # gelu, the tanh form
         0.5 * x * (1.0 + np.tanh(_f32(0.79788456) * (x + _f32(0.044715) * x * x * x)))
     ),
-    4: lambda x: 1.0 / (1.0 + np.exp(-x)),  # sigmoid
+    4: _sigmoid,  # sigmoid: chords above 64 elements, exact below
     5: lambda x: np.exp(x),  # exp
     6: _fast_logf,  # log
     7: lambda x: np.where(x >= 8, x, np.where(x <= -8, 0.0, x / (1.0 + np.exp(-x)))),

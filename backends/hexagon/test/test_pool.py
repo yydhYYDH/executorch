@@ -14,36 +14,27 @@ params, the element mapping that connects them, and every shape that must *not*
 reach the command.
 """
 
-import os
-import pathlib
-import sys
+
 
 import blob_interpreter
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     _channel_block_region,
     _pool_window_intersects,
     pool_spec,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 #: DSP_OP_POOL2D_FP16 and DSP_OP_RASTER_BLIT: the commands a pool lowers to.
 _POOL = 1

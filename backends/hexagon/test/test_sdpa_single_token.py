@@ -26,32 +26,25 @@ mask channel altogether is a failure here rather than a pass.
 
 import contextlib
 import inspect
-import os
-import pathlib
-import sys
+
 
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on the
-# path makes `import executorch` resolve to this tree; this environment has an
-# editable install that points at a second checkout.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-from blob_interpreter import read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     _emit_sdpa,
     DSP_OP_FLASH_ATTN,
 )
-from executorch.backends.hexagon.partition import hexagon_partitioner  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition import hexagon_partitioner
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 #: [batch, seq, heads, dim] over a cache whose head count divides the query's.
 _BATCH, _N_HEADS, _N_KV_HEADS, _MAX_KV_LEN, _HEAD_DIM = 1, 8, 4, 8, 128

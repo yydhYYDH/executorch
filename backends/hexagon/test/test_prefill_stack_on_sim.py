@@ -25,20 +25,16 @@ exactly K.
 
 from __future__ import annotations
 
-import os
 import pathlib
-import sys
 
 import numpy as np
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-import pytest  # noqa: E402
+import pytest
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import hexagon_sim  # noqa: E402
-from test_prefill_on_sim import _SOURCES  # noqa: E402
+import hexagon_sim
+from test_prefill_on_sim import _SOURCES
 
 _RUNNER = pathlib.Path(__file__).resolve().parent / "sim/prefill_stack_runner.cpp"
 

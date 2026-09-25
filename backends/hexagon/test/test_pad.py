@@ -27,35 +27,25 @@ the partitioner as a pad node, because torch lowers them to a small indexing
 program before export sees them.
 """
 
-import os
-import pathlib
 import struct
-import sys
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import constant_pad_region  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon.hexagon_ops import constant_pad_region
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
-from executorch.exir import (  # noqa: E402
+from executorch.backends.hexagon.serialization import blob as B
+from executorch.exir import (
     EdgeCompileConfig,
     to_edge,
     to_edge_transform_and_lower,
 )
-from torch.export import export  # noqa: E402
+from torch.export import export
 
 #: DSP_OP_ZERO and DSP_OP_RASTER_BLIT, the two commands a pad is; and
 #: DSP_OP_UNARY, which is what a relu ahead of one lowers to.
