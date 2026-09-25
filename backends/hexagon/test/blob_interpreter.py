@@ -1613,17 +1613,17 @@ def _run_matmul_w8a16_prefill(
     """hmx_matmul_w8a16_block_fp16, the M > 1 W8A16 prefill kernel."""
     if len(params) != 29:
         raise UnsupportedOp(f"blob: w8a16 prefill has {len(params)} parameters")
-    m, k, n = params[10], params[18], params[20]
-    if k % 64 or n % 32:
+    m, k, n = params[12], params[18], params[20]
+    if m <= 1 or k % 64 or n % 32:
         raise UnsupportedOp(f"blob: a w8a16 prefill of {k}x{n}")
     if params[27] != 1 or params[28] != 0:
         raise UnsupportedOp("blob: w8a16 prefill uses an unsupported scale mode")
 
     raw = bytes(arena.view(command.inputs[1]))
-    w = _unpack_hmx_int8(raw, k, n)
     tile_bytes = (k // 32) * (n // 32) * 1024
-    if len(raw) - tile_bytes < n * 2:
+    if len(raw) < tile_bytes + n * 2:
         raise UnsupportedOp(f"blob: a w8a16 prefill of {k}x{n} has no scale tail")
+    w = _unpack_hmx_int8(raw, k, n)
     scales = np.frombuffer(raw[tile_bytes:], dtype=np.float16)[:n].astype(np.float32)
 
     activation = np.frombuffer(
