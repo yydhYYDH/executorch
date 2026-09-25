@@ -2658,6 +2658,8 @@ def pack_q4a16_gemv_weight(weight, scale, k: int, n: int) -> bytes:
         raise RuntimeError(
             f"hexagon: q4a16 needs K a multiple of 64 and N of 32, got {k}x{n}"
         )
+    if (w < -8).any() or (w > 7).any():
+        raise RuntimeError("hexagon: q4a16 weight contains values outside [-8, 7]")
     kp, np_ = k // 32, n // 32
     padded = np.zeros((np_ * 32, kp * 32), dtype=np.int32)
     padded[:n, :k] = np.clip(w.T, -8, 7) + 8
@@ -2716,6 +2718,8 @@ def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
         raise RuntimeError(
             f"hexagon: w8a16 needs K a multiple of 64 and N of 32, got {k}x{n}"
         )
+    if (w < -128).any() or (w > 127).any():
+        raise RuntimeError("hexagon: w8a16 weight contains values outside [-128, 127]")
     kp, np_ = k // 32, n // 32
     padded = np.zeros((np_ * 32, kp * 32), dtype=np.int32)
     padded[:n, :k] = np.clip(w.T, -128, 127)
@@ -2731,13 +2735,14 @@ def pack_w8a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
     """A (k, n) int8 weight and its fp16 per-channel scales for command 42."""
     import numpy as np
 
+    packed = pack_w8a16_gemv_weight(weight, k, n)
     scales = np.asarray(scale, dtype=np.float32).reshape(-1)
     if scales.size != n:
         raise RuntimeError(f"hexagon: w8a16 has {scales.size} scales, expected {n}")
-    return pack_w8a16_gemv_weight(weight, k, n) + scales.astype(np.float16).tobytes()
+    return packed + scales.astype(np.float16).tobytes()
 
 
-def pack_q4a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
+def pack_q4a16_prefill_weight(weight, scale, k: int, n: int, scale_block_num: int = 1) -> bytes:
     """A (k, n) int4 weight in the tile order the prefill kernel reads.
 
     The GEMV packer above and this one are different layouts for the same
@@ -2774,13 +2779,21 @@ def pack_q4a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
         raise RuntimeError(
             f"hexagon: q4a16 prefill needs K a multiple of 64 and N of 32, got {k}x{n}"
         )
+    if (w < -8).any() or (w > 7).any():
+        raise RuntimeError("hexagon: q4a16 weight contains values outside [-8, 7]")
     kp, np_ = k // 32, n // 32
+    if scale_block_num < 1 or (k // 32) % scale_block_num:
+        raise RuntimeError(
+            f"hexagon: q4a16 needs K/32 divisible by the block count, got {k} and {scale_block_num}"
+        )
     scales = np.asarray(scale, dtype=np.float32).reshape(-1)
-    if scales.size != n:
-        raise RuntimeError(f"hexagon: q4a16 has {scales.size} scales, expected {n}")
+    if scales.size != n * scale_block_num:
+        raise RuntimeError(
+            f"hexagon: q4a16 has {scales.size} scales, expected {n * scale_block_num}"
+        )
 
     # The raw plane the vendored reorder starts from, one byte per two k values.
-    nibbles = np.clip(w.T, -8, 7) + 8
+    nibbles = w.T + 8
     raw = np.zeros((np_, 32, kp, 16), dtype=np.uint8)
     raw[:, :, :, :] = (nibbles[:, 0::2] * 16 + nibbles[:, 1::2]).reshape(
         np_, 32, kp, 16
@@ -2805,7 +2818,17 @@ def pack_q4a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
     tiles = (
         (low.view(np.uint8) | shifted.view(np.uint8)).reshape(np_ * kp, 512).tobytes()
     )
-    return tiles + scales.astype(np.float16).tobytes()
+    if scale_block_num == 1:
+        scale_tail = scales.astype(np.float16)
+    else:
+        # The non-vrmpy kernel addresses each output channel's record first,
+        # then its K blocks; every record is one aligned 64-fp16 vector.
+        records = np.zeros((n // 32, scale_block_num, 64), dtype=np.float16)
+        values = scales.reshape(n // 32, 32, scale_block_num).transpose(0, 2, 1)
+        records[:, :, 0::2] = values.astype(np.float16)
+        records[:, :, 1::2] = records[:, :, 0::2]
+        scale_tail = records.reshape(-1)
+    return tiles + scale_tail.tobytes()
 
 
 def _quantized_weight_values(ctx, quantized: QuantizedWeight, k: int, n: int):
@@ -2993,7 +3016,12 @@ def _emit_quantized_prefill(
     """
     import numpy as np
 
-    packed_weight = pack_q4a16_prefill_weight(weight, scale, k, n)
+    if n <= 0 or scale.size % n:
+        raise RuntimeError("hexagon: q4a16 prefill scales do not divide by output channels")
+    scale_block_num = scale.size // n
+    if scale_block_num < 1 or (k // 32) % scale_block_num:
+        raise RuntimeError("hexagon: q4a16 prefill scale blocks do not divide K/32")
+    packed_weight = pack_q4a16_prefill_weight(weight, scale, k, n, scale_block_num)
     packed_activation = _prefill_activation_ref(node, ctx, activation, m, k)
     packs = (n + 63) // 64
     blocked = ctx.builder.add_activation(packs * m * 64 * FP16_BYTES)
@@ -3008,7 +3036,7 @@ def _emit_quantized_prefill(
                 bias_ref,
             ],
             outputs=[blocked],
-            params=[m, k, n, 0, 1, 1, np_chunk, k // 32, 1, 0],
+            params=[m, k, n, 0, 1, 1, np_chunk, k // 32, scale_block_num, 0],
         ),
     )
     _prefill_output_blit(node, ctx, blocked, out, m, n)
@@ -3049,6 +3077,13 @@ def _emit_quantized_matmul(
         )
 
     weight, scale = _quantized_weight_values(ctx, quantized, k, n)
+    scale_block_num = 1 if quantized.bits == 8 or m == 1 else scale.size // n
+    if scale.size not in (n, n * scale_block_num):
+        raise RuntimeError("hexagon: quantized matmul has an unsupported scale shape")
+    if m == 1 and scale_block_num != 1:
+        raise RuntimeError("hexagon: q4a16 GEMV does not consume block-wise scales")
+    if quantized.bits == 8 and scale_block_num != 1:
+        raise RuntimeError("hexagon: w8a16 prefill does not consume block-wise scales")
     out = ctx.result_for(node, n)
     bias_ref = ABSENT if bias is None else ctx.operand(bias)
     if m > 1:

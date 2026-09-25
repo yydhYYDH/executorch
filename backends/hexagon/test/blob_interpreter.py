@@ -1676,20 +1676,33 @@ def _run_matmul_q4a16_prefill(
     if k % 64 or n % 32:
         raise UnsupportedOp(f"blob: a q4a16 prefill of {k}x{n}")
     scale_blocks = params[8] if len(params) > 8 else 1
-    if scale_blocks != 1:
+    if len(params) > 9 and params[9] != 0:
+        raise UnsupportedOp("blob: q4a16 prefill uses asymmetric scales")
+    if scale_blocks < 1 or (k // 32) % scale_blocks:
         raise UnsupportedOp(f"blob: a q4a16 prefill over {scale_blocks} scale blocks")
 
     dst = command.outputs[0]
     raw = bytes(arena.view(command.inputs[1]))
     w = _unpack_hmx_int4(raw, k, n)
     tiles_bytes = (k // 32) * (n // 32) * 512
-    scales = np.frombuffer(raw[tiles_bytes:], dtype=np.float16)[:n].astype(np.float32)
+    record_width = 64 if scale_blocks > 1 else 1
+    record_count = n // 32 if scale_blocks > 1 else n
+    scale_values = np.frombuffer(
+        raw[tiles_bytes:], dtype=np.float16
+    )[: record_count * scale_blocks * record_width].astype(np.float32)
+    if len(scale_values) != record_count * scale_blocks * record_width:
+        raise UnsupportedOp("blob: a q4a16 prefill has no block-scale tail")
+    scales = scale_values.reshape(record_count, scale_blocks, record_width)[..., ::2]
+    if scale_blocks > 1:
+        scales = scales.transpose(0, 2, 1).reshape(n, scale_blocks)
 
     activation = np.frombuffer(
         bytes(arena.view(command.inputs[0])), dtype=np.float16
     ).reshape(k // 64, m, 64)
     rows = activation.transpose(1, 0, 2).reshape(m, k).astype(np.float32)
-    product = rows @ (w.astype(np.float32) * scales[:, None]).T
+    block_index = ((np.arange(k) // 32) * scale_blocks) // (k // 32)
+    selected_scales = scales[:, block_index] if scale_blocks > 1 else scales[:, 0]
+    product = rows @ (w.astype(np.float32) * selected_scales).T
     out = product.astype(np.float16)
     bias = _gemv_bias(command, arena, 2, n)
     if bias is not None:

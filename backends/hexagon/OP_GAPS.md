@@ -309,16 +309,24 @@ The two gaps that are not of that shape:
   silent fix.
 - **`DSP_OP_POST_ATTN_REDUCE_FUSE`(35) is declared and has no `case`** in
   `execute_command.cc`. Which of the two is missing has not been established.
-- **The q4a16 and w8a16 packers have never run on a DSP.** The upstream host
-  reorders are not in the vendored tree (`src/host/` was dropped at vendoring),
-  so there is no host-side authority for the order to be compared against. The
-  q4a16 **prefill** tile order is no longer agreed with by reading alone:
-  `test_prefill_on_sim.py::test_the_packers_bytes_are_the_vendored_reorders_bytes`
+- **The q4a16 and w8a16 packers have not been checked against a DSP here.** The
+  upstream host reorders are not in the vendored tree (`src/host/` was dropped at
+  vendoring), so there is no host-side authority for the order to be compared
+  against. The q4a16 **prefill** tile order is no longer agreed with by reading
+  alone: `test_prefill_on_sim.py::test_the_packers_bytes_are_the_vendored_reorders_bytes`
   runs the vendored int4 reorder (`htp_ops_weight_reorder_int4`) on hexagon-sim
   and requires the packer's bytes to equal its output byte for byte, with the
-  GEMV packer as the negative control. That is the simulator and not silicon,
-  which is what the first sentence says, and the int8 tile order the w8a16
-  prefill kernel reads is still checked by nothing, because no emitter writes it.
+  GEMV packer as the negative control. That is the simulator and not silicon.
+  The int8 tile order the w8a16 prefill kernel reads was checked by nothing until
+  the prefill entry was wired: an emitter writes it now, and
+  `test_hexagon_quantizer.py::test_a_w8a16_prefill_matmul_lowers_to_command_42`
+  pins the 29-parameter command 42 body, the tiled weight and the fp16 per-channel
+  scale tail, with the int4 geometry as the control that must still emit 22.
+  Those are host-lowering facts. The int8 prefill *kernel* is separately reported
+  device-tested at `M = 4, K = 12800` on a OnePlus 13 by the int8prefill
+  workstream (d6b2cf5, whose comment records the corrected heap-backed skel
+  clearing the measured K boundary); that result is the workstream's report and
+  was not reproduced during this integration.
 - **`OP_SUPPORT.md` had no row for `aten.prelu`.** It has one now, and the
   discrepancy is worth keeping for what changed: the row used to be absent because
   the node does not survive export, so the generated table had nothing to render,
@@ -337,16 +345,19 @@ The two gaps that are not of that shape:
 
 ## 7. Priority
 
-1. **Quantized prefill (`M > 1`) for the int8 weight** -- the int4 half landed and
-   its row has left §2; this is the half of the only functional gap that is left,
-   and the work is a packer for kernel 42's tile order rather than a kernel. The
-   shape limit that stays beside it is the one §4 states, `K % 64 == 0` and
-   `N % 32 == 0`, which is the granularity the block-scaled form (34) exists for.
-   §4 also carries the ceiling the wired int4 entry now holds (`K <= 12672` below the
-   dispatcher's `M <= 32` split): that one is a refusal past a measured bound, not a
-   missing packer.
-   Until the packer exists, a w8a16 model above one row stays on the portable
-   kernels.
+1. **Quantized prefill (`M > 1`) for the int8 weight** -- **done.** This entry
+   used to be the only functional gap left: the int4 half had landed and the int8
+   half was waiting on a packer for kernel 42's tile order rather than on a
+   kernel. Both halves are now wired (commands 22 and 42), so the packer exists
+   and its row has left §2. What stays beside it is the shape limit §4 states,
+   `K % 64 == 0` and `N % 32 == 0`, which is the granularity the block-scaled form
+   (34) exists for -- and the block-scaled int4 prefill now carries its scale
+   block count to the kernel, while the int8 prefill refuses block-wise scales
+   because its kernel does not read them. §4 also carries the ceiling the wired
+   entries hold (`K <= 12672` below the dispatcher's `M <= 32` split): that one is a
+   refusal past a measured bound, not a missing packer. The part of this item that
+   was never about the host is still open and is not a priority entry: the packers
+   have not been compared against a DSP from this tree, which §5 records.
 2. **`aten.where` via `DSP_OP_SELECT`** -- **done.** This entry used to say the
    open question was whether the kernel's condition operand accepts what a
    comparison writes; that question was the wrong way round and is now closed. The
