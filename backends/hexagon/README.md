@@ -978,8 +978,17 @@ Working and verified without a device:
   into the delegate where the kernel applies it, and stays portable wherever the
   kernel would drop it (a query extent of one, a run-time query length or
   stride, more than 64 rows), so an export with masks delegates a count that
-  follows those geometries. With the fusion passes switched off the export
-  splits into 169 subgraphs and leaves 2121 nodes behind;
+  follows those geometries.  The one-row clause is deliberately a step wider
+  than the case that motivates it. Inside that case's window -- `qo_len == 1`,
+  `seq_current == 0`, `seq_add == 1` -- the kernel attends a single key, so a
+  finite mask changes no number there; what the shortcut would drop is a mask
+  that hides that one key entirely. A decode step past the first has
+  `seq_current != 0`, leaves the shortcut and applies the mask normally. The
+  gate cannot narrow to the first step, because the position reaches the command
+  at run time in `params[1]` (`runtime/hexagon_backend.cpp:1790-1825`), so every
+  single-row query that carries a mask stays portable.  With the fusion passes
+  switched off the export splits into 169 subgraphs and leaves 2121 nodes
+  behind;
 - the compile-spec check is exercised on the host over real blobs, from both
   sides: the writer's side in `test/test_compile_specs.py` and the runtime's in
   the ET-free `hexagon_compat.h`, which the same test compiles and drives. That
@@ -1126,7 +1135,24 @@ Working and verified without a device:
   else: `test/test_sdpa_mask.py` asserts the operand, the stride and the
   reservation out of the blob, and then runs the host interpreter -- which walks
   the kernel's addressing -- against a reference for a mask that has to move the
-  answer and for one that has to reproduce the unmasked one. Every other attention path here -- the vision
+  answer and for one that has to reproduce the unmasked one.
+  `test/test_sdpa_single_token.py` pins the geometry rather than the verdict,
+  which one assertion in that file did not: it handed the predicate a four-row
+  mask for a one-row query, so the row-count clause is what refused the node and
+  the assertion held however the query extent moved. It now hands over a mask
+  whose rows are the query's -- the node the shortcut's own clause refuses --
+  and the new file reads the refused side back from a lowering that admits it:
+  the clause is rewritten in the predicate's own source and re-executed, every
+  other refusal left as the backend's, and the command that comes out is
+  asserted parameter by parameter, with one query row without a mask and a
+  masked query of two rows as the controls. Closing the mask channel instead of
+  the hole fails that file rather than passing it, and removing the clause turns
+  exactly four tests red. Op 18 has no simulator tier, so this is host evidence
+  plus the device measurement in the commit that added it: on a OnePlus 13 the
+  one-row masked call answers byte for byte what the same command without a mask
+  answers (V's row 0, broadcast), and a masked query of two rows answers bit for
+  bit what the numpy reference does and 2.72 away from the answer that ignores
+  the mask. Every other attention path here -- the vision
   kernel and the decomposed `scaled_dot_product_attention` -- is a plain loop and
   does run.
 
