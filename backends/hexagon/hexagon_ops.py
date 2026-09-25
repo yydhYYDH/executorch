@@ -4096,6 +4096,14 @@ class ConvSpec(NamedTuple):
     # is the traced example's and the commands carry a patch the runtime
     # resolves from the length it was handed. See `_patch_conv_extents`.
     dynamic_h: bool = False
+    # The graph spelled the window over one axis, and this is the same command
+    # read from the 4-D spelling `(B, C, T, 1)` with a `(k, 1)` window: the
+    # graph's own batch stays the batch, the time axis is the height, the width
+    # is one, and the weight is the `(O, I, k)` one with a unit column
+    # appended. The buffer is the same bytes and the kernel the same walk;
+    # `conv_spec` admits the 3-D spelling and `pack_conv_weight` reads the
+    # weight for it.
+    conv1d: bool = False
 
 
 def conv_1x1_direct_applies(spec: ConvSpec) -> bool:
@@ -4198,6 +4206,32 @@ def _conv_spatial_pair(value, rank: int, default: tuple) -> Optional[tuple]:
         return values
     return None
 
+def _is_one_axis_geometry(args, weight) -> bool:
+    """Whether this node's geometry is the one-axis form, read from the weight.
+
+    A one-axis graph carries a 3-D weight -- (O, I, k) or (C, 1, k) for the
+    depthwise form -- and a 2-D graph a 4-D one, whatever the input's rank
+    turns out to be. Reading the weight here, rather than the input, keeps the
+    stride and padding below, which are one entry long on this form, from being
+    read as a 2-D pair first.
+    """
+    if len(args) < 6:
+        return False
+    value = weight.meta.get("val") if isinstance(weight, torch.fx.Node) else None
+    return isinstance(value, torch.Tensor) and value.dim() == 3
+
+
+def _shape_only(val: torch.Tensor, shape) -> torch.Tensor:
+    """A val carrying `shape` and the dtype it came with, and nothing else.
+
+    Only the shape and dtype are ever read back, so a meta tensor of the kind
+    `new_empty` produces is enough. It is written this way rather than as
+    `unsqueeze` because a fake tensor's unsqueeze adds a dim of its own
+    (torch 2.14) where a unit dim is meant, and a symbolic batch would not be
+    preserved in any case; a meta tensor keeps both.
+    """
+    return val.new_empty(shape)
+
 
 def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     """The convolution's geometry, or None when neither kernel here can run it.
@@ -4253,6 +4287,15 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     stride_3d = _conv_spatial_pair(args[3], rank, (1, 1, 1))
     padding_3d = _conv_spatial_pair(args[4], rank, (0, 0, 0))
     dilation_3d = _conv_spatial_pair(args[5], rank, (1, 1, 1))
+    # A one-axis convolution carries one number where the 2-D form carries a
+    # pair, and the pair's absent axis is the one the reading supplies: the
+    # stride, padding and dilation along the time axis repeat onto the unit
+    # width, and the output padding along it is zero. Every 2-D graph spells
+    # these as a pair (or a bare int), so this is the 3-D spelling alone.
+    rank1d = _is_one_axis_geometry(args, weight)
+    stride = _int_pair(args[3], None)
+    padding = _int_pair(args[4], None)
+    dilation = _int_pair(args[5], (1, 1))
     transposed = False
     tail = (0, 0)
     if convolve:
@@ -4268,6 +4311,25 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         )
         if tail is None:
             return None
+    if rank1d:
+        if None in (stride, padding) or dilation is None or tail is None:
+            return None
+        # The axis the one-axis form has and the 2-D form does not is the
+        # width, and the reading makes it one element wide with no movement
+        # across it: a stride, a dilation and an output padding of 1, 1 and 0.
+        # The lengths are read off the raw argument because _int_pair has
+        # already collapsed a one-entry list to a pair by the time it is
+        # called, so a two-entry list here is the 2-D spelling of a 3-D node
+        # and is refused rather than silently collapsed.
+        for raw in (args[3], args[4], args[5]):
+            if isinstance(raw, (list, tuple)) and len(raw) != 1:
+                return None
+        if convolve and isinstance(args[7], (list, tuple)) and len(args[7]) > 1:
+            return None
+        stride = (stride[0], 1)
+        padding = (padding[0], 0)
+        dilation = (dilation[0], 1)
+        tail = (tail[0], 0)
     if isinstance(group, bool) or not isinstance(group, int) or group <= 0:
         return None
     if stride_3d is None or padding_3d is None or dilation_3d is None:
@@ -4281,7 +4343,41 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
 
     if value.dtype not in (torch.float16, torch.float32):
         return None
-    if rank not in (3, 4, 5) or kernel.dim() != rank or result.dim() != rank:
+    conv1d = False
+    if value.dim() == 3 and kernel.dim() == 3 and result.dim() == 3:
+        conv1d = True
+        # A one-axis convolution, read from the 4-D spelling this kernel walks:
+        # a (B, C, T) run is a (B, C, T, 1) plane, so the graph's own batch is
+        # the command's batch, the time axis is the height, and the width is
+        # one. The weight (O, I, k) is the same bytes as an (O, I, k, 1) one.
+        # Every gate below runs on that reading, so the stride, padding,
+        # dilation and group rules are the 2-D ones unchanged, and the emitter
+        # sees the same `conv1d` flag and packs the weight with the column
+        # appended.
+        # The extents are written out by axis rather than by unsqueezing the
+        # val, because a fake tensor's unsqueeze is not a unit dim here (it
+        # inserts one of its own under torch 2.14) and a view cannot add one
+        # either. This is the reading torch's own conv2d over x.unsqueeze(-1)
+        # computes, and _emit_convolution reads the spec rather than the
+        # graph, so the two cannot disagree about the shape.
+        value = _shape_only(value, tuple(value.shape) + (1,))
+        kernel = _shape_only(kernel, tuple(kernel.shape) + (1,))
+        result = _shape_only(result, tuple(result.shape) + (1,))
+        # From here the node is a 4-D one, so the rank-keyed pairs are the
+        # one-axis ones the block above fixed: the single entry repeats onto
+        # the unit width, not onto a unit height.
+        rank = 4
+        stride_3d, padding_3d, dilation_3d = stride, padding, dilation
+    elif value.dim() == 5 and kernel.dim() == 5 and result.dim() == 5:
+        # The 5-D volume form, which the conv3d work reads directly below.
+        pass
+    elif value.dim() != 4 or kernel.dim() != 4 or result.dim() != 4:
+        return None
+    if conv1d and transposed:
+        # The identity a transposed convolution relies on has never been
+        # measured with a one-axis window, and the transposed weight is indexed
+        # the other way round to begin with, so the 3-D spelling stays refused
+        # rather than read as a degenerate 2-D one.
         return None
     if rank == 4:
         stride, padding, dilation = stride_3d, padding_3d, dilation_3d
@@ -4491,6 +4587,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         tail_x=tail[1],
         groups=group,
         dynamic_h=dynamic_h,
+        conv1d=conv1d,
     )
 
 
@@ -4544,6 +4641,13 @@ def pack_depthwise_weight(weight, channels: int, kernel_y: int, kernel_x: int) -
     import numpy as np
 
     values = weight.astype(np.float16, copy=False)
+    if values.ndim == 3 and values.shape == (channels, 1, kernel_y):
+        # The one-axis depthwise weight torch writes is (C, 1, k): the channel,
+        # the per-group input count (one) and the taps. The 4-D form is the
+        # same bytes with the unit column the reading gives it. This is
+        # matched against kernel_y because a one-axis window is k x 1: the
+        # taps are the height and the width is the unit the reading supplies.
+        values = values.reshape(channels, 1, kernel_y, kernel_x)
     if values.shape != (channels, 1, kernel_y, kernel_x):
         raise RuntimeError(f"hexagon: depthwise weight has shape {values.shape}")
     padded = np.zeros(
@@ -4574,6 +4678,10 @@ def pack_conv_weight(weight, spec: ConvSpec) -> bytes:
     import numpy as np
 
     values = weight.astype(np.float16, copy=False)
+    if spec.conv1d and values.ndim == 3:
+        # The one-axis weight (O, I, K) is the (O, I, K, 1) one: same bytes, one
+        # column of taps that is a single tap wide.
+        values = values[..., None]
     expected = (spec.out_channels, spec.in_channels, spec.kernel_y, spec.kernel_x)
     if values.shape != expected:
         raise RuntimeError(f"hexagon: convolution weight has shape {values.shape}")
@@ -5086,6 +5194,10 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     # height is the spec's rather than the operand's. A plain convolution keeps
     # the operand's own dim, which has to stay the symbol when it is the run-time
     # length so the frame is sized from the length handed in.
+    # The dynamic length is the graph's own time axis on the one-axis form
+    # (axis 2 of a (B, C, T) node) and the command's height on the 4-D one
+    # (axis 2 of (N, C, H, W)), so both are read at index 2 and the two forms
+    # need no separate case here.
     in_h_dim = (
         _value_of(node.args[0]).shape[2]
         if spec.dynamic_h and not spec.transposed

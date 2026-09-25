@@ -173,7 +173,10 @@ static void run_depthwise(const DepthCase &c) {
 
 struct ConvCase {
   const char *tag;
-  int ic, oc, k, stride, pad, dilate, hw, batch;
+  /* The window is ky x kx and the input plane is ih x iw. Every case before
+   * the one-column ones spells these as the same number on both axes, which
+   * is what a square kernel over a square plane is. */
+  int ic, oc, ky, kx, stride, pad, dilate, ih, iw, batch;
   /* What to leave in the lanes past the last channel: 0 zero, 1 an infinity,
    * 2 a finite value with the weight's own padding lanes made nonzero too, so a
    * contribution from them would land in the answer. */
@@ -187,22 +190,33 @@ struct ConvCase {
  * output that is not a whole number of tiles. C8 and C9 are the same shape with
  * the padding lanes filled in. */
 static const ConvCase conv_cases[] = {
-    {"CV_3X3", 64, 64, 3, 1, 1, 1, 5, 1, 0, 1, 2},
-    {"CV_STRIDE", 64, 64, 3, 2, 1, 1, 8, 1, 0, 1, 2},
-    {"CV_NOPAD", 64, 64, 3, 1, 0, 1, 5, 1, 0, 1, 2},
-    {"CV_1X1", 64, 96, 1, 1, 0, 1, 5, 1, 0, 1, 2},
-    {"CV_IC96", 96, 64, 3, 1, 1, 1, 5, 1, 0, 1, 2},
-    {"CV_DIL", 64, 64, 3, 1, 2, 2, 7, 1, 0, 1, 2},
-    {"CV_BATCH", 64, 64, 3, 1, 1, 1, 5, 2, 0, 1, 2},
-    {"CV_IC3", 3, 32, 3, 2, 1, 1, 8, 1, 0, 1, 2},
+    {"CV_3X3", 64, 64, 3, 3, 1, 1, 1, 5, 5, 1, 0, 1, 2},
+    {"CV_STRIDE", 64, 64, 3, 3, 2, 1, 1, 8, 8, 1, 0, 1, 2},
+    {"CV_NOPAD", 64, 64, 3, 3, 1, 0, 1, 5, 5, 1, 0, 1, 2},
+    {"CV_1X1", 64, 96, 1, 1, 1, 0, 1, 5, 5, 1, 0, 1, 2},
+    {"CV_IC96", 96, 64, 3, 3, 1, 1, 1, 5, 5, 1, 0, 1, 2},
+    {"CV_DIL", 64, 64, 3, 3, 1, 2, 2, 7, 7, 1, 0, 1, 2},
+    {"CV_BATCH", 64, 64, 3, 3, 1, 1, 1, 5, 5, 2, 0, 1, 2},
+    {"CV_IC3", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1, 0, 1, 2},
     /* The same convolution with the chunking the kernel defaults to, which is
      * what the emitter must not leave it to. */
-    {"CV_ONE", 3, 32, 3, 2, 1, 1, 8, 1, 0, 1, 1},
+    {"CV_ONE", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1, 0, 1, 1},
     /* A ragged position tile over more than one channel tile, which is the
      * shape the single-tile store gets wrong. */
-    {"CV_ODD", 64, 64, 3, 1, 1, 1, 5, 1, 0, 1, 1},
-    {"CV_INF", 3, 32, 3, 2, 1, 1, 8, 1, 1, 1, 2},
-    {"CV_READ", 3, 32, 3, 2, 1, 1, 8, 1, 2, 1, 2},
+    {"CV_ODD", 64, 64, 3, 3, 1, 1, 1, 5, 5, 1, 0, 1, 1},
+    {"CV_INF", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1, 1, 1, 2},
+    {"CV_READ", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1, 2, 1, 2},
+    /* The one-column windows: a one-axis convolution read from the 4-D
+     * spelling (B, C, T, 1) with a k x 1 window. The plane is T wide by one
+     * column, so the window covers ky rows of it and a single element across,
+     * which is the geometry a 3-D graph asks for. */
+    {"CV_COL1", 64, 64, 1, 1, 1, 0, 1, 8, 1, 1, 0, 1, 2},
+    {"CV_COL3", 64, 64, 3, 1, 1, 1, 1, 8, 1, 1, 0, 1, 2},
+    {"CV_COL5", 64, 64, 5, 1, 2, 2, 1, 16, 1, 1, 0, 1, 2},
+    {"CV_COL7", 64, 96, 7, 1, 1, 3, 1, 8, 1, 1, 0, 1, 2},
+    {"CV_COLDIL", 64, 64, 3, 1, 1, 1, 2, 12, 1, 1, 0, 1, 2},
+    {"CV_COLIC3", 3, 32, 5, 1, 2, 2, 1, 10, 1, 1, 0, 1, 2},
+    {"CV_COLBATCH", 64, 64, 3, 1, 1, 1, 1, 8, 1, 2, 0, 1, 2},
 };
 
 static void poison_padding(int channels, int batch, int area, int mode) {
@@ -219,9 +233,17 @@ static void poison_padding(int channels, int batch, int area, int mode) {
 static void run_convolution(const ConvCase &c) {
   const int blocks = (c.ic + PACK - 1) / PACK;
   const int groups = (c.ic + TILE - 1) / TILE;
-  const int area = c.hw * c.hw;
-  const int oh = out_extent(c.hw, c.k, c.stride, c.pad, c.dilate);
-  const int ow = oh;
+  const int area = c.ih * c.iw;
+  /* A one-column window is the 4-D spelling of a one-axis convolution, so it
+   * carries torch's stride, padding and dilation on the height and a unit on
+   * the width. The unit column is the whole width: a width padded by anything
+   * is a different plane, and the kernel will happily compute it. */
+  const int one_column = c.iw == 1 && c.kx == 1;
+  const int pad_x = one_column ? 0 : c.pad;
+  const int stride_x = one_column ? 1 : c.stride;
+  const int dilate_x = one_column ? 1 : c.dilate;
+  const int oh = out_extent(c.ih, c.ky, c.stride, c.pad, c.dilate);
+  const int ow = out_extent(c.iw, c.kx, stride_x, pad_x, dilate_x);
   const int out_blocks = (c.oc + PACK - 1) / PACK;
 
   memset(cv_src, 0, sizeof(cv_src));
@@ -229,19 +251,19 @@ static void run_convolution(const ConvCase &c) {
   memset(cv_dst, 0, sizeof(cv_dst));
   for (int b = 0; b < c.batch; ++b)
     for (int cb = 0; cb < blocks; ++cb)
-      for (int y = 0; y < c.hw; ++y)
-        for (int x = 0; x < c.hw; ++x)
+      for (int y = 0; y < c.ih; ++y)
+        for (int x = 0; x < c.iw; ++x)
           for (int lane = 0; lane < PACK; ++lane) {
             const int channel = cb * PACK + lane;
             if (channel >= c.ic) continue;
-            cv_src[(cb * c.batch + b) * area * PACK + (y * c.hw + x) * PACK + lane] =
-                (__fp16)(float)(((y * c.hw + x) * 7 + channel * 3) % 11 - 5);
+            cv_src[(cb * c.batch + b) * area * PACK + (y * c.iw + x) * PACK + lane] =
+                (__fp16)(float)(((y * c.iw + x) * 7 + channel * 3) % 11 - 5);
           }
   for (int tile = 0; tile < (c.oc + TILE - 1) / TILE; ++tile)
-    for (int ky = 0; ky < c.k; ++ky)
-      for (int kx = 0; kx < c.k; ++kx)
+    for (int ky = 0; ky < c.ky; ++ky)
+      for (int kx = 0; kx < c.kx; ++kx)
         for (int ib = 0; ib < groups; ++ib) {
-          const int tile_index = (tile * c.k * c.k + ky * c.k + kx) * groups + ib;
+          const int tile_index = (tile * c.ky * c.kx + ky * c.kx + kx) * groups + ib;
           for (int kin = 0; kin < TILE; ++kin) {
             const int channel = ib * TILE + kin;
             for (int cc = 0; cc < TILE; ++cc) {
@@ -263,23 +285,23 @@ static void run_convolution(const ConvCase &c) {
 
   HmxIm2ColConvParam p;
   memset(&p, 0, sizeof(p));
-  p.im2col.padX = c.pad;
+  p.im2col.padX = pad_x;
   p.im2col.padY = c.pad;
-  p.im2col.dilateX = c.dilate;
+  p.im2col.dilateX = dilate_x;
   p.im2col.dilateY = c.dilate;
-  p.im2col.strideX = c.stride;
+  p.im2col.strideX = stride_x;
   p.im2col.strideY = c.stride;
-  p.im2col.kernelX = c.k;
-  p.im2col.kernelY = c.k;
+  p.im2col.kernelX = c.kx;
+  p.im2col.kernelY = c.ky;
   p.im2col.icDiv4 = c.ic / 4;
   p.im2col.icup4 = (c.ic + 3) / 4 * 4;
-  p.im2col.kernelCountUnit = c.k * c.k * groups;
-  p.im2col.iw = c.hw;
-  p.im2col.ih = c.hw;
+  p.im2col.kernelCountUnit = c.ky * c.kx * groups;
+  p.im2col.iw = c.iw;
+  p.im2col.ih = c.ih;
   p.im2col.ow = ow;
   p.im2col.oh = oh;
   p.im2col.srcZStep = c.batch * area * PACK;
-  p.im2col.srcYStep = c.hw * PACK;
+  p.im2col.srcYStep = c.iw * PACK;
   p.im2col.packCUnit = PACK;
   p.im2col.destICStride = area * PACK;
   p.im2col.ic = c.ic;
@@ -295,7 +317,8 @@ static void run_convolution(const ConvCase &c) {
   snprintf(tag, sizeof(tag), "%s_OUT", c.tag);
   print_bits(tag, cv_dst, out_blocks * c.batch * oh * ow * PACK);
   if (!c.poison)
-    print_weight_digest(c.tag, cv_wgt, ((c.oc + TILE - 1) / TILE) * c.k * c.k * groups * 1024);
+    print_weight_digest(c.tag, cv_wgt,
+                        ((c.oc + TILE - 1) / TILE) * c.ky * c.kx * groups * 1024);
 }
 
 /* Where the padding lanes actually are, so the host can see that the buffer the

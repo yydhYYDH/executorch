@@ -808,7 +808,13 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # The two convolution kernels take one weight order and one weight
             # they can see at export, and neither of them walks a group count
             # in between 1 and the channel count: anything else stays on a
-            # portable kernel rather than reach one that reads it wrong.
+            # portable kernel rather than reach one that reads it wrong. A
+            # one-axis (Conv1d) window is read from its 4-D spelling inside
+            # conv_spec, so a 3-D tensor arriving here is not a refusal on rank
+            # alone; what still turns it away is a transposed flag, a group
+            # count, a window the staging buffers cannot hold, or a height the
+            # affine patch cannot rebuild. See _is_one_axis_geometry and the
+            # 3-D reading in conv_spec in hexagon_ops.
             return False
         if (
             node.target in GATHER_TARGETS
