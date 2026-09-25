@@ -1269,7 +1269,7 @@ def _clamp_operand(special, length):
     return special.repeat(repeats)[:length]
 
 
-def _vision_graph(batch, tokens, heads, head_dim, scale):
+def _vision_graph(batch, tokens, heads, head_dim, scale, mask=None):
     """`et_hexagon.vision_attention` as one VISION_ATTENTION_FP16.
 
     The operands go in as the fused op takes them -- `[batch, tokens, heads,
@@ -1286,7 +1286,11 @@ def _vision_graph(batch, tokens, heads, head_dim, scale):
         node = graph.placeholder(name)
         node.meta["val"] = torch.empty(shape, dtype=torch.float16)
         operands.append(node)
-    out = graph.call_function(VISION_ATTENTION, args=(*operands, scale))
+    mask_node = None
+    if mask is not None:
+        mask_node = graph.placeholder("mask")
+        mask_node.meta["val"] = torch.empty(tuple(mask.shape), dtype=torch.float16)
+    out = graph.call_function(VISION_ATTENTION, args=(*operands, scale, mask_node))
     out.meta["val"] = torch.empty(shape, dtype=torch.float16)
     graph.output(out)
     return _program(torch.fx.GraphModule(torch.nn.Module(), graph))
@@ -1303,6 +1307,29 @@ def _vision_reference(query, key, value, scale):
     k = key.float().transpose(1, 2)
     v = value.float().transpose(1, 2)
     scores = (q @ k.transpose(-1, -2)) * scale
+    return (scores.softmax(dim=-1) @ v).transpose(1, 2)
+
+
+def _vision_reference_masked(query, key, value, scale, mask, stride):
+    """The same attention with an additive mask, in the kernel's own indexing.
+
+    attention_entry.cc:50 adds the mask to the score before the row maximum and
+    reads it at mask[(b * tokens + q) * maskStride + k], so a rank two mask is
+    the same rows for every batch item. The reference indexes it the same way
+    rather than broadcasting, because the point of the case is that the
+    command's stride reaches the element the kernel reads.
+    """
+    tokens = query.shape[1]
+    q, k, v = (tensor.float().transpose(1, 2) for tensor in (query, key, value))
+    flat = mask.float().reshape(-1)
+    bias = torch.zeros(
+        query.shape[0], q.shape[1], tokens, tokens, dtype=torch.float32
+    )
+    for b in range(query.shape[0]):
+        for row in range(tokens):
+            at = (b * tokens + row) * stride
+            bias[b, :, row, :] = flat[at : at + tokens]
+    scores = (q @ k.transpose(-1, -2)) * scale + bias
     return (scores.softmax(dim=-1) @ v).transpose(1, 2)
 
 
@@ -2146,6 +2173,47 @@ def _branch_cases():
                 tolerance=_VISION_TOLERANCE,
             )
         )
+        # A mask is the fourth operand and the stride is its own row pitch.
+        # The teeth control widens the stride by one column, which moves every
+        # row's window onto different elements, so a run that still matched
+        # would say the stride is not read where attention_entry.cc:50 reads it.
+        if tag == "AE":
+            # A rank three mask, because this geometry has two batch items and
+            # the kernel's batch pitch is tokens * maskStride with no broadcast
+            # case: a rank two mask would leave the second item reading past
+            # its end. The stride is widened by one on purpose so the pitch is
+            # the only thing that can place a column.
+            mask_gen = torch.Generator().manual_seed(11)
+            stride = tokens + 1
+            mask = (torch.rand((batch, tokens, stride), generator=mask_gen) * 4 - 2).half()
+            masked_program = _vision_graph(
+                batch, tokens, heads, head_dim, scale, mask=mask
+            )
+            masked_expected = _bits(
+                _vision_reference_masked(
+                    *operands, scale=scale, mask=mask, stride=stride
+                ).half()
+            )
+            cases.append(
+                _case(
+                    "AF",
+                    masked_program,
+                    (*operands, mask),
+                    masked_expected,
+                    kind="close",
+                    tolerance=_VISION_TOLERANCE,
+                )
+            )
+            cases.append(
+                _case(
+                    "CV",
+                    masked_program,
+                    (*operands, mask),
+                    masked_expected,
+                    kind="teeth",
+                    mutate=_set_param(5, struct.pack("<i", tokens)),
+                )
+            )
         # The vision command's params are positional and nothing in the ABI
         # names them: the reasons to believe slot 1 is `tokens` and slot 4 the
         # scale are the emitter and this reading. Moving one slot at a time is
@@ -3504,8 +3572,14 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         # The emitter's two blits around the command are part of the command
         # being what it claims: without them the kernel reads other channels.
         assert kinds[tag] == [3, _POOL2D, 3], f"{tag}: the pool is not pack/pool/unpack"
-    for tag in ("AD", "AE"):
+    for tag in ("AD", "AE", "AF"):
         assert kinds[tag] == [_VISION_ATTENTION], f"{tag}: not a vision attention"
+    # The masked command has to name a positive stride, because the kernel
+    # reads a row only when the pointer and the stride are both there
+    # (attention_entry.cc:50); zero would make the bound mask silently unused.
+    masked = next(c for c in _tagged(cases, "AF").commands if c.type == _VISION_ATTENTION)
+    assert masked.params[5] > 0, "AF: the mask is bound but the stride says no"
+    assert len(masked.inputs) == 4, "AF: the mask is not the kernel's fourth input"
     # The two kernels fixed beside the clamp: each has to be the command it
     # claims, and each has to carry a NaN on both sides of its boundary -- index
     # 3 and 4 are inside the vector loop, 95 and 36 are past it -- or it settles
@@ -3689,7 +3763,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert (
         blob_interpreter.read_dynamic_trailer(_tagged(cases, "BM").blob) is None
     ), "the amax control still carries its trailer"
-    for tag in ("S", "X", "Y", "Z", "BA", "AA", "AB", "AC", "AD", "AE"):
+    for tag in ("S", "X", "Y", "Z", "BA", "AA", "AB", "AC", "AD", "AE", "AF"):
         assert (
             blob_interpreter.read_dynamic_trailer(_tagged(cases, tag).blob) is None
         ), f"{tag}: a static blob carries a trailer"

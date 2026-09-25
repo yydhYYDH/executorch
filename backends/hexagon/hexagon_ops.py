@@ -8786,6 +8786,42 @@ def vision_attention_is_emittable(node: torch.fx.Node) -> bool:
         return False
     if any(not int(dim) > 0 for dim in (shape[0], shape[2], shape[3])):
         return False
+    # The mask is the optional fifth operand. The kernel reads
+    # `mask[(b * tokens + q) * maskStride + k]` (attention_entry.cc:50) -- a
+    # batch, a row and a column, with no head term anywhere in it -- so rank two
+    # (broadcast over the batch) and rank three (naming it) are the only shapes
+    # it can index, and a stride below the token count would mask the last
+    # `stride` keys and leave the ones before them attendable.
+    mask = node.args[4] if len(node.args) > 4 else None
+    if mask is not None:
+        if not isinstance(mask, torch.fx.Node):
+            return False
+        mask_shape = _shape_of(mask)
+        if any(isinstance(dim, torch.SymInt) for dim in mask_shape):
+            return False
+        # The kernel casts the pointer to `const __fp16 *`, so an fp32 operand
+        # is read as half floats. This is checked here as well as in the fusion
+        # pass because the predicate is the last thing standing between a graph
+        # and the command.
+        mask_meta = getattr(mask, "meta", {}).get("val")
+        if not isinstance(mask_meta, torch.Tensor) or mask_meta.dtype != torch.float16:
+            return False
+        # The batch pitch in `mask[(b * tokens + q) * maskStride + k]` is
+        # `tokens * maskStride` with no broadcast case, so a rank two mask only
+        # covers a single batch item and a rank three one has to name them all.
+        if len(mask_shape) == 2:
+            if int(shape[0]) != 1:
+                return False
+        elif len(mask_shape) == 3:
+            if int(mask_shape[0]) != int(shape[0]):
+                return False
+        else:
+            return False
+        if len(mask_shape) > 2 and int(mask_shape[-2]) != int(shape[1]):
+            return False
+        stride = mask_shape[-1]
+        if not int(stride) >= int(shape[1]) or isinstance(shape[1], torch.SymInt):
+            return False
     # The scale is a param rather than an operand, so it has to be a number the
     # pass could read out of the graph at export time.
     scale = node.args[3]
@@ -8799,10 +8835,13 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
     value, slot three as the mask, the first output as the result and the second
     as the workspace, with `intParams[0..3]` the batch, token count, head count
     and head width, `floatParams[4]` the scale, `intParams[5]` the mask stride
-    and `intParams[6]` the workspace size. Only three operands are bound, so the
-    dispatcher passes a null mask pointer and the kernel's `maskStride > 0` test
-    never reads one (`attention_entry.cc:49`) -- a mask has no operand to hide
-    in, which is the mistake the FLASH_ATTN emitter made with `-1`.
+    and `intParams[6]` the workspace size. The mask is bound only when the op
+    carries one, and `maskStride` is zero exactly when it does not, so the
+    kernel's `pMask != NULL && maskStride > 0` test (`attention_entry.cc:50`)
+    never sees a positive stride without a buffer behind it -- the mistake the
+    FLASH_ATTN emitter made with `-1`. The kernel adds the mask to the score
+    before the row max rather than gating the probabilities after them, which is
+    what `logits + mask` in the graph means.
 
     The operands are bound as the graph carries them: `[batch, tokens, heads,
     headDim]`, which `attention_entry.cc:36,41,57` strides by `heads * headDim`
@@ -8812,6 +8851,7 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
         raise RuntimeError(f"hexagon: vision attention shape {_shape_of(node.args[0])}")
     query, key, value = node.args[0], node.args[1], node.args[2]
     scale = float(node.args[3])
+    mask = node.args[4] if len(node.args) > 4 else None
     batch, tokens, heads, head_dim = _shape_of(query)
     batch, heads, head_dim = int(batch), int(heads), int(head_dim)
     # The token count is a param the run-time length recomputes, so the value
@@ -8830,7 +8870,8 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
         node,
         Op(
             type=DSP_OP_VISION_ATTENTION_FP16,
-            inputs=[ctx.operand(query), ctx.operand(key), ctx.operand(value)],
+            inputs=[ctx.operand(query), ctx.operand(key), ctx.operand(value)]
+            + ([] if mask is None else [ctx.operand(mask)]),
             outputs=[out, workspace],
             params=[
                 batch,  # batch
@@ -8838,7 +8879,11 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
                 heads,  # heads
                 head_dim,  # headDim
                 _float_bits(scale),  # scale, read through a float* cast
-                0,  # maskStride, which no operand lets the kernel read
+                # The mask's own row pitch. The kernel reads a row only when
+                # both this and the pointer are present (attention_entry.cc:50),
+                # so zero with no operand means "no mask" and a positive stride
+                # always travels with a bound fourth input.
+                0 if mask is None else int(_shape_of(mask)[-1]),
                 workspace_bytes,  # providedWorkspaceBytes
             ],
         ),
