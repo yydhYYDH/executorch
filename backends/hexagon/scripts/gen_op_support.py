@@ -82,6 +82,11 @@ TOPKV2_K1 = "DSP_OP_TOPKV2_K1_FP16"
 # time from the slot the blob sizes for it, which is why a comparison's result
 # can be handed to it at all.
 SELECT = "DSP_OP_SELECT"
+# Leaky ReLU and PReLU. Both are the elementwise relu kernel: it multiplies a
+# negative input by a slope that rides in params for the leaky form and comes
+# from a second operand for the PReLU form.
+RELU = "DSP_OP_RELU"
+PRELU = "DSP_OP_PRELU"
 
 # The arena holds two bytes per element, so every kernel reads and writes fp16.
 # A fp32 operand is narrowed on the way in and a fp32 result widened on the way
@@ -190,6 +195,46 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "Walks whole rows of the last dimension: the mask selects rows that are "
         "entirely the masked value. Row length and pad value ride in params.",
+    ),
+    OpSupport(
+        "aten.leaky_relu.default",
+        RELU,
+        ARENA_FP16,
+        "The negative slope must be a compile-time scalar: it rides in a param, "
+        "so a run-time slope has nowhere to live and the node stays portable. "
+        "One input; element count preserved.",
+    ),
+    OpSupport(
+        "et_hexagon.prelu.default",
+        PRELU,
+        ARENA_FP16,
+        "The channel axis is the second: source rank >= 2 and contiguous, slope "
+        "fp16, contiguous and rank 1 with one entry or one per channel. The "
+        "kernel reads the plane, channel and batch extents from params, so all "
+        "three are static. Produced from `aten::prelu` by prelu.py's "
+        "PreservePRelu pass before decomposition.",
+    ),
+    OpSupport(
+        "et_hexagon.reflect_pad.default",
+        BLIT,
+        ARENA_FP16,
+        "Contiguous source and result, a pad list of two (last axis) or four "
+        "(last two axes) non-negative compile-time integers with at least one "
+        "above zero, and each pad strictly below the extent it reflects: a pad "
+        "of an extent or more reads before the operand. The regions are the "
+        "corner, row and column pieces read with a negative stride, packed "
+        "several to a command. A symbolic extent is refused because the "
+        "offsets and sizes are params.",
+    ),
+    OpSupport(
+        "aten.pow.Tensor_Tensor",
+        BINARY,
+        ARENA_FP16,
+        "A finite integral uniform exponent in {-1, 0, 1, 2, 3, 4}; the base "
+        "must be static and the result must fit fp16. There is no pow kernel: "
+        "the supported exponents lower to the existing unary or binary "
+        "elementwise commands, and any other exponent, a non-integral or "
+        "non-uniform one, and a non-finite base stay portable.",
     ),
     # --- binary family (DSP_OP_BINARY_ELEMENTWISE) -----------------------
     OpSupport(
@@ -642,6 +687,31 @@ SUPPORTED: List[OpSupport] = [
         "partitioner for those.",
     ),
     OpSupport(
+        "aten.repeat.default",
+        BLIT,
+        ARENA_FP16,
+        "At most one of the operand's own axes above one: that is "
+        "cat([x] * factor, dim=axis), two loops, so one region with the factor on "
+        "a level's extent rather than on a region per phase -- a factor of 64 costs "
+        "the same single region a factor of two does. A factor list of all ones "
+        "is the identity and is the only view: a factor on an axis the list adds "
+        "in front of the operand's rank tiles the whole tensor rather than "
+        "reshaping it, so it copies like any other. Two repeated axes are four "
+        "loops against three levels and are refused, as are a non-contiguous "
+        "operand, an empty one, and a symbolic extent: the offsets and sizes are "
+        "params, and a run-time length would leave them at the traced example.",
+    ),
+    OpSupport(
+        "aten.flip.default",
+        BLIT,
+        ARENA_FP16,
+        "Any subset of the axes, static and contiguous: a reversal is a negative "
+        "source stride, which the region's int32 stride and the kernel's signed "
+        "walk already carry, and the axes reversed together are one level each. "
+        "A subset whose extents are all one re-points the operand and emits no "
+        "command. An axis named twice or out of range is refused.",
+    ),
+    OpSupport(
         "et_hexagon.update_cache.default",
         BLIT,
         ARENA_FP16,
@@ -968,12 +1038,12 @@ NOT_SUPPORTED = [
         "which is why `x * torch.full(...)` still delegates its multiply.",
     ),
     (
-        "aten.repeat.default, aten.flip.default",
-        "No command describes them: a tile and an axis reversal are each a "
-        "different region walk from the blits the backend has. A zero-filling pad "
-        "used to be listed here, and it is not that kind of case: it is a memset "
-        "plus one region, both of which the backend already emitted for other ops, "
-        "so it is a supported row.",
+        "aten.repeat.default with two or more axes above one",
+        "One repeated axis is cat([x] * factor, dim=axis), which is two loops and "
+        "so fits one region with the factor on a level's extent. Two repeated "
+        "axes are four loops and do not fit a region's three levels. It is "
+        "expressible as a sequence of single-axis regions, but the emitter emits "
+        "one command, so the shape is refused rather than half applied.",
     ),
     (
         "aten._adaptive_avg_pool2d.default",
@@ -981,12 +1051,11 @@ NOT_SUPPORTED = [
         "sizes the window per output position.",
     ),
     (
-        "aten.leaky_relu.default, aten.elu.default",
-        "No kernel: leaky_relu needs a slope the binary table has no form for, and "
-        "elu an exponential the unary table does not carry. Neither is a missing "
-        "line next to a validated kernel, which is why `aten._log_softmax.default` "
-        "-- no kernel either -- is wired instead: it is a composition of commands "
-        "that do exist.",
+        "aten.elu.default",
+        "No kernel: elu needs a scale and an input-sign branch the unary table "
+        "does not carry, and no composition of the existing commands evaluates "
+        "it. Leaky ReLU, which shares that shape of problem, is wired instead "
+        "because the relu kernel does carry the slope.",
     ),
     (
         "aten.prod.default, aten.var.correction, aten.cumsum.default",
@@ -994,10 +1063,18 @@ NOT_SUPPORTED = [
         "product, a second moment and a prefix scan are each a different walk.",
     ),
     (
-        "aten.clamp.Tensor and aten.pow.Tensor_Tensor",
+        "aten.clamp.Tensor",
         "The operand is the parameter: clamp's entry point carries its bounds as "
-        "two fp16 params and cannot hold a tensor, and there is no pow kernel at "
-        "all. Both stay portable rather than being read as a scalar operand.",
+        "two fp16 params and cannot hold a tensor, so the node stays portable "
+        "rather than being read as a scalar operand.",
+    ),
+    (
+        "aten.pow.Tensor_Tensor outside {-1, 0, 1, 2, 3, 4}",
+        "The supported exponents are the ones the existing unary and binary "
+        "elementwise commands compute exactly, or within the elementwise "
+        "tolerance. Any other finite integral exponent, a non-integral or "
+        "non-uniform one, and a non-finite base have no command and stay "
+        "portable; see the supported row for the forms that do.",
     ),
     (
         "aten.cat.default with more than three operands",

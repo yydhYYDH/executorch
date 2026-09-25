@@ -1319,6 +1319,283 @@ def _emit_reflect_pad(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _repeat_flip_extents(node: torch.fx.Node):
+    """The contiguous source and result a repeat or flip reads and writes.
+
+    Both ops are region walks over the operand's own bytes, so the operand has
+    to be contiguous and the result has to be a plain reshape of it: a
+    non-contiguous operand would be read at strides this emitter does not
+    compute, and a result whose declared layout is not the one the region
+    writes would be read by the next node at strides the graph believes.
+    `to_edge` records a contiguous stride for a flip's result whatever the
+    axes are (the copy is the one that makes it contiguous), so the flip gate
+    takes the axes from the argument and the result's shape.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node) or len(node.args) < 2:
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    if source_value.dtype not in (torch.float16, torch.float32):
+        return None
+    if not source_value.is_contiguous() or not result_value.is_contiguous():
+        return None
+    if source_value.numel() <= 0 or result_value.numel() <= 0:
+        return None
+    return source_value, result_value
+
+
+def repeat_region(node: torch.fx.Node) -> Optional[List[int]]:
+    """The blit region for `aten.repeat.default`, or None when there is none.
+
+    A repeat of one axis is `cat([x] * factor, dim=axis)`: the whole
+    trailing block is copied `factor` times, once per leading index. That is
+    two loops, so it fits one region whichever axis carries the factor, and
+    that region is the answer for a repeat along the last axis as much as for
+    one along a middle or leading axis. One command, any factor -- the factor
+    rides on a level's extent rather than on a region per phase, so a factor
+    of 64 costs the same single region a factor of two does.
+
+    A factor list of all ones is the identity and returns an empty region, so
+    the alias path re-points the operand's TensorRef. It is the only view: a
+    factor above one adds elements, so the bytes are read more than once and
+    an alias would answer a different question than the host's. A factor on
+    an axis the list adds in front of the operand's rank is not a reshape
+    either -- `x.repeat(2, 1)` on a three-element `x` tiles the whole tensor
+    -- so those axes are padded with ones to line the two up rather than
+    dismissed.
+
+    A shape this function cannot describe returns None, and the support check
+    turns that into a portable kernel: a repeat of two or more axes (four
+    loops, and only three levels), a symbolic extent or factor (the offsets
+    and sizes are params, and a run-time length would leave them at the traced
+    example), a non-contiguous operand, or an extent of zero.
+    """
+    values = _repeat_flip_extents(node)
+    if values is None:
+        return None
+    source_value, result_value = values
+    shape = list(source_value.shape)
+    result = list(result_value.shape)
+    rank = len(shape)
+    if rank == 0:
+        return None
+    factors = node.args[1]
+    if not isinstance(factors, (list, tuple)) or len(factors) < rank:
+        return None
+    if not all(
+        isinstance(factor, int) and not isinstance(factor, bool) and factor >= 1
+        for factor in factors
+    ):
+        return None
+    if any(isinstance(size, torch.SymInt) for size in shape + result):
+        return None
+    # The identity comes first, and before the shape check, because a list of
+    # ones may be longer than the operand's rank: the result then has a leading
+    # axis of one that the check below would read as a mismatch. It is the only
+    # view a repeat has: any factor above one adds elements, so the bytes are
+    # read more than once and an alias would answer a different question than
+    # the host's. A factor on an axis the list adds in front of the operand's
+    # rank is not a reshape either -- `x.repeat(2, 1)` on a three-element `x` tiles the
+    # whole tensor -- so the leading axes are padded with ones to line the two
+    # up rather than dismissed.
+    if all(factor == 1 for factor in factors):
+        return []
+    # The result's leading axes are the ones the factor list added, so the
+    # operand's own axes start at the same offset the factors' do. Reading the
+    # result at the operand's index instead is how a prepended axis of two came
+    # to be checked against a shape of one.
+    offset = len(factors) - rank
+    if any(
+        result[offset + axis] != shape[axis] * factors[offset + axis]
+        for axis in range(rank)
+    ):
+        return None
+    padded = (1,) * (len(factors) - rank) + tuple(shape)
+    repeated = [axis for axis in range(len(factors)) if factors[axis] > 1]
+    if len(repeated) > 1:
+        return None
+    axis = repeated[0]
+
+    # A repeat of one axis is `cat([x] * factor, dim=axis)`: the trailing block
+    # `shape[axis:]` is copied `factor` times, once per leading index. That is
+    # two loops, so it fits a region's three levels whichever axis carries the
+    # factor, and the axis need not be the last one -- which is what makes the
+    # form uniform.
+    #
+    # The loops are the leading product and the factor, and the innermost level
+    # is the block itself copied contiguously, with the factor as a broadcast
+    # of it: source stride zero, destination stride one block. The factor rides
+    # on a level's extent rather than on a region per phase, so one command
+    # covers any factor, and nothing here needs a region count past the one a
+    # command already has room for.
+    #
+    # A repeat of two or more axes is `cat` along each in turn, which is four
+    # loops and does not fit three levels. The host composes it exactly from
+    # successive single-axis repeats, but this emitter emits one command, so
+    # the shape is refused rather than half applied.
+    lead = 1
+    for size in padded[:axis]:
+        lead *= size
+    run = 1
+    for size in padded[axis:]:
+        run *= size
+
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [
+        0,
+        0,
+        0,
+        lead,
+        factors[axis],
+        run,
+        run,
+        0,
+        1,
+        run * factors[axis],
+        run,
+        1,
+    ]
+
+
+def flip_region(node: torch.fx.Node) -> Optional[List[int]]:
+    """The blit region for `aten.flip.default`, or None when there is none.
+
+    A reversal of a contiguous operand is a strided read and a contiguous
+    write. `HtpOpsRasterRegion`'s strides are `int32_t` and the kernel's
+    generic walk multiplies them as signed values, so a flipped axis is a
+    negative source stride read from its last element: the innermost axis
+    takes -1, the axis before it takes its inner pitch, and an axis further
+    out takes the pitch of everything behind it. The source offset is where
+    the read starts, which is each reversed axis's last element.
+
+    The walk has three levels -- the last axis, the one before it, and
+    everything else -- so the second-to-last and last axes are exact, while a
+    reversal in the outer group needs that group's other axes to be one. Two
+    reversals inside a group of two is a reversal per axis and is four loops,
+    which no region holds; that shape is refused, and on a rank of three or
+    less there is no outer group, so every subset reverses.
+
+    A flip of axes whose extents are all one is the identity and returns an
+    empty region, as does a flip of no axes, so the alias path re-points the
+    operand. The result's stride as the edge graph records it is not consulted:
+    a flip's result is a view with negative strides, and `to_edge` reports
+    that view as contiguous, so the region's geometry is the only place the
+    reversal can live.
+    """
+    values = _repeat_flip_extents(node)
+    if values is None:
+        return None
+    source_value, result_value = values
+    shape = list(source_value.shape)
+    rank = len(shape)
+    dims = node.args[1]
+    if not isinstance(dims, (list, tuple)):
+        return None
+    if not all(isinstance(dim, int) and not isinstance(dim, bool) for dim in dims):
+        return None
+    # A symbolic extent is a refusal: the source offset is the reversed axis's
+    # last element and its stride is that axis's pitch, so both are params and
+    # a run-time length would leave them at the traced example.
+    if any(isinstance(size, torch.SymInt) for size in shape):
+        return None
+    flipped = sorted((dim + rank if dim < 0 else dim) for dim in dims)
+    if any(not 0 <= dim < rank for dim in flipped) or len(set(flipped)) != len(
+        flipped
+    ):
+        return None
+    if list(result_value.shape) != shape:
+        return None
+    if all(shape[dim] == 1 for dim in flipped):
+        return []
+
+    # The walk is three levels: level 2 is the last axis, level 1 the second to
+    # last, level 0 everything before them. The result is contiguous whatever
+    # the source is, so a level's destination stride is the pitch of the axis
+    # it walks in the output, and its source stride is the same pitch read from
+    # the source, negated where the axis reverses. The two vectors differ only
+    # in their signs.
+    pitch = []
+    for dim in range(rank):
+        inner = 1
+        for size in shape[dim + 1 :]:
+            inner *= size
+        pitch.append(inner)
+    offset = sum((shape[dim] - 1) * pitch[dim] for dim in flipped)
+
+    size1 = shape[rank - 2] if rank >= 2 else 1
+    size2 = shape[-1]
+    if rank >= 3:
+        group = list(range(rank - 2))
+        size0 = 1
+        for size in shape[: rank - 2]:
+            size0 *= size
+        stride0 = size1 * size2
+        stride1 = size2
+    else:
+        group = []
+        size0 = 1
+        stride0 = 0
+        stride1 = size2 if rank >= 2 else 0
+
+    # Levels 1 and 2 each hold one axis, so negating their stride is exact.
+    # Level 0 holds a group, and the walk over it reads the source at an offset
+    # that is affine in the level's index only when the group's other axes are
+    # one -- two reversed axes in a group of two are a reversal per axis, which
+    # is four loops and does not fit.
+    reversed_group = [dim for dim in flipped if dim in group]
+    if reversed_group and any(
+        shape[other] != 1 for other in group if other != reversed_group[0]
+    ):
+        return None
+    source0 = -pitch[reversed_group[0]] if reversed_group else stride0
+    source1 = -stride1 if rank >= 2 and (rank - 2) in flipped else stride1
+    source2 = -1 if (rank - 1) in flipped else 1
+
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [
+        0,
+        offset,
+        0,
+        size0,
+        size1,
+        size2,
+        source0,
+        source1,
+        source2,
+        stride0,
+        stride1,
+        1,
+    ]
+
+
+def _emit_repeat_flip(node: torch.fx.Node, ctx) -> TensorRef:
+    """A repeat or a flip is one blit, or no command when it is a view.
+
+    Both reach the same emitter because both are the same decision: the
+    region function is the gate, a None answer is the alias path, and a
+    region is one RASTER_BLIT command carrying it.
+    """
+    region = repeat_region(node) if node.target in REPEAT_TARGETS else flip_region(node)
+    if region is None:
+        raise RuntimeError(f"hexagon: {node.target} is not an emittable repeat or flip")
+    if not region:
+        return _emit_alias(node, ctx)
+    out = ctx.result_for(node, _numel(node))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + region,
+        ),
+    )
+    return ctx.record(node, out)
 def _emit_constant_pad(node: torch.fx.Node, ctx) -> TensorRef:
     """A zero-filling pad as the memset the pad value is and one region.
 
@@ -6487,6 +6764,11 @@ EMITTERS = {
     exir_ops.edge.aten.cat.default: _emit_cat,
     exir_ops.edge.aten.upsample_nearest2d.vec: _emit_upsample,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
+    # A repeat and a flip are region walks over the operand's own bytes, and
+    # the forms that are views of it emit nothing: see repeat_region and
+    # flip_region for which is which.
+    exir_ops.edge.aten.repeat.default: _emit_repeat_flip,
+    exir_ops.edge.aten.flip.default: _emit_repeat_flip,
     # A zero-filling constant pad: a memset for the border and one region for the
     # operand. See constant_pad_region for the shape and the value it takes.
     exir_ops.edge.aten.constant_pad_nd.default: _emit_constant_pad,
@@ -6555,6 +6837,14 @@ CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
 UPSAMPLE_TARGETS = frozenset({exir_ops.edge.aten.upsample_nearest2d.vec})
 
 PERMUTE_TARGETS = frozenset({exir_ops.edge.aten.permute_copy.default})
+
+# A repeat and a flip. Both gates live in the region functions: a repeat whose
+# factors are all ones, lead the operand, or sit on a unit axis is a view and
+# emits nothing, and a flip of unit axes is the same; every other shape either
+# has a region or is refused.
+REPEAT_TARGETS = frozenset({exir_ops.edge.aten.repeat.default})
+
+FLIP_TARGETS = frozenset({exir_ops.edge.aten.flip.default})
 
 # The zero-filling pad, whose gate lives in constant_pad_region: an op that is
 # two commands, so the shape it is refused on is a property of the region rather
