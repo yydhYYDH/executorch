@@ -132,7 +132,7 @@ def _trains_on_batch_statistics(graph_module) -> bool:
     return False
 
 
-def _repoint_outputs(program: ExportedProgram) -> None:
+def repoint_outputs(program: ExportedProgram) -> None:
     """Name the output specs after the nodes the output node actually holds.
 
     Only the fold's own rename can need this here, and a graph whose outputs it
@@ -179,12 +179,19 @@ class FoldBatchNormIntoConv(ExportedProgramPassBase):
         if not before or _trains_on_batch_statistics(graph_module):
             return ExportedProgramPassResult(exported_program, False)
 
-        upstream = FuseBatchNormWithConvPass(exported_program)
-        upstream(graph_module)
+        # Upstream retraces and hands the retraced module back rather than
+        # writing it into the program, and the retrace is the only thing that
+        # gives the fused weight a shape. Discarding the result leaves a
+        # `get_attr` with no `meta` at all, and every emitter that reads a
+        # constant's extents -- the convolution's among them -- refuses the
+        # convolution the fold just made.
+        result = FuseBatchNormWithConvPass(exported_program)(graph_module)
+        graph_module = result.graph_module
+        exported_program._graph_module = graph_module
         if _batch_norm_count(graph_module) == before:
             return ExportedProgramPassResult(exported_program, False)
 
         remove_unused_parameters_pass(exported_program)
-        _repoint_outputs(exported_program)
+        repoint_outputs(exported_program)
         graph_module.recompile()
         return ExportedProgramPassResult(exported_program, True)
