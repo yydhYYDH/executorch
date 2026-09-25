@@ -490,15 +490,16 @@ SUPPORTED: List[OpSupport] = [
         "aten._softmax.default",
         f"{SOFTMAX} / {REDUCTION} / {BINARY} / {UNARY}",
         ARENA_FP16,
-        "Last axis only. The kernel's strided reduction over any other axis "
-        "disagrees with torch on hardware, so softmax_reduces_the_inner_axis keeps "
-        "those nodes portable. A row shorter than one HVX vector -- 64 fp16 lanes -- "
-        "is the SOFTMAX command; a longer one is the shifted sum of exponentials "
-        "instead: the maximum over the row, the shift, the exponential, the sum of "
-        "at most ones and the division by it. The standalone command's vector loop "
-        "answers its exponential up to 1.76x the correctly rounded value, as a "
-        "function of the argument's fractional part, where its tail path, which is "
-        "all of a row shorter than a vector, is within rounding.",
+        "Last-axis softmaxes, plus contiguous non-last-axis reductions whose "
+        "channel is below 64 when the axis can be moved last and back with three-level "
+        "raster regions. A non-contiguous or non-permuteable source stays portable, as "
+        "does a non-last-axis channel at or above 64. A row shorter than one HVX vector "
+        "-- 64 fp16 lanes -- is the SOFTMAX command; a longer one is the shifted sum of "
+        "exponentials instead: the maximum over the row, the shift, the exponential, "
+        "the sum of at most ones and the division by it. The standalone command's vector "
+        "loop answers its exponential up to 1.76x the correctly rounded value, as a "
+        "function of the argument's fractional part, where its tail path, which is all "
+        "of a row shorter than a vector, is within rounding.",
     ),
     # --- norms -----------------------------------------------------------
     OpSupport(
@@ -868,8 +869,9 @@ NOT_SUPPORTED = [
         "fp16 row inside the kernel, per token, with an uncalibrated absmax scale.",
     ),
     (
-        "softmax over a non-last axis",
-        "The kernel's strided reduction path disagrees with torch on hardware.",
+        "non-permuteable or over-wide non-last-axis softmax",
+        "Only contiguous reductions below channel 64 take the two-blit path; the old "
+        "strided reduction is not used.",
     ),
     (
         "broadcasting binary ops",

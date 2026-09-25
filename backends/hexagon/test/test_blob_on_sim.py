@@ -277,11 +277,7 @@ class _Scale(torch.nn.Module):
 
 
 class _SoftmaxAt(torch.nn.Module):
-    """A softmax along an axis that is neither first nor last.
-
-    That is the only shape of it that gives the kernel a real inside extent; a
-    last-axis softmax has inside 1 and takes a different path.
-    """
+    """A contiguous softmax along a middle axis, before the host-side reshape."""
 
     def forward(self, x):
         return torch.softmax(x, 1)
@@ -1364,6 +1360,28 @@ def _cases():
         kind="close",
         tolerance=_SOFTMAX_TOLERANCE,
     )
+    middle_axis_softmax = []
+    for tag, shape in (
+        ("HAA", (1, 2, 4, 8)),
+        ("HAB", (4, 8, 8)),
+        ("HAC", (64, 8, 8)),
+        ("HAD", (4, 8, 64)),
+        ("HAE", (4, 8, 65)),
+        ("HAF", (2048, 8, 8)),
+    ):
+        value = _small(shape)
+        reference = torch.softmax(value.double(), 1)
+        assert reference.numel() > 0, f"{tag}: the reference is empty"
+        middle_axis_softmax.append(
+            _case(
+                tag,
+                _SoftmaxAt(),
+                (value,),
+                _bits(reference),
+                kind="close",
+                tolerance=1e-3,
+            )
+        )
     mean = _case(
         "I",
         _MeanAt(),
@@ -1529,6 +1547,7 @@ def _cases():
         *advances,
         scale,
         softmax,
+        *middle_axis_softmax,
         mean,
         narrowed,
         gated,
@@ -2488,7 +2507,9 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
     assert kinds["E"] == [19], "the scale is not an element-wise op"
-    assert kinds["H"] == [28], "the softmax is not a softmax"
+    assert kinds["H"] == [3, 28, 3], "the middle-axis softmax is not blit/softmax/blit"
+    for tag in ("HAA", "HAB", "HAC", "HAD", "HAE", "HAF"):
+        assert kinds[tag] == [3, 28, 3], f"{tag}: the middle-axis reshape changed"
     assert kinds["I"] == [29], "the mean is not a reduction"
     assert kinds["J"] == [3], "the narrowing select is not a blit"
     assert kinds["K"] == [19], "the gated activation is not a binary op"

@@ -1327,11 +1327,11 @@ Not done yet:
   MLP and the projection into the text embedding space; on this backend the
   `DecomposePatchEmbed` pass handles the conv-to-matmul step only. Nothing in
   this checkout splices a tower's output into a language model's inputs;
-- softmax is delegated on its last axis only. The kernel's strided path, for a
-  reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
-  reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
-  1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
-  keeps that form off the delegate until the kernel is checked;
+- softmax is delegated on the last axis, and on a contiguous non-last axis when
+  that axis can be moved last and back with three-level raster regions and its channel
+  is below 64. The direct middle-axis stream is a blit, the existing last-axis
+  `DSP_OP_SOFTMAX` with `inside == 1`, and the inverse blit. Non-contiguous,
+  non-permuteable, and channel-at-or-above-64 middle-axis cases stay portable;
 - **The softmax command is wrong for rows longer than one HVX vector, and the
   emitter now gates on the width.** A `(3, 197, 197)` softmax over uniform logits
   came back wrong on 116284 of 116427 elements, worst 5.9e-3 against a row maximum

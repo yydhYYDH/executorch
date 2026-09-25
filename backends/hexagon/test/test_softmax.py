@@ -50,6 +50,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
     SOFTMAX_VECTOR_WIDTH,
+    _permute_region_from_shapes,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
@@ -63,6 +64,7 @@ F16 = torch.float16
 _REDUCTION = 29
 _BINARY = 19
 _UNARY = 4
+_RASTER_BLIT = 3
 _SOFTMAX = 28
 _MAXIMUM = 2
 _SUM = 1
@@ -103,6 +105,75 @@ def _lowered(model, args):
     blob = bytes(inner._processed_bytes)
     _, commands = read_blob(blob)
     return blob, commands
+
+
+def _delegates(model, args):
+    program = to_edge_transform_and_lower(
+        export(model, tuple(args)),
+        partitioner=[HexagonPartitioner()],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    return [
+        program.graph_module.get_submodule(node.args[0].target)._processed_bytes
+        for node in program.graph_module.graph.nodes
+        if node.target is torch.ops.higher_order.executorch_call_delegate
+    ]
+
+
+def test_middle_axis_softmax_uses_two_blits_around_one_last_axis_command():
+    """A contiguous middle-axis reduction is a row-major reshape around softmax."""
+    for shape in (
+        (1, 2, 4, 8),
+        (4, 8, 8),
+        (64, 8, 8),
+        (4, 8, 63),
+        (4, 8, 64),
+        (4, 8, 65),
+        (2048, 8, 8),
+    ):
+        x = (
+            torch.arange(np.prod(shape), dtype=torch.float32)
+            .reshape(shape)
+            .remainder(7)
+            .sub(3)
+            .half()
+        )
+        blob, commands = _lowered(_Softmax(1), (x,))
+        assert [command.type for command in commands] == [
+            _RASTER_BLIT,
+            _SOFTMAX,
+            _RASTER_BLIT,
+        ]
+        assert list(commands[1].params) == [
+            int(np.prod(shape)) // shape[1],
+            shape[1],
+            1,
+            2,
+        ]
+        got = np.frombuffer(execute(blob, [x.numpy()])[0], dtype=np.float16)
+        want = torch.softmax(x.float(), dim=1).numpy().reshape(-1)
+        np.testing.assert_allclose(got.astype(np.float32), want, rtol=2e-3, atol=2e-4)
+
+
+def test_middle_axis_gate_refuses_a_non_unit_stride():
+    """A non-contiguous caller tensor is not silently copied into the path."""
+    x = torch.randn(4, 8, 16, dtype=torch.float32).half().transpose(1, 2)
+    assert not x.is_contiguous()
+    assert not _delegates(_Softmax(1), (x,)), (
+        "a non-contiguous middle-axis softmax reached the delegate"
+    )
+
+
+def test_middle_axis_gate_refuses_a_fourth_advancing_permutation_group():
+    """The shared region helper refuses geometry a single blit cannot describe."""
+    assert _permute_region_from_shapes([2, 2, 2, 2], [2, 2, 2, 2], [2, 1, 0, 3]) is None
+
+
+def test_softmax_gate_keeps_channel_at_and_above_64_portable():
+    """The retained threshold is measured per reduced axis, not by the tail width."""
+    for channel in (64, 128):
+        x = torch.randn(4, channel, 8, dtype=torch.float32).half()
+        assert not _delegates(_Softmax(1), (x,))
 
 
 def test_a_wide_softmax_is_the_shifted_sum_of_exponentials():
