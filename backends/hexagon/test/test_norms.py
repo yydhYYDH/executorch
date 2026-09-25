@@ -231,10 +231,14 @@ def test_group_norm_without_affine_drops_the_two_element_wise_commands():
 def test_instance_norm_is_one_norm_command_per_batch_channel_pair():
     """The batch axis the exporter flattened is the row the command reduces.
 
-    The affine is per row rather than per channel of a nested axis: the graph's
-    `repeat` out to `N*C` is left on the portable kernels, so the two weights
-    arrive as delegate inputs already the length of the row count and are read
-    with a single stride-zero broadcast.
+    The affine is per row rather than per channel of a nested axis, and it is
+    still read with a single stride-zero broadcast. What moved since this was
+    written is how the weights reach the delegate: the graph's `repeat` out to
+    `N*C` used to stay on the portable kernels, which put the two repeated
+    weights in the delegate input list, and `aten.repeat.default` is a supported
+    row now, so the repeat is walked inside the region list instead. That drops
+    the two `(8,)` inputs to one input and adds the blits that place the
+    repeated operands; the norm is still the single command this test names.
     """
     torch.manual_seed(0)
     x = torch.randn(2, 4, 3, 3).half()
@@ -243,14 +247,16 @@ def test_instance_norm_is_one_norm_command_per_batch_channel_pair():
         model.norm.weight.copy_(torch.randn(4).half())
         model.norm.bias.copy_(torch.randn(4).half())
     blob, commands, shapes = _lowered(model, (x,))
-    assert shapes == [(2, 4, 3, 3), (8,), (8,)], shapes
+    assert shapes == [(2, 4, 3, 3)], shapes
     assert [command.type for command in commands] == [
+        3,
+        3,
         _LAYER_NORM,
         _BINARY,
         _BINARY,
         3,
     ]
-    norm, multiply = commands[0], commands[1]
+    norm, multiply = commands[2], commands[3]
     assert list(norm.params[:2]) == [8, 9], (
         "the instance norm does not reduce one row per (batch, channel)"
     )
@@ -267,7 +273,7 @@ def test_instance_norm_is_one_norm_command_per_batch_channel_pair():
         repeated = [weight.detach().repeat(2), bias.detach().repeat(2)]
         expected = _instance_norm_reference(x, *repeated, 1e-5)
     np.testing.assert_allclose(
-        _host(blob, (x, *repeated)).astype(np.float32),
+        _host(blob, (x,)).astype(np.float32),
         expected.numpy().reshape(-1),
         rtol=2e-3,
         atol=_TOLERANCE,
