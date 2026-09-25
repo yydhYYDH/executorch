@@ -308,9 +308,14 @@ SUPPORTED: List[OpSupport] = [
         "reachable: `masked_fill` reaches it with a one-element value. The kernel's "
         "per-channel value mode needs a channel count and an inner size this emitter "
         "does not compute, so it stays portable. The comparison that produces a "
-        "condition is not delegated -- its result is bool and no kernel here writes "
-        "one -- so the condition arrives as a delegate input or as a bool constant "
-        "weight.",
+        "condition is not delegated -- it is in neither EMITTERS nor "
+        "SUPPORTED_TARGETS -- so the condition arrives as a delegate input or as a "
+        "bool constant weight, and a broadcast condition is refused by the extent "
+        "rule above whether it arrives from a comparison or from a graph input. "
+        "The SDPA-through-CPU-flash guard is the shape that shows this up in a "
+        "census: eq -> logical_not -> any(-1) -> logical_not -> where, whose "
+        "condition is one flag per query row, so the where is refused on the extent "
+        "rule and the whole five-node island stays portable.",
     ),
     # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
     OpSupport(
@@ -1127,14 +1132,20 @@ NOT_SUPPORTED = [
     ),
     (
         "aten.eq / ne / gt / lt / ge / le",
-        "The DSP's comparison writes int32 1/0 or fp16 1.0/0.0 and has no one-byte "
-        "mode, so a node declaring torch.bool cannot be handed one without an "
-        "out-of-bounds write. A bool operand is refused at the gate for the same "
-        "reason (operand_dtypes_are_readable), with SELECT the one exception, "
-        "because it is the one command that declares the width it reads. The "
-        "comparison stays on the portable kernels and its result reaches a `where` "
-        "as an ordinary input, which is why `aten.where.self` is a supported row "
-        "and these are not.",
+        "No target here is in EMITTERS, so SUPPORTED_TARGETS refuses each of them "
+        "at the first gate in the predicate and neither the dtype rule nor the "
+        "one-byte question is ever reached. Behind that, the DSP's own comparison "
+        "is two op types and not six: HtpOpsBinaryOpType carries GREATER(9) and "
+        "LESS(10) and htp_ops_binary_is_compare admits nothing else, so eq, ne, ge "
+        "and le have no kernel at any width. The output width is a real limit and "
+        "not the first one: htp_ops_binary_elementwise returns -1 for a bytes that "
+        "is not 2 or 4, and the compare arms write fp16 1.0/0.0, fp32 1.0/0.0 or "
+        "int32 1/0. A bool *operand* is a separate rule and the one "
+        "operand_dtypes_are_readable states, about a misread rather than an "
+        "overrun, with SELECT the exception because it declares the width it "
+        "reads. A comparison that reached a delegate would hand its bool to a "
+        "where inside the same arena, so the one-byte mode is worth having "
+        "eventually; it is not what is holding these nodes.",
     ),
     (
         "aten.sin / cos / expm1 defaults, and aten.erf.default",
@@ -1154,7 +1165,7 @@ NOT_SUPPORTED = [
         "No emitter and no fusion pass: the node does not survive export, and the "
         "partitioner sees `gt`, `mul` and `where` in its place. The `mul` and the "
         "`where` delegate today as one multiply and one select, and the comparison "
-        "stays on the portable kernels because its result is bool. `DSP_OP_PRELU` "
+        "stays on the portable kernels because it is in neither EMITTERS nor SUPPORTED_TARGETS. `DSP_OP_PRELU` "
         "(39) exists in the library and nothing reaches it: fusing the three nodes "
         "back into one command is a pass of the `mul_silu.py` kind, not another "
         "emitter.",

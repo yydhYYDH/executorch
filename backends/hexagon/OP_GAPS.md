@@ -125,7 +125,9 @@ values half is wired -- and they are kept because what each decided is the shape
 the next op in its family will have to decide too. Two were looked at and not
 taken: `expm1`, on a measurement, and `prelu`, which turns out not to be one
 emitter away after all. One is still open and needs a kernel rather than an
-emitter: a one-byte bool output for the comparisons.
+emitter: a one-byte bool output for the comparisons -- but that is the last piece of
+its family and not what is holding the nodes, which is what the entry below now
+says.
 
 - **`aten.sin` and `aten.cos`**: subtypes `SIN`(14) and `COS`(13) exist, and
   `UNARY_OP_TYPES` carried both before anything emitted them. This was the entry
@@ -149,13 +151,20 @@ emitter: a one-byte bool output for the comparisons.
   which of the two an array takes depends only on its length and no emitter can
   decide it at export. A measurement, not a preference: rewiring it would move a model's
   `expm1(x)` from torch's answer to a constant.
-- **`aten.gt`, `aten.ge`, `aten.lt`, `aten.le`, `aten.eq`, `aten.ne`**:
-  `GREATER`(9) and `LESS`(10) exist. They write int32 1/0 or fp16 1.0/0.0, and
-  the table has no one-byte mode, so a node declaring `torch.bool` cannot be
-  handed one without an out-of-bounds write. This is a kernel change, not an
-  emitter change, and it is still open: `where`'s arrival did not need it, since a
-  comparison's result is a `where` input rather than a command's output.
-  `SQUARED_DIFFERENCE`(11) has no ATen node at all.
+- **`aten.gt`, `aten.ge`, `aten.lt`, `aten.le`, `aten.eq`, `aten.ne`**: open, and
+  not for the reason this entry used to give. The one-byte mode is real and still
+  missing -- `htp_ops_binary_elementwise` returns -1 for a `bytes` that is not 2 or 4, and
+  the compare arms write fp16 1.0/0.0, fp32 1.0/0.0 or int32 1/0 -- but it is the
+  *last* missing piece, not the first. Two others are ahead of it. One is that the
+  DSP has two comparison op types and not six: `HtpOpsBinaryOpType` carries `GREATER`(9) and `LESS`(10),
+  `htp_ops_binary_is_compare` admits nothing else, and no host emitter ever passes either,
+  so eq, ne, ge and le have no kernel at any width. The other is that the six
+  targets are in neither `EMITTERS` nor `SUPPORTED_TARGETS`, which is where the
+  partitioner actually refuses them -- the first gate in the predicate, ahead of
+  the fp16/fp32 dtype rule and of `operand_dtypes_are_readable`, which is about bool
+  *operands* and returns True on a fp16-operand comparison whose result is bool.
+  `where`'s arrival did not need the one-byte mode because a comparison's result is a
+  `where` input rather than a command's output. `SQUARED_DIFFERENCE`(11) has no ATen node at all.
 - **`aten.where.self`**: **done.** This was a pure emitter gap plus one
   partitioner predicate rather than a kernel change, and the entry used to ask the
   question the wrong way round -- whether the kernel's condition operand accepts
@@ -431,8 +440,12 @@ The two gaps that are not of that shape:
    the runtime's side of it, which was measured on hexagon-sim. Note that closing
    this does **not** by itself reach `DSP_OP_PRELU`; see the `aten.prelu` entry in
    §3. The half that is left is the producer rather than the consumer: no kernel
-   here writes a one-byte bool, so a comparison whose node declares `torch.bool`
-   still stays portable, and that is a kernel change.
+   here writes a one-byte bool, so a comparison stays portable. That is a kernel
+   change, but it is not the whole of the producer gap: the comparisons are
+   refused before the width is ever a question (see the comparison entry in §3),
+   and a bool producer would not by itself reach the `where` either, because
+   `htp_ops_select`'s own guard admits a condition that is the whole output or a
+   single element and the SDPA guard's condition is one flag per query row.
 3. **A masked reduction as a fusion** -- `DSP_OP_MASKED_REDUCTION` is not a node
    that cannot be placed. The shape that comes closest,
    `(a * m.unsqueeze(-1)).sum(-2)`, already lowers to a `mul` and a `sum` that
