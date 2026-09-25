@@ -1093,9 +1093,20 @@ Working and verified without a device:
   not delegated. `FuseAddReluPass` rewrites `relu(x + y)` into the one
   `BINARY_ELEMENTWISE` command that does `max(a + b, 0)`, the only command here
   that adds and rectifies in one step; without the pass the pair delegates as an
-  add and a unary clamp, so the pass buys a command rather than a round trip. See
-  `test/test_pool.py`, `test/test_sum_amax.py`, `test/test_fmod.py` and
-  `test/test_add_relu.py`.
+  add and a unary clamp, so the pass buys a command rather than a round trip.
+  `FuseCumsumPass` does the same for a prefix scan, which the reduction table does
+  not have: `cumsum(x, -1)` along the last axis becomes one `BATCH_MATMUL` against
+  a host constant `(L, L)` **upper**-triangular ones mask (the lower triangle is
+  the same command stream and the reverse scan), and `cumsum(x, -1) + carry` adds
+  the carry with the ordinary binary emitter, so a streaming caller threads the
+  total as a method argument and no state is kept on the DSP. The scan length is
+  the matmul's `K` and the staged row width, so it must be a multiple of 64; 32 is
+  a whole number of tiles and is still refused, because the phone's skel stages a
+  shorter `K` at `ceil(K/64)*64` and reads it from the wrong row. The accumulator
+  is the matmul's fp32 narrowed once, so the comparison is against an fp64 prefix
+  and not against `torch.cumsum`, which rounds at every step. See
+  `test/test_pool.py`, `test/test_sum_amax.py`, `test/test_fmod.py`,
+  `test/test_add_relu.py` and `test/test_cumsum.py`.
 - the overloads the ops above were missing reach the DSP too. `torch.mean(x)`
   lowers to one REDUCTION over `[1][numel][1]`, the same command
   `torch.mean(x, dim=None)` produces; `torch.max(x)` lowers to one REDUCTION of

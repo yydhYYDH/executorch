@@ -702,13 +702,13 @@ def _et_hexagon_ops():
 def test_every_et_hexagon_op_this_checkout_defines_has_an_emitter():
     """The family is this backend's own, so there is no reason for a gap in it.
 
-    These eight ops exist to be fused into one DSP command each; a `et_hexagon`
+    These nine ops exist to be fused into one DSP command each; a `et_hexagon`
     op without an emitter would be a fusion pass producing something the backend
     cannot run. The first census listed the family as unchecked; this is the
     check, and it is the kind that fails when a new fused op lands without one.
     """
     names = _et_hexagon_ops()
-    assert len(names) == 8, f"the et_hexagon namespace changed: {sorted(names)}"
+    assert len(names) == 9, f"the et_hexagon namespace changed: {sorted(names)}"
     assert not [name for name in sorted(names) if not _has_emitter(name)]
 
 
