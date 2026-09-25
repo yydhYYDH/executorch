@@ -600,10 +600,10 @@ guards, which they answer with an error code); a symmetric per-channel
 dequantize whose every reader is a runnable quantized matmul; and, for `addmm`,
 `alpha == 1`, `beta` in `{0, 1}` and a bias of exactly `n` values (the kernel
 adds `n` contiguous halfs and would otherwise read past the operand). Which
-entry a matmul reaches is the `M` it carries: `M == 1` is the GEMV pair, `M > 1`
-is the prefill entry, and only the int4 weight has one -- a w8a16 matmul above
-one row stays on the portable kernels, because the int8 prefill kernel reads a
-tile order nothing here packs.
+entry a matmul reaches is the `M` it carries: `M == 1` is the GEMV pair, and
+`M > 1` is the prefill entry for both the int4 and int8 weight layouts. The
+int8 prefill command is 42, with its fp16 per-channel scale tail appended to the
+packed weight.
 
 ### Prefill
 
@@ -617,11 +617,13 @@ K > 64      [ 3 ] [ 22 ] [ 3 ]      # pack the activation, matmul, repack the ou
 
 The kernel reads fp16 activations directly and dequantizes the weight itself, so
 neither the per-token int8 activation nor the `scale_block_num == 1` contract of
-the GEMV entries applies. What it does need is a different weight layout: the
-512-byte int4 tiles of 32 output channels by 32 k values, with the fp16
-per-channel scales after them, which is what `pack_q4a16_prefill_weight` builds
-and what the vendored reorder writes -- the two are compared byte for byte on
-the simulator (`test/test_prefill_on_sim.py`). The activation goes into
+the GEMV entries applies. The int4 entry uses 512-byte tiles of 32 output
+channels by 32 k values, followed by fp16 per-channel scales; this is what
+`pack_q4a16_prefill_weight` builds and what the vendored reorder writes, and
+the two are compared byte for byte on the simulator
+(`test/test_prefill_on_sim.py`). The int8 entry uses 1024-byte HMX tiles,
+followed by the same fp16 per-channel scale tail; `pack_w8a16_prefill_weight`
+builds that operand for command 42. The activation goes into
 `[k/64][m][64]` and the output comes back out of `[n/64][m][64]`, which is what
 the two blits are for.
 
@@ -1292,12 +1294,11 @@ Not done yet:
   `mean`/`rsqrt`/`sigmoid` chain is fused into an `rms_norm` op and the casts
   around it are absorbed, since the arena holds fp16 and the vendored kernels
   take fp16 in and out;
-- the int8 half of the quantized matmul path is wired up for `M == 1` only. Its
-  prefill kernel (`MATMUL_W8A16_BLOCK_FP16`, 42) reads a tile order nothing here
-  packs, so a w8a16 matmul above one row stays on the portable kernels, pack64
-  activation and output repack included. The int4 weight has both of its entries
-  now, and `## Status` records what that entry's prefill half has run on and what
-  it has not;
+- the int8 half of the quantized matmul path has both entries. The M>1
+  prefill kernel (`MATMUL_W8A16_BLOCK_FP16`, 42) now uses the host HMX tile
+  packer with its fp16 per-channel scale tail, and the pack64 activation and
+  output repack blits are included. The int4 weight has both of its entries too;
+  `## Status` records the evidence for each prefill half.
 - **the vision attention has now run on hexagon-sim**, bit-for-bit against torch
   on `[1,4,2,64]` and `[2,3,4,64]` at `headDim` 64, with the scale passed as the
   fp32 bit pattern in the param slot it is read from, the mask absent and the

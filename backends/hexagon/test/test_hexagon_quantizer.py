@@ -457,6 +457,17 @@ def test_w8a16_weight_bytes_are_the_kernel_layout():
     assert np.array_equal(unpacked, weight.T.astype(np.int32))
 
 
+def test_w8a16_prefill_weight_appends_fp16_scales():
+    k, n = 64, 32
+    weight = ((torch.arange(k * n).reshape(k, n) % 17) - 8).numpy()
+    scale = np.linspace(0.125, 2.0, n, dtype=np.float32)
+    packed = hexagon_ops.pack_w8a16_prefill_weight(weight, scale, k, n)
+    tiles = hexagon_ops.pack_w8a16_gemv_weight(weight, k, n)
+    assert packed[: len(tiles)] == tiles
+    tail = np.frombuffer(packed[len(tiles) :], dtype=np.float16)
+    assert np.array_equal(tail, scale.astype(np.float16))
+
+
 def test_the_quantized_matmul_is_delegated():
     program, _, _ = _quantized_program("q4a16", 1, 64, 128)
     support = _support(program)
@@ -574,26 +585,66 @@ def test_the_m_over_32_prefill_still_reaches_its_kernel_at_the_vtcm_ceiling():
     assert list(commands[1].params[:10]) == [m, k, n, 0, 1, 1, 2, k // 32, 1, 0]
 
 
-def test_a_w8a16_prefill_matmul_stays_portable():
-    """Only the q4a16 prefill entry is wired, and the difference is the weight.
+def test_a_w8a16_prefill_matmul_lowers_to_command_42():
+    """A real partitioned int8 graph contains command 42 in its delegate blob."""
+    converted, x = _converted("w8a16", 2, 64, 128)
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(converted, (x,)),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    delegates = [
+        module
+        for module in lowered.graph_module.modules()
+        if isinstance(module, LoweredBackendModule)
+    ]
+    assert len(delegates) == 1
+    blob = delegates[0].processed_bytes
+    header, commands = read_blob(blob)
+    assert 42 in [command.type for command in commands]
+    command = next(command for command in commands if command.type == 42)
+    assert len(command.params) == 29
+    tile_bytes = (64 // 32) * (128 // 32) * 1024
+    assert command.inputs[1].size == tile_bytes + 128 * 2
+    packed_weight = bytes(
+        blob_interpreter.Arena(header, blob, "test").view(command.inputs[1])
+    )
+    expected_scale = converted.state_dict()["_scale_0"].detach().float().numpy()
+    actual_scale = np.frombuffer(packed_weight[tile_bytes:], dtype=np.float16)
+    assert np.array_equal(
+        actual_scale.astype(np.float32), expected_scale.astype(np.float16).astype(np.float32)
+    )
 
-    `DSP_OP_MATMUL_W8A16_BLOCK_FP16` reads int8 in an order nothing here packs
-    and takes its geometry in an im2col struct, so a w8a16 matmul with M > 1
-    stays on the portable kernels: an int8 weight in the int4 tile order would
-    be read, multiplied and answered, and only the answer would be wrong.
-    """
-    program, _, _ = _quantized_program("w8a16", 8, 64, 128)
-    support = _support(program)
-    mm = _mm_node(program)
-    assert not support.is_node_supported(None, mm)
-    assert not support.is_node_supported(None, mm.args[1])
-    # The same shape one weight type over does reach the kernel, so what
-    # refuses this is the int8 weight and not the M it carries.
-    program, _, _ = _quantized_program("q4a16", 8, 64, 128)
+    # The same geometry with int4 still uses command 22, so the assertion above
+    # is specifically about the int8 prefill path.
+    program, _, _ = _quantized_program("q4a16", 2, 64, 128)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, q4_commands = read_blob(blob)
+    assert 22 in [command.type for command in q4_commands]
+
+
+def test_w8a16_prefill_bracket_m32_m33_k64_k128_and_refuse_k_tail():
+    """The admitted W8 geometry is explicit at the M and K boundaries."""
+    for m in (32, 33):
+        for k in (64, 128):
+            program, _, _ = _quantized_program("w8a16", m, k, 64)
+            blob = HexagonBackend.preprocess(program, []).processed_bytes
+            _, commands = read_blob(blob)
+            assert 42 in [command.type for command in commands], (m, k)
+            command = next(command for command in commands if command.type == 42)
+            assert command.params[12] == m
+            assert command.params[18] == k
+
+    program, _, _ = _quantized_program("w8a16", 32, 64, 64)
     support = _support(program)
     mm = _mm_node(program)
     assert support.is_node_supported(None, mm)
     assert support.is_node_supported(None, mm.args[1])
+
+    program, _, _ = _quantized_program("w8a16", 33, 96, 64)
+    support = _support(program)
+    mm = _mm_node(program)
+    assert not support.is_node_supported(None, mm)
+    assert not support.is_node_supported(None, mm.args[1])
 
 
 def test_a_prefill_over_two_run_time_tensors_stays_portable():
@@ -684,7 +735,7 @@ def test_the_op_ids_are_the_ones_the_dsp_defines():
         / "include"
         / "htp_command.h"
     ).read_text()
-    for name in ("DSP_OP_MATMUL_Q4A16_GEMV_I8", "DSP_OP_MATMUL_W8A16_GEMV_I8"):
+    for name in ("DSP_OP_MATMUL_Q4A16_GEMV_I8", "DSP_OP_MATMUL_W8A16_BLOCK_FP16", "DSP_OP_MATMUL_W8A16_GEMV_I8"):
         value = getattr(hexagon_ops, name)
         assert re.search(rf"\b{name}\s*=\s*{value}\b", header), name
 

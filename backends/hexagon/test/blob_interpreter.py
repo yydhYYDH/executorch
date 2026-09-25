@@ -53,6 +53,7 @@ PRELU = 39
 FLASH_ATTN = 18
 ROPE = 14
 MATMUL_Q4A16_FP16 = 22
+MATMUL_W8A16_BLOCK_FP16 = 42
 MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
 SHARED_GATHER = 23
@@ -1703,6 +1704,41 @@ def _run_matmul_q4a16_prefill(
     _store(arena, arena.address(dst), blocked.tobytes())
 
 
+def _run_matmul_w8a16_prefill(
+    command: Command, params: List[int], arena: Arena
+) -> None:
+    """hmx_matmul_w8a16_block_fp16, the M > 1 W8A16 prefill kernel."""
+    if len(params) != 29:
+        raise UnsupportedOp(f"blob: w8a16 prefill has {len(params)} parameters")
+    m, k, n = params[12], params[18], params[20]
+    if m <= 1 or k % 64 or n % 32:
+        raise UnsupportedOp(f"blob: a w8a16 prefill of {k}x{n}")
+    if params[27] != 1 or params[28] != 0:
+        raise UnsupportedOp("blob: w8a16 prefill uses an unsupported scale mode")
+
+    raw = bytes(arena.view(command.inputs[1]))
+    tile_bytes = (k // 32) * (n // 32) * 1024
+    if len(raw) < tile_bytes + n * 2:
+        raise UnsupportedOp(f"blob: a w8a16 prefill of {k}x{n} has no scale tail")
+    w = _unpack_hmx_int8(raw, k, n)
+    scales = np.frombuffer(raw[tile_bytes:], dtype=np.float16)[:n].astype(np.float32)
+
+    activation = np.frombuffer(
+        bytes(arena.view(command.inputs[0])), dtype=np.float16
+    ).reshape(k // 64, m, 64)
+    rows = activation.transpose(1, 0, 2).reshape(m, k).astype(np.float32)
+    out = (rows @ (w.astype(np.float32) * scales[:, None]).T).astype(np.float16)
+    bias = _gemv_bias(command, arena, 2, n)
+    if bias is not None:
+        out = (out.astype(np.float32) + bias).astype(np.float16)
+
+    packs = (n + 63) // 64
+    blocked = np.zeros((packs, m, 64), dtype=np.float16)
+    for pack in range(packs):
+        channels = min(n - pack * 64, 64)
+        blocked[pack, :, :channels] = out[:, pack * 64 : pack * 64 + channels]
+    _store(arena, arena.address(command.outputs[0]), blocked.tobytes())
+
 def _quantize_activation_row(a: np.ndarray):
     """Per-token symmetric int8 quantization, as the GEMV kernels do it.
 
@@ -1872,6 +1908,7 @@ _EXECUTORS = {
     BATCH_MATMUL: _run_batch_matmul,
     FLASH_ATTN: _run_flash_attn,
     MATMUL_Q4A16_FP16: _run_matmul_q4a16_prefill,
+    MATMUL_W8A16_BLOCK_FP16: _run_matmul_w8a16_prefill,
     MATMUL_Q4A16_GEMV_I8: _run_matmul_q4a16_gemv,
     MATMUL_W8A16_GEMV_I8: _run_matmul_w8a16_gemv,
     SHARED_GATHER: _run_shared_gather,
