@@ -39,6 +39,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
     DQ_PER_CHANNEL,
+    flip_region,
+    FLIP_TARGETS,
     gather_table,
     GATHER_TARGETS,
     GETITEM,
@@ -72,6 +74,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     quantized_matmul_is_refused,
     reduction_dims,
     REDUCTION_TARGETS,
+    repeat_region,
+    REPEAT_TARGETS,
     sdpa_mask_fits_dsp_limits,
     sdpa_targets,
     select_region,
@@ -349,12 +353,27 @@ def _nearest_upsample_is_emittable(node: torch.fx.Node) -> bool:
     return upsample_regions(node) is not None
 
 
+def _repeat_flip_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether a repeat or a flip is a view or a region.
+
+    The same call the emitter makes, so the partitioner cannot admit a node the
+    emitter would refuse; `repeat_region` and `flip_region` are where the
+    geometry is decided. An empty region is the no-command form -- a leading
+    repeat, a repeat by one, a repeat of a unit axis, a flip of unit axes -- so
+    it is accepted here too, and the alias path re-points the operand.
+    """
+    region = repeat_region(node) if node.target in REPEAT_TARGETS else flip_region(node)
+    return region is not None
+
+
 def _emits_no_command(node: torch.fx.Node) -> bool:
     """Whether this node's emitter only re-points its operand's TensorRef."""
     if node.target in ALIAS_TARGETS:
         return True
     if dim_order_keeps_the_bytes(node):
         return True
+    if node.target in (REPEAT_TARGETS | FLIP_TARGETS) and _repeat_flip_is_emittable(node):
+        return not (repeat_region(node) if node.target in REPEAT_TARGETS else flip_region(node))
     return node.target in CAST_TARGETS and _cast_stays_in_fp16(node)
 
 
@@ -376,6 +395,14 @@ def _alias_keeps_the_same_bytes(node: torch.fx.Node) -> bool:
         result_value, torch.Tensor
     ):
         return False
+    if node.target in (REPEAT_TARGETS | FLIP_TARGETS) and _repeat_flip_is_emittable(node):
+        # A repeat or a flip whose region is the empty one is a view: the result
+        # is the operand's own contiguous bytes under a different shape (a
+        # leading repeat prepends axes, a repeat of a unit axis lengthens its
+        # pitch, a repeat by one is the identity, and a flip of unit axes moves
+        # nothing). A flip that does move elements has a region, not this path.
+        region = repeat_region(node) if node.target in REPEAT_TARGETS else flip_region(node)
+        return region == []
     return (
         source_value.is_contiguous()
         and result_value.is_contiguous()
@@ -695,6 +722,16 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # whole node portable exactly as the pool's reader of its indices
             # does. A k, a dim or an order the one kernel has no argument for is
             # the same verdict, from the same gate.
+            return False
+        if node.target in (REPEAT_TARGETS | FLIP_TARGETS) and not _repeat_flip_is_emittable(node):
+            # A repeat and a flip are region walks over the operand's own bytes,
+            # and the region function says which shapes have one. A view form --
+            # a leading repeat, a repeat by one, a repeat of a unit axis, a flip
+            # of unit axes -- is the empty region and emits nothing; anything the
+            # region cannot describe (a non-contiguous operand, a symbolic
+            # extent or factor, a repeat whose last axis is a unit) stays on a
+            # portable kernel rather than reaching a blit that reads the wrong
+            # elements.
             return False
         if node.target in UPSAMPLE_TARGETS and not _nearest_upsample_is_emittable(node):
             # A nearest upsample is a region per destination phase, and the

@@ -642,6 +642,31 @@ SUPPORTED: List[OpSupport] = [
         "partitioner for those.",
     ),
     OpSupport(
+        "aten.repeat.default",
+        BLIT,
+        ARENA_FP16,
+        "At most one of the operand's own axes above one: that is "
+        "cat([x] * factor, dim=axis), two loops, so one region with the factor on "
+        "a level's extent rather than on a region per phase -- a factor of 64 costs "
+        "the same single region a factor of two does. A factor list of all ones "
+        "is the identity and is the only view: a factor on an axis the list adds "
+        "in front of the operand's rank tiles the whole tensor rather than "
+        "reshaping it, so it copies like any other. Two repeated axes are four "
+        "loops against three levels and are refused, as are a non-contiguous "
+        "operand, an empty one, and a symbolic extent: the offsets and sizes are "
+        "params, and a run-time length would leave them at the traced example.",
+    ),
+    OpSupport(
+        "aten.flip.default",
+        BLIT,
+        ARENA_FP16,
+        "Any subset of the axes, static and contiguous: a reversal is a negative "
+        "source stride, which the region's int32 stride and the kernel's signed "
+        "walk already carry, and the axes reversed together are one level each. "
+        "A subset whose extents are all one re-points the operand and emits no "
+        "command. An axis named twice or out of range is refused.",
+    ),
+    OpSupport(
         "et_hexagon.update_cache.default",
         BLIT,
         ARENA_FP16,
@@ -968,12 +993,12 @@ NOT_SUPPORTED = [
         "which is why `x * torch.full(...)` still delegates its multiply.",
     ),
     (
-        "aten.repeat.default, aten.flip.default",
-        "No command describes them: a tile and an axis reversal are each a "
-        "different region walk from the blits the backend has. A zero-filling pad "
-        "used to be listed here, and it is not that kind of case: it is a memset "
-        "plus one region, both of which the backend already emitted for other ops, "
-        "so it is a supported row.",
+        "aten.repeat.default with two or more axes above one",
+        "One repeated axis is cat([x] * factor, dim=axis), which is two loops and "
+        "so fits one region with the factor on a level's extent. Two repeated "
+        "axes are four loops and do not fit a region's three levels. It is "
+        "expressible as a sequence of single-axis regions, but the emitter emits "
+        "one command, so the shape is refused rather than half applied.",
     ),
     (
         "aten._adaptive_avg_pool2d.default",

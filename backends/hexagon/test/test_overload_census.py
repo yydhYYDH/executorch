@@ -597,16 +597,24 @@ _ROWS = [
         [("aten.expand_copy.default", "refused")],
     ),
     (
+        # A repeat of one axis is cat([x] * factor, dim=axis), which is a region
+        # walk over the operand's own bytes: one RASTER_BLIT, and the factor
+        # rides on a level's extent rather than on a region per phase. The
+        # shapes the gate still turns away -- two repeated axes, an
+        # empty operand, a symbolic extent -- are pinned in test_repeat_flip.py.
         "repeat",
         lambda a: a.repeat(1, 2),
         (_x(2, 3),),
-        [("aten.repeat.default", "unwired")],
+        [("aten.repeat.default", "wired")],
     ),
     (
+        # A flip is a negative source stride, which the region's int32 stride
+        # and the kernel's signed walk already carry. A flip of unit axes is a
+        # view and emits no command at all.
         "flip",
         lambda a: torch.flip(a, [0]),
         (_x(4, 6),),
-        [("aten.flip.default", "unwired")],
+        [("aten.flip.default", "wired")],
     ),
     (
         # The zero-filling pad was the one entry in the "no kernel at all" list

@@ -1546,6 +1546,7 @@ def _cases():
         *([attention] if attention is not None else []),
         *_branch_cases(),
         *_pad_cases(),
+        *_repeat_flip_cases(),
     ]
 
 
@@ -2306,8 +2307,9 @@ _RASTER_BLIT_OP = 3
 _SIM_PARAMS_AT = 16
 
 #: The blit header is three ints (region count, element bytes, source count),
-#: then one region whose third word is the destination offset.
+#: then one region whose words are srcIndex, srcOffset, dstOffset, and so on.
 _SIM_DST_OFFSET_PARAM = 3 + 2
+_SIM_SRC_OFFSET_PARAM = 3 + 1
 
 
 def _pad_graph(pads):
@@ -2378,6 +2380,198 @@ def _pad_cases():
     flat = _small((3, 5))
     last = _pad_graph((2, 1))
     cases.append(_case("PDE", last, (flat,), _bits(last(flat))))
+    return cases
+
+
+def _repeat_graph(factors):
+    """`x.repeat(*factors)` as its own module, so the blob is one repeat."""
+
+    class Repeat(torch.nn.Module):
+        def forward(self, x):
+            return x.repeat(*factors)
+
+    return Repeat()
+
+
+def _flip_graph(dims):
+    """`torch.flip(x, dims)` as its own module, so the blob is one flip."""
+
+    class Flip(torch.nn.Module):
+        def forward(self, x):
+            return torch.flip(x, dims)
+
+    return Flip()
+
+
+def _with_source_stride_positive(blob):
+    """The flip blob read forwards from the start.
+
+    A reversal is a negative source stride read from the axis's last element,
+    and the two params carry it together. Making the stride positive and
+    leaving the offset alone would be a shift rather than a copy, so this
+    clears the offset as well and the region becomes a forward read of the
+    whole operand: the answer a kernel treating the stride as unsigned would
+    give, and it differs from the right one at every element. That is the
+    point -- if the recorded strides were not the ones the kernel walked, this
+    case would come back equal and the flip cases would say nothing.
+    """
+    _, commands = read_blob(blob)
+    for index, command in enumerate(commands):
+        if command.type != _RASTER_PAD_OP:
+            continue
+        data = bytearray(blob)
+        for word in (9, 10, 11):
+            at = (
+                _blob.HEADER_SIZE
+                + index * _blob.OP_SIZE
+                + _SIM_PARAMS_AT
+                + 4 * word
+            )
+            value = struct.unpack_from("<i", data, at)[0]
+            if value < 0:
+                struct.pack_into("<i", data, at, -value)
+        struct.pack_into(
+            "<i",
+            data,
+            _blob.HEADER_SIZE
+            + index * _blob.OP_SIZE
+            + _SIM_PARAMS_AT
+            + 4 * _SIM_SRC_OFFSET_PARAM,
+            0,
+        )
+        return bytes(data)
+    raise AssertionError("the flip blob has no blit to perturb")
+
+
+def _with_destination_offset_moved(blob):
+    """The flip blob writing one element in from the start of its output.
+
+    The companion to the stride tooth, and a different failure: the read is
+    still a reversal, and the answer is still a reversal, but it is one element
+    along from where the result says it is. The arena is larger than the
+    result, so the write stays inside it and the case gets a real answer rather
+    than an out-of-bounds report -- which is the point, because a descriptor
+    read at the wrong offset produces bytes, not an error.
+
+    (The source offset is the other candidate and is not used here: on a
+    reversal, any source offset other than the axis's last element walks off
+    the front of the operand, so it would fail loudly rather than quietly.)
+    """
+    _, commands = read_blob(blob)
+    for index, command in enumerate(commands):
+        if command.type != _RASTER_PAD_OP:
+            continue
+        data = bytearray(blob)
+        struct.pack_into(
+            "<i",
+            data,
+            _blob.HEADER_SIZE
+            + index * _blob.OP_SIZE
+            + _SIM_PARAMS_AT
+            + 4 * _SIM_DST_OFFSET_PARAM,
+            1,
+        )
+        return bytes(data)
+    raise AssertionError("the flip blob has no blit to perturb")
+
+
+#: The blit's own type, the same constant the other teeth cases use.
+_RASTER_PAD_OP = 3
+
+
+def _repeat_flip_cases():
+    """A repeat and a flip, on the DSP.
+
+    Both are one region of a command the backend already emitted for slices and
+    concatenates, so what these cases establish is that the real kernel walks a
+    negative source stride (the flip) and a broadcast source stride of zero (the
+    repeat) the way the host interpreter does. The 63, 64 and 65 lengths are
+    here deliberately: HVX walks the vector part to `size & -64` and finishes
+    scalar, so 63 is all scalar, 64 is all vector, and 65 is 64 plus one, and a
+    kernel that only got the vector case right would pass on 64 alone.
+
+    The teeth are the two failure modes that produce a plausible answer: a
+    positive stride, which writes the operand in its own order, and a source
+    offset of zero, which shifts the read without changing any stride.
+    """
+    cases = []
+
+    # A repeat of the last axis, with a leading product so the region's outer
+    # level moves as well.
+    last_operand = _small((2, 3, 64))
+    last_repeat = _repeat_graph((1, 1, 2))
+    cases.append(_case("RFA", last_repeat, (last_operand,), _bits(last_repeat(last_operand))))
+
+    # The same walk at 63 and 65, where the vector and scalar halves differ.
+    for tag, length in (("RFB", 63), ("RFC", 65)):
+        operand = _small((2, 3, length))
+        model = _repeat_graph((1, 1, 2))
+        cases.append(_case(tag, model, (operand,), _bits(model(operand))))
+
+    # A repeat of a non-last axis, so the region's middle level is the factor
+    # and the block it repeats is the whole rest of the tensor.
+    mid_operand = _small((2, 3, 4))
+    mid_repeat = _repeat_graph((2, 1, 1))
+    cases.append(_case("RFD", mid_repeat, (mid_operand,), _bits(mid_repeat(mid_operand))))
+
+    # A factor past the three regions a parameter block holds. Sixty-four
+    # phases would be sixty-four regions if a region per phase were the shape;
+    # the factor rides on a level's extent instead, so this is one region and
+    # the point of the case is that the kernel reads a level's extent rather
+    # than a list of phases.
+    big_operand = _small((1, 2))
+    big_repeat = _repeat_graph((1, 64))
+    cases.append(_case("RFE", big_repeat, (big_operand,), _bits(big_repeat(big_operand))))
+
+    # A flip of the last axis: stride -1, read from the last element.
+    flip_last = _flip_graph([2])
+    operand = _small((2, 3, 4))
+    cases.append(_case("RFF", flip_last, (operand,), _bits(flip_last(operand))))
+
+    # A flip of the first axis: the source offset is the axis's last element
+    # and its stride is the whole pitch behind it. This is the case where a
+    # positive stride is a contiguous copy rather than a shift.
+    flip_first = _flip_graph([0])
+    cases.append(_case("RFG", flip_first, (operand,), _bits(flip_first(operand))))
+
+    # The two teeth for the first-axis flip: one that reads forwards, whose
+    # answer is the operand in its own order, and one that writes in from the
+    # start, whose answer is a reversal in the wrong place.
+    cases.append(
+        _case(
+            "RFH",
+            flip_first,
+            (operand,),
+            _bits(flip_first(operand)),
+            kind="teeth",
+            mutate=_with_source_stride_positive,
+        )
+    )
+    cases.append(
+        _case(
+            "RFI",
+            flip_first,
+            (operand,),
+            _bits(flip_first(operand)),
+            kind="teeth",
+            mutate=_with_destination_offset_moved,
+        )
+    )
+
+    # Every axis at once, at the three lengths again, so the vector boundary
+    # is crossed with three negative strides in play.
+    flip_all = _flip_graph([0, 1, 2])
+    for tag, length in (("RFJ", 63), ("RFK", 64), ("RFL", 65)):
+        operand = _small((2, 3, length))
+        cases.append(_case(tag, flip_all, (operand,), _bits(flip_all(operand))))
+
+    # An extent of two on the last axis: the case where a sign mistake has the
+    # least room to show, because reading forward leaves the row in its own
+    # order and only the swap differs.
+    two_operand = _small((2, 3, 2))
+    flip_two = _flip_graph([2])
+    cases.append(_case("RFM", flip_two, (two_operand,), _bits(flip_two(two_operand))))
+
     return cases
 
 
@@ -2462,6 +2656,81 @@ def simulated(cases):
         )
     except hexagon_sim.Unavailable as error:
         pytest.skip(str(error))
+
+
+def test_the_flip_teeth_answer_something_else(cases):
+    """The two mutated flips, on the host and before the DSP.
+
+    A teeth case that came back equal to the reference would be a case testing
+    nothing, and one that came back equal to the operand would be a case
+    asserting the truth. RFH reads the operand forwards, so it answers the
+    operand in its own order; RFI writes one element in from the start, so it
+    answers a reversal shifted along. Both differ from the reference, and both
+    differ from each other, so the comparison on the real case below is
+    comparing against a shape that genuinely moved.
+    """
+    by_tag = {case.tag: case for case in cases}
+    operand = by_tag["RFG"].args[0].numpy().reshape(-1)
+    forward = np.asarray(_from_bits(_host_bits(by_tag["RFH"].host[0])))
+    shifted = np.asarray(_from_bits(_host_bits(by_tag["RFI"].host[0])))
+    assert np.array_equal(forward, operand), "reading forwards is not the operand"
+    assert not np.array_equal(shifted, operand)
+    assert not np.array_equal(shifted, forward)
+
+
+def test_the_repeat_and_flip_blobs_are_one_blit_each(cases):
+    """A repeat and a flip are the same decision: one region, one command.
+
+    The count is the load-bearing part. A repeat whose factor exceeded the three
+    regions a parameter block holds would have to be several commands under a
+    region-per-phase encoding, so the factor of 64 case is here to say it is
+    one, and every other case is here to say the two ops did not quietly become
+    something with a second command in it.
+    """
+    kinds = {case.tag: [command.type for command in case.commands] for case in cases}
+    for tag in (
+        "RFA",
+        "RFB",
+        "RFC",
+        "RFD",
+        "RFE",
+        "RFF",
+        "RFG",
+        "RFH",
+        "RFI",
+        "RFJ",
+        "RFK",
+        "RFL",
+        "RFM",
+    ):
+        assert kinds[tag] == [3], f"{tag} is not a single blit: {kinds[tag]}"
+    # The factor rides on a level's extent, so the parameter block is one
+    # header plus one region whatever the factor is.
+    by_tag = {case.tag: case for case in cases}
+    for tag, factor in (("RFA", 2), ("RFE", 64)):
+        params = list(by_tag[tag].commands[0].params)
+        assert params[0] == 1, f"{tag} has {params[0]} regions"
+        assert len(params) >= 3 + 12, f"{tag} has no region"
+        assert params[6] == factor or params[7] == factor, (
+            f"{tag} does not carry its factor on a level's extent: {params[:15]}"
+        )
+
+
+def test_a_flip_blob_carries_a_negative_source_stride(cases):
+    """The whole mechanism, read out of the bytes rather than recomputed.
+
+    A flip that is not a negative source stride is a copy, and the answer would
+    be plausible -- the operand, in order. So the sign is asserted on the
+    command the emitter actually wrote, for every flip case here.
+    """
+    repeats = ("RFA", "RFB", "RFC", "RFD", "RFE")
+    teeth = ("RFH", "RFI")
+    for case in cases:
+        if not case.tag.startswith("RF") or case.tag in repeats + teeth:
+            continue
+        params = list(case.commands[0].params)
+        assert min(params[9:12]) < 0, f"{case.tag} has no negative stride: {params[:15]}"
+        assert max(params[12:15]) > 0, f"{case.tag} writes backwards: {params[:15]}"
 
 
 def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
