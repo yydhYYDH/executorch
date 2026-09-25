@@ -565,7 +565,10 @@ worth reading twice:
   cancels, so the rungs in `test_gemv_on_sim.py` need a coherently signed
   column. The fix splits each lane into its high and low 16 bits and recombines
   them, which converts every int32 correctly and leaves every answer inside
-  `2^22` bit for bit what it was. This is the `M == 1` GEMV path only -- it says
+  `2^22` bit for bit what it was -- measured rather than argued: over all `2^32`
+  int32 values this conversion is the correctly rounded fp32 everywhere, and the
+  old sequence's first failure is at `2^22 + 1`. This is the `M == 1` GEMV path
+  only -- it says
   nothing about the prefill entry -- and the defect is pre-existing in the
   vendored kernels rather than something this work introduced; the upstream
   paths are in the commit that fixed it.
@@ -1180,6 +1183,21 @@ and not a cause. Three of the nine cases say more than "they agree":
   fail -- differs from torch at 1152 of its 4096 outputs by at most one ULP and
   agrees with the phone at all 4096, so the two HMX implementations agree about
   rounding and not only about the layout they walk;
+- the activation staging tile is the other way round: its fix is **simulator
+  evidence only**. The tile is allocated and read as `up_div(K, 64) * 64`
+  elements per row while the copy that filled it used `K`, so a geometry whose
+  `K` is not a multiple of 64 read its rows short of where they were written
+  -- twelve rows of every 32-row tile came back zero from `K = 40` on. The
+  same signature, at the same positions and with the same 64/40 ratio, was
+  measured on the phone in a Stable Diffusion cross-attention, whose second
+  product has SD's context length 77 as its `K`. The copy now pads rows to the
+  stride its reader uses, `K = 40 / 32 / 77` come back inside the fp16
+  accumulation tolerance with no row left empty, and the `K = 64 / 128`
+  controls answer bit for bit what they answered before. That is the
+  simulator, and the phone's skel still carries the old code, so the phone
+  measurement shows the defect and not the fix; the `.so` on the phone has
+  never been diffed against the in-tree `mnn-htp-ops` either, so no phone
+  observation here names a source revision.
 - the NaN `amax` disagrees with torch at exactly one element, in the NaN's
   payload: `0x7e00` from the phone and from the simulator, `0xffff` from torch.
   That is two NaNs, not two numbers.
