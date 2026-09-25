@@ -3395,6 +3395,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         return None
     if rank == 4:
         stride, padding, dilation = stride_3d, padding_3d, dilation_3d
+        kernel_y, kernel_x = (int(dim) for dim in kernel.shape[2:])
     # Only the operand's height may hold the run-time length. A batch, a channel
     # count or the window's width that moved would each need its own patch over
     # the arena's own geometry, and the weight is a constant whose extents are
