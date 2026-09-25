@@ -17,13 +17,15 @@ import pathlib
 import re
 
 import numpy as np
+import pytest
 import torch
 
 
-import blob_interpreter
-from blob_interpreter import execute, read_blob
-from executorch.backends.hexagon import hexagon_ops
-from executorch.backends.hexagon.hexagon_backend import (
+import blob_interpreter  # noqa: E402
+from blob_interpreter import execute, read_blob  # noqa: E402
+from executorch.backends.hexagon import hexagon_ops  # noqa: E402
+from executorch.backends.hexagon import quantizer as hexagon_quantizer  # noqa: E402
+from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
     HexagonBackend,
     owned_weight,
 )
@@ -51,6 +53,7 @@ from torchao.quantization.pt2e.quantize_pt2e import (
 _Q4A16 = blob_interpreter.MATMUL_Q4A16_GEMV_I8
 _W8A16 = blob_interpreter.MATMUL_W8A16_GEMV_I8
 _PREFILL = blob_interpreter.MATMUL_Q4A16_FP16
+_W8A16_PREFILL = blob_interpreter.MATMUL_W8A16_BLOCK_FP16
 _BLIT = blob_interpreter.RASTER_BLIT
 
 
@@ -105,6 +108,71 @@ class _Bias(torch.nn.Module):
         return torch.addmm(self.bias, x, self.weight)
 
 
+class _Linear(torch.nn.Module):
+    """`nn.Linear`, the spelling every projection in a transformer is written in.
+
+    Its weight is stored `[out, in]` rather than `[k, n]`, so `to_edge` lowers it
+    to an `addmm` over a `permute_copy` of the weight -- one node further from
+    the emitter's pattern than `_Mm`, and the reason the quantizer rewrites an
+    admissible one into the `addmm` spelling before the observers go in.
+    """
+
+    def __init__(self, k: int, n: int, bias: bool = False) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(k, n, bias=bias)
+
+    def forward(self, x):
+        return self.projection(x)
+
+
+class _BiasedLinear(_Linear):
+    """`nn.Linear` with the bias it carries by default, which is the common one."""
+
+    def __init__(self, k: int, n: int) -> None:
+        super().__init__(k, n, bias=True)
+
+
+def _carries_a_dequantize(converted) -> bool:
+    """Whether the converted graph holds the weight-only dequantize."""
+    return any(
+        node.op == "call_function"
+        and node.target
+        is torch.ops.quantized_decomposed.dequantize_per_channel.default
+        for node in converted.graph.nodes
+    )
+
+
+def _edge_program(converted, *inputs):
+    """The edge program for an already-converted graph module."""
+    return to_edge(torch.export.export(converted, inputs)).exported_program()
+
+
+def _command_types(converted, *inputs):
+    """The command types the backend emits for an already-converted graph."""
+    program = _edge_program(converted, *inputs)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    return [command.type for command in read_blob(blob)[1]]
+
+
+def _serializes(converted, *inputs) -> int:
+    """Serialize the lowered program, in bytes, or fail the way a caller would.
+
+    `to_executorch` is the tier that says a program exports, and it is stricter
+    than the lowering that most of the shape tests here stop at: every
+    functional op in the portable part of the graph is converted to its out
+    variant, and `quantized_decomposed` has none -- neither the dequantize a
+    weight-only annotation leaves behind nor the quantize a run-time weight would.
+    A program with one stranded in it cannot be serialized at all, whichever
+    kernels a runner links, so a graph that stays portable only counts as
+    portable if this returns.
+    """
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(converted, inputs),
+        partitioner=[HexagonPartitioner()],
+    )
+    return len(bytes(lowered.to_executorch().buffer))
+
+
 def _quantized_program(scheme, m, k, n):
     """Export, quantize and lower one mm, the way a real pipeline would.
 
@@ -134,6 +202,12 @@ def _converted(scheme, m, k, n, module=_Mm):
     x = torch.randn(m, k, dtype=torch.float32)
     converted, _ = _quantize(scheme, module(k, n).eval(), x)
     return converted, x
+
+
+def _linear_program(scheme, m, k, n, module=_Linear):
+    """`_quantized_program` again, over the spelling a model is written in."""
+    converted, x = _converted(scheme, m, k, n, module=module)
+    return _edge_program(converted, x), converted, x
 
 
 def _quantize(scheme, model, *inputs):
@@ -340,11 +414,102 @@ def test_a_batched_at_matmul_keeps_the_fp16_batch_matmul():
             assert op not in types, (scheme, shape, types)
 
 
+def test_the_nn_linear_spelling_reaches_the_same_gemv():
+    """`nn.Linear` is `aten.linear`, a target the annotation table does not hold.
+
+    Its weight is stored `[out, in]`, so `to_edge` lowers it to an `addmm` over a
+    `permute_copy` of the weight and the emitters' pattern -- a dequantize whose
+    only reader is the matmul -- is one node further away than it is for `mm`.
+    The quantizer therefore rewrites an admissible `linear` into the `addmm`
+    spelling before the observers go in, over a `[k, n]` constant, and the entry
+    it reaches is the one the `mm` path already reaches: one command, this
+    geometry, one scale block per output channel, and the same answer. Without
+    the rewrite the graph exports the fp16 model byte for byte and nothing at all
+    is quantized -- a quantizer that silently does nothing, which is what this
+    spelling used to be.
+    """
+    for module, multiply, edge_target, weight_arg in (
+        (_Linear, torch.ops.aten.mm.default, exir_ops.edge.aten.mm.default, 1),
+        (
+            _BiasedLinear,
+            torch.ops.aten.addmm.default,
+            exir_ops.edge.aten.addmm.default,
+            2,
+        ),
+    ):
+        for scheme, op, tolerance in (
+            ("q4a16", _Q4A16, 0.06),
+            ("w8a16", _W8A16, 0.03),
+        ):
+            for k, n in ((64, 32), (128, 96)):
+                program, converted, x = _linear_program(scheme, 1, k, n, module)
+                # Both halves of the path are pinned: the converted graph is the
+                # matmul with its dequantize and no permute left, and the edge
+                # graph has the dequantize on the matmul's weight operand, which
+                # is the pattern the emitter matches. A biased `nn.Linear` leaves
+                # the bias in the kernel's own bias operand, so the result is one
+                # command rather than a matmul and an add.
+                targets = {
+                    node.target
+                    for node in converted.graph.nodes
+                    if node.op == "call_function"
+                }
+                assert multiply in targets, (scheme, k, n, targets)
+                assert targets == {
+                    multiply,
+                    torch.ops.quantized_decomposed.dequantize_per_channel.default,
+                }, (scheme, k, n, targets)
+                matmul = _node_of(program, edge_target)
+                assert (
+                    matmul.args[weight_arg].target is hexagon_ops.DQ_PER_CHANNEL
+                ), (scheme, k, n)
+
+                blob = HexagonBackend.preprocess(program, []).processed_bytes
+                _, commands = read_blob(blob)
+                assert [c.type for c in commands] == [op], (scheme, k, n)
+                assert commands[0].params[1:3] == [k, n]
+                assert commands[0].params[8] == 1
+                got = np.frombuffer(
+                    execute(blob, [x.half().numpy()])[0], dtype=np.float16
+                ).astype(np.float32)
+                with torch.no_grad():
+                    expected = converted(x).detach().float().numpy().reshape(-1)
+                worst = _relative_error(got, expected)
+                assert worst < tolerance, f"{scheme} differs by {worst} at {k}x{n}"
+
+
+def test_an_nn_linear_the_kernels_would_refuse_stays_portable():
+    """The same gate, reached from the spelling a model is written in.
+
+    A classifier's head is `nn.Linear(k, 1000)`, and 1000 is not a multiple of
+    the 32-channel tile: there is no kernel that reads it, so the `nn.Linear`
+    keeps the permuted weight and the fp16 path it already had rather than be
+    rewritten into a matmul the emitters would refuse. The rewrite is gated with
+    the annotation and not separately from it, which is what the converted
+    target says: it is still `linear`.
+    """
+    for k in (64, 128):
+        converted, x = _converted("q4a16", 1, k, 8, module=_Linear)
+        assert torch.ops.aten.linear.default in {
+            node.target for node in converted.graph.nodes
+        }, k
+        assert not _carries_a_dequantize(converted), k
+        assert _Q4A16 not in _command_types(converted, x), k
+        assert _serializes(converted, x) > 0, k
+    # The same projection at a shape the tile divides, so this is not what a
+    # quantizer that ignores `nn.Linear` entirely says.
+    converted, x = _converted("q4a16", 1, 64, 32, module=_Linear)
+    assert _carries_a_dequantize(converted)
+    assert _Q4A16 in _command_types(converted, x)
+
+
+
 def _live_operand_program(scheme, spelling, k, n):
     """The whole chain for a matmul whose second operand is a run-time tensor.
 
     Both operands are method inputs, so there is no weight to recognise: this is
-    what the annotator reads as a weight when the caller hands the value in.
+    what the annotator used to read as a weight when the caller handed the value
+    in.
     """
     model = _Live(spelling).eval()
     x = torch.randn(1, k, dtype=torch.float32)
@@ -353,47 +518,58 @@ def _live_operand_program(scheme, spelling, k, n):
     lowered = to_edge_transform_and_lower(
         torch.export.export(converted, inputs),
         partitioner=[HexagonPartitioner()],
-    ).exported_program()
+    )
     return lowered, converted, x, b
 
 
 def test_a_matmul_over_two_run_time_tensors_stays_portable():
-    """A scores-like matmul is annotated, and it still has to export.
+    """A scores-like matmul is left alone, and it still has to export.
 
-    `annotate` reads the operand's position rather than its provenance, so
-    `a @ b` and `mm(a, b)` over two live tensors get a per-channel observer for
-    something that is not a weight at all. The emitter needs those bytes in hand
-    and cannot have them, and which side says so is the whole point: the
-    partitioner refuses the chain, so the caller is left with portable kernels
-    rather than an export that fails part way through. The dequantize goes back
-    with it -- one delegated on its own would be a partition whose output
-    nothing ever wrote.
+    `a @ b` and `mm(a, b)` over two live tensors put a run-time value where a
+    weight would be, and there is nothing there to quantize: the export cannot
+    read its bytes, and PT2E quantizes what it cannot freeze *at run time*
+    instead -- which leaves a `quantize_per_channel` beside the
+    `dequantize_per_channel` rather than a stored low-bit tensor. Neither has an
+    out variant, so a graph carrying them cannot be serialized at all. This test
+    used to assert the annotation and stop at the lowered program, where that is
+    invisible; `_serializes` is the same graph asked for a `.pte`.
+
+    So the refusal moved to the annotation: the matmul keeps the fp16 path it
+    had, the graph holds no quantized op, and the program serializes. The same
+    shape with a weight in that position does reach the kernel, so this cannot
+    pass by way of an annotator that refuses everything.
     """
     k, n = 64, 32
     for spelling, multiply in (
         ("at", torch.ops.aten.matmul.default),
         ("mm", torch.ops.aten.mm.default),
     ):
-        program, converted, _, _ = _live_operand_program("q4a16", spelling, k, n)
-        # The annotator did its part, so what refuses this is the partitioner
-        # and not an annotation that never happened.
+        lowered, converted, x, b = _live_operand_program("q4a16", spelling, k, n)
+        # The matmul is still there in the spelling it was written in, so what
+        # this says below is about an operand the export does not own and not
+        # about a node that was rewritten into something else.
         converted_targets = {node.target for node in converted.graph.nodes}
         assert multiply in converted_targets, (spelling, converted_targets)
-        assert (
-            torch.ops.quantized_decomposed.dequantize_per_channel.default
-            in converted_targets
+        assert not _carries_a_dequantize(converted), spelling
+        assert torch.ops.quantized_decomposed.quantize_per_channel.default not in (
+            converted_targets
         ), (spelling, converted_targets)
-        graph = program.graph_module.graph
-        assert not [
-            node
-            for node in graph.nodes
-            if str(node.target).endswith("executorch_call_delegate")
-        ], (spelling, [node.name for node in graph.nodes])
-        assert exir_ops.edge.aten.mm.default in {
-            node.target for node in graph.nodes if node.op == "call_function"
-        }, spelling
-    # The same shape with a weight in that position does reach the kernel, so
-    # this cannot pass by way of a partitioner that refuses everything.
+        # What comes out is the fp16 kernel the graph already had: the live
+        # operand reaches the DSP as an ordinary tensor, and neither quantized
+        # entry appears.
+        types = [
+            command.type
+            for command in read_blob(
+                HexagonBackend.preprocess(
+                    _edge_program(converted, x, b), []
+                ).processed_bytes
+            )[1]
+        ]
+        assert blob_interpreter.BATCH_MATMUL in types, (spelling, types)
+        for op in (_Q4A16, _W8A16, _PREFILL):
+            assert op not in types, (spelling, types)
+        assert len(bytes(lowered.to_executorch().buffer)) > 0, spelling
+    # The same shape with a weight in that position does reach the kernel.
     program, _, _ = _quantized_program("q4a16", 1, k, n)
     blob = HexagonBackend.preprocess(program, []).processed_bytes
     _, commands = read_blob(blob)
@@ -484,27 +660,29 @@ def test_a_prefill_quantized_matmul_is_delegated():
 
 
 def test_a_prefill_shape_the_kernels_would_refuse_stays_portable():
-    """The same two guards, asked of the M > 1 entry.
+    """The same two guards, asked of the M > 1 entry, and asked before the fact.
 
     K % 64 and N % 32 gate it for the prefill kernel's own reasons -- a K that
     is not a multiple of 64 packs into half a 64-element activation block, and N
     lands in 32-channel tiles -- and neither is the GEMV path's rule restated:
     the prefill entry would otherwise take shapes the GEMV entries refuse and
-    the other way round.
+    the other way round. The quantizer asks the same question of the operands
+    before it annotates anything, because a matmul it annotated and the emitter
+    then refused leaves its dequantize in the graph, and `to_executorch` cannot
+    serialize a graph carrying one: the refusal has to happen before the
+    dequantize exists or the caller gets no program at all.
     """
     for k, n in ((96, 64), (64, 48), (128, 16)):
-        program, _, _ = _quantized_program("q4a16", 4, k, n)
-        support = _support(program)
-        mm = _mm_node(program)
-        assert not support.is_node_supported(None, mm), (k, n)
-        assert not support.is_node_supported(None, mm.args[1]), (k, n)
+        converted, x = _converted("q4a16", 4, k, n)
+        assert not _carries_a_dequantize(converted), (k, n)
+        types = _command_types(converted, x)
+        assert _PREFILL not in types and _Q4A16 not in types, (k, n, types)
+        assert _serializes(converted, x) > 0, (k, n)
     # A row group that does divide, at the same M: without this the loop above
-    # is also what a support object that refuses every quantized matmul says.
-    program, _, _ = _quantized_program("q4a16", 4, 128, 64)
-    support = _support(program)
-    mm = _mm_node(program)
-    assert support.is_node_supported(None, mm)
-    assert support.is_node_supported(None, mm.args[1])
+    # is also what a quantizer that refuses everything says.
+    converted, x = _converted("q4a16", 4, 128, 64)
+    assert _carries_a_dequantize(converted)
+    assert _PREFILL in _command_types(converted, x)
 
 
 def test_a_prefill_past_the_m_le_32_k_ceiling_stays_portable():
@@ -524,39 +702,38 @@ def test_a_prefill_past_the_m_le_32_k_ceiling_stays_portable():
     last K measured to work.
     """
     for m, k in ((4, 12736), (4, 12800), (2, 12800), (32, 12800)):
-        program, _, _ = _quantized_program("q4a16", m, k, 64)
-        support = _support(program)
-        mm = _mm_node(program)
-        assert not support.is_node_supported(None, mm), (m, k)
-        assert not support.is_node_supported(None, mm.args[1]), (m, k)
+        converted, x = _converted("q4a16", m, k, 64)
+        assert not _carries_a_dequantize(converted), (m, k)
+        assert _PREFILL not in _command_types(converted, x), (m, k)
+        assert _serializes(converted, x) > 0, (m, k)
     # One M over the dispatch, same K: that kernel heap-allocates the
     # descriptors, so nothing about this K is a problem for it.
-    program, _, _ = _quantized_program(
-        "q4a16", hexagon_ops.PREFILL_M32_MAX_M + 1, 12800, 64
-    )
-    assert _support(program).is_node_supported(None, _mm_node(program))
+    converted, x = _converted("q4a16", hexagon_ops.PREFILL_M32_MAX_M + 1, 12800, 64)
+    assert _carries_a_dequantize(converted)
+    assert _PREFILL in _command_types(converted, x)
     # And the widest K that does fit the same branch.
-    program, _, _ = _quantized_program("q4a16", 4, hexagon_ops.PREFILL_M32_MAX_K, 64)
-    assert _support(program).is_node_supported(None, _mm_node(program))
+    converted, x = _converted("q4a16", 4, hexagon_ops.PREFILL_M32_MAX_K, 64)
+    assert _carries_a_dequantize(converted)
 
 
 def test_the_m_le_32_k_ceiling_is_the_thing_that_refuses(monkeypatch):
-    """Move the ceiling and the verdict follows it, at two different ceilings.
+    """Move the ceiling and the annotation follows it, at two different ceilings.
 
     The control for the test above. A K one tile past the ceiling is refused
     whatever the constant says only while the guard reads it, so taking the guard
     out turns this red rather than leaving it green -- which is the difference
-    between testing the shape and testing the rule. The second ceiling is not
-    12672, so a constant that agreed with one hard-coded number by accident would
-    not pass here.
+    between testing the shape and testing the rule. The quantizer reads that
+    constant through the same helper the emitters do, so what moves here is
+    whether the annotation is made at all. The second ceiling is not 12672, so a
+    constant that agreed with one hard-coded number by accident would not pass
+    here.
     """
     for ceiling in (hexagon_ops.PREFILL_M32_MAX_K, 13056):
         monkeypatch.setattr(hexagon_ops, "PREFILL_M32_MAX_K", ceiling)
-        program, _, _ = _quantized_program("q4a16", 4, ceiling, 64)
-        assert _support(program).is_node_supported(None, _mm_node(program)), ceiling
-        program, _, _ = _quantized_program("q4a16", 4, ceiling + 64, 64)
-        support = _support(program)
-        assert not support.is_node_supported(None, _mm_node(program)), ceiling
+        converted, x = _converted("q4a16", 4, ceiling, 64)
+        assert _carries_a_dequantize(converted), ceiling
+        converted, x = _converted("q4a16", 4, ceiling + 64, 64)
+        assert not _carries_a_dequantize(converted), ceiling
 
 
 def test_the_m_over_32_prefill_still_reaches_its_kernel_at_the_vtcm_ceiling():
@@ -632,40 +809,46 @@ def test_w8a16_prefill_bracket_m32_m33_k64_k128_and_refuse_k_tail():
     assert support.is_node_supported(None, mm)
     assert support.is_node_supported(None, mm.args[1])
 
-    program, _, _ = _quantized_program("w8a16", 33, 96, 64)
-    support = _support(program)
-    mm = _mm_node(program)
-    assert not support.is_node_supported(None, mm)
-    assert not support.is_node_supported(None, mm.args[1])
+    # The K tail keeps the fp16 path. `weight_only_matmul_fits` refuses it, so
+    # the quantizer never annotates the dequantize and the graph is an ordinary
+    # supported fp16 matmul that lowers to command 38 -- not an unsupported node.
+    # What the refusal means here is the absence of the quantized path, not an
+    # unsupported operator.
+    program, converted, _ = _quantized_program("w8a16", 33, 96, 64)
+    assert not _carries_a_dequantize(converted)
+    blob = HexagonBackend.preprocess(program, []).processed_bytes
+    _, commands = read_blob(blob)
+    assert 42 not in [command.type for command in commands]
+    assert [command.type for command in commands] == [38]
 
 
-def test_a_prefill_over_two_run_time_tensors_stays_portable():
+def test_a_prefill_over_two_run_time_tensors_is_left_alone():
     """The run-time-weight rule above M == 1, where a different kernel decides.
 
-    `annotate` reads the operand's position rather than its provenance, so an
-    `a @ b` over two live tensors gets a per-channel observer for something that
-    is not a weight. The prefill emitter packs that tensor into the tile order
-    and reads the fp16 scale beside it, so a weight the export cannot read is a
-    failure at the emitter rather than a fallback -- which is why the refusal has
-    to happen here, and has to happen for `M > 1` too: the entry that answers
+    An `a @ b` over two live tensors at eight rows used to be annotated and
+    refused downstream like the M == 1 spelling, and it failed the same way one
+    step later: the prefill emitter packs the weight into its tile order, so a
+    tensor the export cannot read is a refusal at the emitter, and the stranded
+    dequantize made the program unserializable. The refusal is now the
+    annotation's, and it has to be drawn for `M > 1` too: the entry that answers
     above one row is a different kernel from the two the M == 1 rule was written
-    for, and nothing about sharing the predicate for `M == 1` makes it the same
-    question.
+    for, and nothing about sharing the shape predicate with those makes it the
+    same question.
     """
     k, n = 64, 128
     x = torch.randn(8, k, dtype=torch.float32)
     b = torch.randn(k, n, dtype=torch.float32)
-    converted, inputs = _quantize("q4a16", _Live("at").eval(), x, b)
-    program = to_edge_transform_and_lower(
-        torch.export.export(converted, inputs),
-        partitioner=[HexagonPartitioner()],
-    ).exported_program()
-    graph = program.graph_module.graph
-    assert not [
-        node
-        for node in graph.nodes
-        if str(node.target).endswith("executorch_call_delegate")
-    ], [node.name for node in graph.nodes]
+    converted, _ = _quantize("q4a16", _Live("at").eval(), x, b)
+    assert not _carries_a_dequantize(converted)
+    types = [
+        command.type
+        for command in read_blob(
+            HexagonBackend.preprocess(_edge_program(converted, x, b), []).processed_bytes
+        )[1]
+    ]
+    assert blob_interpreter.BATCH_MATMUL in types, types
+    assert _PREFILL not in types, types
+    assert _serializes(converted, x, b) > 0
     # The same shape with a weight in that position does reach the prefill entry,
     # so what refuses this is the run-time weight and not the eight rows.
     program, _, _ = _quantized_program("q4a16", 8, k, n)
@@ -674,6 +857,55 @@ def test_a_prefill_over_two_run_time_tensors_stays_portable():
     # K == 64 needs no activation pack, so this is the kernel and the repack of
     # its 64-channel output packs.
     assert [c.type for c in commands] == [_PREFILL, _BLIT]
+
+
+def test_an_annotated_shape_is_a_shape_that_serializes_as_quantized():
+    """The two symptoms in one table: no shape fails to export, none lies.
+
+    Each row is the whole chain twice, over `mm` and over the `nn.Linear` the
+    quantizer rewrites into it, and the claim is a biconditional: a shape the
+    quantizer annotated is a shape whose command stream carries a quantized
+    entry, and a shape it left alone is a shape whose command stream does not.
+    Either half failing alone is a different bug -- an annotation with no command
+    is the silent no-op, a command with no annotation is not something the
+    emitter can produce -- and the rows are the shapes the kernels' guards
+    divide, so `weight_only_matmul_fits` above them is the same answer asked a
+    second way. Every row has to serialize: that is the symptom the gate exists
+    for, and `to_executorch` cannot serialize a graph carrying a dequantize
+    nothing runs.
+    """
+    rows = (
+        ("q4a16", 1, 64, 32),
+        ("w8a16", 1, 64, 32),
+        ("q4a16", 2, 64, 32),
+        ("w8a16", 2, 64, 32),
+        ("q4a16", 1, 32, 32),
+        ("q4a16", 1, 64, 16),
+        ("q4a16", 4, 128, 64),
+        ("q4a16", 2, 64, 128),
+    )
+    for module in (_Mm, _BiasedLinear):
+        for scheme, m, k, n in rows:
+            converted, x = _converted(scheme, m, k, n, module=module)
+            annotated = _carries_a_dequantize(converted)
+            assert annotated == hexagon_ops.weight_only_matmul_fits(
+                m, k, n, SUPPORTED_SCHEMES[scheme]
+            ), (module.__name__, scheme, m, k, n)
+            types = _command_types(converted, x)
+            quantized = [
+                command
+                for command in types
+                if command in (_Q4A16, _W8A16, _PREFILL, _W8A16_PREFILL)
+            ]
+            assert len(quantized) == (1 if annotated else 0), (
+                module.__name__,
+                scheme,
+                m,
+                k,
+                n,
+                types,
+            )
+            assert _serializes(converted, x) > 0, (module.__name__, scheme, m, k, n)
 
 
 def test_a_batched_quantized_matmul_keeps_the_batch_matmul():
@@ -698,19 +930,50 @@ def test_a_batched_quantized_matmul_keeps_the_batch_matmul():
 
 
 def test_a_shape_the_kernels_would_refuse_stays_portable():
-    """K % 64 and N % 32 are the kernels' own guards, so they gate the partition.
+    """K % 64 and N % 32 are the kernels' own guards, so they gate the annotation.
 
     Both entries check those multiples and return an error rather than compute
     something wrong, but a delegated node cannot fall back, so the check has to
-    happen here: 96 is below no power of two, it just is not a multiple of 64,
-    and 48 is not a multiple of the 32-channel tile.
+    happen before the node is annotated: 96 is below no power of two, it just is
+    not a multiple of 64, and 48 is not a multiple of the 32-channel tile. What
+    the caller gets is the fp16 matmul the graph already had, and a program that
+    serializes -- which a graph with a refused annotation's dequantize in it does
+    not, no matter which kernels a runner links.
     """
     for k, n in ((96, 64), (64, 48)):
-        program, _, _ = _quantized_program("q4a16", 1, k, n)
-        support = _support(program)
-        mm = _mm_node(program)
-        assert not support.is_node_supported(None, mm), (k, n)
-        assert not support.is_node_supported(None, mm.args[1]), (k, n)
+        converted, x = _converted("q4a16", 1, k, n)
+        assert not _carries_a_dequantize(converted), (k, n)
+        types = _command_types(converted, x)
+        for op in (_Q4A16, _W8A16, _PREFILL):
+            assert op not in types, (k, n, types)
+        assert _serializes(converted, x) > 0, (k, n)
+    # The same matmul one multiple over, so this is not what a quantizer that
+    # annotates nothing at all says.
+    converted, x = _converted("q4a16", 1, 64, 32)
+    assert _carries_a_dequantize(converted)
+    assert _Q4A16 in _command_types(converted, x)
+
+
+def test_the_gate_is_what_keeps_a_refused_shape_serializable(monkeypatch):
+    """Open the gate and the same shape fails the way every refused shape did.
+
+    `Missing out variants` is `to_executorch`'s and it is raised for any
+    `quantized_decomposed` node left in the portable part of the graph -- there
+    is no out variant to convert one to, whichever kernels a runner links. That
+    is the whole reason the quantizer asks the emitters' question before it
+    annotates, and this is the control for every test above that says a refused
+    shape "stays portable": with the gate forced open the same shape annotates,
+    its dequantize is refused downstream and stranded, and the program cannot be
+    serialized at all. `N % 32` is the shape a classifier's `nn.Linear(k, 1000)`
+    head has, which is where this was first seen.
+    """
+    monkeypatch.setattr(
+        hexagon_quantizer, "_admits_the_emitters", lambda *args, **kwargs: True
+    )
+    converted, x = _converted("q4a16", 1, 64, 8)
+    assert _carries_a_dequantize(converted)
+    with pytest.raises(RuntimeError, match="Missing out variants"):
+        _serializes(converted, x)
 
 
 def test_the_op_ids_are_the_ones_the_dsp_defines():
@@ -829,7 +1092,9 @@ def test_a_one_block_activation_needs_no_pack_blit():
     blob = HexagonBackend.preprocess(program, []).processed_bytes
     _, commands = read_blob(blob)
     assert [c.type for c in commands] == [_PREFILL, _BLIT]
-    assert commands[0].inputs[0].space == commands[0].inputs[0].space
+    # With no pack blit the prefill must read the method input, not the
+    # packed weight that belongs in operand slot 1.
+    assert commands[0].inputs[0].space == blob_interpreter.B.TensorSpace.INPUT
     assert commands[0].inputs[0].size == 8 * 64 * 2, "the activation is not the input"
 
 
@@ -935,19 +1200,26 @@ def test_a_bias_that_is_not_one_value_per_channel_stays_portable():
     A one-element bias is legal in the graph -- torch broadcasts it against the
     result -- and would have the kernel read n values out of a two-byte operand.
     Neither the shape check nor the emitter's broadcast machinery is what
-    decides this one; it is the kernel's own reading of its bias operand.
+    decides this one; it is the kernel's own reading of its bias operand, which
+    is also why the quantizer asks it before annotating: the addmm it would
+    otherwise have annotated is refused downstream, and its dequantize then
+    strands a program that cannot be serialized.
     """
     for bias_shape in ((1, 1), (1,)):
-        program, _, _ = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
-        addmm = _node_of(program, exir_ops.edge.aten.addmm.default)
-        support = _support(program)
-        assert not support.is_node_supported(None, addmm), bias_shape
-        assert not support.is_node_supported(None, addmm.args[2]), bias_shape
+        program, converted, x = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
+        assert not _carries_a_dequantize(converted), bias_shape
+        types = [
+            command.type
+            for command in read_blob(
+                HexagonBackend.preprocess(program, []).processed_bytes
+            )[1]
+        ]
+        assert _Q4A16 not in types, (bias_shape, types)
+        assert _serializes(converted, x) > 0, bias_shape
     for bias_shape in ((32,), (1, 32)):
-        program, _, _ = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
-        addmm = _node_of(program, exir_ops.edge.aten.addmm.default)
-        support = _support(program)
-        assert support.is_node_supported(None, addmm), bias_shape
+        program, converted, x = _quantized_addmm_program("q4a16", 64, 32, bias_shape)
+        assert _carries_a_dequantize(converted), bias_shape
+        assert _Q4A16 in _command_types(converted, x), bias_shape
 
 
 def test_a_quantized_addmm_puts_the_bias_in_the_kernel():

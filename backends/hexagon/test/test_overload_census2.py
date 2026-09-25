@@ -417,6 +417,11 @@ _QUANTIZED_ROWS = [
         ],
     ),
     (
+        # The int8 prefill entry is what makes this row delegate, so the
+        # quantizer now asks a question it can answer yes to and annotates the
+        # dequantize. The row used to record the pair as refused, back when there
+        # was no w8a16 prefill entry and this shape kept the fp16 matmul it had
+        # rather than carry a dequantize the partitioner would refuse.
         "w8a16 with more than one row",
         "w8a16",
         2,
@@ -428,25 +433,27 @@ _QUANTIZED_ROWS = [
         ],
     ),
     (
+        # Same reason: 32 is not a multiple of the 64-element block, so the
+        # annotation is never made and the fp16 matmul is what the graph holds.
         "q4a16 with K not a multiple of 64",
         "q4a16",
         1,
         32,
         32,
         [
-            ("quantized_decomposed.dequantize_per_channel.default", "refused"),
-            ("aten.mm.default", "refused"),
+            ("aten.mm.default", "wired"),
         ],
     ),
     (
+        # And 16 is not a multiple of the 32-channel tile, which is the shape a
+        # classifier's `nn.Linear(k, 1000)` head has.
         "q4a16 with N not a multiple of 32",
         "q4a16",
         1,
         64,
         16,
         [
-            ("quantized_decomposed.dequantize_per_channel.default", "refused"),
-            ("aten.mm.default", "refused"),
+            ("aten.mm.default", "wired"),
         ],
     ),
 ]
@@ -471,13 +478,18 @@ def test_each_quantized_row_matches_its_recorded_verdict(label, scheme, m, k, n,
 
 @pytest.mark.parametrize("bias_shape", [(32,), (1, 32)])
 def test_the_quantized_linear_folds_its_weight_into_the_matmul(bias_shape):
-    """A bias is fine on the addmm path, and the dequantize is not a node here.
+    """A bias is fine on the `nn.Linear` path, and the permute is gone.
 
-    `torch.nn.functional.linear` over a quantized weight reaches `addmm` with the
-    weight's projection permuted in; the dequantize is folded into the matmul
-    rather than left for the partitioner, so this row has two targets and not
-    three. Both bias shapes the kernel can repeat -- one per output channel, and
-    a broadcast row -- are accepted.
+    `torch.nn.functional.linear` over a quantized weight used to reach `addmm`
+    with the weight's projection permuted in: two targets, neither of them
+    quantized, which is how this row passed while nothing was being quantized at
+    all. The quantizer now rewrites the node into the `addmm` spelling over a
+    `[k, n]` constant before the observers go in, so the dequantize lands on the
+    matmul's weight operand and the permute is not a node here -- two targets,
+    both of them the quantized pattern's. The dequantize emits nothing; it exists
+    so the weight arrives as the pattern the emitter matches. Both bias shapes
+    the kernel can repeat -- one per output channel, and a broadcast row -- are
+    accepted.
     """
     k, n = 64, 32
     model = _quantized_model(
@@ -485,11 +497,11 @@ def test_the_quantized_linear_folds_its_weight_into_the_matmul(bias_shape):
     )
     inputs = (torch.randn(1, k),)
     assert _edge_targets(model, inputs) == [
-        "aten.permute_copy.default",
+        "quantized_decomposed.dequantize_per_channel.default",
         "aten.addmm.default",
     ]
     assert _accepted(model, inputs) == {
-        "aten.permute_copy.default",
+        "quantized_decomposed.dequantize_per_channel.default",
         "aten.addmm.default",
     }
 

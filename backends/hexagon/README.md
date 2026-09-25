@@ -540,6 +540,34 @@ converted = convert_pt2e(prepared)                  # -> dequantize_per_channel
 blob      = HexagonBackend.preprocess(to_edge(exported).exported_program(), [])
 ```
 
+Which matmuls `annotate` reaches is the set the emitters can run rather than the
+set of matmuls in the graph, because an annotation the emitters refuse is not a
+fallback but a failed export: it leaves a `dequantize_per_channel` in the
+portable part of the graph, and `quantized_decomposed` has no out variant for
+`to_executorch` to convert it to (`RuntimeError: Missing out variants`). The
+guards below are therefore asked of the operands before the observer goes in,
+through the same helpers the emitters use (`weight_only_matmul_fits`), so an
+admitted annotation is one the partitioner delegates.
+
+- `mm`, `addmm`, and the two-dimensional `matmul` they are the lowering of. A
+  `matmul` with a batch axis in front of its operands is not one of these: it
+  only becomes a row-major `mm` at `to_edge`, where the batch is folded into the
+  `M` the entries above have an opinion about. A `matmul` whose operands are two
+  run-time tensors has no weight at all: annotating one would leave the run-time
+  quantize beside the dequantize, and neither has an out variant.
+- `nn.Linear` and `F.linear`, which is what a model's projections are written
+  as. Its weight is stored `[out, in]`, so `to_edge` lowers it to an `addmm` over
+  a `permute_copy` of the weight -- the dequantize would sit behind that permute,
+  which is a shape no emitter matches. `transform_for_annotation` rewrites an
+  admissible one into the `addmm` spelling over a `[k, n]` constant before the
+  observers go in, so the entry a caller reaches by writing `nn.Linear` is the
+  same one `mm` reaches, byte for byte (`test_blob_on_sim.py` compares the two
+  blobs).
+- Anything else: a weight the export does not own, an activation that is strided
+  or has a dynamic axis, and every shape the guards below turn away, including a
+  classifier head whose `N` is not a multiple of 32. What such a layer gets is
+  the fp16 path it would have had without a quantizer.
+
 What the graph says and what the DSP does are different, and this is the part
 worth reading twice:
 
@@ -603,7 +631,11 @@ adds `n` contiguous halfs and would otherwise read past the operand). Which
 entry a matmul reaches is the `M` it carries: `M == 1` is the GEMV pair, and
 `M > 1` is the prefill entry for both the int4 and int8 weight layouts. The
 int8 prefill command is 42, with its fp16 per-channel scale tail appended to the
-packed weight.
+packed weight. The quantizer asks these same conditions, through
+`weight_only_matmul_fits` and the bias check, before it annotates anything, so
+a width with no prefill emitter is refused at the annotation rather than left to
+fail downstream, where a dequantize nobody can lower is a program that will not
+serialize.
 
 ### Prefill
 

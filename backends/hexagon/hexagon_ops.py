@@ -2483,6 +2483,43 @@ def quantized_matmul_geometry(activation, quantized: QuantizedWeight):
         return None
 
 
+def weight_only_matmul_fits(m: int, k: int, n: int, bits: int) -> bool:
+    """Whether one of the two quantized matmul emitters can run this geometry.
+
+    The shape half of `quantized_matmul_is_emittable`, asked of the four numbers
+    rather than of a graph. The quantizer needs this answer *before* the
+    dequantize it would create exists, so it cannot read the pattern those
+    predicates read; it calls this instead, which is also what the two `fits`
+    predicates below call, so a shape one caller admits is a shape the other
+    admits.
+
+    The guards are the kernels' own: `K % 64` is what the activation pack's
+    one-region-per-block form needs and is stricter than the kernel's own
+    `K % 32` -- the kernel floors the division, so a K that is not a multiple of
+    32 would silently drop a tile's tail -- and `N % 32` is the output-channel
+    tile. `N % 64` is not required: the output repack carries the ragged last
+    pack as a second region. The prefill entry adds the `M <= 32` K ceiling and
+    its VTCM budget. `M == 1` belongs to the GEMV entries whatever the width of
+    the stored weight, so the width only matters above one row, where it has to
+    be a width a prefill emitter reads: 4 reaches command 22 and 8 reaches
+    command 42. A width outside that set has no prefill kernel at all.
+
+    The two predicates that ask this question have to agree -- the quantizer
+    calls this one before the dequantize exists, and `_quantized_prefill_fits`
+    calls it for the node the partitioner is about to hand it -- so the width set
+    lives here and nowhere else.
+    """
+    if k % 64 or n % 32:
+        return False
+    if m == 1:
+        return True
+    if bits not in (4, 8):
+        return False
+    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
+        return False
+    return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
+
+
 def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
     """Whether the M == 1 GEMV kernels can run this matmul.
 
@@ -2494,20 +2531,16 @@ def _quantized_gemv_fits(activation, quantized: QuantizedWeight) -> bool:
     if geometry is None:
         return False
     m, k, n = geometry
-    return m == 1 and k % 64 == 0 and n % 32 == 0
+    return m == 1 and weight_only_matmul_fits(m, k, n, quantized.bits)
 
 
 def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     """Whether the M > 1 prefill kernel can run this matmul.
 
-    The same two shape guards the GEMV entries carry, and for the same reason:
-    the kernel splits K into 32-element tiles and floors the division, so a K
-    that is not a multiple of 32 would silently drop the tail, and N lands in
-    32-channel tiles. K % 64 is what the activation pack's one-region-per-block
-    form needs and is stricter than the kernel's own K % 32 -- a K that is not a
-    multiple of 64 packs into half a block whose other half is not part of the
-    tensor. N % 64 is not required: the output repack carries the ragged last
-    pack as a second region.
+    The guards themselves are `weight_only_matmul_fits`, which the quantizer also
+    calls before it annotates anything: this predicate owns the `M > 1` half and
+    that function owns the shape and budget half, so neither spelling of the
+    question can move the guards without the other seeing it.
 
     M > 1 is the whole point -- M == 1 belongs to the GEMV entries, which read a
     different weight layout and are already wired. The M <= 32 dispatcher branch
@@ -2520,17 +2553,17 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     different packed layouts, but each has a host packer for the layout its
     kernel reads; the scale representation is the other difference.
     """
+    # The two widths with a prefill emitter and nothing else: 4 reaches
+    # _emit_quantized_prefill for command 22 and 8 reaches _emit_w8a16_prefill
+    # for command 42. A width outside this set has no emitter, so it is refused
+    # here rather than reaching a packer that was written for one of the two.
     if quantized.bits not in (4, 8):
         return False
     geometry = quantized_matmul_geometry(activation, quantized)
     if geometry is None:
         return False
     m, k, n = geometry
-    if m <= 1 or k % 64 != 0 or n % 32 != 0:
-        return False
-    if m <= PREFILL_M32_MAX_M and k > PREFILL_M32_MAX_K:
-        return False
-    return _prefill_vtcm_bytes(k) <= PREFILL_VTCM_BYTES
+    return m > 1 and weight_only_matmul_fits(m, k, n, quantized.bits)
 
 
 def _prefill_vtcm_bytes(k: int) -> int:

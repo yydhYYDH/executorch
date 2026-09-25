@@ -938,6 +938,45 @@ def _quantized_gemv(scheme, k, n, bias=None):
     return HexagonBackend.preprocess(program, []).processed_bytes, weight
 
 
+class _QuantizedLinear(torch.nn.Module):
+    """The same weight-only matmul spelled the way a model is written.
+
+    `_QuantizedMm` above is the spelling the emitters' pattern is written in --
+    a `[k, n]` weight the graph holds directly. This is `nn.Linear`, whose weight
+    is stored `[out, in]` and whose `to_edge` lowering puts a `permute_copy`
+    between the weight and the matmul. The quantizer rewrites an admissible one
+    into the `addmm` spelling; an inadmissible one it leaves alone, which is why
+    the shape table below only holds the shapes the kernels take.
+    """
+
+    def __init__(self, weight, bias=None):
+        super().__init__()
+        self.projection = torch.nn.Linear(
+            weight.shape[0], weight.shape[1], bias=bias is not None
+        )
+        with torch.no_grad():
+            self.projection.weight.copy_(weight.t())
+            if bias is not None:
+                self.projection.bias.copy_(bias)
+
+    def forward(self, x):
+        return self.projection(x)
+
+
+def _quantized_linear_gemv(scheme, k, n, bias=None):
+    """`_quantized_gemv` again, over an `nn.Linear` instead of an `mm`."""
+    weight = _gemv_weight(scheme, k, n)
+    model = _QuantizedLinear(weight, bias).eval()
+    x = torch.ones(1, k, dtype=torch.float32)
+    exported = torch.export.export(model, (x,))
+    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
+    with torch.no_grad():
+        prepared(x)
+    converted = convert_pt2e(prepared)
+    program = to_edge(torch.export.export(converted, (x,))).exported_program()
+    return HexagonBackend.preprocess(program, []).processed_bytes, weight
+
+
 def _gemv_operand(blob, index):
     """One operand of the blob's single GEMV command, as bytes."""
     header, commands = read_blob(blob)
@@ -2107,6 +2146,53 @@ def _branch_cases():
             (_gemv_all_ones_answer(weight, "q4a16") + bias.half().numpy()).astype(
                 np.float16
             ),
+            blob=blob,
+        )
+    )
+    #    The same entries again, reached from `nn.Linear`. This spelling used to
+    #    be a no-op -- the quantizer's table held `mm` and `addmm` only, so an
+    #    `nn.Linear` exported the fp16 graph byte for byte and every transformer
+    #    projection in every model was silently unquantized. It is now rewritten
+    #    into the `addmm` form, and these cases are the entry's own tier: the
+    #    same arithmetic the cases above expect, over a blob the caller's
+    #    spelling produced.
+    for tag, scheme, k, n in (
+        ("LN", "q4a16", 64, 32),
+        ("LO", "w8a16", 64, 32),
+        ("LP", "q4a16", 128, 64),
+    ):
+        blob, weight = _quantized_linear_gemv(scheme, k, n)
+        cases.append(
+            _case(
+                tag,
+                None,
+                (torch.ones(1, k, dtype=torch.float16),),
+                _gemv_all_ones_answer(weight, scheme),
+                blob=blob,
+            )
+        )
+    linear_blob, linear_weight = _quantized_linear_gemv("q4a16", 64, 32)
+    linear_one_hot = torch.zeros(1, 64, dtype=torch.float16)
+    linear_one_hot[0, 1] = 1.0
+    cases.append(
+        _case(
+            "LQ",
+            None,
+            (linear_one_hot,),
+            _gemv_row_answer(linear_weight, "q4a16", 1),
+            blob=linear_blob,
+        )
+    )
+    linear_bias = (torch.arange(32) % 3).to(torch.float32) - 1.0
+    blob, weight = _quantized_linear_gemv("q4a16", 64, 32, bias=linear_bias)
+    cases.append(
+        _case(
+            "LR",
+            None,
+            (torch.ones(1, 64, dtype=torch.float16),),
+            (
+                _gemv_all_ones_answer(weight, "q4a16") + linear_bias.half().numpy()
+            ).astype(np.float16),
             blob=blob,
         )
     )
@@ -3408,6 +3494,32 @@ def test_the_gemv_control_can_tell_the_two_nibble_orders_apart(cases):
             _tagged(cases, tag).blob
             != _tagged(cases, "AJ" if tag == "AX" else "AL").blob
         ), f"{tag}: the control is the case it was meant to control"
+
+
+def test_an_nn_linear_reaches_the_same_bytes_as_its_mm_spelling():
+    """The linear cases' blobs are the mm cases' blobs, byte for byte.
+
+    This is what says the rewrite that makes an `nn.Linear` quantizable opened
+    no new surface: the command, its weight bytes, its parameter slots and its
+    scale block count are the ones the `mm` path already produces and the
+    simulator already answers, so the entry a caller reaches by writing
+    `nn.Linear` is the entry that was verified, not a second one beside it. Both
+    blobs are built here from the same fixture weight, so a difference in the
+    stored weight would have to be the emitter's doing.
+    """
+    for scheme, k, n in (("q4a16", 64, 32), ("w8a16", 64, 32), ("q4a16", 128, 64)):
+        mm_blob, _ = _quantized_gemv(scheme, k, n)
+        linear_blob, _ = _quantized_linear_gemv(scheme, k, n)
+        assert linear_blob == mm_blob, (
+            f"{scheme} k={k} n={n}: the nn.Linear spelling emitted "
+            f"{len(linear_blob)}B against the mm spelling's {len(mm_blob)}B"
+        )
+    # The bias too: `nn.Linear` keeps its bias by default, and the entry that
+    # carries it is the same command with the same last operand.
+    bias = (torch.arange(32) % 3).to(torch.float32) - 1.0
+    mm_blob, _ = _quantized_gemv("q4a16", 64, 32, bias=bias)
+    linear_blob, _ = _quantized_linear_gemv("q4a16", 64, 32, bias=bias)
+    assert linear_blob == mm_blob, "the biased spellings differ"
 
 
 def test_the_split_pieces_reach_the_dsp_in_one_command_each(cases, simulated):
