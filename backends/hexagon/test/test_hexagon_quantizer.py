@@ -518,7 +518,9 @@ def test_a_prefill_past_the_m_le_32_k_ceiling_stays_portable():
     The geometries are the measured ones, and the two assertions after the loop
     are what keep this from being a test of "some wide shape is refused": the
     same K is admitted one M over the dispatch, and the same M is admitted at the
-    last K measured to work.
+    last K measured to work. The measured heap-backed skel also answers these
+    shapes at K=25216, but that source-level fix does not erase this host
+    safety refusal from the requested a47e948 baseline.
     """
     for m, k in ((4, 12736), (4, 12800), (2, 12800), (32, 12800)):
         program, _, _ = _quantized_program("q4a16", m, k, 64)
@@ -535,6 +537,47 @@ def test_a_prefill_past_the_m_le_32_k_ceiling_stays_portable():
     # And the widest K that does fit the same branch.
     program, _, _ = _quantized_program("q4a16", 4, hexagon_ops.PREFILL_M32_MAX_K, 64)
     assert _support(program).is_node_supported(None, _mm_node(program))
+
+
+def test_a_refused_q4_prefill_has_no_delegate_or_command():
+    """The measured M=2/4/32 K=25216 cases emit no command 22."""
+    for m in (2, 4, 32):
+        converted, x = _converted("q4a16", m, 25216, 64)
+        lowered = to_edge_transform_and_lower(
+            torch.export.export(converted, (x,)),
+            partitioner=[HexagonPartitioner()],
+        ).exported_program()
+        delegates = [
+            module
+            for module in lowered.graph_module.modules()
+            if isinstance(module, LoweredBackendModule)
+        ]
+        assert delegates == [], m
+        assert not [
+            node
+            for node in lowered.graph_module.graph.nodes
+            if str(node.target).endswith("executorch_call_delegate")
+        ], m
+
+
+def test_a_w8a16_refusal_has_no_delegate_or_command_42():
+    """This baseline has no W8A16 prefill emitter, so the refusal is silent."""
+    converted, x = _converted("w8a16", 8, 64, 128)
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(converted, (x,)),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    delegates = [
+        module
+        for module in lowered.graph_module.modules()
+        if isinstance(module, LoweredBackendModule)
+    ]
+    assert delegates == []
+    assert not [
+        node
+        for node in lowered.graph_module.graph.nodes
+        if str(node.target).endswith("executorch_call_delegate")
+    ]
 
 
 def test_the_m_le_32_k_ceiling_is_the_thing_that_refuses(monkeypatch):
