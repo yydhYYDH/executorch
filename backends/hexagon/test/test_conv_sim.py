@@ -69,24 +69,40 @@ _DEPTHWISE = [
     ("DW_BLOCKS", 128, 3, 2, 1, 1, 9, 0, 0, 2),
 ]
 
+#: The im2col geometries. (tag, ic, oc, ky, kx, stride, pad, dilate, ih, iw,
+#: batch). The one-column cases are a one-axis convolution read from the 4-D
+#: spelling (B, C, T, 1): the plane is T rows by one column and the window is
+#: k x 1, which is what a 3-D graph asks for and what the emitter emits.
 _CONV = [
-    ("CV_3X3", 64, 64, 3, 1, 1, 1, 5, 1),
-    ("CV_STRIDE", 64, 64, 3, 2, 1, 1, 8, 1),
-    ("CV_NOPAD", 64, 64, 3, 1, 0, 1, 5, 1),
-    ("CV_1X1", 64, 96, 1, 1, 0, 1, 5, 1),
-    ("CV_IC96", 96, 64, 3, 1, 1, 1, 5, 1),
-    ("CV_DIL", 64, 64, 3, 1, 2, 2, 7, 1),
-    ("CV_BATCH", 64, 64, 3, 1, 1, 1, 5, 2),
-    ("CV_IC3", 3, 32, 3, 2, 1, 1, 8, 1),
+    ("CV_3X3", 64, 64, 3, 3, 1, 1, 1, 5, 5, 1),
+    ("CV_STRIDE", 64, 64, 3, 3, 2, 1, 1, 8, 8, 1),
+    ("CV_NOPAD", 64, 64, 3, 3, 1, 0, 1, 5, 5, 1),
+    ("CV_1X1", 64, 96, 1, 1, 1, 0, 1, 5, 5, 1),
+    ("CV_IC96", 96, 64, 3, 3, 1, 1, 1, 5, 5, 1),
+    ("CV_DIL", 64, 64, 3, 3, 1, 2, 2, 7, 7, 1),
+    ("CV_BATCH", 64, 64, 3, 3, 1, 1, 1, 5, 5, 2),
+    ("CV_IC3", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1),
+]
+
+#: The one-column windows alone, so the one-axis geometry is a case list of
+#: its own rather than a tail on the square one.
+_CONV_COLUMN = [
+    ("CV_COL1", 64, 64, 1, 1, 1, 0, 1, 8, 1, 1),
+    ("CV_COL3", 64, 64, 3, 1, 1, 1, 1, 8, 1, 1),
+    ("CV_COL5", 64, 64, 5, 1, 2, 2, 1, 16, 1, 1),
+    ("CV_COL7", 64, 96, 7, 1, 1, 3, 1, 8, 1, 1),
+    ("CV_COLDIL", 64, 64, 3, 1, 1, 1, 2, 12, 1, 1),
+    ("CV_COLIC3", 3, 32, 5, 1, 2, 2, 1, 10, 1, 1),
+    ("CV_COLBATCH", 64, 64, 3, 1, 1, 1, 1, 8, 1, 2),
 ]
 
 #: A geometry whose position count is not a whole number of 32-position tiles,
 #: run with one channel tile per pass: the shape the emitter's pair avoids.
-_SINGLE = ("CV_ODD", 64, 64, 3, 1, 1, 1, 5, 1)
+_SINGLE = ("CV_ODD", 64, 64, 3, 3, 1, 1, 1, 5, 5, 1)
 
 #: The same chunking over a single channel tile, where the store has no second
 #: tile to hand the wrong bias to.
-_SINGLE_EXACT = ("CV_ONE", 3, 32, 3, 2, 1, 1, 8, 1)
+_SINGLE_EXACT = ("CV_ONE", 3, 32, 3, 3, 2, 1, 1, 8, 8, 1)
 
 #: The two shapes with the padding lanes filled in, and the value the finite one
 #: moves the answer by.
@@ -117,12 +133,14 @@ def _uint16(result, tag):
     return np.array(result[tag], dtype=np.uint16)
 
 
-def _source(batch, channels, width):
+def _source(batch, channels, height, width=None):
     """The activation both sides build, in the blocked layout the DSP reads."""
-    values = np.zeros((batch, channels, width, width), dtype=np.float16)
+    if width is None:
+        width = height
+    values = np.zeros((batch, channels, height, width), dtype=np.float16)
     for b in range(batch):
         for c in range(channels):
-            for y in range(width):
+            for y in range(height):
                 for x in range(width):
                     values[b, c, y, x] = np.float16(
                         ((y * width + x) * 7 + c * 3) % 11 - 5
@@ -139,12 +157,14 @@ def _depthwise_weight(channels, kernel):
     return weight
 
 
-def _conv_weight(oc, ic, kernel):
-    weight = np.zeros((oc, ic, kernel, kernel), dtype=np.float16)
+def _conv_weight(oc, ic, kernel_y, kernel_x=None):
+    if kernel_x is None:
+        kernel_x = kernel_y
+    weight = np.zeros((oc, ic, kernel_y, kernel_x), dtype=np.float16)
     for o in range(oc):
         for c in range(ic):
-            for ky in range(kernel):
-                for kx in range(kernel):
+            for ky in range(kernel_y):
+                for kx in range(kernel_x):
                     weight[o, c, ky, kx] = np.float16(
                         ((o * 3 + c * 5 + ky * 7 + kx * 11) % 13) - 6
                     )
@@ -170,39 +190,71 @@ def _digest(packed, count):
     return hash_value, words[:16].tolist()
 
 
-def _spec(batch, ic, hw, oc, kernel, stride, pad, dilate):
-    extent = (hw + 2 * pad - dilate * (kernel - 1) - 1) // stride + 1
+def _spec(batch, ic, ih, iw, oc, kernel_y, kernel_x, stride, pad, dilate):
+    """The emitter's own reading: a one-column window is a k x 1 over T rows.
+
+    A one-column window carries torch's stride, padding and dilation on the
+    height and a unit on the width, which is the 4-D spelling a 3-D graph is
+    read as.
+    """
+    one_column = iw == 1 and kernel_x == 1
+    stride_x = 1 if one_column else stride
+    pad_x = 0 if one_column else pad
+    dilate_x = 1 if one_column else dilate
+    oh = (ih + 2 * pad - dilate * (kernel_y - 1) - 1) // stride + 1
+    ow = (iw + 2 * pad_x - dilate_x * (kernel_x - 1) - 1) // stride_x + 1
     return ConvSpec(
         batch=batch,
         in_channels=ic,
-        in_h=hw,
-        in_w=hw,
+        in_h=ih,
+        in_w=iw,
         out_channels=oc,
-        out_h=extent,
-        out_w=extent,
-        kernel_y=kernel,
-        kernel_x=kernel,
+        out_h=oh,
+        out_w=ow,
+        kernel_y=kernel_y,
+        kernel_x=kernel_x,
         stride_y=stride,
-        stride_x=stride,
+        stride_x=stride_x,
         pad_y=pad,
-        pad_x=pad,
+        pad_x=pad_x,
         dilate_y=dilate,
-        dilate_x=dilate,
+        dilate_x=dilate_x,
         depthwise=False,
+        conv1d=one_column,
     )
 
 
 def _convolution_reference(case):
-    """What torch computes for one of the runner's cases."""
-    _, ic, oc, kernel, stride, pad, dilate, hw, batch = case
-    return torch.nn.functional.conv2d(
-        torch.from_numpy(_source(batch, ic, hw)),
-        torch.from_numpy(_conv_weight(oc, ic, kernel)),
-        torch.from_numpy(_bias(oc)[:oc]),
+    """What torch computes for one of the runner's cases.
+
+    A one-column window is read as conv1d over the 3-D (batch, channels, time)
+    tensor rather than as conv2d over the 4-D (batch, channels, time, 1) one,
+    because the two are the same cross-correlation and the 3-D form is what a
+    graph that spells the layer that way asks torch for.
+    """
+    _, ic, oc, kernel_y, kernel_x, stride, pad, dilate, ih, iw, batch = case
+    source = _source(batch, ic, ih, iw)
+    weight = _conv_weight(oc, ic, kernel_y, kernel_x)
+    bias = _bias(oc)[:oc]
+    if iw != 1 or kernel_x != 1:
+        return torch.nn.functional.conv2d(
+            torch.from_numpy(source),
+            torch.from_numpy(weight),
+            torch.from_numpy(bias),
+            stride=stride,
+            padding=pad,
+            dilation=dilate,
+        ).numpy()
+    # The 3-D result, put back into the plane layout the runner stores, which
+    # is the one-column plane the command's own extents describe.
+    return torch.nn.functional.conv1d(
+        torch.from_numpy(source[:, :, :, 0]),
+        torch.from_numpy(weight[:, :, :, 0]),
+        torch.from_numpy(bias),
         stride=stride,
         padding=pad,
         dilation=dilate,
-    ).numpy()
+    ).numpy()[..., None]
 
 
 def _unblock(flat, channels, batch, area):
@@ -256,13 +308,14 @@ def test_the_runner_receives_the_weight_the_emitter_packs(simulated, case):
 @pytest.mark.parametrize("case", _CONV, ids=[case[0] for case in _CONV])
 def test_the_runner_receives_the_weight_the_emitter_packs_for_the_unit(simulated, case):
     """The im2col path's operand is the HMX unit's 32x32 tiling."""
-    tag, ic, oc, kernel, stride, pad, dilate, hw, batch = case
-    weight = _conv_weight(oc, ic, kernel)
+    tag, ic, oc, kernel_y, kernel_x, stride, pad, dilate, ih, iw, batch = case
+    weight = _conv_weight(oc, ic, kernel_y, kernel_x)
     packed = pack_conv_weight(
-        weight, _spec(batch, ic, hw, oc, kernel, stride, pad, dilate)
+        weight,
+        _spec(batch, ic, ih, iw, oc, kernel_y, kernel_x, stride, pad, dilate),
     )
     tiles, groups = -(-oc // 32), -(-ic // 32)
-    count = tiles * kernel * kernel * groups * 1024
+    count = tiles * kernel_y * kernel_x * groups * 1024
     digest, head = _digest(packed, count)
     assert (
         int(simulated[f"{tag}_WSUM"][0]) == digest
@@ -314,13 +367,71 @@ def test_the_im2col_convolution_on_the_dsp_matches_torch(simulated, case):
     adds. The values are small integers, so it is an equality and not a
     tolerance.
     """
-    tag, ic, oc, kernel, stride, pad, dilate, hw, batch = case
     expected = _convolution_reference(case)
+    tag, _, oc, _, _, _, _, _, _, _, batch = case
     area = expected.shape[2] * expected.shape[3]
     got = _unblock(simulated[f"{tag}_OUT"], oc, batch, area).reshape(batch, oc, area)
     assert _bits(got.reshape(-1)) == _bits(
         expected.reshape(-1)
     ), f"{tag}: not bit-exact"
+
+
+@pytest.mark.parametrize(
+    "case", _CONV_COLUMN, ids=[case[0] for case in _CONV_COLUMN]
+)
+def test_the_runner_receives_the_weight_the_one_axis_emitter_packs(simulated, case):
+    """The unit's weight is the 3-D weight packed by the one-axis reading.
+
+    The weight that goes into a 3-D graph is (oc, ic, k) and the one-axis
+    reading gives the packer a unit column, so the packed bytes are those of
+    the (oc, ic, k, 1) window. This is the same claim the host tier makes
+    about the emitter, checked here against the unit's own hash.
+    """
+    tag, ic, oc, kernel_y, kernel_x, stride, pad, dilate, ih, iw, batch = case
+    spec = _spec(batch, ic, ih, iw, oc, kernel_y, kernel_x, stride, pad, dilate)
+    three = _conv_weight(oc, ic, kernel_y, kernel_x)[..., 0]
+    packed = pack_conv_weight(three, spec)
+    tiles, groups = -(-oc // 32), -(-ic // 32)
+    count = tiles * kernel_y * kernel_x * groups * 1024
+    digest, head = _digest(packed, count)
+    assert (
+        int(simulated[f"{tag}_WSUM"][0]) == digest
+    ), f"{tag}: not the one-axis packing"
+    assert _uint16(simulated, f"{tag}_WHEAD")[:16].tolist() == head
+
+
+@pytest.mark.parametrize(
+    "case", _CONV_COLUMN, ids=[case[0] for case in _CONV_COLUMN]
+)
+def test_the_one_column_window_on_the_dsp_matches_conv1d(simulated, case):
+    """A k x 1 window over a one-column plane is torch's conv1d, bit for bit.
+
+    The runner drives the same im2col command the emitter emits for a 3-D
+    convolution, with the 4-D spelling's geometry: the plane is T rows by one
+    column and the window is k x 1. The reference is computed twice, once as
+    conv1d over the 3-D (batch, channels, time) tensor the graph has and once
+    as conv2d over its (batch, channels, time, 1) spelling, and the two must
+    agree with each other and with the unit before this says anything.
+    """
+    tag, ic, oc, kernel_y, kernel_x, stride, pad, dilate, ih, iw, batch = case
+    expected = _convolution_reference(case)
+    four = torch.nn.functional.conv2d(
+        torch.from_numpy(_source(batch, ic, ih, iw)),
+        torch.from_numpy(_conv_weight(oc, ic, kernel_y, kernel_x)),
+        torch.from_numpy(_bias(oc)[:oc]),
+        stride=(stride, 1),
+        padding=(pad, 0),
+        dilation=(dilate, 1),
+    ).numpy()
+    assert _bits(expected.reshape(-1)) == _bits(four.reshape(-1)), (
+        f"{tag}: conv1d and the 4-D spelling disagree on the host"
+    )
+
+    area = expected.shape[2] * expected.shape[3]
+    got = _unblock(simulated[f"{tag}_OUT"], oc, batch, area).reshape(batch, oc, area)
+    assert _bits(got.reshape(-1)) == _bits(
+        expected.reshape(-1)
+    ), f"{tag}: the unit's one-column window is not conv1d"
 
 
 def test_the_padding_lanes_reach_the_product(simulated):
@@ -332,27 +443,29 @@ def test_the_padding_lanes_reach_the_product(simulated):
     each. That is what makes the emitter's clearing of those lanes (DSP_OP_ZERO)
     load-bearing rather than housekeeping.
     """
-    _, _, _, kernel, stride, pad, dilate, hw, batch = next(
+    _, _, _, kernel_y, kernel_x, stride, pad, dilate, ih, iw, batch = next(
         case for case in _CONV if case[0] == "CV_IC3"
     )
+    assert kernel_y == kernel_x == 3 and ih == iw, "the probe needs a square case"
     assert _uint16(simulated, "CV_READ_A")[:4].view(np.float16).tolist() == [3.0] * 4
     assert _uint16(simulated, "CV_READ_W")[:4].view(np.float16).tolist() == [1.0] * 4
 
-    extent = (hw + 2 * pad - dilate * (kernel - 1) - 1) // stride + 1
-    plain = _unblock(simulated["CV_IC3_OUT"], 32, batch, extent * extent)
-    poisoned = _unblock(simulated["CV_READ_OUT"], 32, batch, extent * extent)
+    oh = (ih + 2 * pad - dilate * (kernel_y - 1) - 1) // stride + 1
+    ow = (iw + 2 * pad - dilate * (kernel_x - 1) - 1) // stride + 1
+    plain = _unblock(simulated["CV_IC3_OUT"], 32, batch, oh * ow)
+    poisoned = _unblock(simulated["CV_READ_OUT"], 32, batch, oh * ow)
     moved = (poisoned.astype(np.float32) - plain.astype(np.float32)).reshape(
-        32, extent * extent
+        32, oh * ow
     )
     taps = np.array(
         [
             sum(
-                0 <= oy * stride - pad + ky < hw and 0 <= ox * stride - pad + kx < hw
-                for ky in range(kernel)
-                for kx in range(kernel)
+                0 <= oy * stride - pad + ky < ih and 0 <= ox * stride - pad + kx < iw
+                for ky in range(kernel_y)
+                for kx in range(kernel_x)
             )
-            for oy in range(extent)
-            for ox in range(extent)
+            for oy in range(oh)
+            for ox in range(ow)
         ],
         dtype=np.float32,
     )
@@ -389,7 +502,7 @@ def test_the_single_tile_chunking_is_what_the_emitter_avoids(simulated):
     channel tile 32 lanes up instead of its own. The same geometry through the
     pair store is exact, and the emitter pins `mp = 1, np = 2`.
     """
-    _, ic, oc, kernel, stride, pad, dilate, hw, batch = _SINGLE
+    _, _, oc, _, _, _, _, _, _, _, batch = _SINGLE
     expected = _convolution_reference(_SINGLE)
     area = expected.shape[2] * expected.shape[3]
     got = _unblock(simulated["CV_ODD_OUT"], oc, batch, area)
@@ -413,7 +526,7 @@ def test_the_single_tile_chunking_is_exact_with_one_channel_tile(simulated):
     ragged path rather than about the chunking parameters.
     """
     expected = _convolution_reference(_SINGLE_EXACT)
-    _, ic, oc, kernel, stride, pad, dilate, hw, batch = _SINGLE_EXACT
+    _, _, oc, _, _, _, _, _, _, _, batch = _SINGLE_EXACT
     area = expected.shape[2] * expected.shape[3]
     got = _unblock(simulated["CV_ONE_OUT"], oc, batch, area)
     assert _bits(got.reshape(-1)) == _bits(expected.reshape(-1)), "not bit-exact"
