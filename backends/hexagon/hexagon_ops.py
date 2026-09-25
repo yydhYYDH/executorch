@@ -39,10 +39,16 @@ from executorch.exir.sym_util import eval_upper_bound
 DSP_OP_POOL2D_FP16 = 1
 DSP_OP_CONV_DEPTHWISE2D_FP16 = 2
 DSP_OP_RASTER_BLIT = 3
-# The im2col convolution, which is also what 17 (CONV1X1_DIRECT_FP16) resolves
-# to: htp_ops_conv1x1_direct_fp16 is a second name for the same function
-# (im2col_convolution_fp16.cc:1840), so nothing here selects between them.
+# The im2col convolution. DSP_OP_CONV1X1_DIRECT_FP16 (17) resolves to the
+# same function (htp_ops_conv1x1_direct_fp16 is a second name for
+# hmx_im2col_convolution_fp16, im2col_convolution_fp16.cc:1840), so the
+# difference between the two commands is not which kernel runs but which of
+# the function's own activation fills is eligible, and that is decided by the
+# parameters the command carries. conv_1x1_direct_applies() below is the host
+# transcription of the fill selection the C makes (fill_im2col_activation_
+# tiles, :1132): a 1x1 convolution only takes a direct fill when there is one.
 DSP_OP_IM2COL_CONVOLUTION_FP16 = 12
+DSP_OP_CONV1X1_DIRECT_FP16 = 17
 DSP_OP_UNARY = 4
 # A memset over one operand, which is the only way to clear the padding lanes a
 # ragged channel count leaves in a blocked activation (blit_ops.cc:1724).
@@ -3825,6 +3831,49 @@ class ConvSpec(NamedTuple):
     dynamic_h: bool = False
 
 
+def conv_1x1_direct_applies(spec: ConvSpec) -> bool:
+    """Whether a convolution should be emitted as CONV1X1_DIRECT_FP16(17).
+
+    `htp_ops_conv1x1_direct_fp16` is a second name for the im2col function
+    (im2col_convolution_fp16.cc:1840), so the command type does not choose a
+    kernel; it records that the function's own activation fill has a 1x1 path
+    this geometry takes. The fill is chosen from the parameters the command
+    carries, in the C (fill_im2col_activation_tiles, :1593): packCUnit 64,
+    kernelX == kernelY == 1, unit dilation, and kp == ceil(ic / 32), which the
+    emitter's own kp (kernel_y * kernel_x * conv_k_units(ic)) only equals when
+    the in-channel count is a whole number of 32-channel blocks. Inside that
+    fill (fill_im2col_activation_1x1_pack64_tiles, :723) a direct copy of the
+    plane is taken when the output plane is the input plane (batch 1, no
+    padding, unit stride: out == in), and a strided direct gather when the
+    stride is not 1 with no padding and batch 1. Everything else -- a batch
+    above one, padding, a stride of 1 with an output plane that is not the
+    input plane -- falls through to the general per-position window walk,
+    which for a 1x1 window is the im2col materialisation the fast path exists
+    to avoid, and that is what CONV1X1_DIRECT_FP16 would then be claiming in
+    the stream. This returns False there, so the command stays
+    IM2COL_CONVOLUTION_FP16(12) and the blob does not name a fast path that
+    will not run.
+
+    A transposed convolution never gets here (it reaches the emitter with the
+    1x1 window spelled after the zero-insert, and the fast path assumes the
+    packed plane the blit produced), so it is refused explicitly rather than
+    by accident.
+    """
+    if spec.transposed or spec.depthwise or spec.upsample_y != 1 or spec.upsample_x != 1:
+        return False
+    if (spec.kernel_x, spec.kernel_y) != (1, 1) or spec.in_channels % 32 != 0:
+        return False
+    if (spec.dilate_x, spec.dilate_y) != (1, 1) or (spec.pad_x, spec.pad_y) != (0, 0):
+        return False
+    if (spec.stride_x, spec.stride_y) == (1, 1):
+        return (
+            spec.batch == 1
+            and spec.out_h == spec.in_h
+            and spec.out_w == spec.in_w
+        )
+    return spec.batch == 1
+
+
 def _zero_insert_regions(source_shape, spec: ConvSpec) -> List[int]:
     """The raster region that scatters an input plane into an interleaved one.
 
@@ -4752,7 +4801,15 @@ def _emit_dense_im2col(
     op_index = ctx.emit(
         node,
         Op(
-            type=DSP_OP_IM2COL_CONVOLUTION_FP16,
+            # 17 names the function's 1x1 activation fill, which this geometry
+            # takes; 12 is the same function on its general window walk.
+            # conv_1x1_direct_applies is the host transcription of the C's own
+            # selection, so the stream says which fill runs.
+            type=(
+                DSP_OP_CONV1X1_DIRECT_FP16
+                if conv_1x1_direct_applies(spec)
+                else DSP_OP_IM2COL_CONVOLUTION_FP16
+            ),
             inputs=[packed_in, weight, bias],
             outputs=[packed_out],
             params=[

@@ -35,6 +35,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+    conv_1x1_direct_applies,
     conv_spec,
     CONV_VTCM_BYTES,
     conv_vtcm_bytes,
@@ -56,6 +57,12 @@ from torch.export import export  # noqa: E402
 #: DSP_OP_RASTER_BLIT and DSP_OP_ZERO: the commands a convolution lowers to.
 _DEPTHWISE = 2
 _IM2COL = 12
+#: DSP_OP_CONV1X1_DIRECT_FP16. It resolves to the same C function as _IM2COL
+#: (htp_ops_conv1x1_direct_fp16 forwards to hmx_im2col_convolution_fp16), so
+#: what the command type records is which of the function's own activation
+#: fills is eligible: the 1x1 direct copy or gather, rather than the general
+#: per-position window walk.
+_CONV1X1 = 17
 _BLIT = 3
 _ZERO = 24
 
@@ -428,7 +435,19 @@ def test_the_general_path_covers_the_geometry_it_claims(
     _whole(model, 24)
     x = _exact((batch, in_channels, area, area), 3, -2, 3)
     data, commands = _blob(_lower(model, (x,)))
+    # A 1x1 layer with no padding, unit dilation, batch 1 and a whole number of
+    # reduction blocks is the geometry the function's own 1x1 fill takes, so the
+    # command names it (17); every other window in this list walks the general
+    # path (12).
     expected_types = [_BLIT, _IM2COL, _BLIT]
+    if (
+        kernel == 1
+        and batch == 1
+        and padding == 0
+        and dilation == 1
+        and in_channels % 32 == 0
+    ):
+        expected_types = [_BLIT, _CONV1X1, _BLIT]
     if in_channels % _PACK:
         # The lanes past the last channel have to be cleared before the pack,
         # or the zero weights the tiles carry for them multiply whatever the
@@ -474,7 +493,7 @@ def test_a_one_position_convolution_needs_no_blits():
     model = _Conv(channels, channels, 1).half()
     _whole(model, 26)
     data, commands = _blob(_lower(model, (x,)))
-    assert [command.type for command in commands] == [_IM2COL]
+    assert [command.type for command in commands] == [_CONV1X1]
     assert (
         _run(data, [x.numpy()]).tobytes()
         == model(x).detach().numpy().reshape(-1).tobytes()
@@ -839,7 +858,7 @@ def test_the_host_interpreter_convolves_the_way_the_kernels_do():
         _whole(model, 28)
         x = _exact((1, in_channels, 9, 9), 10, -2, 3)
         data, commands = _blob(_lower(model, (x,)))
-        assert commands[-2].type in (_DEPTHWISE, _IM2COL)
+        assert commands[-2].type in (_DEPTHWISE, _IM2COL, _CONV1X1)
         got = _run(data, [x.numpy()])
         want = model(x).detach().numpy().reshape(-1)
         assert got.tobytes() == want.tobytes(), (in_channels, out_channels, groups)
@@ -942,3 +961,176 @@ def test_a_depthwise_weight_is_padded_to_whole_vectors():
     block = packed.reshape(2, kernel, kernel, _PACK)
     assert block[0, 0, 0].tolist() == [1.0] * 64
     assert block[1, 0, 0].tolist() == [1.0] + [0.0] * 63
+
+
+# DSP_OP_CONV1X1_DIRECT_FP16 names the 1x1 fill. htp_ops_conv1x1_direct_fp16
+# forwards to hmx_im2col_convolution_fp16 (im2col_convolution_fp16.cc:1840), so
+# the op type does not pick a kernel; it records that the function's own
+# activation fill has a 1x1 path this geometry takes, so the stream says which
+# fill runs rather than naming 12 for a pointwise layer that never walks a
+# window.
+
+
+def _conv1x1_op(model, x):
+    data, commands = _blob(_lower(model, (x,)))
+    types = [command.type for command in commands]
+    assert types.count(_CONV1X1) + types.count(_IM2COL) == 1, types
+    return data, types
+
+
+@pytest.mark.parametrize(
+    "in_channels, out_channels, stride, area",
+    [
+        (64, 64, 1, 5),  # the common pointwise layer, unit stride
+        (64, 96, 1, 5),  # a ragged output tile, which the fill handles
+        (128, 64, 1, 4),  # more than one 32-channel reduction block
+        (32, 32, 1, 1),  # a single reduction block and a single pixel
+        (64, 64, 2, 8),  # a strided pointwise layer: the gather, not the copy
+        (96, 64, 3, 7),  # strided on both axes, batch 1
+    ],
+)
+def test_a_1x1_convolution_the_fill_can_copy_is_emitted_as_17(
+    in_channels, out_channels, stride, area
+):
+    """A 1x1 layer takes the direct fill, so the command is 17 and not 12.
+
+    The kernel's 1x1 fill needs a whole number of 32-channel reduction blocks
+    (kp == ceil(ic / 32), :1593), unit dilation, no padding, batch 1, and
+    either unit stride with the output plane equal to the input plane or a
+    stride above one. The interpreter's product is the same for 12 and 17, so
+    the numbers are compared against torch to show the command is not merely a
+    different number for the same bytes.
+    """
+    model = _Conv(in_channels, out_channels, 1, stride=stride).half()
+    _whole(model, 31)
+    x = _exact((1, in_channels, area, area), 12, -2, 3)
+    data, types = _conv1x1_op(model, x)
+    assert types[-2] == _CONV1X1, types
+    assert _IM2COL not in types, types
+    got = _run(data, [x.numpy()])
+    want = model(x).detach().numpy().reshape(-1)
+    assert got.tobytes() == want.tobytes()
+
+
+@pytest.mark.parametrize(
+    "label, in_channels, out_channels, kernel, stride, padding, dilation, area, batch",
+    [
+        ("a batch of two", 64, 64, 1, 1, 0, 1, 4, 2),
+        ("padding", 64, 64, 1, 1, 1, 1, 5, 1),
+        ("dilation", 64, 64, 1, 1, 0, 2, 6, 1),
+        ("a ragged reduction", 48, 64, 1, 1, 0, 1, 4, 1),
+        ("a 3x3 window", 64, 64, 3, 1, 1, 1, 6, 1),
+        ("depthwise", 64, 64, 1, 1, 0, 1, 4, 1),
+    ],
+)
+def test_a_1x1_geometry_the_direct_fill_cannot_take_stays_im2col(
+    label, in_channels, out_channels, kernel, stride, padding, dilation, area, batch
+):
+    """The negative test: outside the restrictions the command stays 12.
+
+    Each row is a case where the C's 1x1 fill selection does not fire, so
+    fill_im2col_activation_1x1_pack64_tiles is never reached and the general
+    per-position window walk is what runs. Emitting 17 there would put a fast
+    path in the stream that the DSP does not take.
+    """
+    model = _Conv(
+        in_channels,
+        out_channels,
+        kernel,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=in_channels if label == "depthwise" else 1,
+    ).half()
+    _whole(model, 33)
+    x = _exact((batch, in_channels, area, area), 14, -2, 3)
+    data, commands = _blob(_lower(model, (x,)))
+    types = [command.type for command in commands]
+    assert _CONV1X1 not in types, (label, types)
+    if label == "depthwise":
+        assert _DEPTHWISE in types, (label, types)
+    else:
+        assert types.count(_IM2COL) == 1, (label, types)
+    got = _run(data, [x.numpy()])
+    want = model(x).detach().numpy().reshape(-1)
+    assert got.tobytes() == want.tobytes(), label
+
+
+def test_the_predicate_is_the_kernel_selection_and_nothing_else():
+    """The predicate reads the same fields the C does, on the spec it builds.
+
+    This is the transcription of fill_im2col_activation_tiles (:1593) and
+    fill_im2col_activation_1x1_pack64_tiles (:723): a 1x1 window, unit
+    dilation, no padding, a whole number of 32-channel reduction blocks, batch
+    1, and either unit stride with the output plane equal to the input plane
+    or a stride above one. Each row is one field moved off its value.
+    """
+    base = hexagon_ops.ConvSpec(
+        batch=1,
+        in_channels=64,
+        in_h=4,
+        in_w=4,
+        out_channels=64,
+        out_h=4,
+        out_w=4,
+        kernel_y=1,
+        kernel_x=1,
+        stride_y=1,
+        stride_x=1,
+        pad_y=0,
+        pad_x=0,
+        dilate_y=1,
+        dilate_x=1,
+        depthwise=False,
+    )
+    assert conv_1x1_direct_applies(base)
+    assert not conv_1x1_direct_applies(base._replace(batch=2))
+    assert not conv_1x1_direct_applies(base._replace(in_channels=48))
+    assert not conv_1x1_direct_applies(base._replace(kernel_x=3))
+    assert not conv_1x1_direct_applies(base._replace(kernel_y=3))
+    assert not conv_1x1_direct_applies(base._replace(pad_x=1))
+    assert not conv_1x1_direct_applies(base._replace(dilate_x=2))
+    assert not conv_1x1_direct_applies(base._replace(depthwise=True))
+    assert not conv_1x1_direct_applies(base._replace(transposed=True))
+    assert not conv_1x1_direct_applies(base._replace(out_h=3))
+    strided = base._replace(stride_x=2, stride_y=2, out_h=2, out_w=2)
+    assert conv_1x1_direct_applies(strided)
+    assert not conv_1x1_direct_applies(strided._replace(batch=2))
+    assert not conv_1x1_direct_applies(strided._replace(pad_x=1))
+
+
+def test_the_1x1_command_is_absent_from_a_non_1x1_graph():
+    """A 3x3 convolution's stream has no 17 in it at all.
+
+    The direct command must be absent from a stream that does not take the
+    direct fill, not merely accompanied by 12: if a graph on im2col carried a
+    17 as well, the claim that 1x1 avoids the im2col materialisation would be
+    uncheckable from the blob.
+    """
+    model = _Conv(64, 64, 3, padding=1).half()
+    _whole(model, 35)
+    x = _exact((1, 64, 6, 6), 16, -2, 3)
+    data, commands = _blob(_lower(model, (x,)))
+    assert [command.type for command in commands] == [_BLIT, _IM2COL, _BLIT]
+    got = _run(data, [x.numpy()])
+    want = model(x).detach().numpy().reshape(-1)
+    assert got.tobytes() == want.tobytes()
+
+
+def test_the_1x1_stream_counts_17_and_no_12_from_the_blob():
+    """The command types, counted the way the runtime reads them.
+
+    The header's op count says how many commands there are, not which; the
+    types come out of read_blob's command list, which is the same bytes the
+    DSP's dispatcher switches on.
+    """
+    model = _Conv(64, 96, 1).half()
+    _whole(model, 37)
+    x = _exact((1, 64, 5, 5), 18, -2, 3)
+    data, types = _conv1x1_op(model, x)
+    header, commands = read_blob(data)
+    assert header.n_ops == len(commands) == len(types)
+    assert [command.type for command in commands] == types
+    assert types.count(_CONV1X1) == 1
+    assert types.count(_IM2COL) == 0
+    assert types.count(_BLIT) == 2

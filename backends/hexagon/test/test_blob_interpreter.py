@@ -805,16 +805,20 @@ def _emitted_op_types():
 
     Parsed rather than exercised: every `type=` argument in hexagon_ops.py names
     a DSP_OP_ constant, and that is the whole set of commands that can reach a
-    blob.
+    blob. A `type=` whose value is a conditional expression -- the convolution
+    picks between the im2col command and the 1x1 direct one -- contributes every
+    constant its arms name, because either of them is what the stream can carry.
     """
     tree = ast.parse(pathlib.Path(hexagon_ops.__file__).read_text())
-    names = {
-        node.value.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.keyword)
-        and node.arg == "type"
-        and isinstance(node.value, ast.Name)
-    }
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.keyword) or node.arg != "type":
+            continue
+        for value in ast.walk(node.value):
+            # A conditional expression names the predicate too, and only the
+            # DSP_OP_ constants in it are command types.
+            if isinstance(value, ast.Name) and value.id.startswith("DSP_OP_"):
+                names.add(value.id)
     return {getattr(hexagon_ops, name) for name in names}
 
 
@@ -830,10 +834,11 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
     """Pins the set, so a new emitter is a failure here rather than a silent
     hole in the interpreter's coverage."""
     # 1 pool2d, 2 depthwise convolution, 3 blit, 4 unary, 8 layer norm, 12 im2col
-    # convolution, 14 rope, 16 add+fused norm, 18 flash attention, 19 element-wise,
-    # 22 q4a16 prefill, 23 shared gather, 24 zero, 26 select, 27 topk, 28 softmax,
-    # 29 reduction, 37 Leaky ReLU, 38 batch matmul, 39 PReLU, 41 q4a16 GEMV,
-    # 42 w8a16 prefill, 43 vision attention, 45 w8a16 GEMV.
+    # convolution, 14 rope, 16 add+fused norm, 17 1x1 direct convolution, 18
+    # flash attention, 19 element-wise, 22 q4a16 prefill, 23 shared gather, 24
+    # zero, 26 select, 27 topk, 28 softmax, 29 reduction, 37 Leaky ReLU, 38 batch
+    # matmul, 39 PReLU, 41 q4a16 GEMV, 42 w8a16 prefill, 43 vision attention,
+    # 45 w8a16 GEMV.
     # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
     assert _emitted_op_types() == {
         1,
@@ -844,6 +849,7 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
         12,
         14,
         16,
+        17,
         18,
         19,
         22,

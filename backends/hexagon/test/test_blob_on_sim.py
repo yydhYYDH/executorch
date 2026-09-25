@@ -2934,7 +2934,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     assert kinds["R"] == [38, 19], "addmm is not a product followed by an add"
     assert kinds["C"] == [8], "the fused norm is not a layer norm"
     assert kinds["O"] == [3, 2, 3], "the depthwise walk is not between two blits"
-    assert kinds["M"] == [3, 12, 3], "the pointwise layer is not the im2col kernel"
+    assert kinds["M"] == [3, 17, 3], "the pointwise layer is not the 1x1 direct kernel"
     assert kinds["T"] == [3, 3, 12, 3], "the wide pack blit is not split in two"
     for advance in ("D", "F", "G"):
         assert kinds[advance] == [3, 3], f"the cache advance {advance} is not two blits"
