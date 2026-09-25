@@ -18,6 +18,13 @@ interface htp_ops : remote_handle64 {
 
     AEEResult execute_command_group(in int32 groupFd, in int32 groupOffset, in int32 count, in int32 syncGroupFd, in int32 syncGroupOffset, in int32 syncGroupSize);
     AEEResult execute_command_group_profile(in int32 groupFd, in int32 groupOffset, in int32 count, in int32 syncGroupFd, in int32 syncGroupOffset, in int32 syncGroupSize, in int32 profileFd, in int32 profileOffset, in int32 profileSize);
+
+    /* Append-only: method numbers before this one must remain stable. */
+    AEEResult get_skel_source_id(
+        rout uint32 id_0,
+        rout uint32 id_1,
+        rout uint32 id_2,
+        rout uint32 id_3);
 };
 
 #endif /* HTP_OPS_IDL */

@@ -32,10 +32,12 @@ target_include_directories(
 target_sources(
   hexagon_backend
   PRIVATE ${HEXAGON_IDL_DIR}/htp_ops_stub.c
+          ${HEXAGON_IDL_DIR}/hexagon_skel_source_id.h
+          ${CMAKE_CURRENT_SOURCE_DIR}/hexagon_skel_provenance.h
           ${HEXAGON_SDK_ROOT}/utils/examples/dsp_capabilities_utils.c
 )
 
-add_dependencies(hexagon_backend hexagon_idl hexagon_schema)
+add_dependencies(hexagon_backend hexagon_idl hexagon_schema hexagon_skel_source_id)
 
 # libcdsprpc provides the remote_handle64_* entry points the qaic stub calls,
 # rpcmem_alloc and fastrpc_mmap. Its cache maintenance entry points are not in

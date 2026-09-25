@@ -32,10 +32,46 @@ if(NOT HEXAGON_ARCHS)
 endif()
 
 set(HEXAGON_MNN_OPS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third-party/mnn-htp-ops")
+set(HEXAGON_IDL_DIR "${CMAKE_BINARY_DIR}/backends/hexagon/idl")
+
+# Generate one source identifier for the source closure that the host and DSP
+# builds share. The generated header is an RPC value, not a manually maintained
+# version: changing any declared build input changes the ID compiled into the
+# skel and the value the host expects.
+set(MNN_OPS_ROOT "${HEXAGON_MNN_OPS_ROOT}")
+set(SKEL_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/skel/CMakeLists.txt")
+set(HEXAGON_SKEL_SOURCE_ID_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/skel/generate_skel_source_id.cmake")
+set(HEXAGON_SKEL_SOURCE_ID_HELPER "${CMAKE_CURRENT_SOURCE_DIR}/skel/source_id.cmake")
+set(HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+include("${HEXAGON_SKEL_SOURCE_ID_HELPER}")
+hexagon_skel_source_manifest(HEXAGON_SKEL_SOURCE_INPUTS)
+set(_hexagon_source_tools_version unspecified)
+if(HEXAGON_TOOLS_ROOT)
+  get_filename_component(_hexagon_source_tools_version "${HEXAGON_TOOLS_ROOT}" NAME)
+endif()
+hexagon_skel_source_id_config(
+  HEXAGON_SKEL_SOURCE_ID_CONFIG ${_hexagon_source_tools_version})
+set(HEXAGON_SKEL_SOURCE_ID_HEADER "${HEXAGON_IDL_DIR}/hexagon_skel_source_id.h")
+add_custom_command(
+  OUTPUT ${HEXAGON_SKEL_SOURCE_ID_HEADER}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${HEXAGON_IDL_DIR}
+  COMMAND ${CMAKE_COMMAND}
+          -DMNN_OPS_ROOT=${MNN_OPS_ROOT}
+          -DSKEL_CMAKE=${SKEL_CMAKE}
+          -DHEXAGON_SKEL_SOURCE_ID_GENERATOR=${HEXAGON_SKEL_SOURCE_ID_GENERATOR}
+          -DHEXAGON_SKEL_SOURCE_ID_HELPER=${HEXAGON_SKEL_SOURCE_ID_HELPER}
+          -DHEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE=${HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE}
+          -DHEXAGON_SKEL_SOURCE_ID_CONFIG=${HEXAGON_SKEL_SOURCE_ID_CONFIG}
+          -DOUTPUT=${HEXAGON_SKEL_SOURCE_ID_HEADER}
+          -P ${HEXAGON_SKEL_SOURCE_ID_GENERATOR}
+  DEPENDS ${HEXAGON_SKEL_SOURCE_INPUTS}
+  COMMENT "Generating the Hexagon skel source provenance ID"
+  VERBATIM
+)
+add_custom_target(hexagon_skel_source_id DEPENDS ${HEXAGON_SKEL_SOURCE_ID_HEADER})
 
 # The skel is only reachable through the IDL, so the host stub and the skel are
 # generated from the same file and can never disagree about handle numbers.
-set(HEXAGON_IDL_DIR "${CMAKE_BINARY_DIR}/backends/hexagon/idl")
 find_program(
   HEXAGON_QAIC
   NAMES qaic
@@ -66,6 +102,7 @@ add_custom_target(
   DEPENDS ${HEXAGON_IDL_DIR}/htp_ops.h ${HEXAGON_IDL_DIR}/htp_ops_stub.c
           ${HEXAGON_IDL_DIR}/htp_ops_skel.c
 )
+add_dependencies(hexagon_idl hexagon_skel_source_id)
 
 # The schema header checked in with the vendored library was produced by an
 # older flatbuffers codegen and does not compile against the version this tree
@@ -145,10 +182,14 @@ foreach(HEXAGON_ARCH ${HEXAGON_ARCHS})
       -DSKEL_ARCH=${HEXAGON_ARCH}
       -DSKEL_ARCH_FLAGS=${HEXAGON_ARCH_FLAGS}
       -DIDL_DIR=${HEXAGON_IDL_DIR}
+      -DHEXAGON_SKEL_SOURCE_ID_HEADER=${HEXAGON_SKEL_SOURCE_ID_HEADER}
+      -DHEXAGON_SKEL_SOURCE_ID_GENERATOR=${HEXAGON_SKEL_SOURCE_ID_GENERATOR}
+      -DHEXAGON_SKEL_SOURCE_ID_HELPER=${HEXAGON_SKEL_SOURCE_ID_HELPER}
+      -DHEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE=${HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE}
       -DCMAKE_C_FLAGS=${HEXAGON_ARCH_FLAGS}
       -DCMAKE_CXX_FLAGS=${HEXAGON_ARCH_FLAGS}
-    BUILD_ALWAYS OFF
+    BUILD_ALWAYS ON
     INSTALL_COMMAND "" COMMENT "Building Hexagon skel for ${HEXAGON_ARCH}"
   )
-  add_dependencies(hexagon_skel_${HEXAGON_ARCH} hexagon_idl)
+  add_dependencies(hexagon_skel_${HEXAGON_ARCH} hexagon_idl hexagon_skel_source_id)
 endforeach()

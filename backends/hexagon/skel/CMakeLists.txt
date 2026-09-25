@@ -41,6 +41,43 @@ if(SKEL_ARCH_NUM LESS 79)
 endif()
 add_compile_options(${SKEL_ARCH_FLAGS})
 
+# A standalone configure gets its own header. The parent passes the host
+# header instead so the expected value and the value in the skel are literally
+# generated from the same source closure.
+set(HEXAGON_SKEL_SOURCE_ID_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/generate_skel_source_id.cmake")
+set(HEXAGON_SKEL_SOURCE_ID_HELPER "${CMAKE_CURRENT_SOURCE_DIR}/source_id.cmake")
+set(HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/../CMakeLists.txt")
+if(NOT HEXAGON_SKEL_SOURCE_ID_CONFIG)
+  include("${HEXAGON_SKEL_SOURCE_ID_HELPER}")
+  get_filename_component(_hexagon_source_tools_version "${HEXAGON_TOOLS_ROOT}" NAME)
+  hexagon_skel_source_id_config(
+    HEXAGON_SKEL_SOURCE_ID_CONFIG ${_hexagon_source_tools_version})
+endif()
+if(NOT HEXAGON_SKEL_SOURCE_ID_HEADER)
+  set(HEXAGON_SKEL_SOURCE_ID_HEADER "${CMAKE_CURRENT_BINARY_DIR}/hexagon_skel_source_id.h")
+  hexagon_skel_source_manifest(HEXAGON_SKEL_SOURCE_INPUTS)
+  add_custom_command(
+    OUTPUT ${HEXAGON_SKEL_SOURCE_ID_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
+    COMMAND ${CMAKE_COMMAND}
+            -DMNN_OPS_ROOT=${MNN_OPS_ROOT}
+            -DSKEL_CMAKE=${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
+            -DHEXAGON_SKEL_SOURCE_ID_GENERATOR=${HEXAGON_SKEL_SOURCE_ID_GENERATOR}
+            -DHEXAGON_SKEL_SOURCE_ID_HELPER=${HEXAGON_SKEL_SOURCE_ID_HELPER}
+            -DHEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE=${HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE}
+            -DHEXAGON_SKEL_SOURCE_ID_CONFIG=${HEXAGON_SKEL_SOURCE_ID_CONFIG}
+            -DOUTPUT=${HEXAGON_SKEL_SOURCE_ID_HEADER}
+            -P ${HEXAGON_SKEL_SOURCE_ID_GENERATOR}
+    DEPENDS ${HEXAGON_SKEL_SOURCE_INPUTS}
+    COMMENT "Generating the standalone Hexagon skel source provenance ID"
+    VERBATIM
+  )
+  add_custom_target(hexagon_skel_source_id_local DEPENDS ${HEXAGON_SKEL_SOURCE_ID_HEADER})
+  set(HEXAGON_SKEL_SOURCE_ID_TARGET hexagon_skel_source_id_local)
+else()
+  set(HEXAGON_SKEL_SOURCE_ID_TARGET "")
+endif()
+
 # The kernels are unusably stack hungry unoptimized: at -O0 a single fp16 branch
 # chain allocates a 14 KB frame, which overflows the DSP RPC thread's stack and
 # surfaces as a 0x8000040d from execute_command_group.
@@ -121,9 +158,14 @@ set(_skel_c
 
 set(HEX_SKEL_LIB hex-htp-${SKEL_ARCH})
 
+set_source_files_properties(${HEXAGON_SKEL_SOURCE_ID_HEADER} PROPERTIES GENERATED TRUE)
 add_library(
   ${HEX_SKEL_LIB} SHARED ${_skel_cxx} ${_skel_c} ${IDL_DIR}/htp_ops_skel.c
+                           ${HEXAGON_SKEL_SOURCE_ID_HEADER}
 )
+if(HEXAGON_SKEL_SOURCE_ID_TARGET)
+  add_dependencies(${HEX_SKEL_LIB} ${HEXAGON_SKEL_SOURCE_ID_TARGET})
+endif()
 
 # Upstream's kernels gate on the arch and on the PWL variant. learned8 is the
 # upstream default: it specialises SiLU/MulSiLU, the others keep the companded

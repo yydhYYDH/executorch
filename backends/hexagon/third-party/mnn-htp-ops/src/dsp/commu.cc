@@ -24,6 +24,7 @@
 #include <HAP_compute_res.h>
 #include "qurt.h"
 #include "htp_command.h"
+#include "hexagon_skel_source_id.h"
 static int htp_ops_hmx_matmul_fp16_benchmark_core(__fp16 *restrict c, const __fp16 *restrict a,
                                                   const __fp16 *restrict b, __fp16 *restrict scales,
                                                   int M, int K, int N) {
@@ -256,6 +257,24 @@ AEEResult htp_ops_get_skel_arch(remote_handle64 handle, uint32 *arch) {
 }
 
 // FastRPC interface
+AEEResult htp_ops_get_skel_source_id(
+    remote_handle64 handle,
+    uint32 *id_0,
+    uint32 *id_1,
+    uint32 *id_2,
+    uint32 *id_3) {
+  HtpOpsSessionContext *ctx = (HtpOpsSessionContext *)(uintptr_t)handle;
+  if (ctx == nullptr || id_0 == nullptr || id_1 == nullptr ||
+      id_2 == nullptr || id_3 == nullptr) {
+    return AEE_EBADPARM;
+  }
+  *id_0 = HEXAGON_SKEL_SOURCE_ID_0;
+  *id_1 = HEXAGON_SKEL_SOURCE_ID_1;
+  *id_2 = HEXAGON_SKEL_SOURCE_ID_2;
+  *id_3 = HEXAGON_SKEL_SOURCE_ID_3;
+  return AEE_SUCCESS;
+}
+
 AEEResult htp_ops_power_acquire(remote_handle64 handle) {
   HtpOpsSessionContext *ctx = (HtpOpsSessionContext *)(uintptr_t)handle;
   if (ctx == nullptr || !ctx->initialized) {
