@@ -113,6 +113,7 @@ _SOURCES = [
     "ops/matmul_q4fp16_mle32.c",
     "conv_depthwise_ops.cc",
     "im2col_convolution_fp16.cc",
+    "conv1x1_w8a16_sym_per_channel.cc",
     "ops/depthwise_conv_fp16.c",
     "attention_entry.cc",
     "attention_sync_setup.cc",

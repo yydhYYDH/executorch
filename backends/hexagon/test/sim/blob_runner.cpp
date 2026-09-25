@@ -161,6 +161,7 @@ enum {
   kReduction = 29,
   kBatchMatmul = 38,
   kQ4A16Prefill = 22,
+  kW8A16Prefill = 42,
   kQ4A16Gemv = 41,
   kVisionAttention = 43,
   kW8A16Gemv = 45,
@@ -408,6 +409,17 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                                      params[5], params[6], params[7], params[8],
                                      params[9], 0);
     if (ret != 0) printf("%s q4a16 prefill returned %d\n", g_tag, ret);
+    return;
+  }
+  if (op.type == kW8A16Prefill) {
+    HmxIm2ColConvParam matmul_params = {};
+    memcpy(&matmul_params, params, sizeof(matmul_params));
+    int ret = hmx_matmul_w8a16_block_fp16(
+        address(header, op.outputs[0]), address(header, op.inputs[0]),
+        address(header, op.inputs[1]),
+        absent(op.inputs[2]) ? nullptr : address(header, op.inputs[2]),
+        &matmul_params);
+    if (ret != 0) printf("%s w8a16 prefill returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kQ4A16Gemv) {

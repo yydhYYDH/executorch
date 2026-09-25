@@ -79,6 +79,7 @@ DSP_OP_FLASH_ATTN = 18
 # pins the number against htp_command.h.
 DSP_OP_MATMUL_Q4A16_FP16 = 22
 DSP_OP_MATMUL_Q4A16_GEMV_I8 = 41
+DSP_OP_MATMUL_W8A16_BLOCK_FP16 = 42
 DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 
 # The prefill command's own knobs, and the VTCM budget they are spent out of.
@@ -1910,13 +1911,11 @@ def _quantized_prefill_fits(activation, quantized: QuantizedWeight) -> bool:
     here: the kernel chunks M into 32-row groups and walks them, so the value of
     M only decides how long that walk is.
 
-    What is left out: the w8a16 scheme. The w8a16 prefill kernel is
-    DSP_OP_MATMUL_W8A16_BLOCK_FP16, whose parameters are an im2col struct and
-    whose int8 weight is in a tile order nothing in this backend packs yet, so a
-    w8a16 matmul with M > 1 stays on the portable kernels rather than be fed
-    bytes nothing has checked.
+    The int4 and int8 prefill entries share this geometry. Their weights are
+    different packed layouts, but each has a host packer for the layout its
+    kernel reads; the scale representation is the other difference.
     """
-    if quantized.bits != 4:
+    if quantized.bits not in (4, 8):
         return False
     geometry = quantized_matmul_geometry(activation, quantized)
     if geometry is None:
@@ -2190,6 +2189,16 @@ def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
     return packed.astype(np.uint8).reshape(np_ * kp, 1024).tobytes()
 
 
+def pack_w8a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
+    """A (k, n) int8 weight and its fp16 per-channel scales for command 42."""
+    import numpy as np
+
+    scales = np.asarray(scale, dtype=np.float32).reshape(-1)
+    if scales.size != n:
+        raise RuntimeError(f"hexagon: w8a16 has {scales.size} scales, expected {n}")
+    return pack_w8a16_gemv_weight(weight, k, n) + scales.astype(np.float16).tobytes()
+
+
 def pack_q4a16_prefill_weight(weight, scale, k: int, n: int) -> bytes:
     """A (k, n) int4 weight in the tile order the prefill kernel reads.
 
@@ -2341,6 +2350,72 @@ def _prefill_output_blit(node, ctx, blocked: TensorRef, out: TensorRef, m: int, 
     )
 
 
+def _emit_w8a16_prefill(
+    node: torch.fx.Node,
+    ctx,
+    activation: torch.fx.Node,
+    weight,
+    scale,
+    bias_ref: TensorRef,
+    out: TensorRef,
+    m: int,
+    k: int,
+    n: int,
+) -> TensorRef:
+    """A W8A16 matmul with M > 1 as command 42 plus its layout blits."""
+    packed_weight = pack_w8a16_prefill_weight(weight, scale, k, n)
+    packed_activation = _prefill_activation_ref(node, ctx, activation, m, k)
+    packs = (n + 63) // 64
+    blocked = ctx.builder.add_activation(packs * m * 64 * FP16_BYTES)
+    output_bytes = packs * m * 64 * FP16_BYTES
+    params = [
+        0,
+        0,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        k // 4,
+        k // 32,
+        m,
+        m,
+        m,
+        1,
+        m * 64,
+        64,
+        64,
+        m * packs * 64,
+        k,
+        k,
+        n,
+        1,
+        1,
+        0,
+        0,
+        1,
+        output_bytes,
+        1,
+        0,
+    ]
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_MATMUL_W8A16_BLOCK_FP16,
+            inputs=[
+                packed_activation,
+                ctx.builder.add_weights(packed_weight),
+                bias_ref,
+            ],
+            outputs=[blocked],
+            params=params,
+        ),
+    )
+    _prefill_output_blit(node, ctx, blocked, out, m, n)
+    return ctx.record(node, out)
+
+
 def _emit_quantized_prefill(
     node: torch.fx.Node,
     ctx,
@@ -2439,8 +2514,10 @@ def _emit_quantized_matmul(
     out = ctx.result_for(node, n)
     bias_ref = ABSENT if bias is None else ctx.operand(bias)
     if m > 1:
-        # The support check above admits M > 1 only for the 4-bit weight, so
-        # there is no w8a16 fallthrough to get wrong.
+        if quantized.bits == 8:
+            return _emit_w8a16_prefill(
+                node, ctx, activation, weight, scale, bias_ref, out, m, k, n
+            )
         return _emit_quantized_prefill(
             node, ctx, activation, weight, scale, bias_ref, out, m, k, n
         )
