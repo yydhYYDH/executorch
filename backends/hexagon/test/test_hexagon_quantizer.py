@@ -1041,7 +1041,9 @@ def test_a_one_block_activation_needs_no_pack_blit():
     blob = HexagonBackend.preprocess(program, []).processed_bytes
     _, commands = read_blob(blob)
     assert [c.type for c in commands] == [_PREFILL, _BLIT]
-    assert commands[0].inputs[0].space == commands[0].inputs[0].space
+    # With no pack blit the prefill must read the method input, not the
+    # packed weight that belongs in operand slot 1.
+    assert commands[0].inputs[0].space == blob_interpreter.B.TensorSpace.INPUT
     assert commands[0].inputs[0].size == 8 * 64 * 2, "the activation is not the input"
 
 
