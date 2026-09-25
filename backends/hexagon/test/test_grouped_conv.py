@@ -277,3 +277,46 @@ def test_the_command_stream_is_read_from_the_blob_not_the_header():
     kinds = [names[command.type] for command in decoded]
     assert kinds.count("DSP_OP_IM2COL_CONVOLUTION_FP16") == 2
 
+
+
+@pytest.mark.parametrize("groups,per_group", [(3, 4), (2, 63), (4, 65), (7, 8), (16, 4)])
+def test_a_permuted_group_would_not_look_like_the_answer(groups, per_group):
+    """The comparison can tell the group order apart from any other one.
+
+    Each output channel gets a weight that makes it a distinct multiple of its
+    own input, so the answer is separable by channel and a blob that read the
+    groups in the wrong order, or wrote them back in the wrong order, would
+    land the values on the wrong channels rather than merely rounding
+    differently. The assertion is that the observed error is a rounding of the
+    last bits, which is the only thing a correct layout can produce, and the
+    control is that the permuted answer is nowhere near it.
+    """
+    out_per_group = 2
+    in_channels = groups * per_group
+    out_channels = groups * per_group * out_per_group
+    model = _grouped(in_channels, out_channels, groups=groups).half()
+    weight = torch.zeros(out_channels, per_group, 3, 3, dtype=torch.float16)
+    for channel in range(out_channels):
+        weight[channel, :, 0, 0] = float(channel % out_per_group + 1) / 8.0
+    model.conv.weight.data = weight
+    model.conv.bias.data = torch.arange(out_channels, dtype=torch.float16) / 16.0
+    x = C._exact((1, in_channels, 6, 6), groups * 17 + per_group, -2, 3)
+    data, _ = C._blob(C._lower(model, (x,)))
+    got = C._run(data, x.numpy()).reshape(out_channels, 6, 6).astype(np.float64)
+    want = model(x).detach().numpy()[0].astype(np.float64)
+    scale = max(1e-9, float(np.abs(want).max()))
+    # A 1x1x1-style accumulation over `per_group` terms in fp16 loses the low
+    # bits of a value that is O(1) per term; the sum of the group is the
+    # difference, and it is what separates this from a mis-ordered group.
+    assert np.abs(got - want).max() / scale < 1e-2, "the answer is not the layout torch has"
+    # The control: swap two groups worth of output channels. If that were as
+    # close as the honest answer, the test above could not tell them apart.
+    swapped = got.copy()
+    swapped[:per_group * out_per_group], swapped[per_group * out_per_group : 2 * per_group * out_per_group] = (
+        got[per_group * out_per_group : 2 * per_group * out_per_group].copy(),
+        got[: per_group * out_per_group].copy(),
+    )
+    assert np.abs(swapped - want).max() / scale > 100 * np.abs(got - want).max() / scale, (
+        "a swapped group is as close to the answer as the honest one, so this "
+        "comparison would pass on a blob that ordered its groups wrongly"
+    )
