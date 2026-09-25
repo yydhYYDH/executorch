@@ -56,10 +56,10 @@ contain the operator, so an emitter would have nothing to call.
 | `aten.erf.default` | No `HtpOpsUnaryOpType` entry: the enum is 1..17 (`unary_ops.cc:14-31`) |
 | `aten.leaky_relu.default`, `aten.elu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no `elu` |
 | `aten.convolution.default` with a group count above 1, not the depthwise form, and a height that is a run-time length | A group count needs no channel mapping on the kernel at all once the host partitions it, so the rest of this family is a supported row: a plain grouped convolution is one dense im2col command per group (`_emit_grouped_convolution` in `hexagon_ops.py`; 48 commands at `groups == 8` over 32 input channels to 64 outputs, `test_grouped_conv.py`), a grouped transposed one is the same partition behind the zero-insert (24 commands at `groups == 4`), and a dilated transposed window keeps its dilation on the kernel, since the im2col walk consumes the fields directly (`conv_spec`, 4 commands at `dilation == 2`). A run-time height is affine in the length for a single walk, which is why a stride-1 plain convolution and the depthwise form both still delegate with one (`test_conv_dynamic_height.py`). It is not affine per group: each group's plane extents and its own slice offsets reach a different command, so the patch would need a record per command rather than the one record the run-time length gets, and the case stays on the portable kernels rather than being emitted with the export's example extent baked in |
-| `aten.conv3d.default`, `aten.conv_transpose3d.input` | `Im2ColParameter` is `padX`, `padY`, `dilateX`, `dilateY`, `strideX`, `strideY`, `kernelX`, `kernelY`, `iw`, `ih`, `ow`, `oh` -- no depth axis exists (`ops.h:45`), so nothing here walks a volume. 3-D is a different kernel rather than another parameter set, and the two-dimensional identity above cannot be stretched to it: EXIR spells both 3-D forms as their own targets, which `CONV_TARGETS` never names |
+| `aten.conv3d.default` with a genuinely three-dimensional window, `aten.conv_transpose3d.input` | `Im2ColParameter` is `padX`, `padY`, `dilateX`, `dilateY`, `strideX`, `strideY`, `kernelX`, `kernelY`, `iw`, `ih`, `ow`, `oh` -- no depth axis exists (`ops.h:45`), so nothing here walks a volume. 3-D is a different kernel rather than another parameter set, and the two-dimensional identity above cannot be stretched to it. A rank-5 input does reach the two-dimensional kernel, but only through the rank-5 fold `conv_spec` already has (`hexagon_ops.py:4327-4370`): the window must be 1x1xK with stride 1, padding 0 and dilation 1 on the dropped axis, that axis must be 1 in input and output, and the other kept extent must be 1 as well -- a 1x1x3 window over `[1, C, 1, 1, W]` delegates as `[24, 3, 12, 3]`, while a 1xKx1 window (`Conv3d(3, 5, (3, 1, 1))` on `[1, 3, 5, 1, 9]`) is refused. `aten.conv_transpose3d.input` is refused for every geometry: the transposed branch returns before the fold. `test_conv_3d.py` pins the refusals and `test_decompose_conv3d.py` the opt-in 1x1xK depthwise rewrite |
 | `aten.upsample_bilinear2d.vec` | No sampling command: `DSPOpType` (`htp_command.h:32`) has no upsample case and no kernel source mentions interpolation, and bilinear is arithmetic rather than an index map -- its taps alternate with the output row's parity, so it is neither a shift-invariant filter nor the constant-kernel transposed convolution that would let the convolution walk carry it. Nearest was in this row and is not any more: at an exact integer ratio its replication is a set of `s * s` destination-phase regions, each an affine map that reads the whole plane at the same strides, so `aten.upsample_nearest2d.vec` is a supported row now (`upsample_regions` in `hexagon_ops.py`). The ratio that is not an integer multiple is a refusal rather than a gap -- the runs of repeated source elements are then of unequal length, so the phases stop being a constant stride apart -- and `test_upsample.py` pins both sides. `nearest-exact` and `upsample_bicubic2d` are not this row at all: export decomposes them into arithmetic, and the nearest-exact spelling reaches the portable kernels on two `aten.arange.start_step` nodes that have no emitter (measured on `interpolate(..., mode="nearest-exact")`) |
 | `aten.repeat.default` with two or more axes above one | One repeated axis is `cat([x] * factor, dim=axis)`: two loops, so one region, with the factor on a level's extent rather than on a region per phase -- which is why a factor of 64 costs the same single region a factor of two does, and why nothing here needs a region count past the one a serialised command already holds. Two repeated axes are four loops against a region's three levels. The host composes them from successive single-axis repeats exactly, so the shape is a refusal rather than a gap, and a refusal rather than a half-applied axis. A zero-filling `constant_pad_nd` was listed here and is not of this kind: it is a `DSP_OP_ZERO` memset plus one region, both already emitted for other ops, so it is a supported row now (`constant_pad_region` in `hexagon_ops.py`). A pad on a third axis from the end, a nonzero `value` and a negative pad still stay on the portable kernels -- the region is three levels and `htp_ops_zero` writes zero and nothing else |
-| `aten.pow.Tensor_Tensor` | No pow kernel, and the unary table's `SQUARE` is exponent 2 only |
+| `aten.pow.Tensor_Tensor` with a base that is not a static value | No pow kernel: the supported exponents lower to the existing unary or binary elementwise commands, and the gate that decides which (`pow_tensor_tensor_is_emittable`) asks for a base the export can read as a value, so a base computed at run time is refused. With a static base and a uniform integral exponent in `{-1, 0, 1, 2, 3, 4}` the node is a supported row; anything outside that set, a non-integral or non-uniform exponent, and a non-finite base stay portable. `test_pow_tensor_tensor.py` covers both sides at the command stream |
 | `aten.clamp.Tensor` | The clamp entry point carries its bounds as two fp16 params, so an operand bound has nowhere to go |
 | `aten.full`, `aten.full_like`, `aten.arange`, `aten.scalar_tensor` | Not kernels: nothing emits a tensor that was not read from memory |
 
@@ -111,9 +111,9 @@ Three rows have left this table, one per merge: `DSP_OP_TOPKV2_K1_FP16`(27) when
 quantized prefill entry, and `DSP_OP_SELECT`(26) with `aten.where.self`. The
 counts above read 21 and 21 where `b7183d9` read 19 and 23: the same table with
 two fewer rows and the command set with two more. Each is worth reading in §3, and
-the two that carry a qualification are there: the prefill entry reaches the int4
-weight and not the int8 one, and `where` is placed while the comparison that
-produces its condition is not.
+the two that carry a qualification are there: the prefill entry reaches
+neither the int4 nor the int8 weight above its measured ceiling, and `where` is
+placed while the comparison that produces its condition is not.
 
 ## 3. One emitter away, inside a family that is already wired
 
@@ -310,11 +310,14 @@ The two gaps that are not of that shape:
 
 - **Quantized prefill.** This was the only functional gap -- the weight-only path
   was `M == 1` only, so a quantized model could decode and not prefill -- and it
-  is now half closed: an int4 weight above one row reaches
-  `DSP_OP_MATMUL_Q4A16_FP16`(22), which is the row that left §2. The half that
-  stays is the int8 weight, whose prefill kernel (42) reads a tile order this tree
-  does not write. Prefill's own evidence is host lowering plus hexagon-sim, at
-  every layer below the device: no timing, and no device.
+  is now closed for both weight widths: an int4 weight above one row reaches
+  `DSP_OP_MATMUL_Q4A16_FP16`(22) and an int8 weight
+  `DSP_OP_MATMUL_W8A16_BLOCK_FP16`(42), which is the second row that left §2,
+  and both go through `_quantized_prefill_fits`, whose first clause admits 4 and
+  8. What stays beside it is a refusal past a measured bound, not a gap:
+  `K <= 12672` below the dispatcher's `M <= 32` split (§4). Prefill's own
+  evidence is host lowering plus hexagon-sim, at every layer below the device:
+  no timing, and no device.
 - **Multimodal.** `vision_attention` is one block of a tower: the patch
   embedding, the layer norms, the MLP and the projection into the text embedding
   space are all still needed, and `DecomposePatchEmbed` covers only the
@@ -352,7 +355,7 @@ The two gaps that are not of that shape:
   GEMV packer as the negative control. That is the simulator and not silicon.
   The int8 tile order the w8a16 prefill kernel reads was checked by nothing until
   the prefill entry was wired: an emitter writes it now, and
-  `test_hexagon_quantizer.py::test_a_w8a16_prefill_matmul_lowers_to_command_42`
+  `test_hexagon_quantizer.py::test_a_w8a16_prefill_matmul_lowers_to_command_42` (M = 8, K = 64, N = 128)
   pins the 29-parameter command 42 body, the tiled weight and the fp16 per-channel
   scale tail, with the int4 geometry as the control that must still emit 22.
   Those are host-lowering facts. The int8 prefill *kernel* is separately reported
@@ -408,10 +411,11 @@ The two gaps that are not of that shape:
   entry is a one-line forward to `hmx_matmul_w8a16_block_fp16`, so what an
   emitter would have to bring is the int8 HMX tile order, not a convolution.
   `reorderInt8SymWeightForHmx` is not in this tree; the int8 packing and the
-  command 42 emitter are on `hexagon-int8prefill` at `9b9e8bf`, and a layout
-  guessed from the kernel's comments would produce plausible wrong numbers,
-  which is the one failure mode this file exists to prevent. It belongs on
-  top of that rebase.
+  command 42 emitter did come with `hexagon-int8prefill` (`9b9e8bf`, merged as
+  `d6b2cf5`), so what an emitter for this row still lacks is the tile reorder
+  itself, and a layout guessed from the kernel's comments would produce
+  plausible wrong numbers, which is the one failure mode this file exists to
+  prevent. It belongs on top of a port of `reorderInt8SymWeightForHmx`.
 
 ## 7. Priority
 
