@@ -115,7 +115,15 @@ def test_tensor_tensor_power_uses_the_bounded_command_subset(exponent):
 def test_tensor_tensor_power_covers_vector_boundaries(length):
     base = (torch.arange(length, dtype=torch.float32) / 8.0 + 0.25).tolist()
     blob, _, commands = _blob_and_commands(StaticPower(base, 2))
-    assert [command.type for command in commands] == [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE]
+    types = [command.type for command in commands]
+    # The contiguous clone the elementwise branch admits writes the lifted
+    # constants with raster blits before the power itself; the power command is
+    # the one binary elementwise here, and nothing else computes.
+    assert types.count(hexagon_ops.DSP_OP_BINARY_ELEMENTWISE) == 1
+    assert set(types) <= {
+        hexagon_ops.DSP_OP_BINARY_ELEMENTWISE,
+        hexagon_ops.DSP_OP_RASTER_BLIT,
+    }
     actual = np.frombuffer(execute(blob, [])[0], dtype=np.float16)[:length]
     reference = torch.pow(
         torch.tensor(base, dtype=torch.float64),
@@ -139,9 +147,14 @@ def test_runtime_base_identity_is_the_only_dynamic_base_case():
     assert any(node.target is POWER for node in inner.original_module.graph_module.graph.nodes)
     assert any(node.name.startswith("base") for node in inner.original_module.graph_module.graph.nodes)
     assert inner_nodes
-    assert [command.type for command in read_blob(bytes(inner._processed_bytes))[1]] == [
-        hexagon_ops.DSP_OP_RASTER_BLIT
+    dynamic_types = [
+        command.type for command in read_blob(bytes(inner._processed_bytes))[1]
     ]
+    # An identity base with a runtime input is a copy, not a power: the delegate
+    # holds the clone blits and the pow node itself stays portable, so the
+    # stream is copies only and no binary elementwise is written for the power.
+    assert dynamic_types
+    assert set(dynamic_types) == {hexagon_ops.DSP_OP_RASTER_BLIT}
 
     refused = _lowered(
         RuntimeBasePower(2.0),
