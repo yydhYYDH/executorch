@@ -1,26 +1,18 @@
 """What the M <= 32 prefill kernel costs in stack, which no other suite sees.
 
-`hmx_matmulq4fp16_mle32_part` builds one DMA descriptor per K/32 step, and at 32
-bytes each that array is exactly K bytes. While it lived on the stack this
-branch's frame grew with K, and the phone aborts on it -- 0x8000040d at K =
-12736, while the M > 32 branch is fine at K = 25216. No host-side test can see
-that, and neither can an ordinary run on the simulator: on its main thread
-K = 12800 returns the right answer whether the array is on the stack or not,
-because that stack is far larger than the phone's.
+The checked-out Q4 small-M source heap-allocates one DMA descriptor per K/32
+step. The historical VLA implementation put the same K-sized array on the
+command thread's stack, where the phone reported a stack failure at larger K.
+This suite compiles the current heap-backed source and supplies an 8 KiB worker
+stack; it verifies that source on a constrained stack, but it does not compile
+or compare a VLA source variant. The M > 32 branch is the control that confirms
+the runner and the stack budget are viable.
 
-So this suite supplies the stack. `sim/prefill_stack_runner.cpp` runs the kernel
-as a job on a one-worker pool built with 8 KiB, while the kernel's own internal
-submits go to the global pool and keep the normal worker stacks -- the phone's
-arrangement, a small stack at the top of the call and ordinary stacks
-underneath. It then runs K = 12800 on both branches: the M > 32 branch, which
-heap-allocates the same array, is the control that shows 8 KiB is a workable
-stack for this path, and the M <= 32 branch is the claim.
-
-Measured before the move and after it: with the array on the stack the
-simulator reports `QuRT error code 0x2701` and a call trace through
-`hmx_matmulq4fp16_mle32` at K = 12672 on this stack, and the process is gone;
-with the array on the heap every shape here returns 0 with every output element
-exactly K.
+`sim/prefill_stack_runner.cpp` runs the kernel as a job on a one-worker pool
+built with 8 KiB, while the kernel's internal submits go to the global pool and
+keep the normal worker stacks. The cases cover small K, the other prefill branch,
+and the Q4 M <= 32 branch at K = 12800. Every current-source case must return 0
+with every output element exactly K.
 """
 
 from __future__ import annotations
@@ -38,8 +30,8 @@ from test_prefill_on_sim import _SOURCES
 
 _RUNNER = pathlib.Path(__file__).resolve().parent / "sim/prefill_stack_runner.cpp"
 
-#: tag, M, K, N, in the order the runner runs them: the case expected to overrun
-#: is last, because a stack fault takes the whole process with it.
+#: tag, M, K, N, in the order the runner runs them: the largest case is last
+#: so a failure identifies the shape that ran last.
 _CASES = [
     ("SMALLK64", 4, 64, 32),
     ("SMALLK512", 4, 512, 32),

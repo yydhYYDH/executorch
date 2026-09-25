@@ -104,16 +104,21 @@ DSP_OP_MATMUL_W8A16_GEMV_I8 = 45
 # allocations around them (output tile buffers, scales, HMX column scales).
 PREFILL_OUTPUT_CHANNEL_CHUNK = 2
 PREFILL_VTCM_FIXED = 64 * 1024
-#: The M the dispatcher switches prefill kernels on (`matmul_ops.cc:28`). The
-#: M <= 32 kernel now uses heap-backed descriptors, and the corrected skel has
-#: answered M=4, K=12800 on the OnePlus 13. The bound below remains conservative
-#: for the host path until a broader device matrix justifies widening it.
+#: The M the dispatcher switches prefill kernels on (`matmul_ops.cc:28`). At or
+#: below it, command 22 selects `hmx_matmulq4fp16_mle32`; the baseline DSP source
+#: now heap-allocates that kernel's per-tile descriptors. The host ceiling below
+#: remains conservative because a stale skel or a rebuild from another base can
+#: still run the former stack allocation; above M=32 only the VTCM bound applies.
 PREFILL_M32_MAX_M = 32
-#: The largest K measured to work at M <= 32 on the OnePlus 13 before the heap
-#: fix: K=12672 answers and K=12800 aborts the DSP process with
-#: `execute_command_group failed: 0x8000040d`. The corrected heap-backed skel
-#: also answered K=12800, but this gate remains in place because that is one
-#: device and one skel result, not a basis for removing the host safety refusal.
+#: The conservative host ceiling for the Q4 command-22 branch at M <= 32.
+#: The original phone measurement found K=12672 pass and K=12736 abort with
+#: `execute_command_group failed: 0x8000040d` and no output, when the DSP used
+#: the former stack-backed descriptor array. The baseline source now allocates
+#: those descriptors on the heap, and a later OnePlus 13 A/B at K=25216 passed
+#: for M=2, 4, and 32. This host refusal nevertheless remains: deployment does
+#: not encode source provenance, so a stale skel can still carry the VLA. The
+#: constant is not a claim that K=12672 is the largest shape the heap kernel can
+#: compute; widening it requires a matched rebuild and a broader measured matrix.
 PREFILL_M32_MAX_K = 12672
 #: The VTCM the prefill kernels may reserve. The simulator reports 8 MiB
 #: (`vtcm_manager_get_vtcm_size`) and the kernels' own guard is 8 MiB less
