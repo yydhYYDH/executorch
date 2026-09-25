@@ -23,11 +23,14 @@ that kernel over a view the op's own definition already names:
   row per `(batch, channel)` of an `[N*C][H*W]` view.
 
 Neither command carries a weight: the kernel's `gamma` operand is left null, as
-it is on the layer-norm path, and the affine is emitted as the two element-wise
-commands that op spends on its own. So a group norm is three commands and an
-instance norm is three, and what these tests pin is the view each one reduces
-over, the gate that keeps the ones the view cannot describe on the portable
-kernels, and the numbers.
+it is on the layer-norm path, and the affine is emitted as the element-wise
+commands that op spends on its own. A group norm is three commands. An instance
+norm is five once `aten.repeat.default` became a supported row: the two graph
+repeats that give every `(batch, channel)` row its weight and bias are walked
+inside the region list, so they arrive as two leading raster blits, and the
+delegate takes one input rather than three. What these tests pin is the view
+each norm reduces over, the gate that keeps the ones the view cannot describe on
+the portable kernels, and the numbers.
 """
 
 import operator
