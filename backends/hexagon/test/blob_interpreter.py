@@ -67,6 +67,7 @@ FP16_BYTES = 2
 SOFTMAX = 28
 REDUCTION = 29
 TOPKV2_K1_FP16 = 27
+ARGMAX_FP16 = 47
 
 #: HtpOpsReductionOpType.
 REDUCTION_SUM = 1
@@ -726,7 +727,7 @@ def _fast_logf(x):
     out = np.full(values.shape, _f32(-65504.0), dtype=np.float32)
     positive = values > _f32(0.0)
     bits = np.ascontiguousarray(values[positive]).view(np.uint32)
-    exponent = (((bits >> np.uint32(23)) & np.uint32(0xFF)).astype(np.int32) - 127)
+    exponent = ((bits >> np.uint32(23)) & np.uint32(0xFF)).astype(np.int32) - 127
     mantissa = ((bits & np.uint32(0x007FFFFF)) | np.uint32(0x3F800000)).view(np.float32)
     big = mantissa > _f32(1.41421356237)
     mantissa = np.where(big, mantissa * _f32(0.5), mantissa)
@@ -950,7 +951,11 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
     at = np.arange(out_size) * cond_step
     on = np.zeros(out_size, dtype=np.intp) if in1_size == 1 else np.arange(out_size)
     off = np.zeros(out_size, dtype=np.intp) if in2_size == 1 else np.arange(out_size)
-    _store(arena, arena.address(out_ref), np.where(cond[at] != 0, in1[on], in2[off]).tobytes())
+    _store(
+        arena,
+        arena.address(out_ref),
+        np.where(cond[at] != 0, in1[on], in2[off]).tobytes(),
+    )
 
 
 def _run_conv_depthwise2d(command: Command, params: List[int], arena: Arena) -> None:
@@ -1291,9 +1296,7 @@ def _run_topk(command: Command, params: List[int], arena: Arena) -> None:
     row_size, rows = params[0], params[1]
     src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
     if src.size < rows * row_size:
-        raise UnsupportedOp(
-            f"blob: {src.size} values do not fill [{rows}][{row_size}]"
-        )
+        raise UnsupportedOp(f"blob: {src.size} values do not fill [{rows}][{row_size}]")
     row_major = np.ascontiguousarray(src[: rows * row_size].reshape(rows, row_size))
     # The vector walk is a vmax over the row and the scalar tail only replaces a
     # running maximum with something strictly greater, so a NaN never wins.
@@ -1303,6 +1306,42 @@ def _run_topk(command: Command, params: List[int], arena: Arena) -> None:
     first = (row_major.view(np.uint16) == best.view(np.uint16)[:, None]).argmax(axis=1)
     _store(arena, arena.address(command.outputs[0]), best.tobytes())
     _store(arena, arena.address(command.outputs[1]), first.astype(np.int32).tobytes())
+
+
+def _run_arg_reduction(command: Command, params: List[int], arena: Arena) -> None:
+    """One int64 argmax/argmin position per contiguous fp16 row.
+
+    The model intentionally chooses the first NaN, matching the CPU ATen
+    reference used by this backend's tests, and treats both signed zeroes as a
+    tie. Otherwise the vector max/min walk and the scalar strict tail choose the
+    first matching bit pattern, just like the DSP helper.
+    """
+    row_size, rows, is_min = params[:3]
+    if row_size <= 0 or rows <= 0 or is_min not in (0, 1):
+        raise UnsupportedOp("blob: invalid arg-reduction geometry")
+    src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    if src.size < rows * row_size:
+        raise UnsupportedOp(f"blob: {src.size} values do not fill [{rows}][{row_size}]")
+    rows_view = np.ascontiguousarray(src[: rows * row_size].reshape(rows, row_size))
+    out = np.empty(rows, dtype=np.int64)
+    for row_index, row in enumerate(rows_view):
+        bits = row.view(np.uint16)
+        nan_positions = np.flatnonzero(
+            ((bits & 0x7C00) == 0x7C00) & ((bits & 0x03FF) != 0)
+        )
+        if nan_positions.size:
+            out[row_index] = nan_positions[0]
+            continue
+        if is_min:
+            best = np.min(row)
+        else:
+            best = np.max(row)
+        if (np.asarray(best).view(np.uint16) & 0x7FFF) == 0:
+            out[row_index] = np.flatnonzero((bits & 0x7FFF) == 0)[0]
+        else:
+            best_bits = np.asarray(best).view(np.uint16)
+            out[row_index] = np.flatnonzero(bits == best_bits)[0]
+    _store(arena, arena.address(command.outputs[0]), out.astype("<i8").tobytes())
 
 
 def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
@@ -1833,6 +1872,7 @@ _EXECUTORS = {
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,
     TOPKV2_K1_FP16: _run_topk,
+    ARGMAX_FP16: _run_arg_reduction,
     UNARY: _run_unary,
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,

@@ -24,10 +24,12 @@ from executorch.backends.hexagon.hexagon_ops import (
     add_rms_norm_is_emittable,
     ADDMM_TARGETS,
     ALIAS_TARGETS,
-    BATCH_NORM_TARGETS,
+    arg_reduction_is_emittable,
+    ARG_REDUCTION_TARGETS,
     batch_norm_getitem,
     batch_norm_is_emittable,
     batch_norm_normalizes_one_span,
+    BATCH_NORM_TARGETS,
     BINARY_TARGETS,
     BMM_TARGETS,
     CAST_TARGETS,
@@ -42,16 +44,16 @@ from executorch.backends.hexagon.hexagon_ops import (
     gather_table,
     GATHER_TARGETS,
     GETITEM,
-    GROUP_NORM_TARGETS,
     group_norm_getitem,
     group_norm_is_emittable,
     group_norm_normalizes_one_group_per_row,
+    GROUP_NORM_TARGETS,
     LAYER_NORM,
     layer_norm_getitem,
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
-    LOG_SOFTMAX_TARGETS,
     log_softmax_shifts_within_the_arena,
+    LOG_SOFTMAX_TARGETS,
     MAX_DIM,
     max_dim_getitem,
     max_dim_is_emittable,
@@ -618,7 +620,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
             _note_unwired_target(node)
             return False
         dtype = _dtype_of(node)
-        if dtype not in (torch.float16, torch.float32):
+        if node.target in ARG_REDUCTION_TARGETS:
+            if dtype is not torch.int64 or not arg_reduction_is_emittable(node):
+                # An index result is int64 and the row command writes that width
+                # directly. This gate must run before the generic fp16/fp32
+                # result check, which would otherwise reject every valid index
+                # before it reaches the row-geometry predicate.
+                return False
+        elif dtype not in (torch.float16, torch.float32):
             # Both widths the arena holds are emittable: every kernel reads and
             # writes two bytes per element, the runtime narrows a fp32 operand on
             # the way in and widens a fp32 result on the way out, so one declared
@@ -762,8 +771,9 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in SOFTMAX_TARGETS and not softmax_reduces_the_inner_axis(node):
             return False
-        if node.target in LOG_SOFTMAX_TARGETS and not log_softmax_shifts_within_the_arena(
-            node
+        if (
+            node.target in LOG_SOFTMAX_TARGETS
+            and not log_softmax_shifts_within_the_arena(node)
         ):
             # The emitted composition sums at most one per element into an fp16,
             # so a span the export knows to be longer than 65504 would saturate

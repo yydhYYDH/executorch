@@ -293,10 +293,22 @@ _ROWS = [
     ),
     # --- argmax / argmin / topk / sort: index-producing reductions -----------
     (
-        "argmax",
-        lambda a: torch.argmax(a, dim=1),
+        "argmax over the last axis delegates",
+        lambda a: torch.argmax(a, dim=-1),
         (_x(2, 3),),
-        [("aten.argmax.default", "unwired")],
+        [("aten.argmax.default", "wired")],
+    ),
+    (
+        "argmin over the last axis delegates",
+        lambda a: torch.argmin(a, dim=-1),
+        (_x(2, 3),),
+        [("aten.argmin.default", "wired")],
+    ),
+    (
+        "argmax over another axis is refused",
+        lambda a: torch.argmax(a, dim=0),
+        (_x(2, 3),),
+        [("aten.argmax.default", "refused")],
     ),
     (
         "topk",

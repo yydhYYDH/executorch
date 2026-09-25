@@ -105,6 +105,8 @@ extern "C" int htp_ops_shared_gather(uint8_t *dst, uint8_t *indices, uint8_t *we
 extern "C" int htp_ops_topkv2_k1_fp16(uint8_t *values, uint8_t *indices,
                                       uint8_t *input, int32_t rowSize,
                                       int32_t rows);
+extern "C" int htp_ops_argmax_fp16(uint8_t *indices, const uint8_t *input,
+                                   int32_t rowSize, int32_t rows, int32_t is_min);
 /* The element-wise select. Its condition is the one operand this backend hands a
  * kernel that is not two bytes wide: condBytes is a parameter of its own, and the
  * kernel reads the condition at that width (eltwise_ops.cc:2116). */
@@ -164,6 +166,7 @@ enum {
   kQ4A16Gemv = 41,
   kVisionAttention = 43,
   kW8A16Gemv = 45,
+  kArgmaxFp16 = 47,
 };
 
 /* The three unary types that arrive at an entry point of their own, from
@@ -286,6 +289,20 @@ static bool load_patches(const uint8_t *blob, const HexagonBlobHeader *header,
   return true;
 }
 
+static bool is_arg_reduction_output(const HexagonOp *ops, uint32_t n_ops,
+                                     const HexagonTensorRef &ref) {
+  for (uint32_t i = 0; i < n_ops; ++i) {
+    if (ops[i].type != kArgmaxFp16) continue;
+    for (uint32_t k = 0; k < ops[i].n_outputs; ++k) {
+      const HexagonTensorRef &out = ops[i].outputs[k];
+      if (out.space == ref.space && out.index == ref.index &&
+          out.offset == ref.offset && out.size == ref.size)
+        return true;
+    }
+  }
+  return false;
+}
+
 static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                        uint32_t op_index) {
   int32_t params[kMaxOpParams];
@@ -381,6 +398,13 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                                      address(header, op.inputs[0]), params[0],
                                      params[1]);
     if (ret != 0) printf("%s topk returned %d\n", g_tag, ret);
+    return;
+  }
+  if (op.type == kArgmaxFp16) {
+    int ret = htp_ops_argmax_fp16(address(header, op.outputs[0]),
+                                  address(header, op.inputs[0]), params[0],
+                                  params[1], params[2]);
+    if (ret != 0) printf("%s argmax returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kSharedGather) {
@@ -567,9 +591,21 @@ static int run_blob(const unsigned char *blob, uint64_t blob_bytes, uint8_t *are
     }
     const uint8_t *raw = address(header, *ref);
     printf("%s%u", tag, index);
-    /* Little-endian, so print the high byte first to show the fp16 value. */
-    for (uint64_t b = 0; b + 1 < ref->size; b += 2)
-      printf(" %02x%02x", raw[b + 1], raw[b]);
+    /* Existing fixtures decode 16-bit words. An arg-reduction output is
+     * little-endian int64, so print each complete value as one 64-bit hex
+     * word; the Python fixture decoder reads these without float rounding. */
+    const bool int64_output = is_arg_reduction_output(ops, header->n_ops, *ref);
+    if (int64_output) {
+      for (uint64_t b = 0; b + 7 < ref->size; b += 8) {
+        uint64_t word = 0;
+        for (uint64_t byte = 0; byte < 8; ++byte)
+          word |= (uint64_t)raw[b + byte] << (8 * byte);
+        printf(" %016llx", (unsigned long long)word);
+      }
+    } else {
+      for (uint64_t b = 0; b + 1 < ref->size; b += 2)
+        printf(" %02x%02x", raw[b + 1], raw[b]);
+    }
     printf("\n");
   }
   return 0;

@@ -56,6 +56,9 @@ W8A16_GEMV = "DSP_OP_MATMUL_W8A16_GEMV_I8"
 # of a GEMV, with a blit either side for the activation and output layouts. The
 # int8 weight has no such entry, so a w8a16 matmul stays portable above one row.
 Q4A16_PREFILL = "DSP_OP_MATMUL_Q4A16_FP16"
+# The row-wise arg-reduction command. It writes one int64 index per row and
+# takes a mode parameter for min versus max.
+ARG_REDUCTION = "DSP_OP_ARGMAX_FP16"
 # The row gather. One command reads a run of rows out of a fp16 table whose
 # bytes the export step rearranged into the 32x32 tiles the kernel walks.
 SHARED_GATHER = "DSP_OP_SHARED_GATHER"
@@ -382,6 +385,25 @@ SUPPORTED: List[OpSupport] = [
         "other half goes to a scratch activation the kernel dereferences and "
         "nothing reads. The values carry the signed-zero and NaN caveat "
         "max.default has.",
+    ),
+    OpSupport(
+        "aten.argmax.default",
+        ARG_REDUCTION,
+        "fp16 input; int64 output",
+        "Contiguous static fp16 input with positive extents. A no-dim form flattens "
+        "to one row; a dim form must reduce the last axis. The command writes "
+        "one int64 index per row, resolves ordinary ties and signed-zero ties to "
+        "the first occurrence, and chooses the first NaN as CPU torch does. Other "
+        "axes, non-contiguous inputs, symbolic or scalar inputs, and non-fp16 "
+        "inputs stay portable.",
+    ),
+    OpSupport(
+        "aten.argmin.default",
+        ARG_REDUCTION,
+        "fp16 input; int64 output",
+        "The same contiguous static fp16 geometry as argmax.default, with the "
+        "command's min mode. It writes int64 positions and preserves the same "
+        "first-tie, signed-zero, and first-NaN semantics.",
     ),
     OpSupport(
         "aten.relu.default",
@@ -903,8 +925,10 @@ NOT_SUPPORTED = [
         "reach the covered targets instead.",
     ),
     (
-        "aten.argmax.default / aten.argmin.default",
-        "A reduction kernel that returns values and no positions.",
+        "aten.argmax.default / aten.argmin.default outside the supported "
+        "contiguous-last-axis fp16 geometry",
+        "The arg-reduction command has one row walk and no general-axis or layout "
+        "conversion; unsupported forms stay on portable kernels.",
     ),
     (
         "aten.sort.default",
@@ -1083,6 +1107,7 @@ PREDICATES = [
     "max_pool_is_emittable",
     "max_dim_is_emittable",
     "topk_is_emittable",
+    "arg_reduction_is_emittable",
     "where_is_emittable",
 ]
 

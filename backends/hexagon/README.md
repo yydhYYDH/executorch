@@ -425,11 +425,18 @@ Things that bite:
 - **The reduction enum has no minimum.** `HtpOpsReductionOpType` is `sum = 1,
   maximum = 2, mean = 3` (`eltwise_ops.cc:2441-2445`) and the dispatcher rejects
   every other value, so `aten.amin` is not reachable by writing an emitter: it
-  needs a kernel that does not exist, and stays on the portable kernels.
-  `argmax`/`argmin` are in the same position, since the kernel returns values
-  only. Sum and maximum are one command each, over a single contiguous span of
-  the buffer, and `torch.mean(x)` is the widest span of the same kind:
-  `[1][numel][1]`, which is the kernel's `inside == 1` path.
+  needs a kernel that does not exist, and stays on the portable kernels. The
+  row-wise `DSP_OP_ARGMAX_FP16` command is a separate position kernel: it reads
+  contiguous fp16 rows and writes one int64 index per row, with max/min selected
+  by its third parameter. `argmax`/`argmin` are therefore wired for a no-dim
+  flattened reduction or the last axis only; other axes, non-contiguous inputs,
+  non-fp16 inputs, scalar or empty tensors, and symbolic extents stay portable.
+  The command resolves ordinary and signed-zero ties to the first occurrence and
+  returns the first NaN, matching the CPU Torch index semantics measured by the
+  focused host, simulator, and device probes. Sum and maximum are one command
+  each, over a single contiguous span of the buffer, and `torch.mean(x)` is the
+  widest span of the same kind: `[1][numel][1]`, which is the kernel's `inside == 1`
+  path.
 - **`fmod` is the truncated remainder, `remainder` is not.** `HTP_OPS_BINARY_MOD`
   computes `a - trunc(a/b)*b` with a zero divisor answering zero
   (`eltwise_ops.cc:148-166`), which is torch's `fmod`; the floored remainder
