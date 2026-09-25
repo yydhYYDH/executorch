@@ -114,13 +114,6 @@ _GAPS = [
         "aten.pow.Scalar",
     ),
     (
-        "a tensor raised to a tensor",
-        lambda a, b: a**b,
-        _XY,
-        "aten::pow",
-        "aten.pow.Tensor_Tensor",
-    ),
-    (
         "truncated division",
         lambda a, b: torch.div(a, 2.0, rounding_mode="trunc"),
         _XY,
