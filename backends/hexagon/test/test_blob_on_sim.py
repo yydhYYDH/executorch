@@ -161,14 +161,19 @@ _LOG_SOFTMAX_TOLERANCE = 1e-2
 
 #: Measured, not assumed. htp_ops_softmax exponentiates with hvx_my_exp2_vhf, a
 #: degree-six polynomial in fp16 evaluated with qfloat multiplies, and divides by
-#: an approximate reciprocal refined once. On this input its answer is off by
-#: 0.063 while still summing to one along the reduced axis -- the shape of the
-#: distribution moves, not its mass. Transcribing that polynomial in ordinary
-#: fp16 lands further from the kernel than the exact exponential does, so the
-#: rounding mode is load bearing and the exact value is not recoverable on the
-#: host. What this tolerance still catches is a wrong axis, a wrong decomposition
-#: or a wrong offset, none of which move an output by 0.08.
-_SOFTMAX_TOLERANCE = 0.08
+#: an approximate reciprocal refined once. On the old channel-6 H fixture its
+#: answer is off by 0.063 while still summing to one along the reduced axis -- the
+#: shape of the distribution moves, not its mass. Transcribing that polynomial in
+#: ordinary fp16 lands further from the kernel than the exact exponential does, so
+#: the rounding mode is load bearing and the exact value is not recoverable on
+#: the host. This ceiling is only a simulator regression threshold for that
+#: fixture; it catches a wrong axis, decomposition or offset, none of which move
+#: an output by 0.08. It is not a hardware accuracy bound and may not certify the
+#: old strided device path, which reached 1.12e-1, or be reused for the new direct
+#: middle-axis path. The latter's current isolated device evidence supports only a
+#: provisional 1e-3 absolute bound, with worst 2.870e-4; that is pending a broader
+#: device matrix and is not a theorem.
+_OLD_STRIDED_SOFTMAX_H_SIM_TOLERANCE = 0.08
 
 #: htp_ops_reduction sums in fp32 like numpy does, so the two agree to the last
 #: bit of the fp16 store except for one denormal: the kernel's scalar path
@@ -1490,7 +1495,7 @@ def _cases():
         (wide,),
         _bits(torch.softmax(wide.float(), 1)),
         kind="close",
-        tolerance=_SOFTMAX_TOLERANCE,
+        tolerance=_OLD_STRIDED_SOFTMAX_H_SIM_TOLERANCE,
     )
     middle_axis_softmax = []
     for tag, shape in (
@@ -1678,7 +1683,7 @@ def _cases():
     # and the sum before the shift -- are separated from it in
     # test_log_softmax.py instead, because the first cannot be compared bit for
     # bit here: the softmax command's own exponential is the one kernel the host
-    # model does not reproduce (see _SOFTMAX_TOLERANCE).
+    # model does not reproduce (see _OLD_STRIDED_SOFTMAX_H_SIM_TOLERANCE).
     saturated = _saturated_logits((4, 16))
     saturated_log_softmax = _case(
         "CP",
