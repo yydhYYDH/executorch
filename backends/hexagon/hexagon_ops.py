@@ -263,6 +263,14 @@ BATCH_NORM_TARGETS = frozenset({BATCH_NORM_NO_STATS})
 # is an infinity rather than a large negative number.
 LOG_SOFTMAX_MAX_SPAN = 65504
 
+# The row width one HVX vector holds, and the width at which the standalone
+# softmax kernel stops agreeing with torch. The kernel walks a row in chunks of
+# this many fp16 lanes and then finishes it with a tail it copies in and masks;
+# the tail is within rounding of torch and the chunked part is not (see
+# `_emit_softmax`), so a row shorter than one vector -- which is all tail -- is
+# the only width the command is used at.
+SOFTMAX_VECTOR_WIDTH = 64
+
 
 def softmax_reduces_the_inner_axis(node: torch.fx.Node) -> bool:
     """Whether this is the last-axis softmax the DSP kernel is right for.
@@ -4583,6 +4591,29 @@ def _emit_mean_default(node: torch.fx.Node, ctx) -> TensorRef:
 
 
 def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
+    """One command for a row the kernel is right for, five for a wider row.
+
+    The vendored kernel is wrong for rows longer than one HVX vector, and it is
+    wrong inside its exponential rather than in its arithmetic: its vector loop
+    computes exp2 of `(x - max) * log2e` about 1.76x too large once the argument's
+    fractional part passes 0.35, while the tail it copies in and masks answers the
+    same argument within an fp16 ulp. On the device, a (3, 197, 197) softmax over
+    uniform logits came back wrong on 116284 of 116427 elements, mean relative
+    error 9.6%, row sums still one, and the last five columns -- the tail -- clean;
+    at 63 columns, where the whole row is the tail, the same kernel is within
+    rounding, and at 64, where the whole row is the chunked part, it is not.
+
+    So the command is kept for the rows it is measured right for and the wider
+    ones are written as the same log-sum-exp the log_softmax emitter uses, with a
+    division where that one has a log: the maximum, the shift, the exponential,
+    the sum of at most ones, and the division by it. Five commands, no new kernel,
+    and the same three kernels -- the reduction, the unary table and the
+    element-wise op -- the shifted form is already measured on.
+
+    The composition needs the shift for the same reason the log_softmax one does:
+    without it, a logit above 11 overflows the fp16 exponential, and the answer
+    is a row of infinities.
+    """
     src = node.args[0]
     _require_arena_dtype(node, "softmax input")
     dim = int(node.args[1])
@@ -4595,21 +4626,80 @@ def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
     inside = _upper_product(shape[dim + 1 :], ctx)
 
     numel = _numel(node)
-    out = ctx.result_for(node, numel)
-    op_index = ctx.emit(
+    if channel < SOFTMAX_VECTOR_WIDTH:
+        out = ctx.result_for(node, numel)
+        op_index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_SOFTMAX,
+                inputs=[ctx.operand(src)],
+                outputs=[out],
+                # The DSP reduces the middle axis of an [outside][channel][inside]
+                # view, so the reduction dim is described by its strides.
+                params=[outside, channel, inside, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, op_index, shape[:dim], 0)
+        _patch_dynamic_product(ctx, op_index, [shape[dim]], 1)
+        _patch_dynamic_product(ctx, op_index, shape[dim + 1 :], 2)
+        return ctx.record(node, out)
+
+    outer_shape = shape[:dim]
+    span = shape[dim : dim + 1]
+    inside_shape = shape[dim + 1 :]
+    reduced_shape = outer_shape + [1] + inside_shape
+    span_upper = channel
+
+    def reduce_spans(kind: int, source, out_) -> int:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_REDUCTION,
+                inputs=[source],
+                outputs=[out_],
+                params=[outside, span_upper, inside, kind, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, outer_shape, 0)
+        _patch_dynamic_product(ctx, index, span, 1)
+        _patch_dynamic_product(ctx, index, inside_shape, 2)
+        return index
+
+    maximum = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_MAXIMUM, ctx.operand(src), maximum)
+
+    shifted = ctx.activation_for_shape(shape)
+    _emit_elementwise(
+        node, ctx, ctx.operand(src), maximum, "sub", shape, reduced_shape, shape, shifted
+    )
+
+    exponentials = ctx.activation_for_shape(shape)
+    exp_index = ctx.emit(
         node,
         Op(
-            type=DSP_OP_SOFTMAX,
-            inputs=[ctx.operand(src)],
-            outputs=[out],
-            # The DSP reduces the middle axis of an [outside][channel][inside]
-            # view, so the reduction dim is described by its strides.
-            params=[outside, channel, inside, FP16_BYTES],
+            type=DSP_OP_UNARY,
+            inputs=[shifted],
+            outputs=[exponentials],
+            params=[numel, UNARY_OP_TYPES["exp"], FP16_BYTES],
         ),
     )
-    _patch_dynamic_product(ctx, op_index, shape[:dim], 0)
-    _patch_dynamic_product(ctx, op_index, [shape[dim]], 1)
-    _patch_dynamic_product(ctx, op_index, shape[dim + 1 :], 2)
+    _patch_dynamic_product(ctx, exp_index, shape, 0)
+
+    total = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_SUM, exponentials, total)
+
+    out = ctx.result_for(node, numel)
+    _emit_elementwise(
+        node,
+        ctx,
+        exponentials,
+        total,
+        "div",
+        shape,
+        reduced_shape,
+        shape,
+        out,
+    )
     return ctx.record(node, out)
 
 

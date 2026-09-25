@@ -488,11 +488,17 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten._softmax.default",
-        SOFTMAX,
+        f"{SOFTMAX} / {REDUCTION} / {BINARY} / {UNARY}",
         ARENA_FP16,
         "Last axis only. The kernel's strided reduction over any other axis "
         "disagrees with torch on hardware, so softmax_reduces_the_inner_axis keeps "
-        "those nodes portable.",
+        "those nodes portable. A row shorter than one HVX vector -- 64 fp16 lanes -- "
+        "is the SOFTMAX command; a longer one is the shifted sum of exponentials "
+        "instead: the maximum over the row, the shift, the exponential, the sum of "
+        "at most ones and the division by it. The standalone command's vector loop "
+        "answers its exponential up to 1.76x the correctly rounded value, as a "
+        "function of the argument's fractional part, where its tail path, which is "
+        "all of a row shorter than a vector, is within rounding.",
     ),
     # --- norms -----------------------------------------------------------
     OpSupport(
