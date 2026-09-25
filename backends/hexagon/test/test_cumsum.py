@@ -365,6 +365,62 @@ def test_the_scan_is_the_prefix_in_order_and_the_carry_adds_to_it():
     )
 
 
+def test_the_orientation_is_pinned_by_the_answer_and_not_by_the_plan():
+    """Which assertion carries the orientation: this one.
+
+    The other controls in this file all perturb the carry, and none of them can
+    catch a flipped triangle, because a flipped mask emits the same [38] and
+    the same descriptor. The plan cannot see orientation at all, so orientation
+    is pinned here, against the answer: the blob's output is the prefix and is
+    not the suffix. A flipped emitter makes the first assertion fail.
+    """
+    x = _random((4, 64), 19)
+    blob, commands = _blob(_program(_PlainCumsum(), (x,), passes=[FuseCumsumPass()]))
+    assert [c.type for c in commands] == [_BATCH_MATMUL]
+    (got,) = _run(blob, (x,))
+    answer = got.reshape(4, 64).astype(np.float64)
+
+    prefix = torch.cumsum(x, dim=-1).double().numpy()
+    suffix = (x.double() @ torch.tril(torch.ones(64, 64, dtype=torch.float64))).numpy()
+    assert np.array_equal(answer, prefix), (
+        f"the blob is not the prefix; it is off by {np.abs(answer - prefix).max()}"
+    )
+    assert not np.allclose(answer, suffix), (
+        "the blob is the suffix sum, which is what a lower-triangular mask computes"
+    )
+    # And the two are far enough apart that no tolerance could confuse them.
+    assert np.abs(prefix - suffix).max() > 1.0
+
+
+def test_the_orientation_assertion_goes_red_when_the_triangle_flips(monkeypatch):
+    """The mutation probe: flip the emitter's mask and the assertion above fails.
+
+    A control that cannot be shown to go red is not a control. This makes the
+    orientation assertion load-bearing by construction: `torch.triu` is what
+    `_emit_cumsum` builds the mask with, and replacing it with `torch.tril`
+    in place produces a real blob that no plan check can distinguish and that
+    this answer check rejects.
+    """
+    x = _random((4, 64), 19)
+    # Built before the patch, because the patch redirects torch.tril as well.
+    # Rounded to fp16 because that is what the blob stores: this is comparing
+    # the orientation, not re-measuring the accumulator.
+    suffix = (x.double() @ torch.tril(torch.ones(64, 64, dtype=torch.float64))).half()
+    suffix = suffix.double().numpy()
+    prefix = torch.cumsum(x, dim=-1).double().numpy()
+    monkeypatch.setattr(torch, "triu", torch.tril)
+    blob, commands = _blob(_program(_PlainCumsum(), (x,), passes=[FuseCumsumPass()]))
+    # The plan is unchanged by the flip, which is the whole reason the
+    # orientation needs its own assertion.
+    assert [c.type for c in commands] == [_BATCH_MATMUL]
+    (got,) = _run(blob, (x,))
+    flipped = got.reshape(4, 64).astype(np.float64)
+    assert not np.array_equal(flipped, prefix), (
+        "the flipped mask still matched the prefix, so the orientation check is vacuous"
+    )
+    assert np.array_equal(flipped, suffix), "the flipped mask is not the suffix sum"
+
+
 def test_the_lower_triangle_would_be_the_reverse_scan():
     """Why the mask is the upper triangle, as a statement the numbers carry.
 
