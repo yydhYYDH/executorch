@@ -8,7 +8,6 @@
 """Run the emitted Conv1d blob's command stream on the Hexagon simulator."""
 
 import os
-import pathlib
 import sys
 from types import SimpleNamespace
 
