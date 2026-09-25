@@ -292,6 +292,13 @@ class _MeanAt(torch.nn.Module):
         return torch.mean(x, dim=-1)
 
 
+class _Add(torch.nn.Module):
+    """A two-operand add, which is the op a broadcast is asked about."""
+
+    def forward(self, x, y):
+        return x + y
+
+
 class _Narrow(torch.nn.Module):
     """Pick one entry along an axis that has more than one.
 
@@ -1373,6 +1380,22 @@ def _cases():
         tolerance=_MEAN_TOLERANCE,
     )
 
+    # A rank-8 broadcast: the rightmost axis is 8 wide, so the kernel's rowwise fast
+    # path is reachable, and every axis above it is 1, so the stride tables have to
+    # read as 0 there rather than as the axis length. `_small` keeps the sums exact,
+    # so this compares bits rather than tolerances.
+    # "BS" rather than the next free pair: "BF" is the relu6 clamp at 32 elements
+    # in the NaN sweep below, and two fixtures sharing a tag means the runner
+    # prints one answer and the suite reads it twice.
+    rank8_left = _small((2, 1, 1, 1, 1, 1, 2, 8))
+    rank8_right = _small((1, 1, 1, 1, 1, 1, 1, 1))
+    broadcast = _case(
+        "BS",
+        _Add(),
+        (rank8_left, rank8_right),
+        _bits(rank8_left.float() + rank8_right.float()),
+    )
+
     pick = _small((1, 4, 8))
     narrowed = _case("J", _Narrow(), (pick,), _bits(_Narrow()(pick)))
 
@@ -1530,6 +1553,7 @@ def _cases():
         scale,
         softmax,
         mean,
+        broadcast,
         narrowed,
         gated,
         absorbed,
