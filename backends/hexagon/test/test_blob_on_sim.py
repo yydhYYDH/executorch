@@ -141,6 +141,8 @@ _SOURCES = [
     # cases establish is that the first output really is a maximum per row and
     # that the two extents in the command are the ones the layout has.
     "topk_ops.cc",
+    # Tensor-tensor power is composed from the existing binary elementwise
+    # kernel; no additional DSP source is needed for these integer cases.
     # The kernels above call htp_probe_stage, which the device build defines in
     # execute_command.cc -- a translation unit with the whole op table behind it,
     # so the probe is linked on its own here. It is a trace hook and every kernel

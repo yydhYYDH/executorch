@@ -14,6 +14,7 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.backends.hexagon.hexagon_backend import (
     HexagonBackend,
     HexagonCompileOptions,
+    owned_weight,
     SUPPORTED_TARGETS,
 )
 from executorch.backends.hexagon.hexagon_ops import (
@@ -74,6 +75,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     pool_spec,
     POOL_TARGETS,
     pow_is_square,
+    pow_tensor_tensor_is_emittable,
+    POW_TENSOR_TENSOR_TARGETS,
     quantized_matmul_is_refused,
     reduction_dims,
     REDUCTION_TARGETS,
@@ -585,7 +588,11 @@ class HexagonOperatorSupport(OperatorSupportBase):
     whereas one rejected while emitting fails the whole export.
     """
 
-    def __init__(self, data_names: Optional[frozenset] = None) -> None:
+    def __init__(
+        self,
+        data_names: Optional[frozenset] = None,
+        program: Optional[ExportedProgram] = None,
+    ) -> None:
         # The placeholders the program owns rather than the caller handing them
         # in, which is the question a row gather's table has to answer. Without
         # the program there is no way to tell one from a method input, and the
@@ -593,6 +600,9 @@ class HexagonOperatorSupport(OperatorSupportBase):
         # object built without these refuses every op whose weight has to be
         # read at export, which is why the partitioner passes the program's own.
         self.data_names = frozenset(data_names or ())
+        self.program = program
+        self._constant_values = {}
+        self._constant_values_loaded = False
 
     def is_data_placeholder(self, node: torch.fx.Node) -> bool:
         """Whether this operand is a parameter, buffer or lifted constant."""
@@ -677,6 +687,17 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # Only x ** 2 maps to the unary square kernel; another exponent is a
             # different function, not a narrower command.
             return False
+        if node.target in POW_TENSOR_TENSOR_TARGETS:
+            if self.program is None:
+                return False
+            if not self._constant_values_loaded:
+                self._constant_values_loaded = True
+                for arg in self.program.graph_module.graph.nodes:
+                    value = owned_weight(self.program, arg)
+                    if value is not None:
+                        self._constant_values[arg] = value
+            if not pow_tensor_tensor_is_emittable(node, self._constant_values):
+                return False
         if node.target in REDUCTION_TARGETS:
             # One contiguous span, the same shape rule mean has; sum additionally
             # has to be the fp16 sum, since the kernel's accumulator is fp32 and
@@ -972,7 +993,7 @@ class HexagonPartitioner(Partitioner):
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         graph_module = exported_program.graph_module
-        support = HexagonOperatorSupport(_data_placeholders(exported_program))
+        support = HexagonOperatorSupport(_data_placeholders(exported_program), exported_program)
 
         supported = [
             node
