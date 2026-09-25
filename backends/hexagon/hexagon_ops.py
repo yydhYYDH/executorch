@@ -2134,6 +2134,8 @@ def pack_q4a16_gemv_weight(weight, scale, k: int, n: int) -> bytes:
     scales = np.asarray(scale, dtype=np.float32).reshape(-1)
     if scales.size != n:
         raise RuntimeError(f"hexagon: q4a16 has {scales.size} scales, expected {n}")
+    if (w < -8).any() or (w > 7).any():
+        raise RuntimeError("hexagon: q4a16 weight contains values outside [-8, 7]")
     return tiles + scales.tobytes()
 
 
@@ -2178,6 +2180,8 @@ def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
         raise RuntimeError(
             f"hexagon: w8a16 needs K a multiple of 64 and N of 32, got {k}x{n}"
         )
+    if (w < -128).any() or (w > 127).any():
+        raise RuntimeError("hexagon: w8a16 weight contains values outside [-128, 127]")
     kp, np_ = k // 32, n // 32
     padded = np.zeros((np_ * 32, kp * 32), dtype=np.int32)
     padded[:n, :k] = np.clip(w.T, -128, 127)
