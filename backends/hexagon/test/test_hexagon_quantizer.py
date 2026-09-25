@@ -822,6 +822,48 @@ def test_w8a16_prefill_bracket_m32_m33_k64_k128_and_refuse_k_tail():
     assert [command.type for command in commands] == [38]
 
 
+def test_w8a16_command_42_is_present_for_an_admitted_geometry_and_absent_for_the_refused_ones():
+    """Where the int8 prefill command 42 does and does not reach, at the stream.
+
+    The admitted geometry is M = 8, K = 64, N = 128, the one an earlier claim
+    said had no emitter: lowered through the real HexagonPartitioner its
+    delegate decodes as command 42 followed by one raster blit, through
+    `_quantized_prefill_fits` -> `weight_only_matmul_fits(8, 64, 128, 8)`.
+    The refusals are the boundaries that are still real, each asked of the
+    graph the quantizer actually produced rather than of a bare predicate: a
+    K that is not a multiple of 64, an N that is not a multiple of 32, and a K
+    past the `M <= 32` ceiling the two prefill widths share. M == 1 is the
+    control on the other side of the width's M > 1 rule, and it answers with
+    the W8A16 GEMV command 45. A refused quantized matmul is not a portable
+    node: the annotation is never made, the graph keeps its fp16 matmul, and
+    that delegate carries command 38 and no prefill command.
+    """
+    converted, x = _converted("w8a16", 8, 64, 128)
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(converted, (x,)),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    delegates = [
+        module
+        for module in lowered.graph_module.modules()
+        if isinstance(module, LoweredBackendModule)
+    ]
+    assert len(delegates) == 1
+    _, commands = read_blob(bytes(delegates[0].processed_bytes))
+    assert [command.type for command in commands] == [_W8A16_PREFILL, _BLIT]
+
+    converted, x = _converted("w8a16", 1, 64, 128)
+    assert _command_types(converted, x) == [_W8A16]
+
+    for m, k, n in ((8, 96, 128), (8, 64, 48), (32, 12800, 64)):
+        converted, x = _converted("w8a16", m, k, n)
+        assert not _carries_a_dequantize(converted), (m, k, n)
+        assert _command_types(converted, x) == [38], (m, k, n)
+        program, _, _ = _quantized_program("w8a16", m, k, n)
+        _, commands = read_blob(HexagonBackend.preprocess(program, []).processed_bytes)
+        assert _W8A16_PREFILL not in [command.type for command in commands], (m, k, n)
+
+
 def test_a_prefill_over_two_run_time_tensors_is_left_alone():
     """The run-time-weight rule above M == 1, where a different kernel decides.
 

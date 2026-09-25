@@ -37,10 +37,15 @@ idealized fp16 one.
 Weights are per-output-channel symmetric, which is the granularity the kernels'
 scale operand carries (one scale block covering all of K, kernel
 `scale_block_num == 1`). The kernels wired up here are the M == 1 (decode) GEMV
-entries: they read K contiguous fp16, which for a single row is the layout the
-graph already carries. The prefill (M > 1) entries want an activation blocked
-in 64-channel tiles and an output repack, so `hexagon_ops` refuses to delegate
-those and they stay on the portable kernels.
+entries and the M > 1 (prefill) entry for each weight width. The GEMV entries
+read K contiguous fp16, which for a single row is the layout the graph already
+carries. A prefill entry packs the activation in 64-channel tiles and repacks
+the output, so `hexagon_ops` admits only the geometries and constant operands
+that entry can pack: an int4 weight is command 22 and an int8 weight is command
+42, each behind the shared `K % 64 == 0`, `N % 32 == 0`, the
+`M <= 32` K ceiling and the VTCM budget in `weight_only_matmul_fits`. A geometry
+outside those keeps the fp16 matmul the graph had before the quantizer, not a
+dequantize nothing reads.
 
 Usage follows the usual PT2E flow:
 

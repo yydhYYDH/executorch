@@ -1136,9 +1136,12 @@ Working and verified without a device:
   the carry with the ordinary binary emitter, so a streaming caller threads the
   total as a method argument and no state is kept on the DSP. The scan length is
   the matmul's `K` and the staged row width, so it must be a multiple of 64; 32 is
-  a whole number of tiles and is still refused, because the phone's skel stages a
-  shorter `K` at `ceil(K/64)*64` and reads it from the wrong row. The accumulator
-  is the matmul's fp32 narrowed once, so the comparison is against an fp64 prefix
+  a whole number of tiles and is still refused, because the scan's staging
+  descriptor counts rows in 64-wide units and a shorter `K` would be read from
+  the wrong row if the skel copied rows straight through. That copy is the
+  defect a later phone run did not reproduce; see "Status" for what that leaves
+  open. The accumulator is the matmul's fp32 narrowed once, so the comparison is
+  against an fp64 prefix
   and not against `torch.cumsum`, which rounds at every step. See
   `test/test_pool.py`, `test/test_sum_amax.py`, `test/test_fmod.py`,
   `test/test_add_relu.py` and `test/test_cumsum.py`.
