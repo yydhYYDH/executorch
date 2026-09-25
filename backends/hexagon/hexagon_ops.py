@@ -2153,11 +2153,22 @@ def pack_w8a16_gemv_weight(weight, k: int, n: int) -> bytes:
     kernel's own read path, which is the one place that has to agree with it --
     `splat_group_permuted` swaps bytes 1 and 2 of each 4-k activation word, so
     the activation arrives in the same {0, 2, 1, 3} order and every byte of a
-    32-bit vrmpy lane multiplies the weight of the same k. Nothing else here can
-    confirm the tile order offline: unlike the int4 layout, this one is written
-    down only in the kernel header, and the host reorder that produces it
-    (`reorderInt8SymWeightForHmx`) is not in the vendored tree. No DSP has run
-    it.
+    32-bit vrmpy lane multiplies the weight of the same k. The tile order is
+    checked against the host reorder itself: `reorderInt8SymWeightForHmx` is not
+    in the vendored tree, but it is readable in the upstream MNN checkout
+    (`source/backend/hexagon/execution/HexagonConvolution.cpp:464-548`), and
+    `test_w8a16_weight_layout.py` compares this function's bytes against a
+    transcription of it and against the contract above, with the fp16 tile order
+    as the control that must not match. No DSP has run it.
+
+    One blob serves both int8 entries rather than one each: the prefill kernel
+    reads these same tiles and takes its scales from `weight + np*kp*1024`, the
+    byte they end on (`conv1x1_w8a16_sym_per_channel.cc:520-521`), which is where
+    the host reorder puts the one fp16 scale per output channel
+    (HexagonConvolution.cpp:1152-1170, and the same buffer reaches both entries at
+    :892-908). What an int8 prefill blob needs beyond this function is that tail,
+    not another tile order -- this one stops at the tiles because the GEMV entry
+    reads its scales as a separate fp32 operand.
     """
     import numpy as np
 
