@@ -35,11 +35,11 @@ serializes a blob:
     [HexagonBlobHeader][HexagonOp × n_ops][weights][external weights][activations]
 
 The blob is a plain packed layout (`serialization/hexagon_schema.h`), not
-FlatBuffers, so the Python side needs no code generation. Weights are packed in
-the layout the DSP kernels expect at this point; anything that needs a runtime
-reorder is delegated to `htp_ops_weight_reorder` at init instead. What goes into
-the blob and what is left outside it is decided by `HexagonCompileOptions` --
-see [Tunables](#tunables) below.
+FlatBuffers, so the Python side needs no code generation. Weight packing is done
+on the host as the blob is built: in particular, `pack_q4a16_prefill_weight`
+produces the int4 prefill tile order consumed by its kernel. No DSP weight-reorder
+command is emitted at init. What goes into the blob and what is left outside it is
+decided by `HexagonCompileOptions` -- see [Tunables](#tunables) below.
 
 **Init.** `HexagonBackend::init` opens the FastRPC session, picks the skel for
 the device's arch, and turns the blob into the wire format the DSP wants:
@@ -1211,21 +1211,26 @@ and not a cause. Three of the nine cases say more than "they agree":
   fail -- differs from torch at 1152 of its 4096 outputs by at most one ULP and
   agrees with the phone at all 4096, so the two HMX implementations agree about
   rounding and not only about the layout they walk;
-- the activation staging tile is the other way round: its fix is **simulator
-  evidence only**. The tile is allocated and read as `up_div(K, 64) * 64`
-  elements per row while the copy that filled it used `K`, so a geometry whose
-  `K` is not a multiple of 64 read its rows short of where they were written
-  -- twelve rows of every 32-row tile came back zero from `K = 40` on. The
-  same signature, at the same positions and with the same 64/40 ratio, was
-  measured on the phone in a Stable Diffusion cross-attention, whose second
-  product has SD's context length 77 as its `K`. The copy now pads rows to the
-  stride its reader uses, `K = 40 / 32 / 77` come back inside the fp16
-  accumulation tolerance with no row left empty, and the `K = 64 / 128`
-  controls answer bit for bit what they answered before. That is the
-  simulator, and the phone's skel still carries the old code, so the phone
-  measurement shows the defect and not the fix; the `.so` on the phone has
-  never been diffed against the in-tree `mnn-htp-ops` either, so no phone
-  observation here names a source revision.
+- the activation staging tile is the other way round: the simulator
+  reproduction and its padding fix are established, but the device discrepancy
+  is open. The tile is allocated and read as `up_div(K, 64) * 64` elements per
+  row while the copy that filled it used `K`, so a geometry whose `K` is not a
+  multiple of 64 read its rows short of where they were written -- twelve rows of
+  every 32-row tile came back zero from `K = 40` on the simulator. An earlier
+  phone run reported the same signature, at the same positions and with the same
+  64/40 ratio, in a Stable Diffusion cross-attention whose second product has
+  SD's context length 77 as its `K`. A later run on that phone with a freshly
+  built isolated skel did not reproduce the defect on either the old or the new
+  skel: at S40, S32 and S77 the old-skel and new-skel outputs were bit-for-bit
+  equal, and the reported 12.05 disagreement and 7392 exact zeros were absent.
+  The copy now pads rows to the stride its reader uses, `K = 40 / 32 / 77` come
+  back inside the fp16 accumulation tolerance with no row left empty, and the
+  `K = 64 / 128` controls answer bit for bit what they answered before. The
+  earlier phone skel still carried the old code, and that binary had never been
+  diffed against the in-tree `mnn-htp-ops`, so it names no source revision. Why
+  the earlier and later device observations differ is not established: the
+  simulator reproduction remains valid, and the non-reproduction neither
+  invalidates it nor establishes that the device path is right.
 - the NaN `amax` disagrees with torch at exactly one element, in the NaN's
   payload: `0x7e00` from the phone and from the simulator, `0xffff` from torch.
   That is two NaNs, not two numbers.

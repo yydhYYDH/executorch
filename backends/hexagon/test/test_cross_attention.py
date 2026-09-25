@@ -18,13 +18,13 @@ of a head split as a loop: `[1, tokens, heads, dim]` to `[1, heads, tokens, dim]
 is four groups of axes and three loops.
 
 **What this file asserts is the host tier only**: one delegate, nothing refused,
-and the command stream that delegate carries. The DSP tier for the same blob is a
-separate measurement and is *not* green: on the phone the whole chain disagrees
-with torch by 3.2e-02, and a stage-by-stage bisect puts the damage in the first
-`q @ k^T` -- rows 1..19 of every 32-row tile wrong and 20..31 zero, at 77 and at
-32 keys, for any head width. A host model that agreed with torch would say
-nothing about that, which is why the assertions below are about which command
-exists and not about what it computes.
+and the command stream that delegate carries. That says nothing by itself about
+numerical accuracy. A separate device run of the decomposed non-square command
+chain was green on device: the reference output has `max|ref64| = 3.2e-2`, the
+maximum absolute device-to-reference difference is 3.56e-4, and 0 of 256 rows
+exceed 1e-3. The named matmul staging-tile failure signature is therefore absent.
+This verdict is only for the decomposed non-square path; it is not a verdict on
+the fused op, which follows a different path and is a separate question.
 """
 
 import os
