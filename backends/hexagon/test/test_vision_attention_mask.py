@@ -15,13 +15,26 @@ operand is read as half floats whatever the graph says, so a mask that is not
 fp16 is refused too.
 """
 
+import os
+import pathlib
+import sys
 import unittest
 
 import numpy as np
 import torch
-from executorch.backends.hexagon.vision_attention import vision_attention_pattern
-from executorch.exir import to_edge
-from torch.export import export
+
+# The checkout directory is itself named executorch, so putting its parent on
+# the path makes "import executorch" resolve to this tree; the editable install
+# in this environment points at a different checkout with an older backend.
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+# The test directory is not a package, so the interpreter is importable by name.
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
+
+from executorch.backends.hexagon.vision_attention import (  # noqa: E402
+    vision_attention_pattern,
+)
+from executorch.exir import to_edge  # noqa: E402
+from torch.export import export  # noqa: E402
 
 EMBED, HEADS = 32, 2
 HEAD_DIM = EMBED // HEADS
