@@ -944,16 +944,16 @@ that list):
   `exit d0: ok` over an output left as it was. What this does instead is abort
   the process (`rc=134`, `exit d0: failed`, no output at all, in under a second),
   which is the shape of a fault rather than of a refusal.
-- **the host gate was wrong in its M, not in its K, and now refuses rather than
-  emitting it.** `_quantized_prefill_fits` used to admit `K = 25216` and ask
-  nothing about `M`, yet `q4a16_m40_k25216` **passes** at that K (relative 7.1e-4):
-  the ceiling itself is sound for the shape the gate was reasoned about, and what
-  was missing is the other dimension, since the same K that works at `M = 40`
-  destroys `M <= 32`. The gate now carries that branch's bound
-  (`PREFILL_M32_MAX_M = 32`, `PREFILL_M32_MAX_K = 12672` in `hexagon_ops.py`),
-  stated against the largest K seen to work rather than the first that failed.
-  Moving the descriptor array off the stack, as the `m > 32` kernel already does,
-  is the other fix and is still not in this tree.
+- **the host gate is a Q4 safety refusal, not a W8A16 gate.** On the
+  `a47e948` baseline, `_quantized_prefill_fits` returns false for every
+  `quantized.bits != 4`; W8A16 prefill command 42 is not wired by this tree.
+  The Q4 gate remains `M <= 32 && K > 12672`, with `PREFILL_M32_MAX_M = 32`
+  and `PREFILL_M32_MAX_K = 12672` in `hexagon_ops.py`. The measured heap-backed
+  skel now answers `K = 25216` for `M = 2, 4, 32`, but the host keeps the
+  conservative refusal because deployment does not encode whether the skel was
+  rebuilt from the heap source. A stale VLA skel still aborts with
+  `0x8000040d`; widening the gate needs a matched rebuild and broader device
+  evidence, not an unmeasured threshold.
 - **a caveat, because a control was attempted here and it did not work.** The
   obvious way to separate the VLA length from K is to rewrite `params[7]`, which
   is the `kp` the emitter sends -- but the kernel recomputes `int kp = K / 32`
@@ -963,10 +963,10 @@ that list):
   to 420 at `K = 512` still passed with byte-identical output; lowering it to 100
   at `K = 12800` still aborted). That experiment is therefore **null and not a
   refutation**: it shows the parameter does not reach the mechanism, so the VLA
-  attribution above rests on the branch comparison and the eliminated silence
-  path rather than on a direct control. Settling it needs a skel change -- the
-  array moved to the heap, as the `m > 32` kernel does -- which this section
-  leaves undone.
+  attribution rests on the branch comparison and the eliminated silence path
+  rather than on a direct control. The heap allocation is present in the
+  baseline source; the host refusal remains because a stale skel can still carry
+  the former VLA implementation.
 - **the transposed convolution** runs its six commands -- `ZERO`, a weight blit,
   `ZERO` again, the zero-insert interleave, one `IM2COL_CONVOLUTION_FP16` and the
   output repack -- without error, and answers torch within a relative 6.6e-4 on a
