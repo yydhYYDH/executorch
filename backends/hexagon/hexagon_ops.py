@@ -23,6 +23,7 @@ import torch
 # After rms_norm, which opens the et_hexagon namespace these fragments join.
 from executorch.backends.hexagon.add_relu import ADD_RELU
 from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
+from executorch.backends.hexagon.cumsum import CUMSUM, cumsum_is_emittable
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.backends.hexagon.mul_silu import MUL_SILU
 from executorch.backends.hexagon.prelu import PRELU
@@ -3525,6 +3526,96 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     if ctx.is_dynamic_dim(m):
         ctx.add_dynamic_patch(op_index, 0, n, 0)
         ctx.add_dynamic_patch(op_index, 1, n, 0)
+    return ctx.record(node, out)
+
+
+def _emit_cumsum(node: torch.fx.Node, ctx) -> TensorRef:
+    """The fused scan as a batched matmul, plus the add that carries a chunk.
+
+    The mask is the upper-triangular ones: column j of the weight selects
+    inputs 0..j, so out[r, j] is the prefix ending at j. The lower triangle
+    would select j..L-1 and sum the suffix instead, which is the scan read
+    backwards.
+
+    The mask is a host constant here rather than a graph node, so it goes
+    through the same packing rule a matmul's constant weight does: the tile
+    order when the DSP's general kernel will take the region, row-major bytes
+    otherwise. The packed form is only readable by that kernel, so packing
+    unconditionally would hand the fallbacks a matrix in the wrong order.
+    """
+    x, carry = node.args[0], node.args[1] if len(node.args) > 1 else None
+    _require_arena_dtype(node, "cumsum")
+    x_val = x.meta["val"]
+    if not x_val.is_contiguous():
+        raise RuntimeError(
+            "hexagon: cumsum input must be contiguous; strides come from shape"
+        )
+    length = x_val.shape[-1]
+    rows = _upper_product(tuple(x_val.shape[:-1]), ctx)
+    mask = torch.triu(torch.ones((length, length), dtype=torch.float16))
+    mask_ref, prepacked = _mask_operand(ctx, node, mask, rows, length, length)
+
+    out = ctx.result_for(node, rows * length)
+    out_shape = tuple(node.meta["val"].shape)
+    target = out if carry is None else ctx.activation_for_shape(out_shape)
+    _matmul_command(
+        node,
+        ctx,
+        ctx.operand(x),
+        mask_ref,
+        target,
+        1,
+        rows,
+        length,
+        length,
+        hmx_prepacked=prepacked,
+    )
+    if carry is None:
+        return ctx.record(node, out)
+    return _emit_carry_add(node, ctx, target, carry, out, out_shape)
+
+
+def _mask_operand(ctx, node, mask, m: int, k: int, n: int):
+    """The (k, n) scan mask in the layout this region will be read in."""
+    if (
+        ctx.options.hmx_prepack
+        and hmx_prefers_general(k, n)
+        and hmx_general_eligible(m, k, n)
+    ):
+        return ctx.packed_weight(node, mask, k, n), True
+    return ctx.folded_weight(node, mask), False
+
+
+def _emit_carry_add(node, ctx, scanned, carry, out, shape):
+    """The chunk boundary: the previous chunk's total, broadcast over the rows.
+
+    This is the binary emitter's descriptor with the scan's result already in
+    hand, so the add is one BINARY_ELEMENTWISE on a value the graph never
+    named. The carry broadcasts the way the graph's own add would, through
+    the same tail, so a carry of [..., 1] reaches every column and a carry of
+    the full shape adds elementwise.
+    """
+    carry_numel = _upper_product(tuple(carry.meta["val"].shape), ctx)
+    shape = ctx.upper_shape(shape)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_BINARY_ELEMENTWISE,
+            inputs=[scanned, ctx.operand(carry)],
+            outputs=[out],
+            params=[
+                _upper_product(shape, ctx),
+                _upper_product(shape, ctx),
+                carry_numel,
+                BINARY_OP_TYPES["add"],
+                FP16_BYTES,
+                FP16_BYTES,
+                0,  # inputs are not 4-byte floats
+                0,  # output is not a 4-byte float
+                *_broadcast_tail(shape, carry, shape, ctx),
+            ],
+        ),
+    )
     return ctx.record(node, out)
 
 
@@ -7583,6 +7674,7 @@ EMITTERS = {
     MUL_SILU: _binary("mul_silu"),
     ADD_RELU: _binary("add_relu"),
     ROPE: _emit_rope,
+    CUMSUM: _emit_cumsum,
     EMBEDDING: _emit_gather,
     INDEX_SELECT: _emit_gather,
     INDEX_TENSOR: _emit_gather,

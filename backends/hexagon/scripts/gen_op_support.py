@@ -789,6 +789,24 @@ SUPPORTED: List[OpSupport] = [
         "command. An axis named twice or out of range is refused.",
     ),
     OpSupport(
+        "et_hexagon.cumsum.default",
+        f"{MATMUL} / {BINARY}",
+        ARENA_FP16,
+        "Inserted by FuseCumsumPass, which is opt-in (transform_passes). One "
+        "BATCH_MATMUL against a host constant (L, L) upper-triangular ones "
+        "mask -- row j selects inputs 0..j, so out[r, j] is the prefix ending "
+        "at j; the lower triangle is the same plan and the reverse scan -- plus "
+        "the BINARY_ELEMENTWISE the graph already wrote for a streaming carry. "
+        "fp16 and contiguous, rank >= 2, and the last axis a static multiple "
+        "of 64, because the phone skel stages a K-wide row at ceil(K/64)*64 "
+        "and reads a shorter one from the wrong place. The accumulator is the "
+        "matmul's fp32, narrowed once at the store, and torch.cumsum on an fp16 "
+        "CPU tensor accumulates in fp32 the same way, so the two agree bit for "
+        "bit at L = 64..1024 and both sit within one fp16 ulp of the output scale "
+        "of an exact scan. A scan that rounded to fp16 at every step would drift "
+        "by one ulp per frame instead: 0.0078 at L=64, 0.1875 at L=1024.",
+    ),
+    OpSupport(
         "et_hexagon.update_cache.default",
         BLIT,
         ARENA_FP16,
@@ -1137,9 +1155,9 @@ NOT_SUPPORTED = [
         "because the relu kernel does carry the slope.",
     ),
     (
-        "aten.prod.default, aten.var.correction, aten.cumsum.default",
+        "aten.prod.default, aten.var.correction",
         "No kernel. The reduction table has sum, maximum and mean; a running "
-        "product, a second moment and a prefix scan are each a different walk.",
+        "product and a second moment are each a different walk.",
     ),
     (
         "aten.clamp.Tensor",
@@ -1224,6 +1242,7 @@ PREDICATES = [
     "batch_norm_normalizes_one_span",
     "log_softmax_shifts_within_the_arena",
     "add_rms_norm_is_emittable",
+    "cumsum_is_emittable",
     "quantized_matmul_is_emittable",
     "conv_spec",
     "vision_attention_is_emittable",

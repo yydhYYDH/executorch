@@ -322,6 +322,12 @@ _ROWS = [
         [("aten.var.correction", "unwired")],
     ),
     (
+        # A prefix scan reaches the DSP only as et_hexagon.cumsum.default, which
+        # FuseCumsumPass writes and this row cannot see: the census measures the
+        # bare edge graph, ahead of the opt-in pass. So aten.cumsum.default has
+        # no emitter of its own and is unwired here, and the fused op has no
+        # row in either table because no graph produces it without the pass.
+        # test_cumsum.py is where both spellings are pinned.
         "cumsum",
         lambda a: torch.cumsum(a, dim=-1),
         (_x(2, 3),),

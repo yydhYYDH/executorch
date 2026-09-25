@@ -41,6 +41,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     reflect_pad_regions,
     conv_spec,
     CONV_TARGETS,
+    CUMSUM,
+    cumsum_is_emittable,
     dim_order_keeps_the_bytes,
     DIM_ORDER_TARGETS,
     DQ_PER_CHANNEL,
@@ -949,6 +951,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # portable kernels run, not one the DSP should read wrong.
             return False
         if node.target is UPDATE_CACHE and update_cache_layout(node) is None:
+            return False
+        if node.target is CUMSUM and not cumsum_is_emittable(
+            node.args[0] if node.args else None,
+            node.args[1] if len(node.args) > 1 else None,
+        ):
+            # The scan is a matmul against a mask whose side is the scan length, so
+            # an operand that is not a contiguous fp16 tensor with a 64-aligned
+            # static last extent has no mask the two commands can read.
             return False
         for arg in node.args:
             # None is a legitimate argument (custom_sdpa passes no mask), so a
