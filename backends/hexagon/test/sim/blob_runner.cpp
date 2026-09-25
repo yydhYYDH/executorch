@@ -78,6 +78,10 @@ extern "C" int htp_ops_conv_depthwise2d_fp16(
 extern "C" int htp_ops_im2col_convolution_fp16(uint8_t *output, uint8_t *input,
                                                uint8_t *weight, uint8_t *bias,
                                                const HmxIm2ColConvParam *params);
+/* The 1x1 command the DSP dispatcher forwards to `execute_command.cc:771`. */
+extern "C" int htp_ops_conv1x1_direct_fp16(uint8_t *output, uint8_t *input,
+                                           uint8_t *weight, uint8_t *bias,
+                                           const HmxIm2ColConvParam *params);
 extern "C" int htp_ops_zero(uint8_t *dst, int32_t size);
 extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v,
                                   uint8_t *mask, uint8_t *workspace,
@@ -151,6 +155,7 @@ enum {
   kUnary = 4,
   kLayerNorm = 8,
   kIm2Col = 12,
+  kConv1x1Direct = 17,
   kFlashAttn = 18,
   kBinaryElementwise = 19,
   kSharedGather = 23,
@@ -323,6 +328,16 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                                     address(header, op.inputs[1]),
                                     address(header, op.inputs[2]),
                                     (const HmxIm2ColConvParam *)params);
+    return;
+  }
+  if (op.type == kConv1x1Direct) {
+    /* Same parameters as the im2col command: the two names are two entries for
+     * one function, and the DSP dispatcher hands both the same struct. */
+    htp_ops_conv1x1_direct_fp16(address(header, op.outputs[0]),
+                                address(header, op.inputs[0]),
+                                address(header, op.inputs[1]),
+                                address(header, op.inputs[2]),
+                                (const HmxIm2ColConvParam *)params);
     return;
   }
   if (op.type == kZero) {

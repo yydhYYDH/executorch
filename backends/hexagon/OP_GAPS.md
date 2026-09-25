@@ -88,7 +88,7 @@ kernels the skel links and exports with nothing that can reach them:
 | 11 | `DSP_OP_WEIGHT_REORDER_INT4` | `htp_ops_weight_reorder_int4` | same |
 | 13 | `DSP_OP_SCALE` | `htp_ops_scale` | unread. `aten.mul.Scalar` goes through `UNARY`'s `SCALE`(17) subtype, not this op type |
 | 15 | `DSP_OP_ROPE_FUSE_LAYERNORM` | `htp_ops_rope_fuse_layernorm` | a fused rope + norm, one command where two are emitted now |
-| 17 | `DSP_OP_CONV1X1_DIRECT_FP16` | `htp_ops_conv1x1_direct_fp16` | the 1x1 fast path. A 1x1 convolution goes through im2col today |
+| 17 | `DSP_OP_CONV1X1_DIRECT_FP16` | `htp_ops_conv1x1_direct_fp16` | wired, and it adds no kernel: the name is a second entry for `hmx_im2col_convolution_fp16` (`im2col_convolution_fp16.cc:1840`), and the emitter's `conv_1x1_direct_applies` picks 17 only for the geometry whose 1x1 activation fill is the plane copy or the strided gather, falling back to 12 for a padded, dilated, batched, ragged, depthwise, transposed or non-1x1 window. §6.1 |
 | 25 | `DSP_OP_CAST` | `htp_ops_cast` | deliberately unused, as 7 |
 | 30 | `DSP_OP_RELU6` | `htp_ops_relu6` | deliberately unused: `relu6` is `hardtanh(0, 6)` and goes through `UNARY`/`CLAMP`, the entry point that restores a NaN by a bit test |
 | 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | not an emitter: the kernel wants a separate fp16 `[O][R]` predicate operand (`eltwise_ops.cc:2959`) that no ATen node carries, and the graphs that come closest already answer correctly as two commands. A fusion target, not a missing line -- §7 |
@@ -98,7 +98,7 @@ kernels the skel links and exports with nothing that can reach them:
 | 36 | `DSP_OP_LSTM` | `htp_ops_lstm` | an LSTM cell. The recurrent models are unrolled before the partitioner, so nothing reaches it |
 | 37 | `DSP_OP_RELU` | `htp_ops_relu` | deliberately unused, as 30 |
 | 39 | `DSP_OP_PRELU` | `htp_ops_prelu` | `prelu`, which decomposes into `view_copy` + `gt` + `mul` + `select` before the partitioner sees it. Two of those four now delegate and the kernel is not reached, because nothing builds the prelu node back -- §3 |
-| 40 | `DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL` | `hmx_conv1x1_direct_w8a16_sym_per_channel` | quantized 1x1 convolution |
+| 40 | `DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL` | `hmx_conv1x1_direct_w8a16_sym_per_channel` | left unwired on purpose. The entry forwards to `hmx_matmul_w8a16_block_fp16` and reads the int8 HMX tile order `reorderInt8SymWeightForHmx` produces, which is not in this tree; the packer and the command 42 wiring live on `hexagon-int8prefill` at `9b9e8bf`, so this row has to be built on that rebase rather than by guessing a layout -- §6.1 |
 | 42 | `DSP_OP_MATMUL_W8A16_BLOCK_FP16` | `hmx_matmul_w8a16_block_fp16` | quantized prefill, int8 weights. The int4 prefill entry (22) is wired; this one is not, because its int8 weight is in a tile order nothing here packs |
 | 44 | `DSP_OP_VISION_FLASH_ATTENTION_FP16` | `htp_ops_vision_flash_attention_fp16` | a vision attention variant |
 
@@ -307,7 +307,17 @@ The two gaps that are not of that shape:
   `DSP_OP_WEIGHT_REORDER_INT4`. Either the sentence describes a fallback that has
   never had a caller, or the reorder this backend relies on happens at export in
   the Python packers and the sentence is stale. Worth a decision rather than a
-  silent fix.
+  silent fix. The decision, after a grep for `WEIGHT_REORDER` and
+  `weight_reorder` over `backends/hexagon` with the vendored tree and the sim
+  runners excluded, which returns this file and `README.md` alone: stale, and
+  narrowly so. The README's own init list
+  (`README.md:44-53`) names compile-spec, the resident block, the weight copy and
+  the group array, with no reorder step in it, and the reorder that does happen is
+  host-side at export (`hexagon_ops.py:2292`, `pack_q4a16_prefill`), which is what
+  `README.md:479` already says about the int4 tile order. So the line at 40
+  describes a runtime init step this backend never performs, while line 479's
+  claim about the int4 order is true with the location implied by 40 being wrong.
+  The sentence is left as written, deliberately: this file records the verdict.
 - **`DSP_OP_POST_ATTN_REDUCE_FUSE`(35) is declared and has no `case`** in
   `execute_command.cc`. Which of the two is missing has not been established.
 - **The q4a16 and w8a16 packers have never run on a DSP.** The upstream host
@@ -335,6 +345,43 @@ The two gaps that are not of that shape:
   and both schemes produced identical output. Fixed in `53369ff`; recorded here
   because the same shape of gap -- a spelling the emitter table does not know --
   is the one `unwired_overload_census()` now counts.
+
+### 6.1 The 1x1 command, and what wiring it was worth
+
+- **`DSP_OP_CONV1X1_DIRECT_FP16`(17) is now emitted, and it is the same kernel.**
+  `htp_ops_conv1x1_direct_fp16` forwards to `hmx_im2col_convolution_fp16`
+  (`im2col_convolution_fp16.cc:1840`), and the C's fill selection is by
+  geometry, not by the command id: `fill_im2col_activation_tiles`
+  (`:1593`) takes `fill_im2col_activation_1x1_pack64_tiles` whenever
+  `packCUnit == 64`, the window is 1x1, both dilations are 1 and
+  `kp == ceil(ic/32)`. A 1x1 convolution therefore already ran that fill
+  under command 12, which is what row 17 meant by "a 1x1 convolution goes
+  through im2col today".
+- **What the change buys is the stream saying which fill runs, not less work.**
+  The two names are the same function, so the element count, the VTCM
+  footprint and the arithmetic are unchanged; measured on the simulator, the
+  two entry points return bit-identical output for the same 64-to-96 1x1
+  5x5 geometry. Inside the 1x1 fill, the paths command 17 is gated on are the
+  vector plane copy (unit stride, `out plane == in plane`) and the strided
+  gather (`use_pack64_1x1_strided_fast`, `:548`); a padded or differently
+  shaped 1x1 reaches the same fill's per-position walk, which is why the
+  emitter's predicate is a strict subset of the C's selection and a refused
+  geometry stays on 12 rather than being mislabelled 17.
+- **The gate is `conv_1x1_direct_applies`**, a host transcription of that
+  selection: no transposed convolution, no depthwise, no upsample, a 1x1
+  window, `in_channels` a whole number of 32-channel blocks, unit dilation,
+  no padding, batch 1, and either unit stride with `out == in` or a stride
+  above 1. It is tested against the blob rather than against a string: a 1x1
+  graph counts one 17 and no 12, and the 3x3 graph on the same operands
+  counts one 12 and no 17.
+- **`DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL`(40) stays unwired.** Its
+  entry is a one-line forward to `hmx_matmul_w8a16_block_fp16`, so what an
+  emitter would have to bring is the int8 HMX tile order, not a convolution.
+  `reorderInt8SymWeightForHmx` is not in this tree; the int8 packing and the
+  command 42 emitter are on `hexagon-int8prefill` at `9b9e8bf`, and a layout
+  guessed from the kernel's comments would produce plausible wrong numbers,
+  which is the one failure mode this file exists to prevent. It belongs on
+  top of that rebase.
 
 ## 7. Priority
 

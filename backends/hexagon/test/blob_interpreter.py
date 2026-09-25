@@ -41,6 +41,13 @@ from executorch.backends.hexagon.serialization import blob as B
 POOL2D_FP16 = 1
 CONV_DEPTHWISE2D_FP16 = 2
 IM2COL_CONVOLUTION_FP16 = 12
+#: The 1x1 direct command. It resolves to the same C function as 12
+#: (htp_ops_conv1x1_direct_fp16 forwards to hmx_im2col_convolution_fp16), and
+#: the function's own fill dispatcher reads the same parameters either way, so
+#: the two op types are the same product over the same bytes and share this
+#: executor. The selection between them is the emitter's, and
+#: hexagon_ops.conv_1x1_direct_applies is what it reads.
+CONV1X1_DIRECT_FP16 = 17
 ZERO = 24
 RASTER_BLIT = 3
 LAYER_NORM = 8
@@ -1827,6 +1834,7 @@ _EXECUTORS = {
     POOL2D_FP16: _run_pool2d,
     CONV_DEPTHWISE2D_FP16: _run_conv_depthwise2d,
     IM2COL_CONVOLUTION_FP16: _run_im2col_convolution,
+    CONV1X1_DIRECT_FP16: _run_im2col_convolution,
     ZERO: _run_zero,
     SELECT: _run_select,
     RASTER_BLIT: _run_raster_blit,

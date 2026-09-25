@@ -72,6 +72,9 @@ POOL = "DSP_OP_POOL2D_FP16"
 # the activation is packed into 64-lane blocks.
 DEPTHWISE = "DSP_OP_CONV_DEPTHWISE2D_FP16"
 IM2COL = "DSP_OP_IM2COL_CONVOLUTION_FP16"
+# The same im2col function under its 1x1 name: 17 is what the stream carries when
+# the 1x1 activation fill is the one the kernel's own dispatch will take.
+CONV1X1 = "DSP_OP_CONV1X1_DIRECT_FP16"
 ZERO = "DSP_OP_ZERO"
 # The one kernel in the library that answers two outputs: each row's maximum and
 # the first position holding it. The emitter takes the first and puts the second
@@ -442,7 +445,7 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.convolution.default",
-        f"{DEPTHWISE} / {IM2COL}",
+        f"{DEPTHWISE} / {CONV1X1} / {IM2COL}",
         "fp16 (arena); fp32 narrowed on entry",
         "A 4-D batched input, static extents, and a weight and bias that are "
         "constants at export. Two forms, chosen by the group count. A group per "
