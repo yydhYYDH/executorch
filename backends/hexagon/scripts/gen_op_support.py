@@ -763,11 +763,12 @@ SUPPORTED: List[OpSupport] = [
         "aten.cat.default",
         BLIT,
         ARENA_FP16,
-        "Any number of inputs: a region is 12 ints and 3 fit in a command, so a "
-        "longer list is split over as many blits as it needs, every input still "
-        "writing its own disjoint slice (four inputs is two commands, seven is "
-        "three). All contiguous fp16; only the concatenated axis differs and the "
-        "lengths add up. Every length must be known when the commands are built.",
+        "Any number of contiguous inputs, homogeneously fp16 or fp32: a region is "
+        "12 ints and 3 fit in a command, so a longer list is split over as many "
+        "blits as it needs, every input still writing its own disjoint slice (four "
+        "inputs is two commands, seven is three). Only the concatenated axis "
+        "differs and the lengths add up. Every length must be known when the "
+        "commands are built.",
     ),
     OpSupport(
         "aten.permute_copy.default",

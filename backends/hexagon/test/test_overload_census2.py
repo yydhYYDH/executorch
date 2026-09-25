@@ -650,29 +650,27 @@ _RECURRENT_ROWS = [
         lambda: _Lstm(),
         "lstm.input",
         {
-            "aten.cat.default": 1,
             "aten.expand_copy.default": 1,
             "aten.full.default": 2,
         },
-        3,
+        2,
     ),
     (
         "RNN",
         lambda: _Rnn(),
         "rnn_tanh.input",
-        {"aten.cat.default": 1, "aten.expand_copy.default": 1, "aten.full.default": 1},
-        3,
+        {"aten.expand_copy.default": 1, "aten.full.default": 1},
+        2,
     ),
     (
         "GRU",
         lambda: _Gru(),
         "gru.input",
         {
-            "aten.cat.default": 1,
             "aten.expand_copy.default": 1,
             "aten.full.default": 1,
         },
-        3,
+        2,
     ),
 ]
 
@@ -715,15 +713,21 @@ def test_the_recurrent_ops_are_unrolled_before_the_partitioner(
     """`aten.lstm.input` never reaches the partitioner: it is unrolled first.
 
     What is delegated is the per-step arithmetic the unrolling leaves behind, and
-    what stops it is the step boundary: the `cat` that gathers the steps, the
-    `full` the initial state became, and the `expand` beside them. The split of
-    the fused weight matrix into gates used to be a cut point as well -- it was
-    the reader that made the getitem rule a rule, with twelve to eighteen refused
-    getitems behind it -- and is now a blit per piece on the DSP instead, which is
-    why the LSTM and GRU rows have half the delegates they had and no split or
-    getitem left to refuse. The counts are here so a change in how much of a
-    recurrent model is on the DSP is a failed row rather than a number nobody
-    watches.
+    what stops it is the step boundary: the `full` the initial state became and the
+    `expand` beside it. The `cat` that gathers the steps used to be a third stop and
+    is not one any more -- it is a blit inside the per-step region. The split of
+    the fused weight matrix into gates was a cut point before that and is now a blit
+    per piece on the DSP instead, which is why the LSTM and GRU rows have no split
+    or getitem left to refuse.
+
+    The delegate count is in these rows for the same reason the refused counts are,
+    and the two now have to be read together. Taking the cat onto the DSP made the
+    count FALL, from three delegate nodes to two, while the delegated work ROSE: the
+    cat no longer splits the per-step arithmetic into two regions, so one region
+    boundary disappeared even though a command was gained. A delegate count counts
+    regions, not work, and a merge can lower it by covering more. What holds the
+    claim is the refused dict, where the cat is simply gone, and the command
+    streams, which read 23, 61 and 65 commands for the RNN, LSTM and GRU.
     """
     model = make().eval()
     inputs = (torch.randn(2, 3, 4),)
