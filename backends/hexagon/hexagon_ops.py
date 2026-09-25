@@ -852,19 +852,29 @@ def _emit_split(node: torch.fx.Node, ctx) -> TensorRef:
 # blit header is three ints, then srcIndex, then srcOffset.
 _SLICE_OFFSET_PARAM = 4
 
-# A blit header is three ints and each region twelve, and an op's params vector
-# holds blob.MAX_OP_PARAMS (40) of them, which leaves room for three inputs.
-MAX_CAT_INPUTS = 3
+#: One blit command holds at most three regions, because its header is three
+#: ints and each region twelve out of a forty-int parameter block. A longer
+#: concatenation is several commands writing into disjoint slices of one
+#: result rather than a refusal: a per-time-step sequence stitch is T pieces,
+#: and T is whatever length the model was exported with.
+MAX_CAT_INPUTS = BLIT_BLOCKS_PER_COMMAND
 
 
-def cat_region(node: torch.fx.Node):
-    """The blit parameters for a concatenation along one axis, or None.
+def cat_plan(node: torch.fx.Node):
+    """One entry per blit command a concatenation needs, or None.
 
-    Each input becomes one region writing into its own slice of the result, which
-    is what a RoPE rejoin needs: two 64-element halves becoming one 128-element
-    row. The region list is fixed when the command is built, so the split has to
-    be known here -- a concatenation whose lengths are only known at the call
-    cannot be described by it.
+    Each input becomes one region writing into its own slice of the result. A
+    RoPE rejoin needs two 64-element halves becoming one 128-element row; a
+    per-time-step sequence stitch needs T per-step outputs becoming one
+    [B, T, H] tensor. A command holds BLIT_BLOCKS_PER_COMMAND regions, so a
+    T-way stitch is ceil(T / BLIT_BLOCKS_PER_COMMAND) commands whose outputs
+    are disjoint slices of a single allocation. The region list is fixed when
+    a command is built, so the split has to be known here: a concatenation
+    whose lengths are only known at the call cannot be described by it.
+
+    Every entry is (params, input_indices, byte_offset, byte_size): the
+    parameter block for that command, which of the node's inputs it reads,
+    and which slice of the result it writes.
     """
     if not node.args or len(node.args) > 2:
         return None
@@ -874,7 +884,7 @@ def cat_region(node: torch.fx.Node):
         return None
     if not isinstance(dim, int) or isinstance(dim, bool):
         return None
-    if not 1 <= len(tensors) <= MAX_CAT_INPUTS:
+    if not tensors:
         return None
     if not all(isinstance(tensor, torch.fx.Node) for tensor in tensors):
         return None
@@ -914,41 +924,101 @@ def cat_region(node: torch.fx.Node):
         rows *= size
     combined = shape[dim] * inner
 
-    params = [len(values), FP16_BYTES, len(values)]
-    offset = 0
-    for index, value in enumerate(values):
-        run = value.shape[dim] * inner
-        # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
-        params += [index, 0, offset * inner, 1, rows, run, 0, run, 1, 0, combined, 1]
-        offset += value.shape[dim]
-    return params
+    # The prefix of the result each input covers, in elements along the
+    # concatenated axis. A command's own dstOffsets restart at zero, because
+    # its output ref already carries the byte offset of its own slice.
+    starts = []
+    walked = 0
+    for value in values:
+        starts.append(walked)
+        walked += value.shape[dim]
+
+    plan = []
+    for base in range(0, len(values), BLIT_BLOCKS_PER_COMMAND):
+        indices = list(range(base, min(base + BLIT_BLOCKS_PER_COMMAND, len(values))))
+        params = [len(indices), FP16_BYTES, len(indices)]
+        for position, index in enumerate(indices):
+            run = values[index].shape[dim] * inner
+            # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+            # srcIndex is this command's own input: the kernel indexes it into the
+            # src_ptrs array it was handed, which holds this command's inputs and
+            # not the node's whole list.
+            params += [
+                position,
+                0,
+                (starts[index] - starts[base]) * inner,
+                1,
+                rows,
+                run,
+                0,
+                run,
+                1,
+                0,
+                combined,
+                1,
+            ]
+        plan.append(
+            (
+                params,
+                indices,
+                starts[base] * inner * FP16_BYTES,
+                sum(values[index].shape[dim] for index in indices) * inner * FP16_BYTES,
+            )
+        )
+    return plan
+
+
+def cat_region(node: torch.fx.Node):
+    """The parameters of a concatenation that fits in one command, or None.
+
+    The single-command spelling of cat_plan, for the callers that want one
+    parameter block: the RoPE rejoin and the split-piece cases.
+    """
+    plan = cat_plan(node)
+    if plan is None or len(plan) != 1:
+        return None
+    return plan[0][0]
 
 
 def _emit_cat(node: torch.fx.Node, ctx) -> TensorRef:
-    """Each operand is copied into its own slice of a fresh buffer."""
+    """Each operand is copied into its own slice of a fresh buffer.
+
+    A concatenation longer than one command's region budget is several
+    commands over one allocation, each writing the slice of the result it
+    owns. A ref is a section, an offset and a size, so a shifted ref is a
+    shifted write: the runtime resolves every ref as section base plus
+    ref.offset (hexagon_backend.cpp:849) and nothing downstream knows the
+    result was filled in pieces.
+    """
     tensors = node.args[0]
-    params = cat_region(node)
+    plan = cat_plan(node)
     out = ctx.result_for(node, _numel(node))
-    op_index = ctx.emit(
-        node,
-        Op(
-            type=DSP_OP_RASTER_BLIT,
-            inputs=[ctx.operand(tensor) for tensor in tensors],
-            outputs=[out],
-            params=params,
-        ),
-    )
-    # Every region repeats the row count at its own size1 slot, so each one has
-    # to move with the length; the regions that mirror it are patched with it.
     result_shape = _value_of(node).shape
     dim = node.args[1] if len(node.args) > 1 else 0
     if dim < 0:
         dim += len(result_shape)
-    for region_index in range(params[0]):
-        rows_param = 3 + region_index * 12 + 4
-        _patch_dynamic_rows(
-            ctx, op_index, rows_param, params[rows_param], result_shape[:dim]
+    for params, indices, byte_offset, byte_size in plan:
+        op_index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[ctx.operand(tensors[index]) for index in indices],
+                outputs=[
+                    out
+                    if len(plan) == 1
+                    else TensorRef(out.space, out.offset + byte_offset, byte_size, out.index)
+                ],
+                params=params,
+            ),
         )
+        # Every region repeats the row count at its own size1 slot, so each one
+        # has to move with the length; the regions that mirror it are patched
+        # with it.
+        for region_index in range(params[0]):
+            rows_param = 3 + region_index * BLIT_REGION_INTS + 4
+            _patch_dynamic_rows(
+                ctx, op_index, rows_param, params[rows_param], result_shape[:dim]
+            )
     return ctx.record(node, out)
 
 

@@ -31,7 +31,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     BINARY_TARGETS,
     BMM_TARGETS,
     CAST_TARGETS,
-    cat_region,
+    cat_plan,
     CAT_TARGETS,
     constant_pad_region,
     conv_spec,
@@ -828,7 +828,7 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 return False
         if node.target in SLICE_TARGETS and slice_region(node) is None:
             return False
-        if node.target in CAT_TARGETS and cat_region(node) is None:
+        if node.target in CAT_TARGETS and cat_plan(node) is None:
             return False
         if node.target in PERMUTE_TARGETS and permute_region(node) is None:
             return False
