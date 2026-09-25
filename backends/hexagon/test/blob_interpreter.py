@@ -14,10 +14,13 @@ builds the same arena, and executes the command stream.
 
 What it does not model is the HVX kernels: an op whose arithmetic is absent here
 raises rather than guessing, so a subgraph that reaches one is reported as
-unverified instead of silently passing. The layer it does cover is the one where
-the mistakes have been: a region that walks the wrong axis, a patch that lands in
-the wrong param, a stride in the wrong slot. All of those are byte-level and
-visible here.
+unverified instead of silently passing. What it does model of them is
+transcribed operation for operation and checked against the part that runs it --
+the piecewise-linear activations are a table lookup and two fp16 roundings, and
+`test_unary_pwl.py` holds that transcription to a device run. The layer it does
+cover apart from those is the one where the mistakes have been: a region that
+walks the wrong axis, a patch that lands in the wrong param, a stride in the
+wrong slot. All of those are byte-level and visible here.
 
 The structs come from `serialization/blob.py` rather than being restated, so a
 layout change cannot make this agree with a writer it no longer matches.
@@ -492,34 +495,152 @@ def _f32(value):
     return np.float32(value)
 
 
-#: The unary ops computed exactly. The rest -- log, rsqrt, expm1, cos and sin --
-#: go through the DSP's own fast approximations, so a host model would be
-#: guessing at them rather than reproducing them.
+#: The elementwise forms, which are the whole of the arithmetic for abs, neg,
+#: square and sqrt and the *scalar* form of the activations below. exp is torch's
+#: own answer and not the kernel's: what computes it is
+#: `htp_ops_unary_fast_expf` elementwise and `hvx_my_exp2_vhf` in the vector walk
+#: (unary_ops.cc:401-435), and neither is transcribed here. log, rsqrt, expm1,
+#: cos and sin have no entry at all, so a subgraph that reaches one is unverified
+#: rather than silently answered.
 _UNARY = {
     1: lambda x: np.where(x < 0, -x, x),  # abs
     2: lambda x: -x,  # neg
-    3: lambda x: (  # gelu, the tanh form
+    3: lambda x: (  # gelu, the tanh form, which is the tail's form and not the body's
         0.5 * x * (1.0 + np.tanh(_f32(0.79788456) * (x + _f32(0.044715) * x * x * x)))
     ),
-    4: lambda x: 1.0 / (1.0 + np.exp(-x)),  # sigmoid
-    5: lambda x: np.exp(x),  # exp
+    4: lambda x: 1.0 / (1.0 + np.exp(-x)),  # sigmoid, scalar
+    5: lambda x: np.exp(x),  # exp, torch's answer
     7: lambda x: np.where(x >= 8, x, np.where(x <= -8, 0.0, x / (1.0 + np.exp(-x)))),
-    8: lambda x: np.tanh(x),  # tanh
+    8: lambda x: np.tanh(x),  # tanh, scalar
     9: lambda x: x * x,  # square
     10: lambda x: np.sqrt(x),  # sqrt
 }
 
+#: The vector walk's grain: `htp_ops_unary_compute_fp16_chunk` covers
+#: [0, numel & ~63) with an HVX routine and hands the rest of the buffer to
+#: `htp_ops_unary_apply_fp16` (unary_ops.cc:455-491), so the two forms meet
+#: inside one buffer and a buffer shorter than the grain is entirely scalar.
+_PWL_GRAIN = 64
+
+#: What that routine computes for gelu, sigmoid and tanh: a chord table in fp16,
+#: indexed by a companded magnitude, evaluated as one fp16 multiply and one fp16
+#: add, then folded back through the odd or the shifted identity and saturated at
+#: the magnitude the table stops at (unary_ops.cc:259-330). The bits are the
+#: `#if HTP_OPS_PWL_COMPANDED16` branch, twelve chords for gelu and tanh and
+#: sixteen for sigmoid (unary_ops.cc:225-237); the four slots a twelve-entry
+#: table leaves empty read as a slope and bias of zero.
+_PWL_RANGE = {3: 4.0, 4: 8.0, 8: 4.0}
+_PWL_SLOPE = {
+    3: (
+        0x38CA, 0x3A46, 0x3B7F, 0x3C2E, 0x3C6D, 0x3C82,
+        0x3C7C, 0x3C66, 0x3C3E, 0x3C17, 0x3C06, 0x3C01,
+    )
+    + (0,) * 4,
+    4: (
+        0x33F5, 0x33B7, 0x3343, 0x32A4, 0x31EB, 0x3128, 0x3067, 0x2F62,
+        0x2D8C, 0x2B47, 0x28A3, 0x25CD, 0x21C8, 0x1C52, 0x1665, 0x10B7,
+    ),
+    8: (
+        0x3BD6, 0x3AF3, 0x3989, 0x380C, 0x358C, 0x3347, 0x30A3, 0x2DCD,
+        0x29C8, 0x2452, 0x1E65, 0x18B7,
+    )
+    + (0,) * 4,
+}
+_PWL_BIAS = {
+    3: (
+        0x0000, 0xA9EF, 0xAFDC, 0xB285, 0xB43E, 0xB4A8,
+        0xB483, 0xB3D3, 0xB154, 0xAC8F, 0xA56E, 0x9C22,
+    )
+    + (0,) * 4,
+    4: (
+        0x3800, 0x3804, 0x3812, 0x3830, 0x385E, 0x389B, 0x38E4, 0x3933,
+        0x39A9, 0x3A42, 0x3AC0, 0x3B22, 0x3B7F, 0x3BC7, 0x3BE8, 0x3BF6,
+    ),
+    8: (
+        0x0000, 0x271B, 0x2F6F, 0x3418, 0x36A3, 0x3883, 0x3981, 0x3A43,
+        0x3AFD, 0x3B8E, 0x3BD0, 0x3BEC,
+    )
+    + (0,) * 4,
+}
+
+#: silu shares the walk but not the tables: its body is a bank searched out of
+#: eight intervals at build time (pwl.cc:9-12), which is not transcribed here, so
+#: a buffer long enough to take the walk is refused instead of answered with the
+#: scalar form the kernel would not have used.
+_PWL_UNTRANSCRIBED = {7: "silu's learned8 bank"}
+
+
+def _pwl_index(abs_v):
+    """htp_ops_pwl_companded_index16 (pwl.h:57-71), on fp16 bit patterns.
+
+    Below two, `fp16(min(fp16(|x| * 4), 15)) + 16` puts the value's top four
+    mantissa bits where the index is read from, which is a quarter-wide segment;
+    at two and above the exponent's low bit and the top two mantissa bits are the
+    index outright, which is what makes the wider segments free.
+    """
+    scaled = abs_v * np.float16(4.0)
+    scaled = np.where(scaled > np.float16(15.0), np.float16(15.0), scaled)
+    low = (scaled + np.float16(16.0)).view(np.uint16) >> 6
+    wide = ((abs_v.view(np.uint16) >> 8) & np.uint16(7)) + np.uint16(8)
+    return np.where(abs_v >= np.float16(2.0), wide, low)
+
+
+def _pwl_lookup(index, bits):
+    """htp_ops_pwl_lookup16 (pwl.h:38-45): the index is masked to four bits."""
+    return np.asarray(bits, dtype=np.uint16)[index & np.uint16(0x000F)].view(
+        np.float16
+    )
+
+
+def _pwl_body(values, op_type):
+    """unary_ops.cc:259-330, over a whole buffer rather than a vector."""
+    x = values.astype(np.float16)
+    zero, one = np.float16(0.0), np.float16(1.0)
+    negative = zero > x
+    abs_v = np.where(negative, (-x).astype(np.float16), x)
+    index = _pwl_index(abs_v)
+    # htp_ops_pwl_eval (pwl.h:90-93): an fp16 multiply into an fp16 add, so two
+    # roundings and not one.
+    positive = (abs_v * _pwl_lookup(index, _PWL_SLOPE[op_type])).astype(np.float16) + (
+        _pwl_lookup(index, _PWL_BIAS[op_type])
+    )
+    if op_type == 3:  # gelu(-a) = gelu(a) - a
+        folded = (positive - abs_v).astype(np.float16)
+        limit = np.where(negative, zero, abs_v)
+    elif op_type == 4:  # sigmoid(-a) = 1 - sigmoid(a)
+        folded = (one - positive).astype(np.float16)
+        limit = np.where(negative, zero, one)
+    else:
+        folded = (-positive).astype(np.float16)
+        limit = np.where(negative, -one, one)
+    result = np.where(negative, folded, positive)
+    return np.where(abs_v < np.float16(_PWL_RANGE[op_type]), result, limit)
+
 
 def _run_unary(command: Command, params: List[int], arena: Arena) -> None:
-    """Element-wise, one element at a time, from htp_ops_unary_apply_fp16."""
+    """Both halves of htp_ops_unary_compute_fp16_chunk, then the scalar path."""
     numel, op_type = params[0], params[1]
-    if op_type not in _UNARY:
+    if op_type in _PWL_UNTRANSCRIBED and numel >= _PWL_GRAIN:
+        raise UnsupportedOp(
+            f"blob: unary op {op_type} takes the vector walk over {numel} elements, "
+            f"which is {_PWL_UNTRANSCRIBED[op_type]}, not transcribed"
+        )
+    if op_type not in _UNARY and op_type not in _PWL_SLOPE:
         raise UnsupportedOp(
             f"blob: unary op {op_type} uses a DSP approximation, not modelled"
         )
     refs = list(command.inputs) + list(command.outputs)
     source = np.frombuffer(bytes(arena.view(refs[0])), dtype=np.float16)[:numel]
-    out = _UNARY[op_type](source.astype(np.float32)).astype(np.float16)
+    if op_type in _PWL_SLOPE and numel >= _PWL_GRAIN:
+        body = numel - numel % _PWL_GRAIN
+        out = np.concatenate(
+            [
+                _pwl_body(source[:body], op_type),
+                _UNARY[op_type](source[body:].astype(np.float32)).astype(np.float16),
+            ]
+        )
+    else:
+        out = _UNARY[op_type](source.astype(np.float32)).astype(np.float16)
     _store(arena, arena.address(refs[1]), out.tobytes())
 
 

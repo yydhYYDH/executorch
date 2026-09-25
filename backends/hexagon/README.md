@@ -151,6 +151,21 @@ produces wrong numbers, not an error. These are the facts the emitters in
 
 Things that bite:
 
+- **The activation kinds are a piecewise-linear approximation, not torch's
+  functions.** UNARY with kind 3, 4 or 8 walks `htp_ops_unary_pwl_fp16_vec` over
+  `[0, numel & ~63)`: a companded index into a table of fp16 slopes and biases,
+  one fp16 multiply and one fp16 add, a fold through the odd or the shifted
+  identity, and a saturation where the table stops. The tail of a buffer goes to
+  `htp_ops_unary_apply_fp16` instead, so `numel % 64` elements compute a
+  different function from the rest, a buffer under 64 elements takes that second
+  form throughout, and the length of a tensor is what decides. Measured on a
+  device against the definitions over a dense sweep, gelu is off by up to 6.1e-3,
+  sigmoid by 2.4e-3 and tanh by 6.3e-3, worst below `|x| = 0.5` -- where a
+  transformer's activations are, and 6.3 fp16 steps at the scale of a ViT block's
+  MLP output. tanh returns exactly 1 from `|x| = 4`, where its value is 0.999329.
+  Nothing gates these kinds on geometry, so a model that delegates one runs the
+  table: `test/test_unary_pwl.py` holds the numbers and the device run behind
+  them.
 - **Absent operands need `fd = -1`**, not size 0. The dispatcher maps a negative
   fd to a null pointer, which is the only way to say "no bias", "no gamma". A
   zero-size tensor still maps to a live address and is read as data. That is
