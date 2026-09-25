@@ -89,17 +89,34 @@ def test_tensor_tensor_power_runs_on_hexagon_sim():
     )
     assert "Main() returned 0" in hexagon_sim.LAST_STDOUT
     mapping = {v: k for k, v in vars(hexagon_ops).items() if k.startswith("DSP_OP_")}
+    blit = hexagon_ops.DSP_OP_RASTER_BLIT
+    binary = hexagon_ops.DSP_OP_BINARY_ELEMENTWISE
+    # The clone emitter the elementwise branch admits writes both lifted constants
+    # with raster blits before the power itself. Exponent one is the identity, so
+    # its power command collapses to a third blit instead of a binary: the first
+    # two place the base and exponent, the third copies the base through. Every
+    # other case computes the power with one binary elementwise, and exponents
+    # three and four add one binary each because the emitter walks them as
+    # repeated multiplies rather than a loop. The host sibling
+    # test_pow_tensor_tensor.py describes the same prefix, but each twin needs its
+    # own measured list so neither can drift silently under the other.
     expected_types = {
-        "W1": [hexagon_ops.DSP_OP_RASTER_BLIT],
-        "W2": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
-        "W3": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 2,
-        "W4": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE] * 3,
-        "W0": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
-        "WM": [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE],
+        "W1": [blit, blit, blit],
+        "W2": [blit, blit, binary],
+        "W3": [blit, blit, binary, binary],
+        "W4": [blit, blit, binary, binary, binary],
+        "W0": [blit, blit, binary],
+        "WM": [blit, blit, binary],
     }
     reference_base = torch.tensor(base, dtype=torch.float64)
     for tag, _, commands in cases:
-        assert [command.type for command in commands] == expected_types[tag]
+        types = [command.type for command in commands]
+        assert types == expected_types[tag], (tag, types)
+        assert types[:2] == [blit, blit], f"{tag}: the two constant blits are not leading"
+        compute = types.index(binary) if binary in types else len(types)
+        assert all(kind == blit for kind in types[:compute]), (
+            f"{tag}: a blit follows the power computation: {types}"
+        )
         assert {mapping[command.type] for command in commands} <= {
             "DSP_OP_RASTER_BLIT",
             "DSP_OP_BINARY_ELEMENTWISE",
