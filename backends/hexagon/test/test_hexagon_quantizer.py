@@ -102,15 +102,19 @@ class _At(torch.nn.Module):
 
 
 class _Bias(torch.nn.Module):
-    """The same matmul with a bias of a caller-chosen shape."""
+    """The same matmul with a bias and optional addmm coefficients."""
 
-    def __init__(self, k: int, n: int, bias_shape) -> None:
+    def __init__(self, k: int, n: int, bias_shape, alpha=1.0, beta=1.0) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.randn(k, n) * 0.3)
         self.bias = torch.nn.Parameter(torch.randn(bias_shape) * 0.1)
+        self.alpha = alpha
+        self.beta = beta
 
     def forward(self, x):
-        return torch.addmm(self.bias, x, self.weight)
+        return torch.addmm(
+            self.bias, x, self.weight, beta=self.beta, alpha=self.alpha
+        )
 
 
 def _quantized_program(scheme, m, k, n):
@@ -169,10 +173,12 @@ def _annotated(model, x, scheme="q4a16"):
     }
 
 
-def _quantized_addmm_program(scheme, k, n, bias_shape):
+def _quantized_addmm_program(
+    scheme, k, n, bias_shape, m=1, alpha=1.0, beta=1.0
+):
     """The same, for addmm with a bias of the given shape."""
-    model = _Bias(k, n, bias_shape).eval()
-    x = torch.randn(1, k, dtype=torch.float32)
+    model = _Bias(k, n, bias_shape, alpha=alpha, beta=beta).eval()
+    x = torch.randn(m, k, dtype=torch.float32)
     exported = torch.export.export(model, (x,))
     prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer(scheme))
     with torch.no_grad():
@@ -205,6 +211,25 @@ def _node_of(program, target):
 
 def _mm_node(program):
     return _node_of(program, exir_ops.edge.aten.mm.default)
+
+
+def _lowered_delegates(converted, inputs, dynamic_shapes=None):
+    exported = torch.export.export(
+        converted, inputs, dynamic_shapes=dynamic_shapes
+    )
+    lowered = to_edge_transform_and_lower(
+        exported, partitioner=[HexagonPartitioner()]
+    ).exported_program()
+    delegates = [
+        module
+        for module in lowered.graph_module.modules()
+        if isinstance(module, LoweredBackendModule)
+    ]
+    command_types = []
+    for delegate in delegates:
+        _, commands = read_blob(delegate.processed_bytes)
+        command_types.extend(command.type for command in commands)
+    return lowered, delegates, command_types
 
 
 def _relative_error(got, expected):
@@ -543,16 +568,9 @@ def test_a_refused_q4_prefill_has_no_delegate_or_command():
     """The measured M=2/4/32 K=25216 cases emit no command 22."""
     for m in (2, 4, 32):
         converted, x = _converted("q4a16", m, 25216, 64)
-        lowered = to_edge_transform_and_lower(
-            torch.export.export(converted, (x,)),
-            partitioner=[HexagonPartitioner()],
-        ).exported_program()
-        delegates = [
-            module
-            for module in lowered.graph_module.modules()
-            if isinstance(module, LoweredBackendModule)
-        ]
+        lowered, delegates, command_types = _lowered_delegates(converted, (x,))
         assert delegates == [], m
+        assert _PREFILL not in command_types, (m, command_types)
         assert not [
             node
             for node in lowered.graph_module.graph.nodes
@@ -560,19 +578,76 @@ def test_a_refused_q4_prefill_has_no_delegate_or_command():
         ], m
 
 
+def test_a_refused_q4_prefill_shape_has_no_delegate_or_command():
+    """K and N alignment refusals do not leave a prefill command behind."""
+    for k, n in ((96, 64), (64, 48), (128, 16)):
+        converted, x = _converted("q4a16", 4, k, n)
+        lowered, delegates, command_types = _lowered_delegates(converted, (x,))
+        assert delegates == [], (k, n)
+        assert _PREFILL not in command_types, (k, n, command_types)
+        assert not [
+            node
+            for node in lowered.graph_module.graph.nodes
+            if str(node.target).endswith("executorch_call_delegate")
+        ], (k, n)
+    # A valid control keeps the refusal test from passing because everything
+    # was refused for an unrelated reason.
+    converted, x = _converted("q4a16", 4, 128, 64)
+    _, delegates, command_types = _lowered_delegates(converted, (x,))
+    assert len(delegates) == 1
+    assert _PREFILL in command_types
+
+
+def test_a_refused_q4_prefill_vtcm_ceiling_has_no_delegate_or_command():
+    """The final VTCM guard refuses at K=25280 but admits K=25216."""
+    k = 25280
+    assert hexagon_ops._prefill_vtcm_bytes(k) > hexagon_ops.PREFILL_VTCM_BYTES
+    converted, x = _converted("q4a16", 40, k, 64)
+    lowered, delegates, command_types = _lowered_delegates(converted, (x,))
+    assert delegates == []
+    assert _PREFILL not in command_types
+    assert not [
+        node
+        for node in lowered.graph_module.graph.nodes
+        if str(node.target).endswith("executorch_call_delegate")
+    ]
+
+    converted, x = _converted("q4a16", 40, 25216, 64)
+    _, delegates, command_types = _lowered_delegates(converted, (x,))
+    assert len(delegates) == 1
+    assert _PREFILL in command_types
+
+
+def test_a_dynamic_m_geometry_has_no_delegate_or_command():
+    """A SymInt M is not a concrete prefill geometry."""
+    model = _Mm(64, 32).eval()
+    x = torch.randn(4, 64)
+    dim = torch.export.Dim("rows", min=2, max=8)
+    exported = torch.export.export(model, (x,), dynamic_shapes={"x": {0: dim}})
+    prepared = prepare_pt2e(exported.module(), get_hexagon_quantizer("q4a16"))
+    with torch.no_grad():
+        prepared(x)
+    converted = convert_pt2e(prepared)
+    dynamic_shapes = {"x": {0: torch.export.Dim("rows", min=2, max=8)}}
+    lowered, delegates, command_types = _lowered_delegates(
+        converted, (x,), dynamic_shapes=dynamic_shapes
+    )
+    assert delegates == []
+    assert _PREFILL not in command_types
+    assert not [
+        node
+        for node in lowered.graph_module.graph.nodes
+        if str(node.target).endswith("executorch_call_delegate")
+    ]
+
+
 def test_a_w8a16_refusal_has_no_delegate_or_command_42():
     """This baseline has no W8A16 prefill emitter, so the refusal is silent."""
     converted, x = _converted("w8a16", 8, 64, 128)
-    lowered = to_edge_transform_and_lower(
-        torch.export.export(converted, (x,)),
-        partitioner=[HexagonPartitioner()],
-    ).exported_program()
-    delegates = [
-        module
-        for module in lowered.graph_module.modules()
-        if isinstance(module, LoweredBackendModule)
-    ]
+    lowered, delegates, command_types = _lowered_delegates(converted, (x,))
     assert delegates == []
+    assert _PREFILL not in command_types
+    assert 42 not in command_types
     assert not [
         node
         for node in lowered.graph_module.graph.nodes
@@ -845,6 +920,7 @@ def test_the_two_branches_are_two_different_commands():
         blob = HexagonBackend.preprocess(program, []).processed_bytes
         _, commands = read_blob(blob)
         assert [c.type for c in commands] == expected, (m, [c.type for c in commands])
+        assert (_PREFILL in expected) == (m > 1), m
 
 
 def test_the_dequantize_never_materializes_the_weight_twice():
@@ -968,3 +1044,64 @@ def test_a_quantized_addmm_puts_the_bias_in_the_kernel():
     with torch.no_grad():
         expected = converted(x).detach().float().numpy().reshape(-1)
     assert _relative_error(got, expected) < 0.06
+
+
+def test_a_strided_prefill_activation_has_no_delegate_or_command():
+    """A strided activation is refused rather than silently repacked."""
+    x = torch.randn(8, 128)[:, ::2]
+    assert not x.is_contiguous()
+    converted, inputs = _quantize("q4a16", _Mm(64, 32).eval(), x)
+    lowered, delegates, command_types = _lowered_delegates(converted, inputs)
+    assert delegates == []
+    assert _PREFILL not in command_types
+    assert not [
+        node
+        for node in lowered.graph_module.graph.nodes
+        if str(node.target).endswith("executorch_call_delegate")
+    ]
+
+
+def test_a_prefill_bias_that_is_not_one_value_per_channel_stays_portable():
+    """The prefill command's bias guard is enforced at M > 1 too."""
+    for bias_shape in ((1,), (1, 1)):
+        _, converted, x = _quantized_addmm_program(
+            "q4a16", 64, 32, bias_shape, m=4
+        )
+        lowered, delegates, command_types = _lowered_delegates(converted, (x,))
+        assert delegates == [], bias_shape
+        assert _PREFILL not in command_types, (bias_shape, command_types)
+        assert not [
+            node
+            for node in lowered.graph_module.graph.nodes
+            if str(node.target).endswith("executorch_call_delegate")
+        ], bias_shape
+
+    _, converted, x = _quantized_addmm_program(
+        "q4a16", 64, 32, (32,), m=4, alpha=1.0, beta=1.0
+    )
+    _, delegates, command_types = _lowered_delegates(converted, (x,))
+    assert len(delegates) == 1
+    assert _PREFILL in command_types
+
+
+def test_a_prefill_addmm_coefficients_other_than_one_zero_stay_portable():
+    """alpha and beta restrictions are enforced on the M > 1 entry."""
+    for alpha, beta in ((2.0, 1.0), (1.0, 2.0)):
+        _, converted, x = _quantized_addmm_program(
+            "q4a16", 64, 32, (32,), m=4, alpha=alpha, beta=beta
+        )
+        lowered, delegates, command_types = _lowered_delegates(converted, (x,))
+        assert delegates == [], (alpha, beta)
+        assert _PREFILL not in command_types, (alpha, beta, command_types)
+        assert not [
+            node
+            for node in lowered.graph_module.graph.nodes
+            if str(node.target).endswith("executorch_call_delegate")
+        ], (alpha, beta)
+
+    _, converted, x = _quantized_addmm_program(
+        "q4a16", 64, 32, (32,), m=4, alpha=1.0, beta=1.0
+    )
+    _, delegates, command_types = _lowered_delegates(converted, (x,))
+    assert len(delegates) == 1
+    assert _PREFILL in command_types

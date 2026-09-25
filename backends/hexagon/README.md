@@ -644,17 +644,14 @@ its weight layout had an authority to check a packer against: the packer's bytes
 equal the vendored reorder's on the simulator, both kernels answer
 layout-blind expectations bit for bit across both dispatch branches, and a whole
 blob built by the emitter agrees three ways (torch, the host interpreter and the
-simulator) on six shapes. Not verified at the time of writing: no device had
-executed any of these entries, so VTCM as a device sizes it, alignment and the
-multi-worker DMA staging the simulator leaves out are all unmeasured; and of the
-three packers here, two are transcriptions -- the int4 GEMV one is written down
-twice in the vendored tree and cross-checked against the kernel's read path, the
-int8 one only against the kernel's own permuted activation splat -- while the
-prefill one is the byte-for-byte comparison above. That gap has since narrowed
-for the entry itself: a device run at `M > 1` is in "Status", which measures the
-numbers and the K at which the `m <= 32` path stops. The alignment and the
-multi-worker DMA staging the simulator's missing worker pool leaves out are still
-unmeasured, and the speedup is still unmeasured.
+simulator) on six shapes. A separate measurement-only OnePlus 13 A/B then ran
+command 22 with the heap and historical VLA skeletons; the heap outputs and
+`0x8000040d` fault are recorded under "Status". That device run relaxed only the
+host predicate to measure the DSP boundary, so it does not certify that this
+committed host gate admits the wider K. Alignment, multi-worker DMA staging
+absent from the simulator, and speedup remain unmeasured. Of the three packers
+here, the int4 prefill packer is the byte-for-byte device-relevant case; the
+W8A16 prefill packer is still absent from this baseline.
 
 ## Delegating a row gather
 
@@ -910,63 +907,52 @@ that list):
 - **`split`/`chunk`** writes its pieces with `RASTER_BLIT` and answers bit for
   bit, including the case where the region the third piece reads is offset by the
   extent of a middle piece nothing reads;
-- **the int4 weight prefill entry (22) has now run on a device at `M > 1`**,
-  which the offline sections below still say it has not. `[3][22][3]` at
-  `M=8 K=128 N=96` answers within a relative 4.5e-4 of the converted graph's own
-  fp32 `mm` over the *dequantized* weights -- the comparison that keeps 4-bit
-  weight rounding out of the kernel's error budget. A K ladder at `M=4`, `N=64`
-  holds that accuracy up to **`K = 12672`** (relative 3.9e-4 to 6.4e-4 at every
-  rung) and then fails at **`K = 12736` and `K = 12800`** with
-  `execute_command_group failed: 0x8000040d`, `exit d0: failed` and no output at
-  all, in under a second and reproducibly across three interleaved repeats. That
-  this is structural rather than the contention above is the clock and not the
-  code: contention lands at 10.1 s, and this lands in under one;
+- **the int4 weight prefill entry (22) has run on a device at `M > 1`** in a
+  separate measurement-only Q4 A/B. The heap skel exited `0` with non-empty
+  output at `K=25216` for M=2, 4, and 32; the VLA skel exited `134`, emitted
+  no output, and logged `0x8000040d`. The heap outputs were `256`, `512`, and
+  `4096` bytes with maximum absolute errors `0.0009765625`, `0.001953125`, and
+  `0.001953125` against blocked-layout fp16 references. This is external device
+  evidence about the DSP source variants; it is not evidence that the committed
+  GATE host path admits `K=25216`, because that run used a relaxed predicate
+  solely to measure the device boundary.
 - **the boundary belongs to the `m <= 32` branch, and the arena is not what
   runs out.** Holding `K = 12800` and changing only `M` puts the edge exactly on
   the dispatcher's own split (`matmul_ops.cc:28`): `M = 2`, `4` and `32` all fail
-  the same way while `M = 33` and `M = 40` answer within 6.7e-4. The arenas run
-  the other way from the outcome -- `M = 2` fails with 51 KB and `M = 40`
-  succeeds at `K = 25216` with 2.0 MB, forty times the failing request -- so the
-  width of the request, the arena and the VTCM budget are all excluded, and what
-  is left is the one branch. Within it, the only stack object on the whole call
-  path that grows with K is `dma_desc_2d_t act_descs[safe_kp]`
-  (`matmul_q4fp16_mle32.c:528`), which is exactly K bytes because `safe_kp` is
-  `K/32` 32-byte descriptors; the boundary is in K (12672 passes, 12736 does
-  not), so whatever overflows is K-sized. `0x8000040d` is the signature
-  `skel/CMakeLists.txt:44-47` already records for a frame that overflows the
-  **DSP RPC thread's stack**, and it is measured there at 14 KB -- against the
-  12.7 KB this boundary sits at.
+  the same way while `M = 33` and `M = 40` answer within 6.7e-4. The current
+  Q4 small-M source heap-allocates `act_descs` (`memalign` at
+  `matmul_q4fp16_mle32.c:443-447`, freed at `:691`); the old VLA used a
+  K-sized stack object. The heap result is therefore a source-level protection,
+  not a license to widen the host gate: deployment does not record which source
+  produced a skel, so a stale VLA skel can still abort with `0x8000040d`.
 - **the failure is a fault and not a returned error, which is a stronger
   statement than it looks.** `htp_ops_matmul_q4a16_fp16` keeps the kernel's
   return code in a local, logs it and then `return 0`s (`matmul_ops.cc:27-42`),
   and the kernel's own out-of-VTCM path is a returned `AEE_ENOMEMORY`
   (`matmul_q4fp16_mle32.c:739-741`). So a VTCM overrun here would be **silent**:
-  `exit d0: ok` over an output left as it was. What this does instead is abort
-  the process (`rc=134`, `exit d0: failed`, no output at all, in under a second),
-  which is the shape of a fault rather than of a refusal.
+  `exit d0: ok` over an output left as it was. What the VLA run does instead is
+  abort the process (`rc=134`, `exit d0: failed`, no output at all, in under a
+  second), which is the shape of a fault rather than of a refusal.
 - **the host gate is a Q4 safety refusal, not a W8A16 gate.** On the
   `a47e948` baseline, `_quantized_prefill_fits` returns false for every
   `quantized.bits != 4`; W8A16 prefill command 42 is not wired by this tree.
   The Q4 gate remains `M <= 32 && K > 12672`, with `PREFILL_M32_MAX_M = 32`
-  and `PREFILL_M32_MAX_K = 12672` in `hexagon_ops.py`. The measured heap-backed
-  skel now answers `K = 25216` for `M = 2, 4, 32`, but the host keeps the
+  and `PREFILL_M32_MAX_K = 12672` in `hexagon_ops.py`. The heap-backed device
+  measurement passes `K=25216` for M=2, 4, and 32, but the host keeps the
   conservative refusal because deployment does not encode whether the skel was
-  rebuilt from the heap source. A stale VLA skel still aborts with
-  `0x8000040d`; widening the gate needs a matched rebuild and broader device
-  evidence, not an unmeasured threshold.
+  rebuilt from the heap source. Widening the gate needs a matched rebuild and
+  broader device evidence, not an unmeasured threshold.
 - **a caveat, because a control was attempted here and it did not work.** The
-  obvious way to separate the VLA length from K is to rewrite `params[7]`, which
-  is the `kp` the emitter sends -- but the kernel recomputes `int kp = K / 32`
-  inside the worker (`matmul_q4fp16_mle32.c:447`) and `kp_max` reaches only a
-  validation at entry (`:687`), so `params[7]` never sizes the array. Both
-  directions were run against the phone and neither moved the result (raising it
-  to 420 at `K = 512` still passed with byte-identical output; lowering it to 100
-  at `K = 12800` still aborted). That experiment is therefore **null and not a
-  refutation**: it shows the parameter does not reach the mechanism, so the VLA
-  attribution rests on the branch comparison and the eliminated silence path
-  rather than on a direct control. The heap allocation is present in the
-  baseline source; the host refusal remains because a stale skel can still carry
-  the former VLA implementation.
+  obvious way to separate the old VLA length from K is to rewrite `params[7]`,
+  which is the `kp` the emitter sends -- but the kernel recomputes
+  `int kp = K / 32` inside the worker (`matmul_q4fp16_mle32.c:441-442`) and
+  `kp_max` reaches only a validation at entry (`:700-702`), so `params[7]` never
+  sizes the current array. Both directions were run against the phone and
+  neither moved the result. That experiment is therefore **null and not a
+  refutation**: it shows the parameter does not reach the historical mechanism.
+  The current heap allocation is present in the baseline source; the host
+  refusal remains because a stale skel can still carry the former VLA
+  implementation.
 - **the transposed convolution** runs its six commands -- `ZERO`, a weight blit,
   `ZERO` again, the zero-insert interleave, one `IM2COL_CONVOLUTION_FP16` and the
   output repack -- without error, and answers torch within a relative 6.6e-4 on a

@@ -37,10 +37,12 @@ idealized fp16 one.
 Weights are per-output-channel symmetric, which is the granularity the kernels'
 scale operand carries (one scale block covering all of K, kernel
 `scale_block_num == 1`). The kernels wired up here are the M == 1 (decode) GEMV
-entries: they read K contiguous fp16, which for a single row is the layout the
-graph already carries. The prefill (M > 1) entries want an activation blocked
-in 64-channel tiles and an output repack, so `hexagon_ops` refuses to delegate
-those and they stay on the portable kernels.
+entries and the Q4 M > 1 prefill entry. The GEMV entries read K contiguous
+fp16, which for a single row is the layout the graph already carries. Q4
+prefill packs the activation in 64-channel tiles and repacks the output, so
+`hexagon_ops` admits only the geometries and constant operands that entry
+can pack. W8A16 M > 1 stays on the portable kernels because this baseline has
+no command-42 packer or emitter.
 
 Usage follows the usual PT2E flow:
 
