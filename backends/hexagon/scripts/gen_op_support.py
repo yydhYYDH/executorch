@@ -784,9 +784,12 @@ SUPPORTED: List[OpSupport] = [
         SHARED_GATHER,
         "fp16 table",
         "The table must be a parameter, buffer or lifted constant whose bytes are "
-        "tiled at export, and the indices an int32 tensor: the kernel reads "
-        "`const int32_t[]` into a 32x32 tiled fp16 table. An index outside the "
-        "table clears its row rather than raising, which torch does not.",
+        "tiled at export, and the indices an int32 or int64 tensor: the kernel "
+        "reads `const int32_t[]` into a 32x32 tiled fp16 table, so a wider tensor "
+        "is narrowed into that slot on the way in and refused rather than "
+        "truncated when a value is outside the table. On the int32 path an index "
+        "outside the table clears its row rather than raising, which torch does "
+        "not.",
     ),
     OpSupport(
         "aten.index_select.default",
@@ -829,12 +832,13 @@ NOT_SUPPORTED = [
         "approximation would be a wrong answer rather than a slow one.",
     ),
     (
-        "aten.embedding.default with int64 indices, or a table that is not a "
-        "constant",
-        "The kernel reads `const int32_t[]` and its table is tiled at export, so "
-        "neither a width-8 index nor a tensor that only exists at run time has a "
-        "command form. A `tokens.to(torch.int32)` in the model is enough to reach "
-        "the DSP: the cast itself stays portable.",
+        "aten.embedding.default with a table that is not a constant, or with a "
+        "vocabulary past an int32",
+        "The table is tiled at export, so a tensor that only exists at run time "
+        "has no bytes to rearrange. The vocabulary is a command param and every "
+        "element offset in the kernel is derived from it, so a table with more "
+        "rows than an int32 can name is refused rather than emitted with "
+        "arithmetic that would have wrapped.",
     ),
     (
         "aten.index_select.default with dim != 0, and aten.index.Tensor with more "

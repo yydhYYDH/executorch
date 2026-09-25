@@ -548,9 +548,49 @@ static int run_blob(const unsigned char *blob, uint64_t blob_bytes, uint8_t *are
   for (uint32_t index = 0; index < header->n_inputs; ++index) {
     const HexagonTensorRef *ref =
         slot(ops, header->n_ops, (uint32_t)HexagonTensorSpace::kInput, index);
-    if (ref == nullptr || at + ref->size > input_bytes) {
+    if (ref == nullptr) {
       printf("BADINPUT %u\n", index);
       return 1;
+    }
+    /* A gather's index slot is int32 whatever the caller's tensor is, so an
+     * int64 one is narrowed into the slot here, value by value, the way the
+     * runtime narrows it on a device (narrow_indices_to_int32 in
+     * runtime/hexagon_backend.cpp): one outside the range is refused rather than
+     * truncated into a row the caller never asked for, and a negative one means
+     * what it means to the op the command came from -- from the end for
+     * advanced indexing, a range error for embedding and index_select, which is
+     * params[8]. params[7] is the width the caller's tensor has; without it the
+     * slot and the tensor are the same width and the copy below is the whole
+     * story. */
+    int32_t vocabulary = 0;
+    int32_t from_end = 1;
+    for (uint32_t i = 0; i < header->n_ops; ++i) {
+      if (ops[i].type == kSharedGather && ops[i].n_inputs > 0 &&
+          ops[i].n_params > 7 && ops[i].params[7] == 8 &&
+          ops[i].inputs[0].space == (uint32_t)HexagonTensorSpace::kInput &&
+          ops[i].inputs[0].index == index) {
+        vocabulary = ops[i].params[2];
+        from_end = ops[i].n_params > 8 ? ops[i].params[8] : 1;
+      }
+    }
+    const uint64_t take = vocabulary > 0 ? ref->size * 2 : ref->size;
+    if (at + take > input_bytes) {
+      printf("BADINPUT %u\n", index);
+      return 1;
+    }
+    if (vocabulary > 0) {
+      const int64_t *from = (const int64_t *)(input_data + at);
+      int32_t *to = (int32_t *)address(header, *ref);
+      for (uint32_t i = 0; i < ref->size / 4; ++i) {
+        const int64_t low = from_end ? -(int64_t)vocabulary : 0;
+        if (from[i] < low || from[i] >= vocabulary) {
+          printf("BADINDEX %s %u %lld\n", tag, i, (long long)from[i]);
+          return 1;
+        }
+        to[i] = (int32_t)(from[i] < 0 ? from[i] + vocabulary : from[i]);
+      }
+      at += take;
+      continue;
     }
     memcpy(address(header, *ref), input_data + at, ref->size);
     at += ref->size;

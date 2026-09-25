@@ -852,6 +852,9 @@ _ROWS = [
         (_x(4, 6),),
         [("aten.native_layer_norm.default", "wired"), (_GETITEM, "wired")],
     ),
+    # Both of these are refused for the table, which is a method input here and
+    # so has no bytes to rearrange at export -- not for the index width, which the
+    # host narrows either way.
     (
         "embedding with int64 indices",
         lambda t, i: torch.nn.functional.embedding(i, t),

@@ -238,13 +238,6 @@ _ROWS = [
         1,
     ),
     (
-        "an embedding with int64 indices",
-        _Embedding(),
-        (torch.zeros(1, 8, dtype=torch.int64),),
-        {EMBEDDING: 1},
-        0,
-    ),
-    (
         "an embedding with int32 indices",
         _Embedding(),
         (torch.zeros(1, 8, dtype=torch.int32),),
@@ -291,12 +284,14 @@ def test_a_delegate_can_hold_none_of_the_op_that_was_refused():
     ]
 
 
-def test_the_gather_is_the_command_that_goes_missing_with_int64_indices():
-    """Same table, same graph, two index widths, and the command stream differs.
+def test_both_index_widths_emit_the_same_gather_command():
+    """Same table, same graph, two index widths, and the command stream agrees.
 
-    The int64 graph has a delegate either way. What it does not have is the
-    SHARED_GATHER command the int32 graph has, which is what "the embedding runs on
-    the DSP" would have meant.
+    The int64 graph used to be refused here, which is the thing this change took
+    away: the command is the same SHARED_GATHER in both, and what differs is one
+    param the DSP never reads -- the width the caller's tensor has, which is
+    what the host narrows with. A command that differed would mean the index slot
+    differed, and the slot is four bytes an element in both.
     """
 
     def graph(model):
@@ -305,17 +300,15 @@ def test_the_gather_is_the_command_that_goes_missing_with_int64_indices():
 
         return forward
 
-    wide = _commands(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int64),))
-    narrow = _commands(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int32),))
-    assert wide == [hexagon_ops.DSP_OP_BINARY_ELEMENTWISE, hexagon_ops.DSP_OP_REDUCTION]
-    assert narrow == [
+    expect = [
         hexagon_ops.DSP_OP_SHARED_GATHER,
         hexagon_ops.DSP_OP_BINARY_ELEMENTWISE,
         hexagon_ops.DSP_OP_REDUCTION,
     ]
-    assert _refusals(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int64),)) == {
-        EMBEDDING: 1
-    }
+    wide = _commands(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int64),))
+    narrow = _commands(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int32),))
+    assert wide == narrow == expect
+    assert _refusals(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int64),)) == {}
     assert _refusals(graph(_Embedding()), (torch.zeros(1, 8, dtype=torch.int32),)) == {}
 
 

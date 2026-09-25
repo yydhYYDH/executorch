@@ -110,6 +110,19 @@ constexpr int kDspOpTypes = 100;
 constexpr uint32_t kFlashAttnOp = kFlashAttnType;
 // DSP_OP_RASTER_BLIT. Its three-input, patched form is the KV-cache advance.
 constexpr int32_t kRasterBlitOp = 3;
+// DSP_OP_SHARED_GATHER, the row gather. Its params are htp_ops_shared_gather's
+// own in order: selectSize, ic, oc, element width, table kind, scaleBlockNum,
+// scaleAsymmetric, and then the width one index has in the caller's tensor,
+// which the DSP never reads and the host does.
+constexpr int32_t kSharedGatherOp = 23;
+constexpr int kGatherVocabularyParam = 2;
+constexpr int kGatherIndexBytesParam = 7;
+constexpr int kGatherNegativeIndexParam = 8;
+// The two answers to a negative index. `embedding` and `index_select` raise on
+// one, and advanced indexing counts back from the last row; which one this
+// command is came from the op it was emitted for.
+constexpr int32_t kNegativeIndexRefused = 0;
+constexpr int32_t kNegativeIndexFromEnd = 1;
 
 // A run of bytes inside the arena.
 // Round-to-nearest-even fp32 to fp16, matching what a __fp16 cast produces on
@@ -240,6 +253,52 @@ float half_bits_to_float(uint16_t bits) {
   return result;
 }
 
+// What a method input means to a row gather that reads it for its indices: the
+// vocabulary that command carries, and whether a negative value counts back from
+// the last row or is refused. A zero vocabulary is an input no gather reads.
+struct GatherIndices {
+  int32_t vocabulary;
+  int32_t negative_index;
+};
+
+// The other narrowing the runtime does at the boundary, and it is there for
+// the same reason as the fp32 one: the blob declares the slot the kernel reads,
+// and a caller's tensor of another width is converted into that slot rather than
+// rejected. A gather's index slot is int32 whatever the caller's dtype is, so a
+// tensor of int64 tokens is read here, one value at a time, and every value is
+// checked against the vocabulary the command carries. Truncating would name a
+// row the caller never asked for -- 2**40 mod 2**32 is a row in a table of a few
+// hundred thousand, and it would answer rather than say so -- and a negative
+// value that is in range counts back from the last row, which is what torch's
+// index_select does with it. Out of range in either direction the call is
+// refused, which is what torch does too: its embedding raises where the kernel
+// on its own would have cleared the row.
+bool narrow_indices_to_int32(
+    const int64_t* from,
+    int32_t* to,
+    size_t elements,
+    int32_t vocabulary,
+    int32_t negative_index) {
+  const bool from_end = negative_index == kNegativeIndexFromEnd;
+  for (size_t i = 0; i < elements; ++i) {
+    const int64_t value = from[i];
+    const bool too_low =
+        from_end ? value < -static_cast<int64_t>(vocabulary) : value < 0;
+    if (too_low || value >= static_cast<int64_t>(vocabulary)) {
+      ET_LOG(
+          Error,
+          "hexagon: gather index %lld at %zu is outside %lld to %d",
+          static_cast<long long>(value),
+          i,
+          static_cast<long long>(from_end ? -vocabulary : 0),
+          vocabulary);
+      return false;
+    }
+    to[i] = static_cast<int32_t>(value < 0 ? value + vocabulary : value);
+  }
+  return true;
+}
+
 struct Region {
   size_t offset = 0;
   size_t size = 0;
@@ -334,6 +393,11 @@ struct HexagonDelegate {
     size_t size;
   };
   std::vector<RuntimeLayout> runtime_layouts;
+
+  // The gather that reads a method input for its indices, by signature index,
+  // and a zero vocabulary for an input no gather reads. Resolved once at load
+  // because the copy-in loop needs it before anything is narrowed.
+  std::vector<GatherIndices> gather_indices;
 
   // Method inputs the subgraph writes to, by signature index. Their scratch
   // slots are copied back to the caller once the command group has run.
@@ -1677,9 +1741,40 @@ Result<DelegateHandle*> HexagonBackend::init(
 
   delegate->inputs.assign(header->n_inputs, Region{});
   delegate->outputs.assign(header->n_outputs, Region{});
+  delegate->gather_indices.assign(header->n_inputs, GatherIndices{0, 0});
 
   // Bind each method argument to the slot its tensors already refer to.
   for (uint32_t i = 0; i < header->n_ops; i++) {
+    // A gather that reads a method input for its indices is the one command
+    // whose operand slot is narrower than the caller's tensor can be, and the
+    // vocabulary it carries is what the copy-in loop checks those values
+    // against. A blob without the width param is the older form, where the
+    // index slot and the caller's tensor were both int32.
+    if (ops[i].type == kSharedGatherOp && ops[i].n_inputs > 0 &&
+        ops[i].n_params > kGatherIndexBytesParam &&
+        ops[i].params[kGatherIndexBytesParam] == 8 &&
+        ops[i].inputs[0].space ==
+            static_cast<uint32_t>(HexagonTensorSpace::kInput) &&
+        ops[i].inputs[0].index < header->n_inputs &&
+        ops[i].params[kGatherVocabularyParam] > 0) {
+      auto& entry = delegate->gather_indices[ops[i].inputs[0].index];
+      GatherIndices this_one{
+          ops[i].params[kGatherVocabularyParam],
+          ops[i].n_params > kGatherNegativeIndexParam
+              ? ops[i].params[kGatherNegativeIndexParam]
+              : kNegativeIndexFromEnd,
+      };
+      // Two gathers on one input tensor answer the same question about a value
+      // only if they agree on it. The intersection is the rule that survives both:
+      // the smaller vocabulary, and a negative index refused rather than
+      // translated, because one op refusing it is enough to fail the call.
+      if (entry.vocabulary == 0) {
+        entry = this_one;
+      } else {
+        entry.vocabulary = std::min(entry.vocabulary, this_one.vocabulary);
+        entry.negative_index = std::min(entry.negative_index, this_one.negative_index);
+      }
+    }
     for (uint32_t j = 0; j < ops[i].n_inputs; j++) {
       const auto& ref = ops[i].inputs[j];
       if (!IsKnownSpace(ref.space)) {
@@ -2127,6 +2222,29 @@ Error HexagonBackend::execute(
       const float* const from =
           static_cast<const float*>(tensor.const_data_ptr());
       narrow_fp32_to_fp16(from, reinterpret_cast<uint16_t*>(dst), elements);
+      continue;
+    }
+
+    // The indices of a row gather are the one int input with the same shape: the
+    // slot is int32 because that is what the kernel reads, and an int64 caller's
+    // tensor is narrowed into it here, each value checked against the vocabulary
+    // rather than truncated. The slot holds the bound the export declared, which
+    // is a run-time length above the tensor handed over, so it is the tensor's
+    // own element count that has to fit in it.
+    if (i < delegate->gather_indices.size() &&
+        delegate->gather_indices[i].vocabulary > 0 &&
+        tensor.scalar_type() == runtime::etensor::ScalarType::Long &&
+        nbytes == elements * 8 &&
+        delegate->inputs[i].size >= elements * 4) {
+      if (!narrow_indices_to_int32(
+              static_cast<const int64_t*>(tensor.const_data_ptr()),
+              reinterpret_cast<int32_t*>(dst),
+              elements,
+              delegate->gather_indices[i].vocabulary,
+              delegate->gather_indices[i].negative_index)) {
+        return Error::InvalidArgument;
+      }
+      input_bytes += elements * 4;
       continue;
     }
 
