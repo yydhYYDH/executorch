@@ -38,7 +38,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     DSP_OP_BATCH_MATMUL,
     DSP_OP_BINARY_ELEMENTWISE,
     DSP_OP_RASTER_BLIT,
-    DSP_OP_SOFTMAX,
+    DSP_OP_REDUCTION,
+    DSP_OP_UNARY,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
@@ -53,6 +54,16 @@ SCALE = 40**-0.5
 #: The chain as one stream: q, k and v projections, the three head splits, the key
 #: transpose, the scale, the softmax, `p @ v`, the output merge, the output
 #: projection, and the copy into the output slot.
+#:
+#: The softmax here is over the 77 context tokens, i.e. one row past the width the
+#: standalone softmax command is right for, so it is the five-command shifted sum
+#: of exponentials the emitter uses above that width: the maximum over the row,
+#: the shift, the exponential, the sum of at most ones, and the division by it.
+#:
+#: The second blit after `p @ v` is the broadcast's `clone_dim_order`, which
+#: arrives with `dim_order = [0, 1, 2, 3]`, so the blit copies the bytes unchanged.
+#: It is in the stream because the partitioner learned to delegate that node; the
+#: base tree had no `CLONE_DIM_ORDER` case and left it portable.
 COMMANDS = [
     DSP_OP_BATCH_MATMUL,
     DSP_OP_RASTER_BLIT,
@@ -63,8 +74,13 @@ COMMANDS = [
     DSP_OP_RASTER_BLIT,
     DSP_OP_BATCH_MATMUL,
     DSP_OP_BINARY_ELEMENTWISE,
-    DSP_OP_SOFTMAX,
+    DSP_OP_REDUCTION,
+    DSP_OP_BINARY_ELEMENTWISE,
+    DSP_OP_UNARY,
+    DSP_OP_REDUCTION,
+    DSP_OP_BINARY_ELEMENTWISE,
     DSP_OP_BATCH_MATMUL,
+    DSP_OP_RASTER_BLIT,
     DSP_OP_RASTER_BLIT,
     DSP_OP_BATCH_MATMUL,
     DSP_OP_RASTER_BLIT,

@@ -694,7 +694,7 @@ derived by hand from that source, and end to end against `torch.embedding` throu
 A vision transformer's attention is the decomposed form: split the projections
 into heads, `q @ k.T * scale`, `softmax`, `@ v`, merge the heads back. Lowered as
 it stands, a ViT block is three partitions -- the three projections, the
-attention core (two `BATCH_MATMUL` and one `SOFTMAX`), and the output projection
+attention core (two `BATCH_MATMUL` and the softmax), and the output projection
 -- with all four head transposes left on the portable kernels, because a permute
 at a partition boundary is not something the backend can keep. One
 `VISION_ATTENTION_FP16` replaces the middle of that, so the shape is worth
@@ -1329,11 +1329,26 @@ Not done yet:
   MLP and the projection into the text embedding space; on this backend the
   `DecomposePatchEmbed` pass handles the conv-to-matmul step only. Nothing in
   this checkout splices a tower's output into a language model's inputs;
-- softmax is delegated on its last axis only. The kernel's strided path, for a
-  reduction over any other axis, disagrees with torch on hardware: `[1,2,4,8]`
-  reduced over dim 1 came back with 8 of 64 elements past 1e-2, the worst by
-  1.1e-1, where the last-axis form is exact to 4.9e-4. `softmax_reduces_the_inner_axis`
-  keeps that form off the delegate until the kernel is checked;
+- softmax is delegated on the last axis, and on a contiguous non-last axis when
+  that axis can be moved last and back with three-level raster regions and its channel
+  is below 64. The direct middle-axis stream is a blit, the existing last-axis
+  `DSP_OP_SOFTMAX` with `inside == 1`, and the inverse blit. Non-contiguous,
+  non-permuteable, and channel-at-or-above-64 middle-axis cases stay portable;
+- **The softmax command is wrong for rows longer than one HVX vector, and the
+  emitter now gates on the width.** A `(3, 197, 197)` softmax over uniform logits
+  came back wrong on 116284 of 116427 elements, worst 5.9e-3 against a row maximum
+  of 1.3e-2, mean relative error 9.6%, row sums still one. At 63 columns the same
+  kernel is within an fp16 ulp and at 64 it is not, and within a wrong row the
+  tail the kernel copies in and masks -- the last `channel % 64` elements -- is
+  clean: its share of the error is the inflated normaliser the vector loop's
+  exponentials give the whole row. The vector loop's exponential is up to 1.76x
+  the correctly rounded value, as a function of the argument's fractional part
+  only and identically for every octave, and the `UNARY` exp command over the same
+  arguments is within an ulp of torch, so the defect is the softmax kernel's own
+  path and not the shared polynomial. Rows shorter than a vector keep the command;
+  longer ones are the shifted sum of exponentials, five commands and no new
+  kernel. Measured on a OnePlus 13 (SM8750, Android 15, CDSP, v79) with the
+  vendored skel the `executor_runner` beside it loads;
 - **Convolutions have now run on the device, and the gate the emitter puts in
   front of them is the gate the device has.** A 3x3 conv and a 1x1 conv went
   through one three-delegate run on a OnePlus 13 (SM8750, Android 15, CDSP, v79)

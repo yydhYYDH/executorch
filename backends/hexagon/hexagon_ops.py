@@ -254,17 +254,127 @@ BATCH_NORM_TARGETS = frozenset({BATCH_NORM_NO_STATS})
 # is an infinity rather than a large negative number.
 LOG_SOFTMAX_MAX_SPAN = 65504
 
+# The row width one HVX vector holds, and the width at which the standalone
+# softmax kernel stops agreeing with torch. The kernel walks a row in chunks of
+# this many fp16 lanes and then finishes it with a tail it copies in and masks;
+# the tail is within rounding of torch and the chunked part is not (see
+# `_emit_softmax`), so a row shorter than one vector -- which is all tail -- is
+# the only width the command is used at.
+SOFTMAX_VECTOR_WIDTH = 64
+
+
+def softmax_reduces_the_last_axis(node: torch.fx.Node) -> bool:
+    """Whether softmax already reduces the last axis of its input."""
+    if len(node.args) < 2:
+        return False
+    return int(node.args[1]) in (-1, node.meta["val"].dim() - 1)
+
+
+def _softmax_permutation(node: torch.fx.Node):
+    """Return the axis order and inverse used to put the reduction last."""
+    value = _value_of(node)
+    shape = list(value.shape)
+    dim = int(node.args[1]) % len(shape)
+    order = [axis for axis in range(len(shape)) if axis != dim] + [dim]
+    inverse = [0] * len(shape)
+    for position, axis in enumerate(order):
+        inverse[axis] = position
+    permuted_shape = [shape[axis] for axis in order]
+    return dim, order, inverse, permuted_shape
+
 
 def softmax_reduces_the_inner_axis(node: torch.fx.Node) -> bool:
-    """Whether this is the last-axis softmax the DSP kernel is right for.
+    """Whether the DSP can express this softmax after a bounded reshape.
 
-    The kernel's inside-greater-than-one path reduction over a strided span does
-    not agree with torch on hardware: [1,2,4,8] reduced over dim 1 came back with
-    eight of 64 elements past 1e-2, the worst by 1.1e-1, where the last-axis form
-    is exact to 4.9e-4. Until that path is checked against the kernel, a softmax
-    over anything but the last axis stays on the portable kernels.
+    A last-axis softmax already has the layout the kernel reads. A reduction
+    over another axis is safe only when its source is contiguous, the axis can
+    be moved last and back with one raster region each way, and the reduced
+    span is below the measured standalone-command width. In particular, a
+    non-unit-stride view is not silently materialized by this path.
     """
-    return int(node.args[1]) in (-1, node.meta["val"].dim() - 1)
+    if len(node.args) < 2 or not isinstance(node.args[0], torch.fx.Node):
+        return False
+    result = _value_of(node)
+    if not isinstance(result, torch.Tensor):
+        return False
+    raw_dim = int(node.args[1])
+    shape = list(result.shape)
+    if raw_dim < -len(shape) or raw_dim >= len(shape):
+        return False
+    dim = raw_dim % len(shape)
+    if dim == len(shape) - 1:
+        return True
+    source = node.args[0].meta.get("val")
+    if not isinstance(source, torch.Tensor):
+        return False
+    if source.dtype not in (torch.float16, torch.float32):
+        return False
+    if result.dtype not in (torch.float16, torch.float32):
+        return False
+    if len(shape) < 2 or len(source.shape) != len(shape):
+        return False
+    if source.numel() != result.numel():
+        return False
+    if not source.is_contiguous() or not result.is_contiguous():
+        return False
+    if any(not isinstance(extent, int) for extent in shape):
+        return False
+    if tuple(source.stride()) != tuple(_row_major_strides(shape)):
+        return False
+    if tuple(result.stride()) != tuple(_row_major_strides(shape)):
+        return False
+    if shape[dim] >= SOFTMAX_VECTOR_WIDTH:
+        return False
+    _, order, inverse, permuted_shape = _softmax_permutation(node)
+    forward = _permute_region_from_shapes(shape, permuted_shape, order)
+    backward = _permute_region_from_shapes(permuted_shape, shape, inverse)
+    return forward is not None and backward is not None
+
+
+def _permute_region_from_shapes(source_shape, result_shape, dims):
+    """Build the three-level blit region for a concrete axis permutation."""
+    if not isinstance(dims, (list, tuple)):
+        return None
+    rank = len(source_shape)
+    if rank < 2 or len(dims) != rank or sorted(dims) != list(range(rank)):
+        return None
+    if len(result_shape) != rank:
+        return None
+    source_strides = _row_major_strides(source_shape)
+    result_strides = _row_major_strides(result_shape)
+    positions = [0] * rank
+    for position, axis in enumerate(dims):
+        positions[axis] = position
+    destinations = [result_strides[position] for position in positions]
+
+    groups = []
+    first = 0
+    for axis in range(1, rank):
+        if positions[axis] != positions[first] + (axis - first):
+            groups.append((first, axis - 1))
+            first = axis
+    groups.append((first, rank - 1))
+
+    levels = []
+    for start, last in groups:
+        run = 1
+        for axis in range(start, last + 1):
+            run *= int(source_shape[axis])
+        if run > 1:
+            levels.append((run, source_strides[last], destinations[last]))
+    if len(levels) > 3:
+        return None
+    while len(levels) < 3:
+        levels.append((1, 0, 0))
+    for index, level in enumerate(levels):
+        if level[1] == 1 and level[2] == 1 and index != 2:
+            levels[index] = levels[2]
+            levels[2] = level
+            break
+    size = [level[0] for level in levels]
+    src = [level[1] for level in levels]
+    dst = [level[2] for level in levels]
+    return [0, 0, 0] + size + src + dst
 
 
 def log_softmax_shifts_within_the_arena(node: torch.fx.Node) -> bool:
@@ -279,7 +389,7 @@ def log_softmax_shifts_within_the_arena(node: torch.fx.Node) -> bool:
     the last axis (see softmax_reduces_the_inner_axis), whose extent the export
     knows whether or not it is static.
     """
-    if not softmax_reduces_the_inner_axis(node):
+    if not softmax_reduces_the_last_axis(node):
         return False
     shape = list(node.meta["val"].shape)
     return _upper_product([shape[int(node.args[1]) % len(shape)]]) <= (
@@ -992,56 +1102,9 @@ def permute_region(node: torch.fx.Node):
     if source_value.numel() != result_value.numel():
         return None
 
-    source_strides = _row_major_strides(source_value.shape)
-    result_strides = _row_major_strides(result_value.shape)
-    # Where each source axis lands, and so the stride the destination keeps it at.
-    positions = [0] * rank
-    for position, axis in enumerate(dims):
-        positions[axis] = position
-    destinations = [result_strides[position] for position in positions]
-
-    # A group ends where the destination stops advancing one axis at a time.
-    groups = []
-    first = 0
-    for axis in range(1, rank):
-        if positions[axis] != positions[first] + (axis - first):
-            groups.append((first, axis - 1))
-            first = axis
-    groups.append((first, rank - 1))
-
-    levels = []
-    for start, last in groups:
-        run = 1
-        for axis in range(start, last + 1):
-            run *= int(source_value.shape[axis])
-        # A group of axes whose extents multiply to one is not a loop: it
-        # iterates once and neither stride ever advances, so it covers nothing
-        # the other levels do not while still spending one of the three. The
-        # head split of a batch-one attention -- `[1, tokens, heads, dim]` to
-        # `[1, heads, tokens, dim]`, which is every attention in a batch-one
-        # export -- splits into four groups of axes and three loops, so counting
-        # the batch group refuses a permutation that three levels describe
-        # exactly. What is refused is a fourth level that advances.
-        if run > 1:
-            levels.append((run, source_strides[last], destinations[last]))
-    if len(levels) > 3:
-        return None
-    while len(levels) < 3:
-        levels.append((1, 0, 0))
-    # A run both sides read contiguously is one copy where it is innermost and
-    # one two-byte copy per element where it is not, and the loop order does not
-    # change which elements the region covers.
-    for index, level in enumerate(levels):
-        if level[1] == 1 and level[2] == 1 and index != 2:
-            levels[index] = levels[2]
-            levels[2] = level
-            break
-
-    size = [level[0] for level in levels]
-    src = [level[1] for level in levels]
-    dst = [level[2] for level in levels]
-    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
-    return [0, 0, 0] + size + src + dst
+    return _permute_region_from_shapes(
+        source_value.shape, result_value.shape, dims
+    )
 
 
 def constant_pad_region(node: torch.fx.Node):
@@ -5704,34 +5767,176 @@ def _emit_mean_default(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_reduction(node, ctx, REDUCTION_MEAN)
 
 
+def _emit_middle_axis_softmax(node: torch.fx.Node, ctx, src, shape):
+    """Copy a contiguous middle-axis reduction into the last-axis kernel.
+
+    The two raster regions are deliberately explicit. The first changes only
+    the address order, the softmax command then sees `inside == 1`, and the
+    second restores the graph's original row-major shape. The support gate has
+    already checked both regions and the reduced span. A direct contiguous input
+    needs these three commands; an explicit exported permute plus contiguous
+    nodes can carry one additional RASTER_BLIT, which is a graph copy rather
+    than a different softmax algorithm.
+    """
+    _, order, inverse, permuted_shape = _softmax_permutation(node)
+    forward = _permute_region_from_shapes(shape, permuted_shape, order)
+    backward = _permute_region_from_shapes(permuted_shape, shape, inverse)
+    if forward is None or backward is None:
+        raise RuntimeError("hexagon: softmax permutation is not representable")
+
+    permuted = ctx.activation_for_shape(permuted_shape)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(src)],
+            outputs=[permuted],
+            params=[1, FP16_BYTES, 1] + forward,
+        ),
+    )
+
+    reduced = ctx.activation_for_shape(permuted_shape)
+    channel = int(permuted_shape[-1])
+    outside = _upper_product(permuted_shape[:-1], ctx)
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_SOFTMAX,
+            inputs=[permuted],
+            outputs=[reduced],
+            params=[outside, channel, 1, FP16_BYTES],
+        ),
+    )
+    _patch_dynamic_product(ctx, op_index, permuted_shape[:-1], 0)
+    _patch_dynamic_product(ctx, op_index, [permuted_shape[-1]], 1)
+
+    out = ctx.result_for(node, _numel(node))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[reduced],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + backward,
+        ),
+    )
+    return ctx.record(node, out)
+
+
 def _emit_softmax(node: torch.fx.Node, ctx) -> TensorRef:
+    """One command for a row the kernel is right for, five for a wider row.
+
+    The vendored kernel is wrong for rows longer than one HVX vector, and it is
+    wrong inside its exponential rather than in its arithmetic: its vector loop
+    computes exp2 of `(x - max) * log2e` about 1.76x too large once the argument's
+    fractional part passes 0.35, while the tail it copies in and masks answers the
+    same argument within an fp16 ulp. On the device, a (3, 197, 197) softmax over
+    uniform logits came back wrong on 116284 of 116427 elements, mean relative
+    error 9.6%, row sums still one, and the last five columns -- the tail -- clean;
+    at 63 columns, where the whole row is the tail, the same kernel is within
+    rounding, and at 64, where the whole row is the chunked part, it is not.
+
+    So the command is kept for the rows it is measured right for and the wider
+    ones are written as the same log-sum-exp the log_softmax emitter uses, with a
+    division where that one has a log: the maximum, the shift, the exponential,
+    the sum of at most ones, and the division by it. Five commands, no new kernel,
+    and the same three kernels -- the reduction, the unary table and the
+    element-wise op -- the shifted form is already measured on.
+
+    The composition needs the shift for the same reason the log_softmax one does:
+    without it, a logit above 11 overflows the fp16 exponential, and the answer
+    is a row of infinities.
+    """
     src = node.args[0]
     _require_arena_dtype(node, "softmax input")
     dim = int(node.args[1])
     shape = list(node.meta["val"].shape)
-
     if dim < 0:
         dim += len(shape)
+    if dim != len(shape) - 1:
+        if not softmax_reduces_the_inner_axis(node):
+            raise RuntimeError("hexagon: softmax input is not emittable")
+        return _emit_middle_axis_softmax(node, ctx, src, shape)
+
     outside = _upper_product(shape[:dim], ctx)
     channel = ctx.upper_bound(shape[dim])
     inside = _upper_product(shape[dim + 1 :], ctx)
 
     numel = _numel(node)
-    out = ctx.result_for(node, numel)
-    op_index = ctx.emit(
+    if channel < SOFTMAX_VECTOR_WIDTH:
+        out = ctx.result_for(node, numel)
+        op_index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_SOFTMAX,
+                inputs=[ctx.operand(src)],
+                outputs=[out],
+                # The DSP reduces the middle axis of an [outside][channel][inside]
+                # view, so the reduction dim is described by its strides.
+                params=[outside, channel, inside, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, op_index, shape[:dim], 0)
+        _patch_dynamic_product(ctx, op_index, [shape[dim]], 1)
+        _patch_dynamic_product(ctx, op_index, shape[dim + 1 :], 2)
+        return ctx.record(node, out)
+
+    outer_shape = shape[:dim]
+    span = shape[dim : dim + 1]
+    inside_shape = shape[dim + 1 :]
+    reduced_shape = outer_shape + [1] + inside_shape
+    span_upper = channel
+
+    def reduce_spans(kind: int, source, out_) -> int:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_REDUCTION,
+                inputs=[source],
+                outputs=[out_],
+                params=[outside, span_upper, inside, kind, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, outer_shape, 0)
+        _patch_dynamic_product(ctx, index, span, 1)
+        _patch_dynamic_product(ctx, index, inside_shape, 2)
+        return index
+
+    maximum = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_MAXIMUM, ctx.operand(src), maximum)
+
+    shifted = ctx.activation_for_shape(shape)
+    _emit_elementwise(
+        node, ctx, ctx.operand(src), maximum, "sub", shape, reduced_shape, shape, shifted
+    )
+
+    exponentials = ctx.activation_for_shape(shape)
+    exp_index = ctx.emit(
         node,
         Op(
-            type=DSP_OP_SOFTMAX,
-            inputs=[ctx.operand(src)],
-            outputs=[out],
-            # The DSP reduces the middle axis of an [outside][channel][inside]
-            # view, so the reduction dim is described by its strides.
-            params=[outside, channel, inside, FP16_BYTES],
+            type=DSP_OP_UNARY,
+            inputs=[shifted],
+            outputs=[exponentials],
+            params=[numel, UNARY_OP_TYPES["exp"], FP16_BYTES],
         ),
     )
-    _patch_dynamic_product(ctx, op_index, shape[:dim], 0)
-    _patch_dynamic_product(ctx, op_index, [shape[dim]], 1)
-    _patch_dynamic_product(ctx, op_index, shape[dim + 1 :], 2)
+    _patch_dynamic_product(ctx, exp_index, shape, 0)
+
+    total = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_SUM, exponentials, total)
+
+    out = ctx.result_for(node, numel)
+    _emit_elementwise(
+        node,
+        ctx,
+        exponentials,
+        total,
+        "div",
+        shape,
+        reduced_shape,
+        shape,
+        out,
+    )
     return ctx.record(node, out)
 
 
