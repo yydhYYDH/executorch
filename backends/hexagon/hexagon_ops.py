@@ -4025,9 +4025,8 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
 # torch.export writes for nn.Conv2d, and convolution is the one its own rewrites
 # produce, with transposed/output_padding/benchmark arguments it adds -- and the
 # two kernels behind it split on groups: groups == in_channels == out_channels
-# is the per-channel walk MobileNet's depthwise layers are, groups == 1 is the
-# other plain convolution, and a grouped transposed convolution is partitioned
-# below into one dense walk per group.
+# is the per-channel walk MobileNet's depthwise layers are, and any other grouped
+# convolution is partitioned below into one dense walk per group.
 #
 # Both read and write their activation in the same 64-channel blocking pooling
 # uses, so both are wrapped in the same pair of blits, and the general path
@@ -4089,9 +4088,9 @@ class ConvSpec(NamedTuple):
     upsample_x: int = 1
     tail_y: int = 0
     tail_x: int = 0
-    # A grouped transposed convolution is lowered as one dense walk per group.
-    # The DSP command has no group field; the host partitions the channels and
-    # gives each command the group-local in/out counts.
+    # A grouped convolution is lowered as one dense walk per group. The DSP
+    # command has no group field; the host partitions the channels and gives
+    # each command the group-local in/out counts. One is the identity.
     groups: int = 1
     # The operand's height held the bare run-time symbol, so every extent below
     # is the traced example's and the commands carry a patch the runtime
@@ -4448,16 +4447,18 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     depthwise = (
         not transposed and group == in_channels == out_channels and per_group == 1
     )
-    if not depthwise and group != 1 and not transposed:
-        # A plain grouped convolution is a third kernel: neither walk carries
-        # the channel mapping for it. A grouped transposed convolution is not
-        # passed to a kernel whole; the emitter below gives each group its own
-        # dense walk.
+    if not depthwise and group != 1 and dynamic_h:
+        # A grouped walk is lowered as one dense command per group, and each
+        # command's plane extents and the group slice's own offsets are affine
+        # in a run-time height only when every group sees the same share of the
+        # plane. The per-group patch this would need is a different record per
+        # command, so a grouped height that moves stays portable rather than
+        # being emitted with the export's example extent baked in.
         return None
     if (
         not depthwise
         and conv_vtcm_bytes(
-            kernel_y, kernel_x, in_channels // group if transposed else in_channels
+            kernel_y, kernel_x, in_channels // group if group > 1 else in_channels
         )
         > CONV_VTCM_BYTES
     ):
@@ -4488,7 +4489,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         upsample_x=upsample[1],
         tail_y=tail[0],
         tail_x=tail[1],
-        groups=group if transposed else 1,
+        groups=group,
         dynamic_h=dynamic_h,
     )
 
@@ -5012,223 +5013,8 @@ def _emit_upsample(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
-def _emit_dense_im2col(
-    node: torch.fx.Node,
-    ctx,
-    spec: ConvSpec,
-    source: TensorRef,
-    out: TensorRef,
-    weight: TensorRef,
-    bias: TensorRef,
-) -> None:
-    """Run one dense im2col walk over a row-major activation pair."""
-    in_area = spec.in_h * spec.in_w
-    out_area = spec.out_h * spec.out_w
-    in_h_dim = (
-        _value_of(node.args[0]).shape[2]
-        if spec.dynamic_h and not spec.transposed
-        else spec.in_h
-    )
-    out_h_dim = _value_of(node).shape[2] if spec.dynamic_h else spec.out_h
-    packed_in = source
-    if not _conv_layouts_agree(in_area, spec.in_channels):
-        packed_in = _blocked_activation(
-            ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
-        )
-        if not spec.depthwise and spec.in_channels % POOL_CHANNEL_BLOCK:
-            _emit_zero(
-                ctx,
-                node,
-                packed_in,
-                dynamic_frame_bytes=(
-                    spec.batch
-                    * spec.in_w
-                    * _channel_blocks(spec.in_channels)
-                    * POOL_CHANNEL_BLOCK
-                    * FP16_BYTES
-                    if spec.dynamic_h
-                    else 0
-                ),
-            )
-        _emit_channel_block_blit(
-            ctx,
-            node,
-            source,
-            packed_in,
-            spec.batch,
-            in_area,
-            spec.in_channels,
-            True,
-            dynamic_area=spec.in_w if spec.dynamic_h else 0,
-        )
-    packed_out = out
-    if not _conv_layouts_agree(out_area, spec.out_channels):
-        packed_out = _blocked_activation(
-            ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
-        )
-    op_index = ctx.emit(
-        node,
-        Op(
-            # 17 names the function's 1x1 activation fill, which this geometry
-            # takes; 12 is the same function on its general window walk.
-            # conv_1x1_direct_applies is the host transcription of the C's own
-            # selection, so the stream says which fill runs.
-            type=(
-                DSP_OP_CONV1X1_DIRECT_FP16
-                if conv_1x1_direct_applies(spec)
-                else DSP_OP_IM2COL_CONVOLUTION_FP16
-            ),
-            inputs=[packed_in, weight, bias],
-            outputs=[packed_out],
-            params=[
-                spec.pad_x,
-                spec.pad_y,
-                spec.dilate_x,
-                spec.dilate_y,
-                spec.stride_x,
-                spec.stride_y,
-                spec.kernel_x,
-                spec.kernel_y,
-                spec.in_channels // 4,
-                spec.kernel_y * spec.kernel_x * conv_k_units(spec.in_channels),
-                spec.in_w,
-                spec.in_h,
-                spec.out_w,
-                spec.out_h,
-                spec.batch * in_area * POOL_CHANNEL_BLOCK,
-                spec.in_w * POOL_CHANNEL_BLOCK,
-                POOL_CHANNEL_BLOCK,
-                in_area * POOL_CHANNEL_BLOCK,
-                spec.in_channels,
-                (spec.in_channels + 3) // 4 * 4,
-                spec.out_channels,
-                1,
-                2,
-                0,
-                0,
-                spec.batch,
-                0,
-                0,
-                0,
-            ],
-        ),
-    )
-    _patch_conv_extents(ctx, op_index, spec, im2col=True)
-    if packed_out is not out:
-        _emit_channel_block_blit(
-            ctx,
-            node,
-            packed_out,
-            out,
-            spec.batch,
-            out_area,
-            spec.out_channels,
-            False,
-            dynamic_area=spec.out_w if spec.dynamic_h else 0,
-        )
 
 
-def _emit_grouped_transposed_convolution(
-    node: torch.fx.Node, ctx, spec: ConvSpec, source: TensorRef, out: TensorRef
-) -> TensorRef:
-    """Run one dense im2col walk for each transposed-convolution group."""
-    in_per_group = spec.in_channels // spec.groups
-    out_per_group = spec.out_channels // spec.groups
-    in_area = spec.in_h * spec.in_w
-    out_area = spec.out_h * spec.out_w
-    for index in range(spec.groups):
-        group = spec._replace(
-            groups=1,
-            in_channels=in_per_group,
-            out_channels=out_per_group,
-        )
-        group_in = ctx.builder.add_activation(
-            spec.batch * in_per_group * in_area * FP16_BYTES
-        )
-        ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_RASTER_BLIT,
-                inputs=[source],
-                outputs=[group_in],
-                params=[
-                    1,
-                    FP16_BYTES,
-                    1,
-                    0,
-                    index * in_per_group * in_area,
-                    0,
-                    spec.batch,
-                    in_per_group,
-                    in_area,
-                    spec.in_channels * in_area,
-                    in_area,
-                    1,
-                    in_per_group * in_area,
-                    in_area,
-                    1,
-                ],
-            ),
-        )
-        group_out = ctx.builder.add_activation(
-            spec.batch * out_per_group * out_area * FP16_BYTES
-        )
-        weight_start = index * in_per_group
-        weight_end = weight_start + in_per_group
-        weight = ctx.packed_weights(
-            node.args[1],
-            lambda array: pack_conv_weight(
-                deconv_weight_as_conv(array[weight_start:weight_end]), group
-            ),
-            f"transposed im2col group {index}",
-        )
-        bias_start = index * out_per_group
-        bias_end = bias_start + out_per_group
-        if node.args[2] is None:
-            bias = _conv_bias_ref(
-                ctx,
-                None,
-                out_per_group,
-                -(-out_per_group // 32) * 32 + 32,
-                f"transposed im2col group {index}",
-            )
-        else:
-            bias = ctx.packed_weights(
-                node.args[2],
-                lambda array: pack_conv_bias(
-                    array[bias_start:bias_end],
-                    out_per_group,
-                    -(-out_per_group // 32) * 32 + 32,
-                ),
-                f"transposed im2col group {index}",
-            )
-        _emit_dense_im2col(node, ctx, group, group_in, group_out, weight, bias)
-        ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_RASTER_BLIT,
-                inputs=[group_out],
-                outputs=[out],
-                params=[
-                    1,
-                    FP16_BYTES,
-                    1,
-                    0,
-                    0,
-                    index * out_per_group * out_area,
-                    spec.batch,
-                    out_per_group,
-                    out_area,
-                    out_per_group * out_area,
-                    out_area,
-                    1,
-                    spec.out_channels * out_area,
-                    out_area,
-                    1,
-                ],
-            ),
-        )
-    return ctx.record(node, out)
 
 
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
@@ -5236,9 +5022,9 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
 
     Dense and depthwise forms use the same blocked activation, with the blit
     in, the convolution, and the blit out of its result. A transposed
-    convolution is the same dense walk with an interleaving blit ahead of it and
-    a flipped weight; a grouped transposed convolution repeats that walk per
-    group.
+    convolution is the same three with an interleaving blit ahead of them and a
+    flipped weight, and a grouped one is the dense walk repeated per group with
+    a raster region on either side of each group's command.
     """
     spec = conv_spec(node, lambda operand: ctx.constant_value(operand) is not None)
     if spec is None:
@@ -5254,7 +5040,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     out = ctx.result_for(node, _numel(node))
     if not spec.depthwise:
         if spec.groups > 1:
-            return _emit_grouped_transposed_convolution(node, ctx, spec, source, out)
+            return _emit_grouped_convolution(node, ctx, spec, source, out)
 
         def _pack(array):
             # A rank-3 or rank-5 weight reaches the same two-dimensional kernel
@@ -5351,54 +5137,50 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
         )
 
-    if spec.depthwise:
-        weight = ctx.packed_weights(
-            weight_node,
-            lambda array: pack_depthwise_weight(
-                array.reshape(spec.in_channels, 1, spec.kernel_y, spec.kernel_x),
-                spec.in_channels,
+    weight = ctx.packed_weights(
+        weight_node,
+        lambda array: pack_depthwise_weight(
+            array.reshape(spec.in_channels, 1, spec.kernel_y, spec.kernel_x), spec.in_channels, spec.kernel_y, spec.kernel_x
+        ),
+        "depthwise",
+    )
+    bias = _conv_bias_ref(
+        ctx,
+        bias_node,
+        spec.out_channels,
+        _channel_blocks(spec.out_channels) * POOL_CHANNEL_BLOCK,
+        "depthwise",
+    )
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_CONV_DEPTHWISE2D_FP16,
+            inputs=[packed_in, weight, bias],
+            outputs=[packed_out],
+            params=[
+                spec.batch,
+                spec.in_h,
+                spec.in_w,
+                spec.out_h,
+                spec.out_w,
+                _channel_blocks(spec.in_channels),
                 spec.kernel_y,
                 spec.kernel_x,
-            ),
-            "depthwise",
-        )
-        bias = _conv_bias_ref(
-            ctx,
-            bias_node,
-            spec.out_channels,
-            _channel_blocks(spec.out_channels) * POOL_CHANNEL_BLOCK,
-            "depthwise",
-        )
-        op_index = ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_CONV_DEPTHWISE2D_FP16,
-                inputs=[packed_in, weight, bias],
-                outputs=[packed_out],
-                params=[
-                    spec.batch,
-                    spec.in_h,
-                    spec.in_w,
-                    spec.out_h,
-                    spec.out_w,
-                    _channel_blocks(spec.in_channels),
-                    spec.kernel_y,
-                    spec.kernel_x,
-                    spec.stride_y,
-                    spec.stride_x,
-                    spec.pad_y,
-                    spec.pad_x,
-                    spec.dilate_y,
-                    spec.dilate_x,
-                    # The kernel fuses relu and relu6 after the bias, and to_edge
-                    # leaves a relu as its own node rather than folding it in, so
-                    # both are always off here.
-                    0,
-                    0,
-                ],
-            ),
-        )
-        _patch_conv_extents(ctx, op_index, spec, im2col=False)
+                spec.stride_y,
+                spec.stride_x,
+                spec.pad_y,
+                spec.pad_x,
+                spec.dilate_y,
+                spec.dilate_x,
+                # The kernel fuses relu and relu6 after the bias, and to_edge
+                # leaves a relu as its own node rather than folding it in, so
+                # both are always off here.
+                0,
+                0,
+            ],
+        ),
+    )
+    _patch_conv_extents(ctx, op_index, spec, im2col=False)
     if packed_out is not out:
         _emit_channel_block_blit(
             ctx,
@@ -5410,6 +5192,264 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             spec.out_channels,
             False,
             dynamic_area=spec.out_w if spec.dynamic_h else 0,
+        )
+    return ctx.record(node, out)
+
+
+def _emit_dense_im2col(
+    node: torch.fx.Node,
+    ctx,
+    spec: ConvSpec,
+    source: TensorRef,
+    out: TensorRef,
+    weight: TensorRef,
+    bias: TensorRef,
+) -> None:
+    """Run one dense im2col walk over a row-major activation pair."""
+    in_h_dim = (
+        _value_of(node.args[0]).shape[2]
+        if spec.dynamic_h and not spec.transposed
+        else spec.in_h
+    )
+    out_h_dim = _value_of(node).shape[2] if spec.dynamic_h else spec.out_h
+    in_area = spec.in_h * spec.in_w
+    out_area = spec.out_h * spec.out_w
+    packed_in = source
+    if not _conv_layouts_agree(in_area, spec.in_channels):
+        packed_in = _blocked_activation(
+            ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
+        )
+        if spec.in_channels % POOL_CHANNEL_BLOCK:
+            _emit_zero(
+                ctx,
+                node,
+                packed_in,
+                dynamic_frame_bytes=(
+                    spec.batch
+                    * spec.in_w
+                    * _channel_blocks(spec.in_channels)
+                    * POOL_CHANNEL_BLOCK
+                    * FP16_BYTES
+                    if spec.dynamic_h
+                    else 0
+                ),
+            )
+        _emit_channel_block_blit(
+            ctx,
+            node,
+            source,
+            packed_in,
+            spec.batch,
+            in_area,
+            spec.in_channels,
+            True,
+            dynamic_area=spec.in_w if spec.dynamic_h else 0,
+        )
+    packed_out = out
+    if not _conv_layouts_agree(out_area, spec.out_channels):
+        packed_out = _blocked_activation(
+            ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
+        )
+    op_index = ctx.emit(
+        node,
+        Op(
+            # 17 names the function's 1x1 activation fill, which this geometry
+            # takes; 12 is the same function on its general window walk.
+            # conv_1x1_direct_applies is the host transcription of the C's own
+            # selection, so the stream says which fill runs.
+            type=(
+                DSP_OP_CONV1X1_DIRECT_FP16
+                if conv_1x1_direct_applies(spec)
+                else DSP_OP_IM2COL_CONVOLUTION_FP16
+            ),
+            inputs=[packed_in, weight, bias],
+            outputs=[packed_out],
+            params=[
+                spec.pad_x,
+                spec.pad_y,
+                spec.dilate_x,
+                spec.dilate_y,
+                spec.stride_x,
+                spec.stride_y,
+                spec.kernel_x,
+                spec.kernel_y,
+                # icDiv4 and icup4 belong to the int4 entry points; the fp16
+                # path reads neither.
+                spec.in_channels // 4,
+                spec.kernel_y * spec.kernel_x * conv_k_units(spec.in_channels),
+                spec.in_w,
+                spec.in_h,
+                spec.out_w,
+                spec.out_h,
+                # srcZStep steps between 64-channel blocks, srcYStep between
+                # rows of one, and destICStride is what a batch advances by:
+                # all three in the blocked layout the blit above produced
+                # (input_block_offset_fp16, :213).
+                spec.batch * in_area * POOL_CHANNEL_BLOCK,
+                spec.in_w * POOL_CHANNEL_BLOCK,
+                POOL_CHANNEL_BLOCK,
+                in_area * POOL_CHANNEL_BLOCK,
+                spec.in_channels,
+                (spec.in_channels + 3) // 4 * 4,
+                spec.out_channels,
+                # One position tile and two channel tiles per pass. The pair
+                # is not a tuning choice: the single-tile store rotates an
+                # odd tile's accumulator *after* adding its bias, so an odd
+                # tile that reaches it is handed the neighbouring tile's bias
+                # on the last position of a ragged position tile.
+                # test/sim/conv_runner.cpp runs that case as CV_ODD and
+                # test_conv_sim.py pins the wrong channels and the size of
+                # the error on the simulator.
+                1,
+                2,
+                # relu and relu6 are fused into the store, and to_edge
+                # leaves a relu as its own node, so both are off here.
+                0,
+                0,
+                spec.batch,
+                # outputBytes turns the store's own bounds check off.
+                0,
+                0,
+                0,
+            ],
+        ),
+    )
+    _patch_conv_extents(ctx, op_index, spec, im2col=True)
+    if packed_out is not out:
+        _emit_channel_block_blit(
+            ctx,
+            node,
+            packed_out,
+            out,
+            spec.batch,
+            out_area,
+            spec.out_channels,
+            False,
+            dynamic_area=spec.out_w if spec.dynamic_h else 0,
+        )
+
+
+def _emit_grouped_convolution(
+    node: torch.fx.Node, ctx, spec: ConvSpec, source: TensorRef, out: TensorRef
+) -> TensorRef:
+    """Run one dense im2col walk for each group of a grouped convolution.
+
+    The DSP command carries no group field, so the host supplies the channel
+    mapping: group `g` reads the `C_in / groups` input channels at offset
+    `g * C_in / groups * area`, its own weight tile and bias, and writes the
+    `C_out / groups` result channels at the same ordinal position in the
+    output. A plain convolution's weight is `[C_out, C_in/groups, ky, kx]`,
+    so the group's rows are the contiguous slice of that first axis; a
+    transposed one's is `[C_in, C_out/groups, ky, kx]`, so the slice is of
+    the first axis too, after the flip the identity asks for. torch orders the
+    output by group as well, so the ordinal placement is the tensor's own
+    order and no permutation is involved.
+    """
+    in_per_group = spec.in_channels // spec.groups
+    out_per_group = spec.out_channels // spec.groups
+    in_area = spec.in_h * spec.in_w
+    out_area = spec.out_h * spec.out_w
+    weight_node = node.args[1]
+    bias_node = node.args[2] if len(node.args) > 2 else None
+    for index in range(spec.groups):
+        group = spec._replace(
+            groups=1,
+            in_channels=in_per_group,
+            out_channels=out_per_group,
+        )
+        group_in = ctx.builder.add_activation(
+            spec.batch * in_per_group * in_area * FP16_BYTES
+        )
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[group_in],
+                params=[
+                    1,
+                    FP16_BYTES,
+                    1,
+                    0,
+                    index * in_per_group * in_area,
+                    0,
+                    spec.batch,
+                    in_per_group,
+                    in_area,
+                    spec.in_channels * in_area,
+                    in_area,
+                    1,
+                    in_per_group * in_area,
+                    in_area,
+                    1,
+                ],
+            ),
+        )
+        group_out = ctx.builder.add_activation(
+            spec.batch * out_per_group * out_area * FP16_BYTES
+        )
+        out_first = index * out_per_group
+        if spec.transposed:
+            in_first = index * in_per_group
+            weight = ctx.packed_weights(
+                weight_node,
+                lambda array: pack_conv_weight(
+                    deconv_weight_as_conv(array[in_first : in_first + in_per_group]),
+                    group,
+                ),
+                f"transposed im2col group {index}",
+            )
+        else:
+            weight = ctx.packed_weights(
+                weight_node,
+                lambda array: pack_conv_weight(
+                    array[out_first : out_first + out_per_group], group
+                ),
+                f"grouped im2col group {index}",
+            )
+        # The kind carries the group index because packed_weights caches
+        # on (node, kind): without it every group would read the first group's
+        # bias, which is a plausible wrong tensor rather than a refusal.
+        lanes = -(-out_per_group // 32) * 32 + 32
+        if bias_node is None:
+            bias = _conv_bias_ref(
+                ctx, None, out_per_group, lanes, f"im2col group {index}"
+            )
+        else:
+            bias = ctx.packed_weights(
+                bias_node,
+                lambda array: pack_conv_bias(
+                    array[out_first : out_first + out_per_group],
+                    out_per_group,
+                    lanes,
+                ),
+                f"im2col group {index}",
+            )
+        _emit_dense_im2col(node, ctx, group, group_in, group_out, weight, bias)
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[group_out],
+                outputs=[out],
+                params=[
+                    1,
+                    FP16_BYTES,
+                    1,
+                    0,
+                    0,
+                    index * out_per_group * out_area,
+                    spec.batch,
+                    out_per_group,
+                    out_area,
+                    out_per_group * out_area,
+                    out_area,
+                    1,
+                    spec.out_channels * out_area,
+                    out_area,
+                    1,
+                ],
+            ),
         )
     return ctx.record(node, out)
 

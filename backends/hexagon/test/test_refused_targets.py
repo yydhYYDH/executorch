@@ -210,20 +210,6 @@ _ROWS = [
         0,
     ),
     (
-        "a grouped convolution with two output channels per group",
-        _Conv(16, 32, groups=16),
-        (torch.randn(1, 16, 16, 16, dtype=F16),),
-        {CONVOLUTION: 1},
-        0,
-    ),
-    (
-        "a grouped convolution with four input channels per group",
-        _Conv(16, 16, groups=4),
-        (torch.randn(1, 16, 16, 16, dtype=F16),),
-        {CONVOLUTION: 1},
-        0,
-    ),
-    (
         "a depthwise convolution: groups == in == out",
         _Conv(16, 16, groups=16),
         (torch.randn(1, 16, 16, 16, dtype=F16),),
@@ -399,13 +385,13 @@ def test_the_diagnostic_cannot_change_a_verdict(monkeypatch):
         ("pool 64", *_pool(64)),
         ("avg pool 3", *_pool(3, kind="avg")),
         (
-            "conv grouped",
-            _Conv(16, 32, groups=16),
+            "conv depthwise",
+            _Conv(16, 16, groups=16),
             (torch.randn(1, 16, 16, 16, dtype=F16),),
         ),
         (
-            "conv depthwise",
-            _Conv(16, 16, groups=16),
+            "conv grouped",
+            _Conv(16, 32, groups=16),
             (torch.randn(1, 16, 16, 16, dtype=F16),),
         ),
         ("embedding int64", _Embedding(), (torch.zeros(1, 8, dtype=torch.int64),)),
