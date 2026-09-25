@@ -832,8 +832,8 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
     # 1 pool2d, 2 depthwise convolution, 3 blit, 4 unary, 8 layer norm, 12 im2col
     # convolution, 14 rope, 16 add+fused norm, 18 flash attention, 19 element-wise,
     # 22 q4a16 prefill, 23 shared gather, 24 zero, 26 select, 27 topk, 28 softmax,
-    # 29 reduction, 38 batch matmul, 41 q4a16 GEMV, 43 vision attention, 45 w8a16
-    # GEMV.
+    # 29 reduction, 37 Leaky ReLU, 38 batch matmul, 39 PReLU, 41 q4a16 GEMV,
+    # 43 vision attention, 45 w8a16 GEMV.
     # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
     assert _emitted_op_types() == {
         1,
@@ -853,7 +853,9 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
         27,
         28,
         29,
+        37,
         38,
+        39,
         41,
         43,
         45,
