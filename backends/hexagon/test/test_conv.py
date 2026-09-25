@@ -647,6 +647,15 @@ def test_conv_spec_reads_the_command_out_of_a_node_that_fits():
             (1, 64, 4, 4),
             False,
         ),
+        # A valid intermediate group count. The dense walk has no channel
+        # mapping, so a plain grouped convolution remains portable.
+        (
+            (None, [1, 1], [1, 1], [1, 1], 2),
+            (1, 64, 8, 8),
+            (32, 32, 3, 3),
+            (1, 32, 8, 8),
+            False,
+        ),
         # A group count that does not divide the input, which a real graph
         # cannot have but a hand-built one can.
         (

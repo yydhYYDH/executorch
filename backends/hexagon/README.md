@@ -818,10 +818,11 @@ every chain that does not end at a constant alone, and the run-time-weight
 case is tested from the lowering rather than from the pass's return value. It
 is what carries a FIR upsampler's transposed convolution: without the fold the
 weight is a computation `conv_spec` cannot read and the node stays portable.
-The geometry that reaches the DSP is a `groups == 1` transposed convolution --
-which is SDXL's: `FirUpsample2D` calls `conv_transpose2d` without `groups`. A
-grouped variant folds too and keeps its convolution portable, so the boundary
-is `groups` must be 1, not unsupported.
+The geometry that reaches the DSP includes both a `groups == 1`
+transposed convolution and a grouped transposed convolution. A grouped
+`FirUpsample2D` still folds its weight, then the host slices each group and
+emits one dense im2col walk per group. A plain forward convolution remains
+restricted to `groups == 1` or the genuine depthwise shape.
 
 **Unresolved: the folded blob has never been executed on the simulator or a
 device.** The simulator fixture that runs blobs builds its fx graph by hand

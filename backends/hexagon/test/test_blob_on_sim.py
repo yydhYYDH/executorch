@@ -36,6 +36,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 # The checkout directory is itself named executorch, so putting its parent on
 # the path makes "import executorch" resolve to this tree; the editable install
@@ -56,6 +57,7 @@ from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: 
 from executorch.backends.hexagon.prelu import PreservePRelu  # noqa: E402
 from executorch.backends.hexagon.reflect_pad import PreserveReflectPad  # noqa: E402
 from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
+from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
 from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
 from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower  # noqa: E402
@@ -580,6 +582,53 @@ def _whole_conv(in_channels, out_channels, kernel, padding, groups, stride=1, se
         -1, 2, model.conv.bias.shape, generator=generator
     ).to(torch.float16)
     return model
+
+
+class _TransposedConv(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel, **kwargs) -> None:
+        super().__init__()
+        self.conv = torch.nn.ConvTranspose2d(
+            in_channels, out_channels, kernel, bias=True, **kwargs
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def _whole_transposed(
+    in_channels, out_channels, kernel, stride, padding, dilation, groups, seed
+):
+    generator = torch.Generator().manual_seed(seed)
+    model = _TransposedConv(
+        in_channels,
+        out_channels,
+        kernel,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+        groups=groups,
+    ).half()
+    model.conv.weight.data = torch.randint(
+        -1, 2, model.conv.weight.shape, generator=generator
+    ).half()
+    model.conv.bias.data = torch.randint(
+        -1, 2, model.conv.bias.shape, generator=generator
+    ).half()
+    return model
+
+
+def _transposed_reference_fp64(model, x):
+    conv = model.conv
+    return F.conv_transpose2d(
+        x.double(),
+        conv.weight.detach().double(),
+        conv.bias.detach().double() if conv.bias is not None else None,
+        stride=conv.stride,
+        padding=conv.padding,
+        output_padding=conv.output_padding,
+        groups=conv.groups,
+        dilation=conv.dilation,
+    ).reshape(-1).detach().cpu().numpy()
 
 
 def _whole(*shape, seed=0):
@@ -1317,6 +1366,28 @@ def _cases():
         "T", split_model, (split_x,), _bits(_conv_reference(split_model, split_x))
     )
 
+    dilated_model = _whole_transposed(64, 64, 3, 2, 2, 2, 1, seed=21)
+    dilated_x = _whole(1, 64, 4, 4, seed=22)
+    dilated = _case(
+        "TD",
+        dilated_model,
+        (dilated_x,),
+        _transposed_reference_fp64(dilated_model, dilated_x),
+        kind="close",
+        tolerance=1e-6,
+    )
+
+    grouped_model = _whole_transposed(256, 256, 3, 2, 1, 1, 4, seed=23)
+    grouped_x = _whole(1, 256, 4, 4, seed=24)
+    grouped = _case(
+        "TG",
+        grouped_model,
+        (grouped_x,),
+        _transposed_reference_fp64(grouped_model, grouped_x),
+        kind="close",
+        tolerance=1e-6,
+    )
+
     x = _small((2, 3, 8))
     norm = _case(
         "C",
@@ -1559,6 +1630,8 @@ def _cases():
         depthwise,
         pointwise,
         split,
+        dilated,
+        grouped,
         split_pieces,
         split_pieces_control,
         group_norm,
@@ -3137,6 +3210,32 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         assert (
             blob_interpreter.read_dynamic_trailer(_tagged(cases, tag).blob) is None
         ), f"{tag}: a static blob carries a trailer"
+
+
+def test_transposed_cases_reach_the_expected_kernel_shapes(cases):
+    dilated = _tagged(cases, "TD")
+    assert [command.type for command in dilated.commands] == [
+        hexagon_ops.DSP_OP_ZERO,
+        hexagon_ops.DSP_OP_RASTER_BLIT,
+        hexagon_ops.DSP_OP_RASTER_BLIT,
+        hexagon_ops.DSP_OP_IM2COL_CONVOLUTION_FP16,
+        hexagon_ops.DSP_OP_RASTER_BLIT,
+    ]
+    walk = next(
+        command
+        for command in dilated.commands
+        if command.type == hexagon_ops.DSP_OP_IM2COL_CONVOLUTION_FP16
+    )
+    assert list(walk.params[2:4]) == [2, 2]
+
+    grouped = _tagged(cases, "TG")
+    walks = [
+        command
+        for command in grouped.commands
+        if command.type == hexagon_ops.DSP_OP_IM2COL_CONVOLUTION_FP16
+    ]
+    assert len(walks) == 4
+    assert all(list(command.params[18:21]) == [64, 64, 64] for command in walks)
 
 
 def test_every_blob_agrees_three_ways(cases, simulated):

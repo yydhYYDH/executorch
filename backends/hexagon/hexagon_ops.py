@@ -3654,8 +3654,9 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
 # torch.export writes for nn.Conv2d, and convolution is the one its own rewrites
 # produce, with transposed/output_padding/benchmark arguments it adds -- and the
 # two kernels behind it split on groups: groups == in_channels == out_channels
-# is the per-channel walk MobileNet's depthwise layers are, groups == 1 is every
-# other convolution.
+# is the per-channel walk MobileNet's depthwise layers are, groups == 1 is the
+# other plain convolution, and a grouped transposed convolution is partitioned
+# below into one dense walk per group.
 #
 # Both read and write their activation in the same 64-channel blocking pooling
 # uses, so both are wrapped in the same pair of blits, and the general path
@@ -3700,20 +3701,25 @@ class ConvSpec(NamedTuple):
     # identity
     #
     #   conv_transpose(x, w, s, p, op) ==
-    #       conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc), K - 1 - p)
+    #       conv2d(zero_insert(x, s, op), flip(w).transpose(ic, oc),
+    #               d * (K - 1) - p, dilation=d)
     #
-    # so everything above is the *convolution's* geometry: stride and dilation
-    # are 1, pad_y/pad_x are the remapped padding, and in_h/in_w are the
-    # upsampled extents the kernel actually walks. `transposed` says the weight
-    # needs the flip, and the other four describe the zero-insert blit in front
-    # of it: `upsample_*` is the interleave stride and `tail_*` the all-zero
-    # rows and columns output_padding appends at the far edge. All four are the
-    # identity (1, 1, 0, 0) for a plain convolution, which needs no blit.
+    # so everything above is the *convolution's* geometry: stride is 1,
+    # pad_y/pad_x are the remapped padding, and in_h/in_w are the upsampled
+    # extents the kernel actually walks. Dilation stays on the DSP because its
+    # im2col kernel reads dilateX and dilateY when it gathers each tap. The
+    # `transposed` flag says the weight needs the flip; `upsample_*` and
+    # `tail_*` describe the zero-insert blit. All four are the identity
+    # (1, 1, 0, 0) for a plain convolution, which needs no blit.
     transposed: bool = False
     upsample_y: int = 1
     upsample_x: int = 1
     tail_y: int = 0
     tail_x: int = 0
+    # A grouped transposed convolution is lowered as one dense walk per group.
+    # The DSP command has no group field; the host partitions the channels and
+    # gives each command the group-local in/out counts.
+    groups: int = 1
     # The operand's height held the bare run-time symbol, so every extent below
     # is the traced example's and the commands carry a patch the runtime
     # resolves from the length it was handed. See `_patch_conv_extents`.
@@ -3861,7 +3867,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         # leading axis is the input's channels and the second the output's share
         # of the group.
         weight_in, per_group, kernel_y, kernel_x = (int(dim) for dim in kernel.shape)
-        if weight_in * group != in_channels:
+        if weight_in != in_channels:
             return None
         out_channels = per_group * group
     else:
@@ -3878,15 +3884,13 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     # only a transposed one turns its stride into a zero-insert.
     upsample = stride if transposed else (1, 1)
     if transposed:
-        # Only the undilated form. The identity holds with a dilated tap too,
-        # but nothing here has measured that one, so the gate keeps the claim to
-        # the case the tests cover.
-        if dilation != (1, 1) or group != 1:
-            return None
-        # The convolution's own padding is what the transposed window's padding
-        # becomes once the input is interleaved, and a transposed padding wider
-        # than its kernel leaves the convolution nothing to walk.
-        conv_pad = (kernel_y - 1 - padding[0], kernel_x - 1 - padding[1])
+        # The kernel's dilated im2col walk is the same window walk as the
+        # undilated one. Only the effective kernel extent changes, so remap
+        # padding without expanding the kernel.
+        conv_pad = (
+            dilation[0] * (kernel_y - 1) - padding[0],
+            dilation[1] * (kernel_x - 1) - padding[1],
+        )
         if conv_pad[0] < 0 or conv_pad[1] < 0:
             return None
         # The interleaved plane reaches as far as the transposed window does,
@@ -3896,7 +3900,6 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         in_w = (in_w - 1) * stride[1] + 1 + tail[1]
         stride = (1, 1)
         padding = conv_pad
-        dilation = (1, 1)
 
     out_h = (in_h + 2 * padding[0] - dilation[0] * (kernel_y - 1) - 1) // stride[0] + 1
     out_w = (in_w + 2 * padding[1] - dilation[1] * (kernel_x - 1) - 1) // stride[1] + 1
@@ -3930,14 +3933,18 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     depthwise = (
         not transposed and group == in_channels == out_channels and per_group == 1
     )
-    if not depthwise and group != 1:
-        # A group count in between is a third kernel: neither walk carries the
-        # channel mapping for it, and faking it with blits is not worth the
-        # commands.
+    if not depthwise and group != 1 and not transposed:
+        # A plain grouped convolution is a third kernel: neither walk carries
+        # the channel mapping for it. A grouped transposed convolution is not
+        # passed to a kernel whole; the emitter below gives each group its own
+        # dense walk.
         return None
     if (
         not depthwise
-        and conv_vtcm_bytes(kernel_y, kernel_x, in_channels) > CONV_VTCM_BYTES
+        and conv_vtcm_bytes(
+            kernel_y, kernel_x, in_channels // group if transposed else in_channels
+        )
+        > CONV_VTCM_BYTES
     ):
         # The staging buffers are sized from kp, so a wide enough window has
         # nowhere to put them. The budget is the one the simulator reports and
@@ -3966,6 +3973,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         upsample_x=upsample[1],
         tail_y=tail[0],
         tail_x=tail[1],
+        groups=group if transposed else 1,
         dynamic_h=dynamic_h,
     )
 
@@ -4489,13 +4497,225 @@ def _emit_upsample(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _emit_dense_im2col(
+    node: torch.fx.Node,
+    ctx,
+    spec: ConvSpec,
+    source: TensorRef,
+    out: TensorRef,
+    weight: TensorRef,
+    bias: TensorRef,
+) -> None:
+    """Run one dense im2col walk over a row-major activation pair."""
+    in_area = spec.in_h * spec.in_w
+    out_area = spec.out_h * spec.out_w
+    in_h_dim = (
+        _value_of(node.args[0]).shape[2]
+        if spec.dynamic_h and not spec.transposed
+        else spec.in_h
+    )
+    out_h_dim = _value_of(node).shape[2] if spec.dynamic_h else spec.out_h
+    packed_in = source
+    if not _conv_layouts_agree(in_area, spec.in_channels):
+        packed_in = _blocked_activation(
+            ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
+        )
+        if not spec.depthwise and spec.in_channels % POOL_CHANNEL_BLOCK:
+            _emit_zero(
+                ctx,
+                node,
+                packed_in,
+                dynamic_frame_bytes=(
+                    spec.batch
+                    * spec.in_w
+                    * _channel_blocks(spec.in_channels)
+                    * POOL_CHANNEL_BLOCK
+                    * FP16_BYTES
+                    if spec.dynamic_h
+                    else 0
+                ),
+            )
+        _emit_channel_block_blit(
+            ctx,
+            node,
+            source,
+            packed_in,
+            spec.batch,
+            in_area,
+            spec.in_channels,
+            True,
+            dynamic_area=spec.in_w if spec.dynamic_h else 0,
+        )
+    packed_out = out
+    if not _conv_layouts_agree(out_area, spec.out_channels):
+        packed_out = _blocked_activation(
+            ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
+        )
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_IM2COL_CONVOLUTION_FP16,
+            inputs=[packed_in, weight, bias],
+            outputs=[packed_out],
+            params=[
+                spec.pad_x,
+                spec.pad_y,
+                spec.dilate_x,
+                spec.dilate_y,
+                spec.stride_x,
+                spec.stride_y,
+                spec.kernel_x,
+                spec.kernel_y,
+                spec.in_channels // 4,
+                spec.kernel_y * spec.kernel_x * conv_k_units(spec.in_channels),
+                spec.in_w,
+                spec.in_h,
+                spec.out_w,
+                spec.out_h,
+                spec.batch * in_area * POOL_CHANNEL_BLOCK,
+                spec.in_w * POOL_CHANNEL_BLOCK,
+                POOL_CHANNEL_BLOCK,
+                in_area * POOL_CHANNEL_BLOCK,
+                spec.in_channels,
+                (spec.in_channels + 3) // 4 * 4,
+                spec.out_channels,
+                1,
+                2,
+                0,
+                0,
+                spec.batch,
+                0,
+                0,
+                0,
+            ],
+        ),
+    )
+    _patch_conv_extents(ctx, op_index, spec, im2col=True)
+    if packed_out is not out:
+        _emit_channel_block_blit(
+            ctx,
+            node,
+            packed_out,
+            out,
+            spec.batch,
+            out_area,
+            spec.out_channels,
+            False,
+            dynamic_area=spec.out_w if spec.dynamic_h else 0,
+        )
+
+
+def _emit_grouped_transposed_convolution(
+    node: torch.fx.Node, ctx, spec: ConvSpec, source: TensorRef, out: TensorRef
+) -> TensorRef:
+    """Run one dense im2col walk for each transposed-convolution group."""
+    in_per_group = spec.in_channels // spec.groups
+    out_per_group = spec.out_channels // spec.groups
+    in_area = spec.in_h * spec.in_w
+    out_area = spec.out_h * spec.out_w
+    for index in range(spec.groups):
+        group = spec._replace(
+            groups=1,
+            in_channels=in_per_group,
+            out_channels=out_per_group,
+        )
+        group_in = ctx.builder.add_activation(
+            spec.batch * in_per_group * in_area * FP16_BYTES
+        )
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[group_in],
+                params=[
+                    1,
+                    FP16_BYTES,
+                    1,
+                    0,
+                    index * in_per_group * in_area,
+                    0,
+                    spec.batch,
+                    in_per_group,
+                    in_area,
+                    spec.in_channels * in_area,
+                    in_area,
+                    1,
+                    in_per_group * in_area,
+                    in_area,
+                    1,
+                ],
+            ),
+        )
+        group_out = ctx.builder.add_activation(
+            spec.batch * out_per_group * out_area * FP16_BYTES
+        )
+        weight_start = index * in_per_group
+        weight_end = weight_start + in_per_group
+        weight = ctx.packed_weights(
+            node.args[1],
+            lambda array: pack_conv_weight(
+                deconv_weight_as_conv(array[weight_start:weight_end]), group
+            ),
+            f"transposed im2col group {index}",
+        )
+        bias_start = index * out_per_group
+        bias_end = bias_start + out_per_group
+        if node.args[2] is None:
+            bias = _conv_bias_ref(
+                ctx,
+                None,
+                out_per_group,
+                -(-out_per_group // 32) * 32 + 32,
+                f"transposed im2col group {index}",
+            )
+        else:
+            bias = ctx.packed_weights(
+                node.args[2],
+                lambda array: pack_conv_bias(
+                    array[bias_start:bias_end],
+                    out_per_group,
+                    -(-out_per_group // 32) * 32 + 32,
+                ),
+                f"transposed im2col group {index}",
+            )
+        _emit_dense_im2col(node, ctx, group, group_in, group_out, weight, bias)
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[group_out],
+                outputs=[out],
+                params=[
+                    1,
+                    FP16_BYTES,
+                    1,
+                    0,
+                    0,
+                    index * out_per_group * out_area,
+                    spec.batch,
+                    out_per_group,
+                    out_area,
+                    out_per_group * out_area,
+                    out_area,
+                    1,
+                    spec.out_channels * out_area,
+                    out_area,
+                    1,
+                ],
+            ),
+        )
+    return ctx.record(node, out)
+
+
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     """A convolution as the DSP's depthwise walk or its im2col convolution.
 
-    Both take the same blocked activation, so both are three commands: the blit
+    Dense and depthwise forms use the same blocked activation, with the blit
     in, the convolution, and the blit out of its result. A transposed
-    convolution is the same three with an interleaving blit ahead of them and a
-    flipped weight.
+    convolution is the same dense walk with an interleaving blit ahead of it and
+    a flipped weight; a grouped transposed convolution repeats that walk per
+    group.
     """
     spec = conv_spec(node, lambda operand: ctx.constant_value(operand) is not None)
     if spec is None:
@@ -4509,6 +4729,25 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     weight_node = node.args[1]
     bias_node = node.args[2] if len(node.args) > 2 else None
     out = ctx.result_for(node, _numel(node))
+    if not spec.depthwise:
+        if spec.groups > 1:
+            return _emit_grouped_transposed_convolution(node, ctx, spec, source, out)
+        weight = ctx.packed_weights(
+            weight_node,
+            lambda array: pack_conv_weight(
+                deconv_weight_as_conv(array) if spec.transposed else array, spec
+            ),
+            "transposed im2col" if spec.transposed else "im2col",
+        )
+        bias = _conv_bias_ref(
+            ctx,
+            bias_node,
+            spec.out_channels,
+            -(-spec.out_channels // 32) * 32 + 32,
+            "im2col",
+        )
+        _emit_dense_im2col(node, ctx, spec, source, out, weight, bias)
+        return ctx.record(node, out)
 
     # The packed input holds the plane the kernel walks, and for a transposed
     # convolution that is the interleaved plane the zero-insert writes, so its
@@ -4611,78 +4850,6 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             ),
         )
         _patch_conv_extents(ctx, op_index, spec, im2col=False)
-    else:
-        weight = ctx.packed_weights(
-            weight_node,
-            lambda array: pack_conv_weight(
-                deconv_weight_as_conv(array) if spec.transposed else array, spec
-            ),
-            "transposed im2col" if spec.transposed else "im2col",
-        )
-        bias = _conv_bias_ref(
-            ctx,
-            bias_node,
-            spec.out_channels,
-            -(-spec.out_channels // 32) * 32 + 32,
-            "im2col",
-        )
-        op_index = ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_IM2COL_CONVOLUTION_FP16,
-                inputs=[packed_in, weight, bias],
-                outputs=[packed_out],
-                params=[
-                    spec.pad_x,
-                    spec.pad_y,
-                    spec.dilate_x,
-                    spec.dilate_y,
-                    spec.stride_x,
-                    spec.stride_y,
-                    spec.kernel_x,
-                    spec.kernel_y,
-                    # icDiv4 and icup4 belong to the int4 entry points; the fp16
-                    # path reads neither.
-                    spec.in_channels // 4,
-                    spec.kernel_y * spec.kernel_x * conv_k_units(spec.in_channels),
-                    spec.in_w,
-                    spec.in_h,
-                    spec.out_w,
-                    spec.out_h,
-                    # srcZStep steps between 64-channel blocks, srcYStep between
-                    # rows of one, and destICStride is what a batch advances by:
-                    # all three in the blocked layout the blit above produced
-                    # (input_block_offset_fp16, :213).
-                    spec.batch * in_area * POOL_CHANNEL_BLOCK,
-                    spec.in_w * POOL_CHANNEL_BLOCK,
-                    POOL_CHANNEL_BLOCK,
-                    in_area * POOL_CHANNEL_BLOCK,
-                    spec.in_channels,
-                    (spec.in_channels + 3) // 4 * 4,
-                    spec.out_channels,
-                    # One position tile and two channel tiles per pass. The pair
-                    # is not a tuning choice: the single-tile store rotates an
-                    # odd tile's accumulator *after* adding its bias, so an odd
-                    # tile that reaches it is handed the neighbouring tile's bias
-                    # on the last position of a ragged position tile.
-                    # test/sim/conv_runner.cpp runs that case as CV_ODD and
-                    # test_conv_sim.py pins the wrong channels and the size of
-                    # the error on the simulator.
-                    1,
-                    2,
-                    # relu and relu6 are fused into the store, and to_edge
-                    # leaves a relu as its own node, so both are off here.
-                    0,
-                    0,
-                    spec.batch,
-                    # outputBytes turns the store's own bounds check off.
-                    0,
-                    0,
-                    0,
-                ],
-            ),
-        )
-        _patch_conv_extents(ctx, op_index, spec, im2col=True)
     if packed_out is not out:
         _emit_channel_block_blit(
             ctx,

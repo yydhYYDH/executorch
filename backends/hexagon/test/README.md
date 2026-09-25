@@ -43,8 +43,10 @@ model and not a node of the graph `../README.md` ran: the max pool and the
 depthwise convolution there are single-op blobs that did delegate, while the same
 two ops inside that graph did not, and why is now established: the two call sites
 do not ask for the same geometry. `pool_spec` admits a pooling window only when
-its channel count is exactly `POOL_CHANNEL_BLOCK`, and `conv_spec` admits only
-`groups == 1` or a genuine depthwise convolution, one input channel per group.
+its channel count is exactly `POOL_CHANNEL_BLOCK`. For a plain
+convolution, `conv_spec` admits only `groups == 1` or a genuine depthwise
+convolution, one input channel per group. A grouped transposed convolution is
+different: the host partitions it into one dense walk per group.
 The graph's pool sees 32 channels, and its convolution is 16 input channels to 32
 outputs across 16 groups -- two outputs per group -- so neither operand set is the
 shape the gates accept, and both call sites fall back for a reason a reader can
