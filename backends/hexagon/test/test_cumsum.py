@@ -150,8 +150,11 @@ def _random(shape, seed):
 def _reference(x, carry=None):
     """The scan in fp64: the reference both sides are measured against.
 
-    torch's fp16 cumsum rounds every step, so it is a second opinion and not
-    the reference for a kernel that accumulates in fp32.
+    Not torch. Measured at L = 64..1024, torch.cumsum on an fp16 CPU tensor
+    accumulates in fp32 and narrows once exactly as this kernel does, so it
+    agrees with the blob bit for bit and would hide the one narrowing rather
+    than show it. The scan that rounds at every step is `_fp16_sequential`,
+    and the difference between the two is a number this suite measures.
     """
     scanned = torch.cumsum(x.double(), dim=-1)
     return scanned if carry is None else scanned + carry.double()
