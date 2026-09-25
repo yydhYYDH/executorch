@@ -96,7 +96,7 @@ static void run_matmul(const PrefillCase &c) {
   if (c.bias != 0) memcpy(g_bias, c.bias, c.bias_bytes);
   memset(g_out, 0xaa, sizeof(g_out));
   int ret = htp_ops_matmul_q4a16_fp16(g_out, g_act, g_weight, c.bias == 0 ? 0 : g_bias,
-                                      c.m, c.k, c.n, 0, 1, c.mp, c.np, c.kp, 1, 0);
+                                      c.m, c.k, c.n, 0, 1, c.mp, c.np, c.kp, c.scale_blocks, 0);
   printf("%s_RET %d\n", c.tag, ret);
   char tag[32];
   snprintf(tag, sizeof(tag), "%s_OUT", c.tag);

@@ -128,7 +128,7 @@ def _one_hot(m, k, at):
     return activation
 
 
-def _case(tag, activation, weight, scale, np_chunk=2, bias=None):
+def _case(tag, activation, weight, scale, np_chunk=2, bias=None, scale_blocks=1):
     m, k = activation.shape
     n = weight.shape[1]
     return {
@@ -138,8 +138,9 @@ def _case(tag, activation, weight, scale, np_chunk=2, bias=None):
         "n": n,
         "np": np_chunk,
         "kp": k // 32,
+        "scale_blocks": scale_blocks,
         "act": _pack_activation(activation),
-        "weight": pack_q4a16_prefill_weight(weight, scale, k, n),
+        "weight": pack_q4a16_prefill_weight(weight, scale, k, n, scale_blocks),
         "bias": None if bias is None else bias.astype(np.float16).tobytes(),
         "a": activation,
         "w": weight,
@@ -173,6 +174,7 @@ def _matmul_cases():
         _case("P5", _pattern(3, 64), w0, s0, bias=bias),
         _case("P6", _pattern(3, 64), w6, s6),
         _case("P7", _pattern(64, 128), w2, s2),
+        _case("BLOCK2", _one_hot(3, 128, (1, 65)), _weight(128, 64, 21), np.tile(_scale(64)[:, None], (1, 2)), scale_blocks=2),
     ]
 
 
@@ -248,7 +250,7 @@ def _fixture_header(cases, reorders):
 
     lines.append("struct PrefillCase {")
     lines.append(
-        "  const char *tag; int m, k, n, mp, np, kp, act_bytes, weight_bytes,"
+        "  const char *tag; int m, k, n, mp, np, kp, scale_blocks, act_bytes, weight_bytes,"
         " bias_bytes, out_bytes; const unsigned char *act, *weight, *bias; };"
     )
     lines.append("static const PrefillCase kCases[] = {")
@@ -256,7 +258,7 @@ def _fixture_header(cases, reorders):
         bias = f"kBias{index}" if case["bias"] is not None else "0"
         lines.append(
             f'  {{"{case["tag"]}", {case["m"]}, {case["k"]}, {case["n"]}, 1, '
-            f'{case["np"]}, {case["kp"]}, {len(case["act"])}, '
+            f'{case["np"]}, {case["kp"]}, {case["scale_blocks"]}, {len(case["act"])}, '
             f'{len(case["weight"])}, {len(case["bias"] or b"")}, '
             f'{(case["n"] + 63) // 64 * case["m"] * 128}, kAct{index}, '
             f"kWeight{index}, {bias}}},"
@@ -385,12 +387,17 @@ def test_the_kernel_computes_the_layout_blind_arithmetic(measured, cases):
     """
     for case in cases:
         tag = case["tag"]
+        k = case["k"]
         assert _returned(measured, tag) == 0, f"{tag}: the kernel refused"
         got = _unpack_output(_halfwords(measured[f"{tag}_OUT"]), case["m"], case["n"])
+        scales = (
+            case["scale"]
+            if case["scale_blocks"] == 1
+            else np.take(case["scale"].reshape(-1, case["scale_blocks"]), ((np.arange(k) // 32) * case["scale_blocks"]) // (k // 32), axis=1).T
+        )
         want = (
             case["a"].astype(np.float32)
-            @ case["w"].astype(np.float32)
-            * case["scale"].reshape(1, -1)
+            @ (case["w"].astype(np.float32) * scales)
         ).astype(np.float16)
         if case["bias"] is not None:
             want = (
