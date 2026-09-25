@@ -3437,7 +3437,18 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
         spatial_result = [int(dim) for dim in result.shape[2:]]
         spatial_kernel = [int(dim) for dim in kernel.shape[2:]]
         if spatial_kernel[0] == spatial_kernel[1] == 1:
-            if spatial_in[0] != spatial_result[0] or spatial_in[1] != spatial_result[1]:
+            if (
+                spatial_in[0] != spatial_result[0]
+                or spatial_in[1] != spatial_result[1]
+                or spatial_in[0] != 1
+                or spatial_in[1] != 1
+                or stride_3d[0] != 1
+                or stride_3d[1] != 1
+                or padding_3d[0] != 0
+                or padding_3d[1] != 0
+                or dilation_3d[0] != 1
+                or dilation_3d[1] != 1
+            ):
                 return None
             in_h, in_w = 1, spatial_in[2]
             kernel_y, kernel_x = 1, spatial_kernel[2]
