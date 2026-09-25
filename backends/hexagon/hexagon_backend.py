@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 from executorch.backends.hexagon.hexagon_ops import (
     EMITTERS,
+    gather_index_placeholders,
     pack_hmx_weight,
     pack_shared_gather_table,
 )
@@ -746,6 +747,10 @@ class HexagonBackend(BackendDetails):
         for node, tensor in weights.items():
             context.producer[node] = context.builder.add_weights(weight_bytes(tensor))
 
+        gather_indices = gather_index_placeholders(
+            graph_module, lambda operand: context.constant_value(operand) is not None
+        )
+
         for index, placeholder in enumerate(inputs):
             value = _val_of(placeholder)
             # A scalar input such as llama.custom_sdpa's start_pos arrives as a
@@ -757,18 +762,26 @@ class HexagonBackend(BackendDetails):
                 )
                 # The kernels read activations as fp16, so a fp32 input gets a
                 # half-width slot and the runtime narrows it on the way into the
-                # arena. Other widths, such as the int64 position read the patch
-                # mechanism consumes, keep their own size.
-                narrowed = value.dtype == torch.float32
+                # arena. A gather's indices get an int32 slot the same way and
+                # for the same reason: the kernel reads `const int32_t[]`, and an
+                # int64 caller's tensor is narrowed into that slot, checked
+                # against the vocabulary rather than truncated. Other widths,
+                # such as the int64 position the patch mechanism consumes, keep
+                # their own size.
+                slot_dtype = value.dtype
+                if value.dtype == torch.float32:
+                    slot_dtype = torch.float16
+                elif placeholder in gather_indices:
+                    slot_dtype = torch.int32
                 max_numel = 1
                 for dim in context.upper_shape(
                     value.shape, allow_static_fallback=is_dynamic_input
                 ):
                     max_numel *= dim
-                size = bytes_for(max_numel, torch.float16 if narrowed else value.dtype)
+                size = bytes_for(max_numel, slot_dtype)
                 dynamic_layout = context.dynamic_bytes_for_shape(
                     value.shape,
-                    torch.float16 if narrowed else value.dtype,
+                    slot_dtype,
                     allow_static_fallback=is_dynamic_input,
                 )
             else:

@@ -34,6 +34,7 @@ import torch
 import blob_interpreter
 from blob_interpreter import execute, read_blob, SHARED_GATHER
 from executorch.backends.hexagon.hexagon_ops import (
+    gather_table,
     pack_shared_gather_table,
     SHARED_GATHER_FP16,
 )
@@ -203,8 +204,9 @@ def test_an_embedding_reaches_the_delegate_and_gathers_the_rows(dtype):
     assert indices.size == tokens.nbytes
     assert table.space is blob_interpreter.B.TensorSpace.WEIGHTS
     assert table.size == _tiled_bytes(64, 8)
-    # selectSize, ic, oc, bytes, isInt4.
-    assert command.params == [len(tokens), 8, 64, 2, SHARED_GATHER_FP16]
+    # selectSize, ic, oc, bytes, isInt4, scaleBlockNum, scaleAsymmetric, and
+    # the width the caller's index tensor has.
+    assert command.params == [len(tokens), 8, 64, 2, SHARED_GATHER_FP16, 1, 0, 4, 0]
 
     # The row-major copy `preprocess` stored for the placeholder is not reachable
     # from any command, so it is not in the file: one table, tiled, not two.
@@ -261,31 +263,53 @@ def test_one_table_read_twice_is_stored_once():
     assert np.array_equal(got, want)
 
 
-def test_int64_indices_keep_the_embedding_on_a_portable_kernel():
-    """The negative control for the test above: no int32, no delegate.
+def test_int64_indices_reach_the_dsp_through_a_checked_narrowing():
+    """An int64 token tensor is a command, and the numbers are torch's.
 
-    The kernel reads `const int32_t[]`, so an int64 token tensor would be read as
-    five low words interleaved with five zero high words. Refusing in the support
-    check is what keeps that from being emitted at all, and the export has to
-    succeed with the op left where it was.
+    The kernel reads `const int32_t[]`, so the blob declares a four-byte slot
+    for the indices whatever the caller's dtype is -- params[7] says which the
+    caller handed over, and nothing on the DSP reads it -- and the runtime
+    narrows the caller's values into that slot on the way in. What has to hold
+    here is that the embedding delegated at all, that the slot is the int32 one
+    rather than the int64 the placeholder declares, and that the rows come back
+    equal to a reference torch computed itself.
     """
     torch.manual_seed(0)
     model = _Embedding().eval()
     tokens = np.array([3, 63, 0, 17, 5], dtype=np.int64)
+
     lowered, blobs = _lowered(model, (torch.from_numpy(tokens),))
-    assert blobs == []
+    assert len(blobs) == 1
+    header, command = _only_command(blobs[0])
+    indices, _ = command.inputs
+    assert indices.space is blob_interpreter.B.TensorSpace.INPUT
+    assert indices.size == tokens.size * 4, "the slot is not the kernel's width"
+    assert command.params[7] == 8, "the command does not say the caller's width"
     assert any(
-        "embedding" in str(node.target) for node in lowered.graph_module.graph.nodes
+        "embedding" in str(node.target)
+        for node in _delegates(lowered)[0].original_module.graph_module.graph.nodes
     )
+
+    got = np.frombuffer(execute(blobs[0], [tokens])[0], dtype=np.float16)
+    assert np.array_equal(got, _reference(model, tokens))
+    # The same rows the table holds, read straight out of it, so a reference that
+    # would accept a wrong row still has to accept these.
+    with torch.no_grad():
+        # The arena holds fp16, which is the width the table is read at.
+        table = model.emb.weight.detach().numpy().astype(np.float16)
+    assert np.array_equal(got.reshape(len(tokens), -1), table[tokens])
 
 
 def test_int64_tokens_reach_the_dsp_through_an_int32_cast():
-    """What a model has to do today to delegate an embedding fed by int64 tokens.
+    """The model-side cast is still accepted, and is still a portable kernel.
 
-    The cast is not delegated -- a cast out of int64 is a conversion the kernels
-    have no command for -- so it stays on a portable kernel and splits the graph
-    there. The embedding on the other side of the split is a command like any
-    other, and what its kernel reads is four bytes per token.
+    It is no longer what a model has to do: the command above takes int64 tokens
+    directly. A cast is not delegated either way -- a conversion out of int64 is
+    a command the kernels have none for, and the portable `to_copy` the runtime
+    would run has no int case at all (kernels/portable/cpu/op_to_copy.cpp, whose
+    ET_SWITCH_REALHBBF16_TYPES names no integer type) -- so the graph is split
+    there and the embedding on the far side is a command like any other. What
+    this pins is that the width a model asks for is the width the command says.
     """
 
     class _Casting(_Embedding):
@@ -314,6 +338,123 @@ def test_int64_tokens_reach_the_dsp_through_an_int32_cast():
     )
     assert np.array_equal(got, _reference(model, tokens))
 
+
+def test_an_int64_index_of_negative_sign_is_answered_as_the_op_defines_it():
+    """A negative index is two different things, and the command says which.
+
+    Measured on this torch, not assumed: `embedding` and `index_select` raise
+    IndexError on a negative index, and advanced indexing counts back from the
+    last row, so `table[-1]` is the last row and `table[-64]` is the first. A
+    narrowing that picked one rule for both would answer where torch refuses, or
+    refuse where torch has a row, and the DSP on its own would be wrong either
+    way: it clears a row whose index is outside [0, oc)
+    (shared_gather_ops.cc:292-295).
+    """
+    torch.manual_seed(0)
+
+    class _Index(torch.nn.Module):
+        def __init__(self, rows=64, dim=8):
+            super().__init__()
+            self.table = torch.nn.Parameter(torch.randn(rows, dim))
+
+        def forward(self, index):
+            return self.table[index]
+
+    indexed = _Index().eval()
+    tokens = np.array([-1, -64, -2, 0], dtype=np.int64)
+    _, blobs = _lowered(indexed, (torch.from_numpy(tokens),))
+    assert len(blobs) == 1
+    _, command = _only_command(blobs[0])
+    assert command.params[8] == 1, "advanced indexing counts back from the end"
+    got = np.frombuffer(execute(blobs[0], [tokens])[0], dtype=np.float16)
+    assert np.array_equal(got, _reference(indexed, tokens))
+    with torch.no_grad():
+        table = indexed.table.detach().numpy().astype(np.float16)
+    assert np.array_equal(got.reshape(len(tokens), -1), table[[63, 0, 62, 0]])
+
+    embedding = _Embedding().eval()
+    _, blobs = _lowered(embedding, (torch.from_numpy(tokens),))
+    _, command = _only_command(blobs[0])
+    assert command.params[8] == 0, "embedding has no row for a negative index"
+    with pytest.raises(ValueError, match="outside 0 to 64"):
+        execute(blobs[0], [tokens])
+    with pytest.raises(IndexError):
+        embedding(torch.from_numpy(tokens))
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        np.array([0, 64], dtype=np.int64),  # one past the last row
+        np.array([0, 2**40], dtype=np.int64),  # wider than a vocabulary, or a slot
+        np.array([0, -(64 + 1)], dtype=np.int64),  # before the first row
+        np.array([0, 2**40 + 7], dtype=np.int64),  # the value a truncation names
+    ],
+    ids=["one-past-the-end", "past-int32", "one-before-the-start", "wraps-to-7"],
+)
+def test_an_int64_index_out_of_range_is_refused_rather_than_wrapped(tokens):
+    """A token the vocabulary does not have stops the call, as it does on the CPU.
+
+    Truncation would be worse than a wrong answer, because the value a truncation
+    produces is a real row: 2**40 is row 0 and 2**40 + 7 is row 7 in a table of
+    64, so the gather would answer with a row the caller never asked for and
+    report nothing. Refusing is what torch does, and the value is never written,
+    so there is no half-narrowed slot left behind either. The row a truncation
+    would have named is asserted to exist and to differ, so a narrowing that did
+    wrap would fail on something before it ever reached the refusal.
+    """
+    torch.manual_seed(0)
+    model = _Embedding().eval()
+    _, blobs = _lowered(model, (torch.from_numpy(tokens),))
+    with pytest.raises(ValueError, match="outside"):
+        execute(blobs[0], [tokens])
+    with pytest.raises(IndexError):
+        model(torch.from_numpy(tokens))
+    sent = int(tokens[1])
+    wrapped = int(np.asarray(sent, dtype=np.int64).astype(np.int32).astype(np.int64))
+    if not -(2**31) <= sent < 2**31:
+        # These are the ones a truncation would have turned into a row at all;
+        # the others are already int32 and are refused for being out of range.
+        assert wrapped != sent
+    with torch.no_grad():
+        table = model.emb.weight.detach().numpy().astype(np.float16)
+    if 0 <= wrapped < table.shape[0]:
+        # In range, so a narrowing that truncated would have answered with a row
+        # rather than refused, and that row is not the one the caller named.
+        assert wrapped < int(tokens[1])
+
+
+def test_a_vocabulary_the_kernel_cannot_address_is_refused():
+    """A table past int32 has no command, and no narrowing to make it fit.
+
+    The vocabulary is a command param and every element offset in the kernel is
+    derived from it, so a table with more rows than an int32 can name is refused
+    at export rather than emitted with arithmetic that would have wrapped. No
+    run-time check could catch that one: the wrap would be in the kernel's own
+    addressing, on a table no caller could supply values for anyway. A meta
+    tensor carries the shape without the terabytes a real one would cost.
+    """
+
+    class _Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(64, 8)
+
+        def forward(self, tokens):
+            return self.emb(tokens)
+
+    torch.manual_seed(0)
+    tokens = np.array([0, 1], dtype=np.int64)
+    lowered, _ = _lowered(_Embedding().eval(), (torch.from_numpy(tokens),))
+    graph = _delegates(lowered)[0].original_module.graph_module.graph
+    embedding = next(node for node in graph.nodes if "embedding" in str(node.target))
+    weight = embedding.args[0]
+    # The control: the table this graph really has is one the kernel addresses.
+    assert gather_table(embedding, lambda node: node is weight) is not None
+    weight.meta["val"] = torch.empty(
+        (2**31, 8), dtype=torch.float16, device="meta"
+    )
+    assert gather_table(embedding, lambda node: node is weight) is None
 
 def test_a_padding_index_comes_back_as_the_zero_row_it_is():
     """`embedding` ignores padding_idx in the forward, so nothing has to carry it.
@@ -384,7 +525,7 @@ def test_index_select_and_index_tensor_gather_rows_too():
     _, blobs = _lowered(select, (torch.from_numpy(index),))
     assert len(blobs) == 1
     header, command = _only_command(blobs[0])
-    assert command.params == [4, 40, 70, 2, SHARED_GATHER_FP16]
+    assert command.params == [4, 40, 70, 2, SHARED_GATHER_FP16, 1, 0, 4, 0]
     assert header.weights_bytes == _tiled_bytes(70, 40)
     got = np.frombuffer(execute(blobs[0], [index])[0], dtype=np.float16)
     assert np.array_equal(got, _reference(select, index))
@@ -394,7 +535,7 @@ def test_index_select_and_index_tensor_gather_rows_too():
     _, blobs = _lowered(indexed, (torch.from_numpy(index),))
     assert len(blobs) == 1
     _, command = _only_command(blobs[0])
-    assert command.params == [3, 5, 12, 2, SHARED_GATHER_FP16]
+    assert command.params == [3, 5, 12, 2, SHARED_GATHER_FP16, 1, 0, 4, 1]
     got = np.frombuffer(execute(blobs[0], [index])[0], dtype=np.float16)
     assert np.array_equal(got, _reference(indexed, index))
 

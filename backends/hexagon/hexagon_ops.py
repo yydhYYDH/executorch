@@ -173,6 +173,30 @@ POOL_CHANNEL_BLOCK = 64
 # params those paths read, and nothing in this backend produces them.
 SHARED_GATHER_FP16 = 0
 
+# The two params the int4 and int8 table paths read past isInt4 (execute_command.cc:809).
+# The dispatcher supplies 1 and 0 for a command that stops before them, which is
+# what a plain fp16 table wants and what this backend writes explicitly so the
+# index width below can have a slot of its own.
+SHARED_GATHER_SCALE_BLOCK_NUM = 1
+SHARED_GATHER_SCALE_ASYMMETRIC = 0
+
+# Params[7] of the same command: the width one index has in the caller's tensor.
+# Nothing on the DSP reads it -- the index slot is four bytes an element either
+# way, and the kernel reads int32 -- so it is the host's: the runtime and the
+# host interpreter narrow a wider tensor into the slot with it.
+SHARED_GATHER_INDEX_BYTES = 7
+
+# Params[8], and what the op this command came from does with a negative index.
+# `embedding` and `index_select` raise on one -- measured on torch 2.14, whose
+# answer is "index out of range in self" for both -- while advanced indexing
+# counts back from the last row, so `table[-1]` is the last row and `table[-5]`
+# in a table of four rows is a range error. A narrowing that picked one of those
+# for the other would answer where torch refuses, so the command carries which
+# one it is. The DSP reads no param past scaleAsymmetric.
+SHARED_GATHER_NEGATIVE_INDEXES = 8
+NEGATIVE_INDEX_REFUSED = 0
+NEGATIVE_INDEX_FROM_END = 1
+
 # HtpOpsUnaryOpType, declared in the DSP's unary_ops.cc. Transcribed whole so
 # the numbering can be checked against one place; only the entries with an
 # emitter in EMITTERS below are reachable.
@@ -7551,8 +7575,14 @@ class GatherTable(NamedTuple):
 
     #: The constant whose rows are gathered.
     table: torch.fx.Node
-    #: The runtime int32 tensor naming those rows.
+    #: The runtime tensor naming those rows, int32 or int64.
     indices: torch.fx.Node
+    #: Bytes one index occupies in the caller's tensor, 4 or 8. The command's
+    #: index slot is always four bytes an element; a wider caller's tensor is
+    #: narrowed into it on the way in, checked against `oc`.
+    index_bytes: int
+    #: What a negative index means, which the op this came from decides.
+    negative_index: int
     #: Table rows, as htp_ops_shared_gather's `oc`.
     oc: int
     #: Elements per table row, as its `ic`.
@@ -7574,9 +7604,10 @@ def gather_table(node: torch.fx.Node, is_constant) -> Optional[GatherTable]:
     The table has to be a value this layer can read now -- the kernel reads a
     tiled table, so its bytes are rearranged at export (`pack_shared_gather_table`)
     and a table that only exists at run time has no bytes to rearrange. The
-    indices have to be the caller's own int32 tensor: the kernel reads them as
-    `const int32_t[]`, and an int64 index tensor is not one, so the whole op stays
-    on a portable kernel until the runtime can narrow it (see README).
+    indices have to be the caller's own int32 or int64 tensor, and the width is
+    what `index_bytes` carries: the kernel reads `const int32_t[]` either way, so
+    an int64 tensor is narrowed into a four-byte slot on the way in, with every
+    value checked against `oc` (see README).
 
     `is_constant` is the caller's own test for "a value I can read now". The
     support check passes the graph's, keyed on the names the partitioner tags as
@@ -7597,14 +7628,17 @@ def gather_table(node: torch.fx.Node, is_constant) -> Optional[GatherTable]:
         return None
     if not is_constant(table_arg) or is_constant(index_arg):
         return None
-    # The kernel reads the indices as `const int32_t[]`, and a method input keeps
-    # the width its own dtype declares, so an int64 index tensor would be read as
-    # alternating low and high words. The narrower type is also what makes the
-    # operand safe to read at four bytes an element wherever it comes from: an
-    # op whose result is int32 is never delegated -- the support check only
-    # accepts fp16 and fp32 results -- so an int32 tensor can only reach a
-    # command as a method input, which is the width the emitter declares for it.
-    if indices_value.dtype is not torch.int32:
+    # The kernel reads the indices as `const int32_t[]`. The caller's tensor
+    # keeps the width its own dtype declares, so an int64 index tensor is a slot
+    # of eight bytes an element that the kernel would read as alternating low and
+    # high words. The slot is declared four bytes an element either way, and the
+    # runtime narrows a wider tensor into it on the way in, value by value and
+    # refused against `oc` rather than truncated (hexagon_backend.cpp, and
+    # `index_bytes` below). Both widths are safe to read at four bytes an
+    # element wherever they come from: an op whose result is int32 or int64 is
+    # never delegated -- the support check only accepts fp16 and fp32 results --
+    # so such a tensor can only reach a command as a method input.
+    if indices_value.dtype not in (torch.int32, torch.int64):
         return None
     if indices_value.dim() < 1:
         return None
@@ -7633,10 +7667,32 @@ def gather_table(node: torch.fx.Node, is_constant) -> Optional[GatherTable]:
     return GatherTable(
         table_arg,
         index_arg,
+        8 if indices_value.dtype is torch.int64 else 4,
+        (
+            NEGATIVE_INDEX_FROM_END
+            if node.target is INDEX_TENSOR
+            else NEGATIVE_INDEX_REFUSED
+        ),
         int(oc),
         int(ic),
         _upper_product(indices_shape),
         indices_shape,
+    )
+
+
+def gather_index_placeholders(graph_module, is_constant) -> frozenset:
+    """The method inputs a gather command takes its indices from as int64.
+
+    Those are the slots the blob declares four bytes an element: the kernel reads
+    `const int32_t[]`, so an int64 caller's tensor is narrowed into the slot on
+    the way in, and the slot's own size is what says so.
+    """
+    return frozenset(
+        fit.indices
+        for node in graph_module.graph.nodes
+        if node.target in GATHER_TARGETS
+        for fit in (gather_table(node, is_constant),)
+        if fit is not None and fit.index_bytes == 8 and fit.indices.op == "placeholder"
     )
 
 
@@ -7699,9 +7755,12 @@ def _emit_gather(node: torch.fx.Node, ctx) -> TensorRef:
     `htp_ops_shared_gather(mapped_ptrs[inputs->size()], mapped_ptrs[0],
     mapped_ptrs[1], ...)` reads the output past every input and takes the first
     input as the indices and the second as the table (execute_command.cc:806-811).
-    Five params are enough for it: the two the quantized paths read past them
-    (scaleBlockNum, scaleAsymmetric) have no slot here and the dispatcher supplies
-    its own defaults, which the fp16 path never looks at.
+    The five the kernel reads are followed by the two the quantized paths would
+    read (scaleBlockNum, scaleAsymmetric), which this table kind never looks at
+    and which are written as the dispatcher's own defaults (execute_command.cc:809),
+    and then by the width the caller's index tensor has in the .pte, which the DSP
+    ignores: the index slot is four bytes an element whatever the command says,
+    and the host is what narrows a wider tensor into it.
     """
     fit = gather_table(node, lambda operand: ctx.constant_value(operand) is not None)
     if fit is None:
@@ -7728,6 +7787,10 @@ def _emit_gather(node: torch.fx.Node, ctx) -> TensorRef:
                 fit.oc,
                 FP16_BYTES,
                 SHARED_GATHER_FP16,
+                SHARED_GATHER_SCALE_BLOCK_NUM,
+                SHARED_GATHER_SCALE_ASYMMETRIC,
+                fit.index_bytes,
+                fit.negative_index,
             ],
         ),
     )

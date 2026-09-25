@@ -464,18 +464,33 @@ Things that bite:
   when both sides are multiples of 32, and 32x when the row width is one element.
   A 1024-wide token embedding -- the case this exists for -- is exactly its
   row-major size.
-- **The gather's indices are read as `int32`, so an `int64` index tensor stays on
-  a portable kernel.** The kernel takes `const int32_t*`, and a method input keeps
-  the width its own dtype declares, so five int64 tokens would read as five low
-  words interleaved with five zero high words. `gather_table` refuses the node
-  instead, which leaves `nn.Embedding` on the CPU for a graph whose tokens are
-  int64 -- the dtype `torch.export` gives you by default. Adding a
-  `tokens.to(torch.int32)` in the model is enough: the cast is not delegated, so
-  it stays on a portable kernel and only the gather after it reaches the DSP.
+- **The gather's indices are read as `int32`, and the host narrows the caller's
+  tensor into that width on the way in.** The kernel takes `const int32_t*`; a
+  method input keeps the width its own dtype declares, and five int64 tokens read
+  as five low words interleaved with five zero high words. So the blob declares
+  an int32 slot whatever the graph's dtype is, `params[7]` of the command says
+  which width the caller handed over, and the runtime converts value by value
+  (`narrow_indices_to_int32`, beside the fp32-to-fp16 narrowing it already did).
+  An int64 token tensor therefore delegates with no cast in the model. A
+  `tokens.to(torch.int32)` still works and still keeps the cast on a portable
+  kernel -- the portable `_to_copy` has no int case at all
+  (`kernels/portable/cpu/op_to_copy.cpp`), so the model-side cast is a graph that
+  would have to run a conversion no portable kernel implements.
+- **A narrowed index outside the table is refused, not wrapped.** The values come
+  from the caller and the vocabulary from the graph, so a token the table does
+  not have cannot be narrowed into one it does: the copy-in loop refuses the
+  call, which is what torch does. Truncation would be worse than wrong, because
+  `2**40` is row 0 and `2**40 + 7` is row 7 in a table of 64 -- a plausible row
+  and no error. A negative index follows the op it came from: `embedding` and
+  `index_select` raise on one and the narrowing refuses it, while advanced
+  indexing counts back from the last row and the narrowing adds the vocabulary,
+  which is `params[8]`. A vocabulary past an int32 has no command at all and is
+  refused at export. The int32 path is the kernel's own and is unchanged.
 - **An index outside the table clears the row rather than raising**
-  (`shared_gather_ops.cc:292-295`). Torch's `embedding` raises there. The count
-  and the table come from the graph and the index comes from the caller, so a
-  token outside the vocabulary is a zero row on the DSP and an error on the CPU.
+  (`shared_gather_ops.cc:292-295`) on the int32 path. Torch's `embedding` raises
+  there. The count and the table come from the graph and the index comes from the
+  caller, so a token outside the vocabulary is a zero row on the DSP and an error
+  on the CPU. An int64 tensor never reaches that: the host refuses it first.
 - **`htp_ops_matmul_q4a16_fp16` returns success even when the kernel fails.** The
   block variant propagates the error; the plain one logs and returns 0. The two
   GEMV entries propagate and are checked by `execute_command.cc`.
@@ -889,12 +904,13 @@ weights after `torch.manual_seed(0)`, which cost this work two rounds of a
   portable kernels, which is a different claim from "this graph ran on the DSP";
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
   (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
-  1.56e-2 against a reference of 16.9. An `embedding` on its own is not delegated
-  when its indices are int64 and lands on the portable kernels instead -- not
-  because a gather cannot be delegated but because the kernel reads
-  `const int32_t[]` and the partitioner refuses the dtype. The same table with
-  int32 indices reaches one delegate, which is the form the simulator comparison
-  below runs;
+  1.56e-2 against a reference of 16.9. The gather is run on the phone at both
+  index widths: a standalone `nn.Embedding(70, 64)` fed int64 tokens delegates,
+  writes 768 bytes for six tokens, and every one of those 384 fp16 values is
+  bit-for-bit the float64 reference; the same program with a token of `2**40 + 7`
+  -- a value that truncates to row 7, a row the table has -- exits non-zero and
+  writes no output at all, while the int32 path with a token of 70 still answers
+  with the zero row the kernel gives it;
 - single-op `add`, `amax` and `sum` graphs each reach one delegate; `add` and
   `amax` answer bit-for-bit, and `sum` is 5.86e-3 out, one and a half ULP of its
   largest element;

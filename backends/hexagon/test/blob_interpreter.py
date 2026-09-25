@@ -70,6 +70,8 @@ SELECT = 26
 #: The isInt4 slot of htp_ops_shared_gather that names an fp16 table, which is
 #: the only kind this backend stores; 2 and 3 are int4 and int8 tables.
 SHARED_GATHER_FP16 = 0
+#: What a negative index means, per the op the command was emitted for.
+NEGATIVE_INDEX_FROM_END = 1
 
 #: fp16, the only element size any op this backend emits carries.
 FP16_BYTES = 2
@@ -1997,6 +1999,57 @@ def _run_shared_gather(command: Command, params: List[int], arena: Arena) -> Non
     _store(arena, arena.address(command.outputs[0]), out.tobytes())
 
 
+def _gather_index_rule(commands: List[Command], input_index: int):
+    """The (vocabulary, negative policy) of the gather reading this input, or None.
+
+    The command carries the width the caller's index tensor has in the .pte
+    (params[7]) and what a negative index means to the op it was emitted for
+    (params[8]), both of which the DSP ignores and the host narrows with. A blob
+    without the width is the older form, where the slot and the tensor were both
+    int32; one without the policy predates the measurement that the two differ.
+    """
+    for command in commands:
+        if (
+            command.type == SHARED_GATHER
+            and len(command.params) > 7
+            and command.params[7] == 8
+            and command.inputs
+            and command.inputs[0].space == B.TensorSpace.INPUT
+            and command.inputs[0].index == input_index
+        ):
+            return (
+                int(command.params[2]),
+                bool(command.params[8])
+                if len(command.params) > 8
+                else NEGATIVE_INDEX_FROM_END,
+            )
+    return None
+
+
+def narrow_indices(
+    tensor: np.ndarray, vocabulary: int, from_end: bool = True
+) -> np.ndarray:
+    """The int32 values a gather command reads, from a caller's int64 tensor.
+
+    The model of narrow_indices_to_int32 in runtime/hexagon_backend.cpp, and the
+    same rules: with `from_end` a negative value counts back from the last row,
+    which is what advanced indexing does with one, and without it a negative
+    value is a range error, which is what `embedding` and `index_select` raise.
+    Either way a value outside the range is refused rather than truncated, because
+    the truncated value would name a row the caller never asked for and answer
+    with it.
+    """
+    values = np.asarray(tensor, dtype=np.int64).reshape(-1)
+    low = -vocabulary if from_end else 0
+    outside = (values < low) | (values >= vocabulary)
+    if outside.any():
+        raise ValueError(
+            f"gather index {int(values[outside][0])} is outside {low} to "
+            f"{vocabulary}"
+        )
+    return (values + np.where(values < 0, vocabulary, 0)).astype(np.int32)
+
+
 _EXECUTORS = {
     POOL2D_FP16: _run_pool2d,
     CONV_DEPTHWISE2D_FP16: _run_conv_depthwise2d,
@@ -2061,9 +2114,15 @@ def execute(
         ref = _slot(commands, B.TensorSpace.INPUT, index)
         raw = tensor.tobytes()
         if len(raw) != ref.size:
-            raise ValueError(
-                f"input {index} is {len(raw)} bytes, the blob expects {ref.size}"
-            )
+            # A gather's index slot is int32 whatever the caller's tensor is, so
+            # an int64 one arrives twice the slot's size and is narrowed into it
+            # here, the way the runtime narrows it on a device.
+            rule = _gather_index_rule(commands, index)
+            if rule is None or len(raw) != ref.size * 2:
+                raise ValueError(
+                    f"input {index} is {len(raw)} bytes, the blob expects {ref.size}"
+                )
+            raw = narrow_indices(tensor, *rule).tobytes()
         _copy(arena, arena.address(ref), arena.address(ref), 0)
         arena.bytes[arena.address(ref) : arena.address(ref) + ref.size] = raw
 

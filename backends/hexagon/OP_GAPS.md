@@ -275,12 +275,22 @@ the stable part):
 | `conv_spec`: group count | `groups == 1`, the im2col path, at any channel count (3->16 and 64->64 both delegate, with a leading `ZERO` command when `C_in % 64 != 0`); `groups == in_channels == out_channels` with one channel per group, the depthwise kernel; and any count in between as one dense im2col command per group, measured on the host, the simulator and the phone for 2, 3, 4, 8, 16 and 32 groups and for 63, 64 and 65 channels per group | a group count that does not divide the input channels, and a grouped convolution whose height is a run-time length, because the per-group partition emits static extents and the per-group dynamic record is not produced | `hexagon_ops.py` `_emit_grouped_convolution`, `test_grouped_conv.py` |
 | `max_pool2d_with_indices`: readers | every reader takes `getitem 0` | reading the indices leaves the pool on the portable kernels, whatever its shape | `hexagon_partitioner.py:607` |
 
-The gather's index width is the same kind of gate: `embedding`, `index_select` and
-`index.Tensor` take an int32 index tensor and refuse an int64 one (`:3733`), which
-is why a `tokens.to(torch.int32)` in the model is enough and an `nn.Embedding`
-spelled with `torch.long` indices is not. A graph can hold a delegate either way --
-the ops after the refused one form their own -- so a delegate count says nothing
-about which of the two happened, and the command stream does.
+The gather's index width was a gate like that and is not any more. `embedding`,
+`index_select` and `index.Tensor` take an int32 index tensor or an int64 one, and
+an int64 tensor is narrowed into the int32 slot the kernel reads on the way in,
+value by value and refused against the vocabulary rather than truncated
+(`narrow_indices_to_int32` in `runtime/hexagon_backend.cpp`, beside the
+fp32-to-fp16 narrowing the runtime already did for the same reason). The width
+the caller handed over is `params[7]` of the command, and what a negative index
+means is `params[8]`, because torch's own answer is not uniform: `embedding` and
+`index_select` raise on a negative index and advanced indexing counts back from
+the last row. A table past an int32 is still refused at export, which is a
+different check and a different reason: the vocabulary is a command param and
+every element offset in the kernel is derived from it. A `tokens.to(torch.int32)`
+in the model is no longer needed, and the portable `_to_copy` would not have run
+it anyway -- its type switch names no integer type
+(`kernels/portable/cpu/op_to_copy.cpp`), so the documented workaround was a graph
+the runtime could not execute.
 
 ## 5. What the gaps cost a model
 
@@ -292,8 +302,6 @@ guards (`_assert_scalar` 227, `getitem` 114, `le` 113, `_local_scalar_dense` 85,
 `lt` 57, `ge` 57, `add` 57, `sym_size` 1), which is what a dynamic-shape export
 looks like rather than a gap. The real remainder is small:
 
-- **`embedding`**, because the graph carries int64 indices. One cast in the model
-  source moves it.
 - **one `view_copy` per layer**, which is the boundary rule above.
 - **85 int64 `select_copy`**, the sequence-position reads, which belong on the
   host because the patch mechanism needs the value where it is.

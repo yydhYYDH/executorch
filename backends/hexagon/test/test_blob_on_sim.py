@@ -775,23 +775,31 @@ def _fake(tensor):
     return FakeTensorMode().from_tensor(tensor)
 
 
-def _gather_graph(oc, ic, rows):
-    """`embedding` as one SHARED_GATHER.
+def _gather_graph(oc, ic, rows, index_dtype=torch.int32, indexed=False):
+    """A row gather as one SHARED_GATHER, with the caller's index width as asked.
 
     The table is an attribute, which is the only kind the emitter can read -- it
     rearranges the bytes into the order the kernel walks, so a table that only
     exists at run time has nothing to rearrange. The indices are the caller's own
-    int32 placeholder: the kernel reads `const int32_t[]`, and an int64 tensor
-    would be read as alternating low and high words.
+    placeholder, in whatever width the case wants: the kernel reads
+    `const int32_t[]` either way, and a wider tensor is narrowed into that slot
+    on the way in, so the width is what a case varies rather than the command.
+`indexed` picks `table[index]` over `embedding`, which is the same read with
+    another answer to a negative index.
     """
     graph = torch.fx.Graph()
     index = graph.placeholder("index")
-    index.meta["val"] = _fake(torch.empty((rows,), dtype=torch.int32))
+    index.meta["val"] = _fake(torch.empty((rows,), dtype=index_dtype))
     weight = graph.get_attr("weight")
     weight.meta["val"] = torch.empty((oc, ic), dtype=torch.float16)
-    out = graph.call_function(
-        exir_ops.edge.aten.embedding.default, args=(weight, index)
-    )
+    if indexed:
+        out = graph.call_function(
+            exir_ops.edge.aten.index.Tensor, args=(weight, [index])
+        )
+    else:
+        out = graph.call_function(
+            exir_ops.edge.aten.embedding.default, args=(weight, index)
+        )
     out.meta["val"] = torch.empty((rows, ic), dtype=torch.float16)
     graph.output(out)
     root = torch.nn.Module()
@@ -812,6 +820,24 @@ def _gather_reference(table, indices):
             out[row] = table[int(index)]
     return out
 
+
+def _gather_reference_fp64(table, indices):
+    """The rows torch names, gathered in float64 and rounded to the arena's width.
+
+    Every entry of the table is an fp16 value, so the double-precision gather is
+    exact and the single rounding on the way back is the one the arena's own
+    width makes: nothing in the reference accumulates in a narrower type than
+    the answer is compared in. A negative index counts back from the last row,
+    which is advanced indexing's rule; the range assertion is here because a
+    case that asked for a row the table does not have would be a case about the
+    kernel's own divergence, which the case above already is.
+    """
+    rows = indices.to(torch.int64)
+    rows = torch.where(rows < 0, rows + table.shape[0], rows)
+    assert bool(((rows >= 0) & (rows < table.shape[0])).all()), (
+        f"the case asks for a row outside the table: {indices.tolist()}"
+    )
+    return torch.index_select(table.double(), 0, rows).half()
 
 def _weights_base(blob):
     """Where the file's weights section starts, from the header and the op count."""
@@ -1780,6 +1806,37 @@ def _branch_cases():
             _bits(_gather_reference(table, indices)),
             kind="teeth",
             mutate=_with_row_major_table(table),
+        )
+    )
+
+    # 1b. The same gather fed int64 tokens, which is the case the narrowing is
+    #     for. The command is the same one -- the index slot is four bytes an
+    #     element either way, and params[7] is what says the caller's tensor was
+    #     wider -- so what this adds is the narrowing on the way in, checked here
+    #     against a reference gathered in float64. The tokens are in range because
+    #     that is all `embedding` accepts: a negative index is a range error to it,
+    #     and the negative half of the narrowing is the indexed case below.
+    wide = torch.tensor([3, 0, 17, 5, 34], dtype=torch.int64)
+    cases.append(
+        _case(
+            "PI",
+            _gather_graph(35, 33, len(wide), index_dtype=torch.int64),
+            (wide,),
+            _bits(_gather_reference_fp64(table, wide)),
+        )
+    )
+    # 1c. `table[index]` fed int64 tokens, where a negative one names the row it
+    #     counts back to. This is the other half of the narrowing, and the case
+    #     that says which rule was picked: the same -1 that `embedding` refuses
+    #     reads the last row here, because that is what advanced indexing does
+    #     with one.
+    tail = torch.tensor([-1, -35, -2, 0], dtype=torch.int64)
+    cases.append(
+        _case(
+            "PJ",
+            _gather_graph(35, 33, len(tail), index_dtype=torch.int64, indexed=True),
+            (tail,),
+            _bits(_gather_reference_fp64(table, tail)),
         )
     )
 
