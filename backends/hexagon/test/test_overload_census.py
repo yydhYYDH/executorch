@@ -651,10 +651,20 @@ _ROWS = [
         [("aten.max_pool2d_with_indices.default", "refused"), (_GETITEM, "wired")],
     ),
     (
-        "max_pool2d over a channel count that is not 64",
+        # 32 channels is one block with a 32-wide tail, which is a narrower blit
+        # region and a memset rather than a refusal; 192 is three whole blocks.
+        # The row is here as a census of what the command now takes, and the
+        # refusal the pool still has is the dilated window above.
+        "max_pool2d over a half block and over three blocks",
         lambda a: torch.nn.functional.max_pool2d(a, 2, 2),
         (_x(1, 32, 8, 8),),
-        [("aten.max_pool2d_with_indices.default", "refused"), (_GETITEM, "wired")],
+        [("aten.max_pool2d_with_indices.default", "accepted"), (_GETITEM, "wired")],
+    ),
+    (
+        "max_pool2d over three whole blocks",
+        lambda a: torch.nn.functional.max_pool2d(a, 2, 2),
+        (_x(1, 192, 8, 8),),
+        [("aten.max_pool2d_with_indices.default", "accepted"), (_GETITEM, "wired")],
     ),
     (
         "avg_pool2d",

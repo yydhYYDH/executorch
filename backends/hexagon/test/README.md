@@ -42,13 +42,12 @@ convolution and the 3x3 im2col convolution. Each of those is its own one-delegat
 model and not a node of the graph `../README.md` ran: the max pool and the
 depthwise convolution there are single-op blobs that did delegate, while the same
 two ops inside that graph did not, and why is now established: the two call sites
-do not ask for the same geometry. `pool_spec` admits a pooling window only when
-its channel count is exactly `POOL_CHANNEL_BLOCK`, while `conv_spec` now admits
-any group count and lowers it to one dense command per group, so the graph's
-convolution -- 16 input channels to 32 outputs across 16 groups, two outputs per
-group -- delegates where it used to fall back. The graph's pool still sees 32
-channels rather than the 64 the pool kernel wants, so that call site stays on a
-portable kernel for a reason a reader can see. `OP_GAPS.md` carries the
+do not ask for the same geometry. `conv_spec` admits any group count and lowers
+it to one dense command per group, so the graph's convolution -- 16 input channels
+to 32 outputs across 16 groups, two outputs per group -- delegates where it used
+to fall back. The pool is no longer the other: `pool_spec` reads any channel count,
+so the graph's 32-channel pool delegates as well and the reading of it as a
+portable call site is history. `OP_GAPS.md` carries the
 condition with its line numbers and the 56-cell channel grid behind it. The convolution is the one
 worth naming, because it goes through HMX and `--mhmx=3` is a second
 implementation of that unit rather than a recompilation of it, and because the

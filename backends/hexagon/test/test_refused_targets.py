@@ -4,10 +4,12 @@
 other half of the same complaint: an op with an emitter looks supported, so a
 reader of `OP_SUPPORT.md` expects it to run, and a geometry or a dtype the kernels
 do not take sends it back to the portable kernels with nothing printed. The
-spelling census found that shape three times -- a pool that wants exactly 64
-channels, a grouped convolution whose group count no kernel here covers, and a
-gather whose indices are int64 -- and each of them lowers to a graph that still
-returns torch's answer, so nothing but a delegate count tells them apart.
+spelling census found that shape three times -- a pool whose window the
+command cannot describe, a grouped convolution whose group count no kernel here
+covers, and a gather whose indices are int64 -- and each of them lowers to a
+graph that still returns torch's answer, so nothing but a delegate count tells
+them apart. A pool's channel count is no longer on that list: the command
+counts 64-lane blocks and reads any C.
 
 Every row asserts both directions: the count the census reports, and the delegate
 count the graph actually has. The second half matters, because two of these cases
@@ -171,22 +173,20 @@ def _pool(channels, kind="max", **kwargs):
 
 
 #: (label, model, inputs, {target: count}, delegates)
+#:
+#: The three widths that used to sit in this list as refusals are not here any
+#: more: the pool command counts 64-lane blocks rather than channels, so 3, 32
+#: and 65 are one block of 64 with the tail a narrower blit region. They are
+#: in `_ROWS` as delegates, which is the point -- a refusal list that keeps a
+#: case that now delegates is a list that is not measuring anything.
 _ROWS = [
-    (
-        "max pool at 3 channels: the kernel wants exactly 64",
-        *_pool(3),
-        {MAX_POOL: 1},
-        0,
-    ),
-    ("max pool at 32 channels: still not 64", *_pool(32), {MAX_POOL: 1}, 0),
-    (
-        "max pool at 65 channels: one block and a remainder",
-        *_pool(65),
-        {MAX_POOL: 1},
-        0,
-    ),
+    ("max pool at 3 channels: one block, a 3-wide tail", *_pool(3), {}, 1),
+    ("max pool at 32 channels: half a block", *_pool(32), {}, 1),
+    ("max pool at 65 channels: one block and a one-channel remainder",
+*_pool(65), {}, 1),
+    ("max pool at 128 channels: two whole blocks", *_pool(128), {}, 1),
     ("max pool at 64 channels", *_pool(64), {}, 1),
-    ("average pool at 3 channels", *_pool(3, kind="avg"), {AVG_POOL: 1}, 0),
+    ("average pool at 3 channels", *_pool(3, kind="avg"), {}, 1),
     ("average pool at 64 channels", *_pool(64, kind="avg"), {}, 1),
     (
         "max pool at 64 channels with dilation: the kernel has none",
@@ -263,11 +263,15 @@ def test_a_delegate_can_hold_none_of_the_op_that_was_refused():
     `MaxPool2d` into a graph that keeps going gets a delegate -- of the ops
     *after* the pool. Reading the delegate count alone says "part of this model
     runs on the DSP", which is true and tells a reader nothing about the pool.
+
+    The refusal is the dilation, not the channel count: a dilated window is a
+    geometry the command has no argument for, and it is the one thing here that
+    still keeps a 32-channel pool off the DSP.
     """
     inputs = (torch.randn(1, 32, 16, 16, dtype=F16),)
 
     def forward(x):
-        return torch.relu(torch.nn.functional.max_pool2d(x, 2, 2)[0] + 1.0)
+        return torch.relu(torch.nn.functional.max_pool2d(x, 2, 2, 0, 2)[0] + 1.0)
 
     assert _refusals(forward, inputs) == {MAX_POOL: 1}
     assert len(_delegates(forward, inputs)) == 1  # the add and the relu, not the pool
@@ -360,7 +364,7 @@ def test_the_census_only_holds_targets_the_table_has():
 def test_the_debug_line_names_the_target_and_the_node(caplog):
     """The human surface: which op, and which node in the graph."""
     caplog.set_level(10, logger=hexagon_partitioner.__name__)
-    _refusals(*_pool(3))
+    _refusals(*_pool(64, dilation=2))
     assert MAX_POOL in caplog.text
     assert "refused" in caplog.text
 
@@ -381,9 +385,9 @@ def test_the_diagnostic_cannot_change_a_verdict(monkeypatch):
     the delegates are identical with the counting removed.
     """
     corpus = [
-        ("pool 3", *_pool(3)),
+        ("pool 3", *_pool(3, dilation=2)),
         ("pool 64", *_pool(64)),
-        ("avg pool 3", *_pool(3, kind="avg")),
+        ("avg pool 3", *_pool(3, kind="avg", ceil_mode=True)),
         (
             "conv depthwise",
             _Conv(16, 16, groups=16),
@@ -478,13 +482,13 @@ def test_a_lowering_counts_each_refused_node_once():
     `_refusals` helper above -- one pass over the graph -- disagreed by that
     factor, and the number a caller reads after a lowering is the inflated one.
     """
-    _delegates(*_pool(3))
+    _delegates(*_pool(3, dilation=2))
     assert refused_overload_census() == {MAX_POOL: 1}
 
 
 def test_two_nodes_of_the_same_target_count_twice():
     """The dedupe is by node and not by target: two refusals are two."""
-    pool = _Pool(3)
+    pool = _Pool(3, dilation=2)
     inputs = (torch.randn(1, 3, 16, 16, dtype=F16),)
     _delegates(_M(lambda x: pool(x) + pool(x * 0.5)), inputs)
     assert refused_overload_census() == {MAX_POOL: 2}

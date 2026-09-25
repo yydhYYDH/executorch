@@ -3751,6 +3751,7 @@ class PoolSpec(NamedTuple):
     """Everything the pool command carries, once the node is known to fit."""
 
     batch: int
+    channels: int
     ih: int
     iw: int
     oh: int
@@ -3850,12 +3851,17 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
         batch, channels, ih, iw = shape
     else:
         batch, channels, ih, iw = 1, shape[0], shape[1], shape[2]
-    # The kernel reads its activation as [ceil(C/64)][batch][h*w][64] blocks,
-    # which is not the row-major [batch][C][h*w] the arena holds. At C == 64
-    # there is exactly one block and this emitter can hand the kernel that block
-    # with one blit either side; any other channel count is a padded or
-    # multi-block grid this batch does not build.
-    if channels != POOL_CHANNEL_BLOCK:
+    # The kernel reads its activation as [ceil(C/64)][batch][h*w][64] blocks
+    # (pool_fp16.c:22), which is not the row-major [batch][C][h*w] the arena
+    # holds, and it writes the same blocked layout. The channel axis is a
+    # packing granularity rather than a shape the kernel needs: `c4` is the
+    # number of 64-lane blocks and the walk already loops over all of them
+    # (pool_fp16.c:21), so any channel count is a number of blocks and the
+    # emitter's job is to describe the rearranged grid, not to reshape the
+    # command. A ragged last block costs a narrower blit region and a zeroed
+    # tail, because the pack writes only the channels the tensor has while the
+    # kernel reads whole 64-lane vectors.
+    if channels <= 0:
         return None
 
     if node.target is ADAPTIVE_AVG_POOL2D:
@@ -3872,6 +3878,7 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
         kernel = (ih // oh, iw // ow)
         return PoolSpec(
             batch=batch,
+            channels=channels,
             ih=ih,
             iw=iw,
             oh=oh,
@@ -3934,6 +3941,7 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
 
     return PoolSpec(
         batch=batch,
+        channels=channels,
         ih=ih,
         iw=iw,
         oh=oh,
@@ -3949,27 +3957,6 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
     )
 
 
-def _channel_block_region(batch: int, area: int, channels: int, packing: bool) -> list:
-    """The blit region that moves one 64-channel block between the two layouts.
-
-    `packing` reads row-major ``[batch][channels][area]`` and writes the
-    kernel's ``[batch][area][64]``; the other direction is the same region with
-    the two stride triples exchanged. The two are exactly the geometries the
-    DSP's own pack paths are written for: with `channels == 64` and this stride
-    pair, `htp_ops_try_pack_area_blit` (blit_ops.cc:816-831) takes the case and
-    reads/writes element ``(b, c, x)`` as
-    ``dst[b * area * 64 + x * 64 + c] = src[b * 64 * area + c * area + x]``,
-    which is the same mapping this region describes.
-    """
-    inner = (
-        [channels * area, area, 1],
-        [area * POOL_CHANNEL_BLOCK, 1, POOL_CHANNEL_BLOCK],
-    )
-    if not packing:
-        inner = (inner[1], inner[0])
-    return [0, 0, 0, batch, POOL_CHANNEL_BLOCK, area] + list(inner[0]) + list(inner[1])
-
-
 def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     """Fixed-window max, average, and adaptive average as one POOL2D_FP16.
 
@@ -3978,8 +3965,17 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     before the window walk and back out after. That is two blits around the
     command, and they are not optional: reading the blocked layout's
     ``(y * width + x) * 64`` step over a row-major buffer would return other
-    channels' values at every position. A spatial extent of one is the one case
-    where the two layouts agree element for element, and the blit is dropped.
+    channels' values at every position. A spatial extent of one over whole blocks
+    is the one case where the two layouts agree element for element, and the
+    blit is dropped.
+
+    The channel axis is a count of blocks and not a shape the kernel needs: the
+    command carries `ceil(C / 64)` in its `c4` slot and `hvx_pool2d_fp16` walks
+    every one of them, so a wide pool is this same command with a larger `c4`
+    and one more blit region per block. Nothing here widens the parameter
+    budget: `c4` was already one of the fifteen ints the pool command carries,
+    and a blit region is twelve of the forty `kMaxOpParams` leaves after the
+    three-int header, so three blocks move per command at any width.
     """
     spec = pool_spec(node)
     if spec is None:
@@ -3994,28 +3990,34 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
     out = ctx.result_for(sink, _numel(node))
     area = spec.ih * spec.iw
     out_area = spec.oh * spec.ow
-    channels = POOL_CHANNEL_BLOCK
+    channels = spec.channels
+    blocks = _channel_blocks(channels)
 
     packed_in = source
-    if area != 1:
+    if not _conv_layouts_agree(spec.batch, area, channels):
         packed_in = ctx.builder.add_activation(
-            spec.batch * area * channels * FP16_BYTES
+            spec.batch * area * blocks * POOL_CHANNEL_BLOCK * FP16_BYTES
         )
-        ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_RASTER_BLIT,
-                inputs=[source],
-                outputs=[packed_in],
-                params=[1, FP16_BYTES, 1]
-                + _channel_block_region(spec.batch, area, channels, True),
-            ),
+        if channels % POOL_CHANNEL_BLOCK:
+            # The kernel loads whole 64-lane vectors and the pack blit writes
+            # only the channels the tensor has, so the tail lanes of the last
+            # block are whatever the arena last held. Each lane pools
+            # independently of every other, so those lanes cannot reach a real
+            # channel and the unpack never reads them -- but an arena block is
+            # memset once, on the first allocation of its size, and reused after
+            # that (runtime/hexagon_driver.cpp, SharedArenaPool::Acquire), so
+            # what is there is the previous run rather than a known value.
+            _emit_zero(ctx, node, packed_in)
+        _emit_channel_block_blit(
+            ctx, node, source, packed_in, spec.batch, area, channels, True
         )
 
     pooled = (
         out
-        if out_area == 1
-        else ctx.builder.add_activation(spec.batch * out_area * channels * FP16_BYTES)
+        if _conv_layouts_agree(spec.batch, out_area, channels)
+        else ctx.builder.add_activation(
+            spec.batch * out_area * blocks * POOL_CHANNEL_BLOCK * FP16_BYTES
+        )
     )
     ctx.emit(
         node,
@@ -4029,8 +4031,7 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
                 spec.iw,
                 spec.oh,
                 spec.ow,
-                # One block: the support check only lets C == 64 through.
-                1,
+                blocks,
                 spec.kernel_y,
                 spec.kernel_x,
                 spec.stride_y,
@@ -4043,16 +4044,9 @@ def _emit_pool2d(node: torch.fx.Node, ctx) -> TensorRef:
             ],
         ),
     )
-    if out_area != 1:
-        ctx.emit(
-            node,
-            Op(
-                type=DSP_OP_RASTER_BLIT,
-                inputs=[pooled],
-                outputs=[out],
-                params=[1, FP16_BYTES, 1]
-                + _channel_block_region(spec.batch, out_area, channels, False),
-            ),
+    if not _conv_layouts_agree(spec.batch, out_area, channels):
+        _emit_channel_block_blit(
+            ctx, node, pooled, out, spec.batch, out_area, channels, False
         )
     return ctx.record(node, out)
 
@@ -4766,16 +4760,24 @@ def pack_conv_bias(bias, channels: int, lanes: int) -> bytes:
     return out.tobytes()
 
 
-def _conv_layouts_agree(area: int, channels: int) -> bool:
+def _conv_layouts_agree(batch: int, area: int, channels: int) -> bool:
     """Whether a row-major ``[batch][channels][area]`` buffer is the blocked one.
 
     The blocked index ``((c // 64) * batch + n) * area * 64 + (m * 64) + c % 64``
     collapses to the row-major ``(n * channels + c) * area + m`` only when a plane
-    is a single element and every block is full: with a ragged channel count the
-    blocked form is wider than the tensor it would be read from, so the kernel
-    would walk past the buffer rather than inside it.
+    is a single element and either the tensor is exactly one full block or the
+    batch is one. The batch clause is the one that is easy to leave out: the
+    blocked layout puts the channel block outside the batch and the row-major one
+    puts it inside, so from the second block on the two orders part company at
+    any batch above one even when every block is full. With a single block there
+    is no order to disagree about and the batch does not enter. A ragged channel
+    count widens the blocked form past the tensor it would be read from, so the
+    kernel would walk past the buffer rather than inside it.
     """
-    return area == 1 and channels % POOL_CHANNEL_BLOCK == 0
+    return area == 1 and (
+        channels == POOL_CHANNEL_BLOCK
+        or (batch == 1 and channels % POOL_CHANNEL_BLOCK == 0)
+    )
 
 
 def _channel_block_regions(
@@ -4783,7 +4785,7 @@ def _channel_block_regions(
 ) -> List[int]:
     """The blits that move every 64-channel block between the two layouts.
 
-    This is `_channel_block_region`'s geometry once per block, with the offsets
+    The geometry is one block's, repeated once per block, with the offsets
     that move block ``i`` from ``[batch][channels][area]`` (packing) or back to
     it (unpacking). The blocked layout puts the channel block outside the batch
     (``[c4][batch][area][64]``), which is why the source offset is the block
@@ -5243,7 +5245,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     in_area = spec.in_h * spec.in_w
     out_area = spec.out_h * spec.out_w
     packed_in = source
-    if not _conv_layouts_agree(in_area, spec.in_channels):
+    if not _conv_layouts_agree(spec.batch, in_area, spec.in_channels):
         packed_in = _blocked_activation(
             ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
         )
@@ -5280,7 +5282,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             dynamic_area=spec.in_w if spec.dynamic_h else 0,
         )
     packed_out = out
-    if not _conv_layouts_agree(out_area, spec.out_channels):
+    if not _conv_layouts_agree(spec.batch, out_area, spec.out_channels):
         packed_out = _blocked_activation(
             ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
         )
@@ -5363,7 +5365,7 @@ def _emit_dense_im2col(
     in_area = spec.in_h * spec.in_w
     out_area = spec.out_h * spec.out_w
     packed_in = source
-    if not _conv_layouts_agree(in_area, spec.in_channels):
+    if not _conv_layouts_agree(spec.batch, in_area, spec.in_channels):
         packed_in = _blocked_activation(
             ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
         )
@@ -5394,7 +5396,7 @@ def _emit_dense_im2col(
             dynamic_area=spec.in_w if spec.dynamic_h else 0,
         )
     packed_out = out
-    if not _conv_layouts_agree(out_area, spec.out_channels):
+    if not _conv_layouts_agree(spec.batch, out_area, spec.out_channels):
         packed_out = _blocked_activation(
             ctx, spec.batch, out_h_dim, spec.out_w, spec.out_channels
         )
