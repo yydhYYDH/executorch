@@ -14,6 +14,7 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 
 import operator
 import re
+import math
 import struct
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -24,6 +25,8 @@ from executorch.backends.hexagon.add_relu import ADD_RELU
 from executorch.backends.hexagon.add_rms_norm import ADD_RMS_NORM
 from executorch.backends.hexagon.kv_cache import UPDATE_CACHE
 from executorch.backends.hexagon.mul_silu import MUL_SILU
+from executorch.backends.hexagon.prelu import PRELU
+from executorch.backends.hexagon.reflect_pad import REFLECT_PAD
 from executorch.backends.hexagon.rms_norm import RMS_NORM
 from executorch.backends.hexagon.rope import ROPE
 from executorch.backends.hexagon.row_guard import ROW_GUARD
@@ -62,6 +65,8 @@ DSP_OP_BINARY_ELEMENTWISE = 19
 DSP_OP_SOFTMAX = 28
 DSP_OP_REDUCTION = 29
 DSP_OP_BATCH_MATMUL = 38
+DSP_OP_RELU = 37
+DSP_OP_PRELU = 39
 DSP_OP_FLASH_ATTN = 18
 # The quantized matmuls, from the DSP's enum (htp_command.h pins both GEMV
 # numbers with a static_assert). They take an fp16 activation and a packed
@@ -1211,6 +1216,109 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def reflect_pad_regions(node: torch.fx.Node):
+    source = node.args[0]
+    source_value = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+    result_value = node.meta.get("val")
+    if source_value is None or result_value is None or not source_value.is_contiguous():
+        return None
+    shape = tuple(source_value.shape)
+    pads = tuple(node.args[1])
+    if len(pads) not in (2, 4) or not result_value.is_contiguous():
+        return None
+    if any(isinstance(size, bool) or not isinstance(size, int) for size in shape):
+        return None
+    if any(isinstance(pad, bool) or not isinstance(pad, int) for pad in pads):
+        return None
+    if any(pad < 0 for pad in pads) or not any(pads):
+        return None
+    inner = shape[-1]
+    before_inner, after_inner = pads[0], pads[1]
+    if max(before_inner, after_inner) >= inner:
+        return None
+    before_rows = after_rows = 0
+    rows = 1
+    outer = 1
+    if len(pads) == 2:
+        outer = math.prod(shape[:-1]) if shape[:-1] else 1
+    if len(pads) == 4:
+        rows = shape[-2]
+        outer = math.prod(shape[:-2]) if shape[:-2] else 1
+        before_rows, after_rows = pads[2], pads[3]
+        if max(before_rows, after_rows) >= rows:
+            return None
+    out_inner = inner + before_inner + after_inner
+    out_rows = rows + before_rows + after_rows
+    if result_value.numel() != outer * out_rows * out_inner:
+        return None
+    row_pieces = []
+    if before_rows:
+        row_pieces.append((before_rows, -inner, 0, before_rows))
+    row_pieces.append((0, inner, before_rows, rows))
+    if after_rows:
+        row_pieces.append((rows - 2, -inner, before_rows + rows, after_rows))
+    col_pieces = []
+    if before_inner:
+        col_pieces.append((before_inner, -1, 0, before_inner))
+    col_pieces.append((0, 1, before_inner, inner))
+    if after_inner:
+        col_pieces.append((inner - 2, -1, before_inner + inner, after_inner))
+    regions = []
+    for src_row, src_row_step, dst_row, row_count in row_pieces:
+        for src_col, src_col_step, dst_col, col_count in col_pieces:
+            regions.append([
+                0,
+                src_row * inner + src_col,
+                dst_row * out_inner + dst_col,
+                outer,
+                row_count,
+                col_count,
+                rows * inner,
+                src_row_step,
+                src_col_step,
+                out_rows * out_inner,
+                out_inner,
+                1,
+            ])
+    return regions
+
+
+def _emit_clone_copy(node: torch.fx.Node, ctx) -> TensorRef:
+    source = ctx.operand(node.args[0])
+    out = ctx.result_for(node, _numel(node))
+    numel = _numel(node)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[source],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1, 0, 0, 0, 1, 1, numel, 1, 1, 1, 1, 1, 1],
+        ),
+    )
+    return ctx.record(node, out)
+
+
+def _emit_reflect_pad(node: torch.fx.Node, ctx) -> TensorRef:
+    regions = reflect_pad_regions(node)
+    if regions is None:
+        raise RuntimeError("hexagon: reflect pad has no region plan")
+    out = ctx.result_for(node, _numel(node))
+    operand = ctx.operand(node.args[0])
+    for start in range(0, len(regions), BLIT_BLOCKS_PER_COMMAND):
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[operand],
+                outputs=[out],
+                params=[min(BLIT_BLOCKS_PER_COMMAND, len(regions) - start), FP16_BYTES, 1]
+                + [value for region in regions[start : start + BLIT_BLOCKS_PER_COMMAND] for value in region],
+            ),
+        )
+    return ctx.record(node, out)
+
+
 def _emit_constant_pad(node: torch.fx.Node, ctx) -> TensorRef:
     """A zero-filling pad as the memset the pad value is and one region.
 
@@ -1229,6 +1337,43 @@ def _emit_constant_pad(node: torch.fx.Node, ctx) -> TensorRef:
             inputs=[ctx.operand(node.args[0])],
             outputs=[out],
             params=[1, FP16_BYTES, 1] + constant_pad_region(node),
+        ),
+    )
+    return ctx.record(node, out)
+
+
+def _emit_leaky_relu(node: torch.fx.Node, ctx) -> TensorRef:
+    slope = _scalar_arg(node, "negative_slope", 1, 0.01)
+    if slope is None:
+        raise RuntimeError("hexagon: leaky_relu needs a compile-time negative_slope")
+    out = ctx.result_for(node, _numel(node))
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RELU,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[_upper_product(tuple(_value_of(node).shape), ctx), FP16_BYTES, _float_bits(slope)],
+        ),
+    )
+    _patch_dynamic_numel(ctx, op_index, node)
+    return ctx.record(node, out)
+
+
+def _emit_prelu(node: torch.fx.Node, ctx) -> TensorRef:
+    source, slope = node.args[:2]
+    shape = tuple(_value_of(node).shape)
+    channel = shape[1]
+    plane = math.prod(shape[2:]) if shape[2:] else 1
+    batch = shape[0] if shape else 1
+    out = ctx.result_for(node, _numel(node))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_PRELU,
+            inputs=[ctx.operand(source), ctx.operand(slope)],
+            outputs=[out],
+            params=[_numel(node), FP16_BYTES, plane, channel, _numel(slope), 1, batch],
         ),
     )
     return ctx.record(node, out)
@@ -6002,7 +6147,7 @@ def _emit_gather(node: torch.fx.Node, ctx) -> TensorRef:
 # which is also what keeps a non-identity order on a portable kernel.
 TO_DIM_ORDER_COPY = exir_ops.edge.dim_order_ops._to_dim_order_copy.default
 CLONE_DIM_ORDER = exir_ops.edge.dim_order_ops._clone_dim_order.default
-DIM_ORDER_TARGETS = frozenset({TO_DIM_ORDER_COPY, CLONE_DIM_ORDER})
+DIM_ORDER_TARGETS = frozenset({TO_DIM_ORDER_COPY})
 
 EMITTERS = {
     exir_ops.edge.aten.abs.default: _unary("abs"),
@@ -6021,6 +6166,9 @@ EMITTERS = {
     # relu has no entry of its own in the unary table; it is the clamp above
     # with these bounds.
     exir_ops.edge.aten.relu.default: _emit_relu,
+    exir_ops.edge.aten.leaky_relu.default: _emit_leaky_relu,
+    PRELU: _emit_prelu,
+    REFLECT_PAD: _emit_reflect_pad,
     # x ** 2 and torch.square both arrive as pow.Tensor_Scalar.
     POW_TENSOR_SCALAR: _emit_square_pow,
     ROW_GUARD: _emit_row_guard,
@@ -6088,7 +6236,7 @@ EMITTERS = {
     exir_ops.edge.aten.view_copy.default: _emit_alias,
     exir_ops.edge.aten.expand_copy.default: _emit_alias,
     TO_DIM_ORDER_COPY: _emit_alias,
-    CLONE_DIM_ORDER: _emit_alias,
+    CLONE_DIM_ORDER: _emit_clone_copy,
     exir_ops.edge.aten.select_copy.int: _emit_select_copy,
     exir_ops.edge.aten._to_copy.default: _emit_alias,
     exir_ops.edge.aten.to.dtype: _emit_alias,

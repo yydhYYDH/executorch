@@ -79,6 +79,8 @@ extern "C" int htp_ops_im2col_convolution_fp16(uint8_t *output, uint8_t *input,
                                                uint8_t *weight, uint8_t *bias,
                                                const HmxIm2ColConvParam *params);
 extern "C" int htp_ops_zero(uint8_t *dst, int32_t size);
+extern "C" int htp_ops_relu(uint8_t *dst, const uint8_t *src, int32_t size, int32_t bytes, float slope);
+extern "C" int htp_ops_prelu(uint8_t *dst, const uint8_t *src, const uint8_t *slope, int32_t size, int32_t bytes, int32_t plane, int32_t channel, int32_t slope_count, int32_t pack, int32_t batch);
 extern "C" int htp_ops_flash_attn(uint8_t *o, uint8_t *q, uint8_t *k, uint8_t *v,
                                   uint8_t *mask, uint8_t *workspace,
                                   uint8_t *pastK, uint8_t *pastV, int32_t qo_len,
@@ -160,6 +162,8 @@ enum {
   kSoftmax = 28,
   kReduction = 29,
   kBatchMatmul = 38,
+  kRelu = 37,
+  kPrelu = 39,
   kQ4A16Prefill = 22,
   kQ4A16Gemv = 41,
   kVisionAttention = 43,
@@ -327,6 +331,18 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
   }
   if (op.type == kZero) {
     htp_ops_zero(address(header, op.outputs[0]), params[0]);
+    return;
+  }
+  if (op.type == kRelu) {
+    float slope;
+    memcpy(&slope, &params[2], sizeof(slope));
+    htp_ops_relu(address(header, op.outputs[0]), address(header, op.inputs[0]), params[0], params[1], slope);
+    return;
+  }
+  if (op.type == kPrelu) {
+    htp_ops_prelu(
+        address(header, op.outputs[0]), address(header, op.inputs[0]), address(header, op.inputs[1]),
+        params[0], params[1], params[2], params[3], params[4], params[5], params[6]);
     return;
   }
   if (op.type == kSelect) {

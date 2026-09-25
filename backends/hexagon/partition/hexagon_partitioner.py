@@ -10,12 +10,14 @@ from typing import Dict, final, FrozenSet, Optional, Set
 
 import torch
 from executorch.backends.hexagon.fold_transposes import FoldConstantTransposes
+from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.backends.hexagon.hexagon_backend import (
     HexagonBackend,
     HexagonCompileOptions,
     SUPPORTED_TARGETS,
 )
 from executorch.backends.hexagon.hexagon_ops import (
+    CLONE_DIM_ORDER,
     _dequantize_is_fused,
     _scalar_arg,
     _scalar_source,
@@ -34,6 +36,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     cat_region,
     CAT_TARGETS,
     constant_pad_region,
+    reflect_pad_regions,
     conv_spec,
     CONV_TARGETS,
     dim_order_keeps_the_bytes,
@@ -64,6 +67,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     NATIVE_LAYER_NORM,
     operand_dtypes_are_readable,
     PAD_TARGETS,
+    PRELU,
+    REFLECT_PAD,
     permute_region,
     PERMUTE_TARGETS,
     pool_spec,
@@ -832,6 +837,22 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in PERMUTE_TARGETS and permute_region(node) is None:
             return False
+        if node.target is exir_ops.edge.aten.leaky_relu.default:
+            if _scalar_arg(node, "negative_slope", 1, 0.01) is None:
+                return False
+        if node.target is PRELU:
+            source, slope = node.args[:2]
+            source_value = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+            slope_value = slope.meta.get("val") if isinstance(slope, torch.fx.Node) else None
+            if source_value is None or slope_value is None or not source_value.is_contiguous() or source_value.dim() < 2:
+                return False
+            if slope_value.dim() != 1 or not slope_value.is_contiguous():
+                return False
+            channel = source_value.shape[1]
+            if slope_value.numel() not in (1, channel):
+                return False
+        if node.target is REFLECT_PAD and reflect_pad_regions(node) is None:
+            return False
         if node.target in PAD_TARGETS and constant_pad_region(node) is None:
             # A zero-filling pad is a memset plus one region, so it is bounded
             # twice over: the region's three levels only reach a pad on the last
@@ -840,7 +861,18 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # nonzero value all have to stay on a portable kernel rather than
             # reach a command that would read or write elsewhere.
             return False
-        if node.target in DIM_ORDER_TARGETS and not dim_order_keeps_the_bytes(node):
+        if node.target is CLONE_DIM_ORDER:
+            source = node.args[0]
+            source_value = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
+            result_value = node.meta.get("val")
+            if (
+                source_value is None
+                or result_value is None
+                or not source_value.is_contiguous()
+                or not result_value.is_contiguous()
+            ):
+                return False
+        elif node.target in DIM_ORDER_TARGETS and not dim_order_keeps_the_bytes(node):
             # A dim-order copy the alias emitter cannot stand in for is one the
             # portable kernels run, not one the DSP should read wrong.
             return False
@@ -932,7 +964,11 @@ class HexagonPartitioner(Partitioner):
         constant is left alone, so a weight that is a run-time input still
         reaches a portable kernel.
         """
-        return FoldConstantTransposes()(exported_program).exported_program
+        folded = FoldConstantTransposes()(exported_program).exported_program
+        from executorch.backends.hexagon.prelu import PreservePRelu
+        from executorch.backends.hexagon.reflect_pad import PreserveReflectPad
+        prelu = PreservePRelu()(folded).exported_program
+        return PreserveReflectPad()(prelu).exported_program
 
     def partition(self, exported_program: ExportedProgram) -> PartitionResult:
         graph_module = exported_program.graph_module

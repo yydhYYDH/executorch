@@ -708,7 +708,7 @@ def test_every_et_hexagon_op_this_checkout_defines_has_an_emitter():
     check, and it is the kind that fails when a new fused op lands without one.
     """
     names = _et_hexagon_ops()
-    assert len(names) == 8, f"the et_hexagon namespace changed: {sorted(names)}"
+    assert len(names) == 10, f"the et_hexagon namespace changed: {sorted(names)}"
     assert not [name for name in sorted(names) if not _has_emitter(name)]
 
 
