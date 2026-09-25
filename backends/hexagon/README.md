@@ -803,6 +803,34 @@ op never reached the DSP. The device numbers are the phone's own
 run separately on host lowering, in `hexagon-sim`, and on the phone.
 
 
+## Folding a weight's preparation before the split
+`FoldConstantTransposes` turns a weight written as a chain of permutations
+into the tensor that chain computes, once at export, into the blob's weight
+section. It is registered on `transform_for_pre_decomposition`, which EXIR
+calls ahead of the split, so no caller has to opt in with `transform_passes`
+-- and `partition` cannot do it, because EXIR asserts that call leaves the
+graph module unchanged. The hook runs on the ATen program before
+decomposition, where a weight's preparation is spelled `aten::permute`,
+`aten::reshape` and `aten::flip` and only the convolution's second argument
+matters, so the pass matches schema names across both dialects; the walk
+replays the graph's own targets rather than a table of equivalents, leaves
+every chain that does not end at a constant alone, and the run-time-weight
+case is tested from the lowering rather than from the pass's return value. It
+is what carries a FIR upsampler's transposed convolution: without the fold the
+weight is a computation `conv_spec` cannot read and the node stays portable.
+The geometry that reaches the DSP is a `groups == 1` transposed convolution --
+which is SDXL's: `FirUpsample2D` calls `conv_transpose2d` without `groups`. A
+grouped variant folds too and keeps its convolution portable, so the boundary
+is `groups` must be 1, not unsupported.
+
+**Unresolved: the folded blob has never been executed on the simulator or a
+device.** The simulator fixture that runs blobs builds its fx graph by hand
+and never goes through the partitioner, and the convolution simulator's
+weights come from a formula in its own case table, so a folded weight cannot
+reach either. What the simulator does cover is the kernel that consumes it --
+the 35 cases of `test_conv_sim.py`. Closing this needs a simulator runner that
+takes weight bytes, or a device run of the whole `.pte`.
+
 ## Status
 
 Working and verified on a device. The whole of this list is one OnePlus 13
