@@ -659,7 +659,7 @@ _ROWS = [
         "adaptive_avg_pool2d",
         lambda a: torch.nn.functional.adaptive_avg_pool2d(a, 2),
         (_x(1, 64, 8, 8),),
-        [("aten._adaptive_avg_pool2d.default", "unwired")],
+        [("aten._adaptive_avg_pool2d.default", "wired")],
     ),
     # --- elementwise arithmetic: Tensor vs Scalar ---------------------------
     (
@@ -941,11 +941,6 @@ def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
         ("sort's values", lambda a: torch.sort(a, dim=0)[0], (_x(6, 3),)),
         ("erf", lambda a: torch.erf(a), (_x(8),)),
         ("zeros_like", lambda a: torch.zeros_like(a), (_x(8),)),
-        (
-            "adaptive_avg_pool2d",
-            lambda a: torch.nn.functional.adaptive_avg_pool2d(a, 2),
-            (_x(1, 64, 8, 8),),
-        ),
     ],
 )
 def test_the_uncovered_overloads_leave_the_whole_graph_on_the_host(

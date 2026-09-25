@@ -441,6 +441,19 @@ SUPPORTED: List[OpSupport] = [
         "divisor_override has no command form and keeps the node portable.",
     ),
     OpSupport(
+        "aten._adaptive_avg_pool2d.default",
+        POOL,
+        "fp16 (arena); fp32 narrowed on entry",
+        "As avg_pool2d.default, but only when each input spatial extent is an "
+        "exact positive integer multiple of its output extent. Each axis then "
+        "has a constant window and a constant stride, both the input/output "
+        "quotient, so this is one ordinary pool command. Identity and a "
+        "single-position axis are included; a remainder, an output larger than "
+        "its input, or a window whose start would clamp is refused because the "
+        "adaptive windows are not fixed. A normal (1, 1) request exports as "
+        "aten.mean.dim, not as this target, and reaches the reduction command.",
+    ),
+    OpSupport(
         "aten.convolution.default",
         f"{DEPTHWISE} / {IM2COL}",
         "fp16 (arena); fp32 narrowed on entry",
@@ -974,11 +987,6 @@ NOT_SUPPORTED = [
         "used to be listed here, and it is not that kind of case: it is a memset "
         "plus one region, both of which the backend already emitted for other ops, "
         "so it is a supported row.",
-    ),
-    (
-        "aten._adaptive_avg_pool2d.default",
-        "The pool command takes one fixed window and stride; an adaptive output "
-        "sizes the window per output position.",
     ),
     (
         "aten.leaky_relu.default, aten.elu.default",

@@ -41,7 +41,11 @@ from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
+from executorch.exir import (  # noqa: E402
+    EdgeCompileConfig,
+    to_edge,
+    to_edge_transform_and_lower,
+)
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 from torch.export import export  # noqa: E402
 
@@ -61,6 +65,15 @@ _PACK = 64
 #: torch's own max_pool2d padding limit, which is what makes a window that
 #: misses the input unreachable through the functional API.
 _MAX_PADDING_RATIO = 0.5
+
+
+class _Adaptive(torch.nn.Module):
+    def __init__(self, output_size) -> None:
+        super().__init__()
+        self.output_size = output_size
+
+    def forward(self, x):
+        return torch.nn.functional.adaptive_avg_pool2d(x, self.output_size)
 
 
 class _Pool(torch.nn.Module):
@@ -108,13 +121,16 @@ def _commands(program):
     return bytes(lowered._processed_bytes), commands
 
 
-def _lowered(model, x):
-    program = to_edge_transform_and_lower(
+def _lowered_program(model, x):
+    return to_edge_transform_and_lower(
         export(model, (x,)),
         partitioner=[HexagonPartitioner()],
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     ).exported_program()
-    return _commands(program)
+
+
+def _lowered(model, x):
+    return _commands(_lowered_program(model, x))
 
 
 def _run(blob, x):
@@ -478,13 +494,13 @@ def _pool_node(
     graph = torch.fx.Graph()
     source = graph.placeholder("x")
     source.meta["val"] = torch.empty(source_shape, dtype=torch.float16)
-    node = graph.call_function(
-        target or exir_ops.edge.aten.max_pool2d_with_indices.default,
-        args=(source, *args),
-    )
+    target = target or exir_ops.edge.aten.max_pool2d_with_indices.default
+    node = graph.call_function(target, args=(source, *args))
+    result = torch.empty(result_shape, dtype=torch.float16)
     node.meta["val"] = (
-        torch.empty(result_shape, dtype=torch.float16),
-        torch.empty(result_shape, dtype=torch.int64),
+        (result, torch.empty(result_shape, dtype=torch.int64))
+        if target is exir_ops.edge.aten.max_pool2d_with_indices.default
+        else result
     )
     return node
 
@@ -529,3 +545,162 @@ def test_pool_spec_refuses_what_the_command_cannot_describe(
 ):
     """Every refusal the partitioner depends on, on the node it reads."""
     assert pool_spec(_pool_node(args, source_shape, result_shape)) is None
+
+
+@pytest.mark.parametrize("extent, output, window", [(63, 21, 3), (64, 32, 2), (65, 13, 5)])
+def test_adaptive_pool_spec_uses_the_exact_integer_quotient(extent, output, window):
+    spec = pool_spec(
+        _pool_node(
+            ([output, output],),
+            (1, 64, extent, extent),
+            (1, 64, output, output),
+            target=exir_ops.edge.aten._adaptive_avg_pool2d.default,
+        )
+    )
+    assert spec == hexagon_ops.PoolSpec(
+        batch=1,
+        ih=extent,
+        iw=extent,
+        oh=output,
+        ow=output,
+        kernel_y=window,
+        kernel_x=window,
+        stride_y=window,
+        stride_x=window,
+        pad_y=0,
+        pad_x=0,
+        count_type=_COUNT_KERNEL,
+        pool_type=_AVERAGE,
+    )
+
+
+def test_adaptive_pool_spec_accepts_identity_and_a_single_output_axis():
+    identity = pool_spec(
+        _pool_node(
+            ([8, 12],),
+            (1, 64, 8, 12),
+            (1, 64, 8, 12),
+            target=exir_ops.edge.aten._adaptive_avg_pool2d.default,
+        )
+    )
+    assert identity is not None
+    assert (identity.kernel_y, identity.kernel_x) == (1, 1)
+    assert (identity.stride_y, identity.stride_x) == (1, 1)
+    one_axis = pool_spec(
+        _pool_node(
+            ([1, 3],),
+            (1, 64, 8, 12),
+            (1, 64, 1, 3),
+            target=exir_ops.edge.aten._adaptive_avg_pool2d.default,
+        )
+    )
+    assert one_axis == hexagon_ops.PoolSpec(
+        batch=1,
+        ih=8,
+        iw=12,
+        oh=1,
+        ow=3,
+        kernel_y=8,
+        kernel_x=4,
+        stride_y=8,
+        stride_x=4,
+        pad_y=0,
+        pad_x=0,
+        count_type=_COUNT_KERNEL,
+        pool_type=_AVERAGE,
+    )
+
+
+def test_adaptive_pool_spec_accepts_a_hand_built_single_output_node():
+    spec = pool_spec(
+        _pool_node(
+            ([1, 1],),
+            (1, 64, 8, 8),
+            (1, 64, 1, 1),
+            target=exir_ops.edge.aten._adaptive_avg_pool2d.default,
+        )
+    )
+    assert spec == hexagon_ops.PoolSpec(
+        batch=1,
+        ih=8,
+        iw=8,
+        oh=1,
+        ow=1,
+        kernel_y=8,
+        kernel_x=8,
+        stride_y=8,
+        stride_x=8,
+        pad_y=0,
+        pad_x=0,
+        count_type=_COUNT_KERNEL,
+        pool_type=_AVERAGE,
+    )
+
+
+@pytest.mark.parametrize(
+    "source_shape, output",
+    [
+        ((1, 64, 63, 63), (4, 4)),
+        ((1, 64, 64, 64), (3, 3)),
+        ((1, 64, 65, 65), (3, 3)),
+        ((1, 64, 8, 8), (16, 16)),
+        ((1, 64, 8, 12), (3, 4)),
+    ],
+)
+def test_adaptive_pool_refuses_every_nonfixed_or_clamped_geometry(source_shape, output):
+    assert (
+        pool_spec(
+            _pool_node(
+                (output,),
+                source_shape,
+                (source_shape[0], source_shape[1], *output),
+                target=exir_ops.edge.aten._adaptive_avg_pool2d.default,
+            )
+        )
+        is None
+    )
+    x = torch.randn(*source_shape, dtype=torch.float16)
+    program = _lowered_program(_Adaptive(output), x)
+    assert _delegates(program) == []
+
+
+def test_adaptive_pool_lowers_to_one_fixed_pool_with_matching_node_membership():
+    x = torch.randn(1, 64, 8, 12, dtype=torch.float16)
+    program = _lowered_program(_Adaptive((2, 3)), x)
+    call = _delegates(program)[0]
+    delegate = program.graph_module.get_submodule(call.args[0].target)
+    edge = to_edge(
+        export(_Adaptive((2, 3)), (x,)),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    edge_names = {
+        node.name
+        for node in edge.graph_module.graph.nodes
+        if node.op == "call_function"
+        and node.target is exir_ops.edge.aten._adaptive_avg_pool2d.default
+    }
+    delegate_names = {
+        node.name
+        for node in delegate.original_module.graph_module.graph.nodes
+        if node.op == "call_function"
+    }
+    assert delegate_names == edge_names
+    blob, commands = _commands(program)
+    assert [command.type for command in commands] == [_BLIT, _POOL, _BLIT]
+    assert list(commands[1].params) == [1, 8, 12, 2, 3, 1, 4, 4, 4, 4, 0, 0, 0, 1, _AVERAGE]
+    np.testing.assert_allclose(
+        _run(blob, x),
+        _Adaptive((2, 3))(x).numpy().reshape(-1),
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+def test_adaptive_pool_output_one_uses_the_existing_reduction_not_a_pool():
+    x = torch.randn(1, 64, 8, 8, dtype=torch.float16)
+    model = _Adaptive((1, 1))
+    blob, commands = _lowered(model, x)
+    assert _POOL not in [command.type for command in commands]
+    np.testing.assert_allclose(
+        _run(blob, x), model(x).numpy().reshape(-1), rtol=2e-3, atol=2e-3
+    )
