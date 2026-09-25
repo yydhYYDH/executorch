@@ -436,10 +436,10 @@ Things that bite:
   agrees with it only when the dividend is non-negative, so `aten.remainder` is
   refused. Where the remainder is exactly zero the kernel lands on `+0` and torch
   on `-0` for a negative dividend: equal, not bit-identical.
-- **Binary broadcasting is unreachable.** The DSP's broadcast path wants 25 more
-  params than a command carries, so only same-shape and scalar operands work;
-  the emitter raises instead of emitting a command that would leave the output
-  stale.
+- **Binary broadcasting is limited to eight dimensions.** The broadcast command's
+  25-entry tail plus its 9-int head uses 33 or 34 of the 40-int budget, so
+  ranks through 8 fit. Rank 9 has no representation and stays on the portable
+  kernel.
 - **The fp16 quantized matmul's activations and outputs are pack64-blocked**,
   `[ceil(K/64)][M][64]` and `[ceil(N/64)][M][64]`, not row-major. This coincides
   with row-major only when `M == 1` or the dimension is at most 64, which is why

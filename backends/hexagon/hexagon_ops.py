@@ -7682,9 +7682,9 @@ EMITTERS = {
     VISION_ATTENTION: _emit_vision_attention,
 }
 
-# Ops whose operands must match the output's shape or be scalar. The support
-# check needs this so a broadcast operand keeps the node on a portable kernel
-# instead of reaching an emitter that refuses it and failing the whole export.
+# Binary targets that use the rank-eight broadcast-table gate. The support
+# check keeps rank-9 operands on a portable kernel because the fixed-width tail
+# has no representation for them.
 BINARY_TARGETS = frozenset(
     {
         exir_ops.edge.aten.add.Tensor,

@@ -249,7 +249,7 @@ the same node delegates or does not depending on a shape.
 | limit | ops it holds back | what it would take |
 |---|---|---|
 | The arena holds two bytes per element | every op: fp16 only. int64 casts, `select_copy` on int64 (85 of them per Qwen3 forward pass, all sequence-position reads), and any `torch.bool` operand | a wider dtype on the DSP, or keeping these on the host, which is where they belong |
-| The DSP's broadcast path needs 25 more params than a command carries | every binary op: operands must be the result's shape or a scalar | a command form with a region list, or a layout transform at export |
+| Binary broadcast has an 8-D representation | every binary op at rank 9 | a wider broadcast table; the 25-entry tail plus the 9-int command head uses 33 or 34 of the 40-int budget, so rank 8 fits but rank 9 has no representation |
 | One contiguous `[outside][reduce][inside]` span per reduction | `mean.dim` and `sum.dim_IntList` with non-adjacent reduced dims, `amax` the same way | a strided reduction, which is the same kernel the softmax row below needs |
 | Softmax takes only a contiguous middle axis below channel 64, plus the last axis | `_softmax` over a non-last axis with a non-contiguous source, a permutation that needs more than three advancing region groups, or a channel at or above 64 | a wider safe middle-axis command or a more expressive permutation region; the old strided reduction is not used |
 | Pooling needs `C == 64` and static shapes | `max_pool2d`, `avg_pool2d` | the blocking the pool kernel assumes is one 64-channel block |
