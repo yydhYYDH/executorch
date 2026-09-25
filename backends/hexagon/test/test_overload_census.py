@@ -472,10 +472,14 @@ _ROWS = [
         [("aten._softmax.default", "wired")],
     ),
     (
-        "softmax over another axis is refused",
+        "softmax over another axis delegates through blits",
         lambda a: torch.nn.functional.softmax(a, dim=0),
         (_x(2, 8),),
-        [("aten._softmax.default", "refused")],
+        # The kernel is last-axis, so this axis is moved last and back: one
+        # delegate carrying a blit, the softmax and a blit. The row is two wide,
+        # under one 64-lane vector, so it is the SOFTMAX command rather than the
+        # shifted sum. A source that cannot be permuted this way stays portable.
+        [("aten._softmax.default", "wired")],
     ),
     (
         "log_softmax over the last axis",
