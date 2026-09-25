@@ -7,14 +7,11 @@ bit patterns compared against torch. It needs HEXAGON_SDK_ROOT, and a
 libncurses5 for the simulator, and skips with a reason when either is missing.
 """
 
-import os
 import pathlib
-import sys
 
 import pytest
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import hexagon_sim
 

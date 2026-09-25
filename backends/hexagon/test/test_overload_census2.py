@@ -22,41 +22,34 @@ construction. They are pinned here instead.
 """
 
 import operator
-import os
-import pathlib
-import sys
+
 
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
     reset_unwired_overload_census,
     unwired_overload_census,
 )
-from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
-from executorch.exir import (  # noqa: E402
+from executorch.backends.hexagon.quantizer import get_hexagon_quantizer
+from executorch.exir import (
     EdgeCompileConfig,
     to_edge,
     to_edge_transform_and_lower,
 )
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
-from torchao.quantization.pt2e import MinMaxObserver  # noqa: E402
-from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
+from torchao.quantization.pt2e import MinMaxObserver
+from torchao.quantization.pt2e.quantize_pt2e import (
     convert_pt2e,
     prepare_pt2e,
 )
-from torchao.quantization.pt2e.quantizer import (  # noqa: E402
+from torchao.quantization.pt2e.quantizer import (
     QuantizationAnnotation,
     QuantizationSpec,
     Quantizer,

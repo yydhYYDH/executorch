@@ -17,35 +17,26 @@ two commands rather than one, and the pass buys a command rather than a
 round trip.
 """
 
-import os
-import pathlib
-import sys
+
 
 import numpy as np
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon.add_relu import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon.add_relu import (
     fuse_add_relu,
     FuseAddReluPass,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import (  # noqa: E402
+from executorch.exir import (
     EdgeCompileConfig,
     to_edge,
     to_edge_transform_and_lower,
 )
-from torch.export import export  # noqa: E402
+from torch.export import export
 
 #: DSP_OP_BINARY_ELEMENTWISE and HTP_OPS_BINARY_ADD_RELU.
 _BINARY = 19

@@ -6,22 +6,16 @@
 
 """The partitioner's answers about a node whose emitter adds no command."""
 
-import os
-import pathlib
-import sys
+
 
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     _cast_stays_in_fp16,
     _emits_no_command,
 )
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops
 
 
 def _cast(source_dtype, result_dtype):

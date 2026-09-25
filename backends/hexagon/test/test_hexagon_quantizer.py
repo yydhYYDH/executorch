@@ -13,34 +13,26 @@ packing and the command's parameters. `blob_interpreter` then runs the bytes the
 DSP would run, against the same arena the runtime builds.
 """
 
-import os
 import pathlib
 import re
-import sys
 
 import numpy as np
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter  # noqa: E402
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_backend import (
     HexagonBackend,
     owned_weight,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     _data_placeholders,
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
-from executorch.backends.hexagon.quantizer import (  # noqa: E402
+from executorch.backends.hexagon.quantizer import (
     get_hexagon_quantization_config,
     get_hexagon_quantizer,
     get_q4a16_config,
@@ -48,10 +40,10 @@ from executorch.backends.hexagon.quantizer import (  # noqa: E402
     HexagonQuantizer,
     SUPPORTED_SCHEMES,
 )
-from executorch.exir import to_edge, to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from executorch.exir.lowered_backend_module import LoweredBackendModule  # noqa: E402
-from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
+from executorch.exir import to_edge, to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.lowered_backend_module import LoweredBackendModule
+from torchao.quantization.pt2e.quantize_pt2e import (
     convert_pt2e,
     prepare_pt2e,
 )

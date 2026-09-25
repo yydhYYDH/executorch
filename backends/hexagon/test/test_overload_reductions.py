@@ -19,33 +19,24 @@ The interpreter is the second implementation of the kernels, so the numbers are
 checked against torch eager rather than against the emitter's own arithmetic.
 """
 
-import os
-import pathlib
-import sys
+
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     _mean_reduces_one_span,
     HexagonOperatorSupport,
     HexagonPartitioner,
     mean_result_width_is_emittable,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 #: DSP_OP_REDUCTION, REDUCTION_MEAN and REDUCTION_MAXIMUM, and the width.
 _REDUCTION = 29

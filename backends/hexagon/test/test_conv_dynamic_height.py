@@ -27,25 +27,18 @@ the buffer for the run, and a count left at the export's longest clears past the
 end of the shorter arena -- a device answers that with `0x8000040d` and no output.
 """
 
-import os
-import pathlib
-import sys
+
 
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import read_blob, read_dynamic_trailer  # noqa: E402
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from blob_interpreter import read_blob, read_dynamic_trailer
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from torch.export import Dim, export  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from torch.export import Dim, export
 
 #: DSP_OP_ZERO, DSP_OP_RASTER_BLIT and DSP_OP_IM2COL_CONVOLUTION_FP16: what a
 #: convolution over a mel reaches, because the plane is neither one element wide

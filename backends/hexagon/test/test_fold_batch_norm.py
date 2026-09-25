@@ -25,42 +25,33 @@ check the other cases pass to fail on it.
 """
 
 import hashlib
-import os
-import sys
+
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.fspath(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(
-    0,
-    os.fspath(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    ),
-)
-
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon.fold_batch_norm import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon.fold_batch_norm import (
     FoldBatchNormIntoConv,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.backends.transforms.fuse_batch_norm_with_conv import (  # noqa: E402
+from executorch.backends.transforms.fuse_batch_norm_with_conv import (
     FuseBatchNormWithConvPass,
 )
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.pass_base import (  # noqa: E402
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from executorch.exir.pass_base import (
     ExportPass,
     ExportedProgramPassBase,
     ExportedProgramPassResult,
 )
-from executorch.exir.passes.remove_unused_parameters_pass import (  # noqa: E402
+from executorch.exir.passes.remove_unused_parameters_pass import (
     remove_unused_parameters_pass,
 )
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 #: The band a fp16 convolution is already held to in this suite: `test_pool.py`
 #: and `test_mean.py` compare with rtol=2e-3, atol=2e-3, and the README's

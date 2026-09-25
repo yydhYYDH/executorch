@@ -35,17 +35,14 @@ handed -- the `_check()` below is the same pre-flight `run()` does, so anything
 after it is a defect and not a missing toolchain.
 """
 
-import os
 import pathlib
 import re
-import sys
 
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import hexagon_sim  # noqa: E402
+import hexagon_sim
 
 _RUNNER = pathlib.Path(__file__).resolve().parent / "sim/zero_insert_runner.cpp"
 

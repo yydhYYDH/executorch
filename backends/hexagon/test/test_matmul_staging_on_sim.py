@@ -33,19 +33,15 @@ rather than noise, and periodic data can make a shifted read agree by accident,
 which would be a case that decides nothing.
 """
 
-import os
-import pathlib
-import sys
+
 
 import numpy as np
 import pytest
 import torch
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import hexagon_sim  # noqa: E402
-import test_blob_on_sim as blob_sim  # noqa: E402
+import hexagon_sim
+import test_blob_on_sim as blob_sim
 
 #: (tag, M, K, N). 40 is Stable Diffusion 1.5's head width, 32 is a K that is a
 #: multiple of 32 and not of 64, 77 is SD's context length -- which is the K of

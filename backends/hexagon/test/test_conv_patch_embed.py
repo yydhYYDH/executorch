@@ -7,35 +7,29 @@
 """The patch-embed convolution rewrite: what it changes, and what it must not."""
 
 import copy
-import os
-import pathlib
-import sys
+
 
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes "import executorch" resolve to this tree; the editable install
-# in this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-from executorch.backends.hexagon.conv_patch_embed import (  # noqa: E402
+from executorch.backends.hexagon.conv_patch_embed import (
     DecomposePatchEmbed,
     patch_embed,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.backends.hexagon.test.blob_interpreter import (  # noqa: E402
+from executorch.backends.hexagon.test.blob_interpreter import (
     BATCH_MATMUL,
     BINARY_ELEMENTWISE,
     execute,
     RASTER_BLIT,
     read_blob,
 )
-from executorch.exir import to_edge, to_edge_transform_and_lower  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.exir import to_edge, to_edge_transform_and_lower
+from torch.export import export
 
 _CONVOLUTION = "aten.convolution.default"
 

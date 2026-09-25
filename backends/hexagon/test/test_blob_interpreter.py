@@ -13,37 +13,27 @@ against an arena laid out the way the runtime lays it out.
 """
 
 import ast
-import os
 import pathlib
 import struct
-import sys
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
-
-import blob_interpreter  # noqa: E402
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
-from executorch.backends.hexagon.kv_cache import (  # noqa: E402
+import blob_interpreter
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_backend import HexagonBackend
+from executorch.backends.hexagon.kv_cache import (
     _update_cache,
     UPDATE_CACHE,
 )
-from executorch.backends.hexagon.rms_norm import RMS_NORM  # noqa: E402
-from executorch.backends.hexagon.rope import _rope, ROPE  # noqa: E402
-from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
-from executorch.exir import to_edge  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.backends.hexagon.rms_norm import RMS_NORM
+from executorch.backends.hexagon.rope import _rope, ROPE
+from executorch.backends.hexagon.serialization import blob as B
+from executorch.exir import to_edge
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 
 # The outputs are fp16, so the granularity of the comparison is the step of that type at the

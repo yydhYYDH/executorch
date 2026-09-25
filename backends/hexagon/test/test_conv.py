@@ -15,26 +15,17 @@ two commands' params, the packed weights' byte counts and order, the numbers
 against torch, and every shape that has to stay on a portable kernel.
 """
 
-import os
-import pathlib
-import sys
+
 
 import blob_interpreter
 import numpy as np
 import pytest
 import torch
 
-# The checkout directory is itself named executorch, so putting its parent on
-# the path makes `import executorch` resolve to this tree. Without it the
-# editable install wins, and in this environment that points at a different
-# checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
-# The test directory is not a package, so the interpreter is importable by name.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
-from executorch.backends.hexagon import hexagon_ops  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+from blob_interpreter import execute, read_blob
+from executorch.backends.hexagon import hexagon_ops
+from executorch.backends.hexagon.hexagon_ops import (
     conv_1x1_direct_applies,
     conv_spec,
     CONV_VTCM_BYTES,
@@ -45,13 +36,13 @@ from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
     pack_conv_weight,
     pack_depthwise_weight,
 )
-from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonPartitioner,
 )
-from executorch.backends.hexagon.serialization import blob as B  # noqa: E402
-from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # noqa: E402
-from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
-from torch.export import export  # noqa: E402
+from executorch.backends.hexagon.serialization import blob as B
+from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
+from executorch.exir.dialects._ops import ops as exir_ops
+from torch.export import export
 
 #: DSP_OP_CONV_DEPTHWISE2D_FP16, DSP_OP_IM2COL_CONVOLUTION_FP16,
 #: DSP_OP_RASTER_BLIT and DSP_OP_ZERO: the commands a convolution lowers to.

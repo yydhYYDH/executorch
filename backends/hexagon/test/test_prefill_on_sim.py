@@ -30,20 +30,16 @@ and not a tolerance that could hide a wrong layout inside a rounding error.
 
 from __future__ import annotations
 
-import os
 import pathlib
-import sys
 
 import numpy as np
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 
-import pytest  # noqa: E402
+import pytest
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import hexagon_sim  # noqa: E402
-from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
+import hexagon_sim
+from executorch.backends.hexagon.hexagon_ops import (
     pack_q4a16_gemv_weight,
     pack_q4a16_prefill_weight,
 )
