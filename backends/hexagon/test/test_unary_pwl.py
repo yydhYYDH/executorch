@@ -35,6 +35,18 @@ beyond this: for these three op types its answers match the in-tree vendored
 tables and index arithmetic bit for bit, which is what the cases below assert.
 Re-measuring them is one device run of the same five cases; a table that was
 refitted upstream would land here as a red test rather than as a silent drift.
+
+What these recorded answers cannot decide is worth writing down here, because a
+golden table that looks as though it settles something and does not is how a
+wrong model stays green. Of the three, only tanh's recorded values straddle a
+rounding boundary: substituting an fp32 multiply for the kernel's fp16 one leaves
+every recorded gelu and sigmoid answer passing and turns only tanh's red. And
+the grain case below is gelu's alone, so a sigmoid could be walked by either
+arithmetic with the whole tree green. Both questions are therefore also asked
+elsewhere, where they can discriminate: test_interp_sigmoid.py's
+ChordArithmeticTest for the rounding, and test_sigmoid_grain.py for the grain end
+to end through execute. Neither gap closes by adding values here, because a
+golden at a value the two forms happen to agree on buys nothing.
 """
 
 import os
@@ -182,6 +194,14 @@ _GOLDEN = {
     },
 }
 
+#: tanh at 64 is the only place in this file where the device can settle how the
+#: chord's product is rounded, and it does: replayed through execute() with the
+#: kernel's fp16 multiply the seventeen bits above all match, and with the same
+#: multiply carried in fp32 fifteen do, losing index 2 (-3.5, 0xBBFC where the
+#: model says 0xBBFD) and index 14 (3.5, 0x3BFC against 0x3BFD) -- one
+#: representable step each, one on either side of zero. The gelu and sigmoid sets
+#: match both roundings exactly, so they are not evidence for either.
+
 #: The worst absolute distance from the definition each of the three may have, at
 #: the buffer length the walk covers the whole of. The measured values are 6.1e-3
 #: for gelu, 2.4e-3 for sigmoid and 6.3e-3 for tanh, and the ceilings sit just
@@ -254,6 +274,14 @@ def test_the_host_model_reproduces_the_phone(name, length):
     subgraph, so what is asserted here is that its model of the walk is the
     device's: table lookups, the two fp16 roundings, the fold and the saturation,
     at the length that picks the form.
+
+    Read the last clause as a limit and not a boast. A golden pins the value it
+    was recorded at, so it says nothing about any value the two forms happen to
+    agree on: of the sixteen recorded here, tanh's are the only ones that
+    separate the fp16 multiply from an fp32 one, and the gelu and sigmoid sets
+    both stay green under either. Where the two roundings are the question, that
+    is test_interp_sigmoid.py's ChordArithmeticTest, which is built to fail when
+    they are interchanged.
     """
     got = _dsp_answer(name, length)
     inputs = _input(length)
@@ -277,6 +305,13 @@ def test_the_position_of_an_element_picks_the_form():
     the scalar form throughout. That is the whole of the length dependence: the
     walk covers [0, numel & ~63) and the rest of the buffer is the scalar path,
     so a tensor one element shorter than the grain is not approximated at all.
+
+    Those numbers are gelu's, and the case is gelu's: gelu is the only one of the
+    three whose recorded values this file carries at a length below 64, so for
+    sigmoid and tanh the grain was unpinned here and a buffer could have been
+    split at the wrong place without anything turning red. Sigmoid's is
+    test_sigmoid_grain.py's, end to end through execute() and at 1, 33, 63, 64,
+    65, 127, 128, 129 and 256 elements.
     """
     def answer(length, value):
         return {
