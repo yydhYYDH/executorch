@@ -57,6 +57,13 @@ DSP_OP_ZERO = 24
 # The one kernel that answers two outputs: htp_ops_topkv2_k1_fp16 writes a
 # maximum and its position per row (topk_ops.cc:48).
 DSP_OP_TOPKV2_K1_FP16 = 27
+# Row-wise argmax/argmin. The command carries a mode in its third parameter:
+# zero selects max and one selects min. Its output is one int64 per row, which
+# is the width ATen declares for an index result; an int32 slot cannot be
+# attached to an int64 result, because the upper four bytes of every element
+# would otherwise stay stale, so the kernel writes the 64-bit width directly
+# rather than a 32-bit one widened by a second command.
+DSP_OP_ARGMAX_FP16 = 47
 
 # One command's parameters live in a fixed-size block of 40 ints
 # (serialization/hexagon_schema.h:44). The raster blit spends three of them on its
@@ -4573,9 +4580,7 @@ def conv_spec(node: torch.fx.Node, is_constant) -> Optional[ConvSpec]:
     )
     if [int(dim) for dim in result.shape] != expected_result:
         return None
-    if dynamic_h and (
-        stride[0] != 1 or 2 * padding[0] != dilation[0] * (kernel_y - 1)
-    ):
+    if dynamic_h and (stride[0] != 1 or 2 * padding[0] != dilation[0] * (kernel_y - 1)):
         # One output row per input row, and a window that starts on its own row:
         # then the output height is the input height, which is the one relation
         # an affine patch over the run length reproduces. A stride divides and a
@@ -4888,7 +4893,9 @@ def _emit_channel_block_blit(
         # entries that stay static, and the two packings put them in different
         # places.
         for offset in range(chunk):
-            blocked_offset = (start + offset) * batch * dynamic_area * POOL_CHANNEL_BLOCK
+            blocked_offset = (
+                (start + offset) * batch * dynamic_area * POOL_CHANNEL_BLOCK
+            )
             row_major_offset = (start + offset) * POOL_CHANNEL_BLOCK * dynamic_area
             if packing:
                 # source row-major, dest blocked.
@@ -6018,6 +6025,9 @@ def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
 # The values carry the caveat max and amax already carry -- a NaN row and the
 # sign of a zero are where the DSP's maximum and torch's differ.
 TOPK = exir_ops.edge.aten.topk.default
+ARGMAX = exir_ops.edge.aten.argmax.default
+ARGMIN = exir_ops.edge.aten.argmin.default
+ARG_REDUCTION_TARGETS = frozenset({ARGMAX, ARGMIN})
 
 
 class TopkSpec(NamedTuple):
@@ -6039,6 +6049,84 @@ def _node_arg(node: torch.fx.Node, name: str, index: int, default):
     if name in node.kwargs:
         return node.kwargs[name]
     return node.args[index] if len(node.args) > index else default
+
+
+class ArgReductionSpec(NamedTuple):
+    """The contiguous rows one arg-reduction command can walk."""
+
+    row_size: int
+    rows: int
+    is_min: bool
+
+
+def arg_reduction_spec(node: torch.fx.Node) -> Optional[ArgReductionSpec]:
+    """The row geometry for a precisely supported argmax or argmin.
+
+    The command walks contiguous fp16 rows and writes int64 positions. A
+    flattened reduction is one row; an axis reduction is accepted only on the
+    last axis, where the row pitch is the graph's contiguous innermost extent.
+    The command's row and column counts are int32 words, so symbolic or
+    unrepresentable extents are refused rather than baked at the example shape.
+    """
+    if node.target not in ARG_REDUCTION_TARGETS:
+        return None
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return None
+    value = source.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dtype is not torch.float16:
+        return None
+    if value.dim() == 0 or value.numel() <= 0 or not value.is_contiguous():
+        return None
+    shape = list(value.shape)
+    if not all(isinstance(extent, int) and extent > 0 for extent in shape):
+        return None
+    dim = _node_arg(node, "dim", 1, None)
+    keepdim = _node_arg(node, "keepdim", 2, False)
+    if not isinstance(keepdim, bool):
+        return None
+    is_min = node.target is ARGMIN
+    if dim is None:
+        row_size = value.numel()
+    else:
+        rank = value.dim()
+        if (
+            isinstance(dim, bool)
+            or not isinstance(dim, int)
+            or not (-rank <= dim < rank)
+        ):
+            return None
+        if dim % rank != rank - 1:
+            return None
+        row_size = shape[-1]
+    if row_size <= 0 or row_size > 0x7FFFFFFF:
+        return None
+    rows = value.numel() // row_size
+    if rows <= 0 or rows > 0x7FFFFFFF:
+        return None
+    return ArgReductionSpec(row_size=row_size, rows=rows, is_min=is_min)
+
+
+def arg_reduction_is_emittable(node: torch.fx.Node) -> bool:
+    return arg_reduction_spec(node) is not None
+
+
+def _emit_arg_reduction(node: torch.fx.Node, ctx) -> TensorRef:
+    spec = arg_reduction_spec(node)
+    if spec is None:
+        raise RuntimeError("hexagon: this arg reduction is outside the DSP boundary")
+    source = node.args[0]
+    out = ctx.result_for(node, spec.rows, dtype=torch.int64)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_ARGMAX_FP16,
+            inputs=[ctx.operand(source)],
+            outputs=[out],
+            params=[spec.row_size, spec.rows, int(spec.is_min)],
+        ),
+    )
+    return ctx.record(node, out)
 
 
 def topk_spec(node: torch.fx.Node) -> Optional[TopkSpec]:
@@ -7065,7 +7153,15 @@ def _emit_log_softmax(node: torch.fx.Node, ctx) -> TensorRef:
 
     shifted = ctx.activation_for_shape(shape)
     _emit_elementwise(
-        node, ctx, ctx.operand(src), maximum, "sub", shape, reduced_shape, shape, shifted
+        node,
+        ctx,
+        ctx.operand(src),
+        maximum,
+        "sub",
+        shape,
+        reduced_shape,
+        shape,
+        shifted,
     )
 
     exponentials = ctx.activation_for_shape(shape)
@@ -7895,6 +7991,8 @@ EMITTERS = {
     # k == 1 over the last axis; the positions the kernel also writes go to
     # scratch, because they are not the positions torch writes (see TOPK).
     TOPK: _emit_topk,
+    ARGMAX: _emit_arg_reduction,
+    ARGMIN: _emit_arg_reduction,
     exir_ops.edge.aten.fmod.Tensor: _binary("mod"),
     # `cond ? a : b`. The only ATen node the library's select kernel serves, and
     # the only command here whose condition is one byte per element.

@@ -2128,8 +2128,7 @@ Error HexagonBackend::execute(
       }
       auto& value = args[delegate->inputs.size() + i]->toTensor();
       const size_t target_bytes = delegate->outputs[i].size;
-      const size_t itemsize =
-          value.scalar_type() == runtime::etensor::ScalarType::Float ? 4 : 2;
+      const size_t itemsize = static_cast<size_t>(value.element_size());
       const size_t logical_target =
           value.scalar_type() == runtime::etensor::ScalarType::Float
           && target_bytes * 2 == value.nbytes() ? target_bytes * 2

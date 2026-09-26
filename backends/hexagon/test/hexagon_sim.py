@@ -250,7 +250,8 @@ def run(
                 "hexagon-sim did not run the runner:\n" + "\n".join(interesting)[-3000:]
             )
         # A runner reports a named result per line: an uppercase tag followed by
-        # the result as raw fp16 bit patterns.
+        # the result as raw fp16 bit patterns or exact 32-bit words. Callers
+        # choose the decoder from the fixture's output width.
         results: Dict[str, List[int]] = {}
         for line in done.stdout.splitlines():
             parts = line.split()

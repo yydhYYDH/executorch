@@ -237,6 +237,19 @@ class _Addmm(torch.nn.Module):
         return torch.addmm(bias, x, weight)
 
 
+class _ArgReduction(torch.nn.Module):
+    def __init__(self, operation, dim=None, keepdim=False):
+        super().__init__()
+        self.operation = operation
+        self.dim = dim
+        self.keepdim = keepdim
+
+    def forward(self, x):
+        if self.dim is None:
+            return getattr(torch, self.operation)(x, keepdim=self.keepdim)
+        return getattr(torch, self.operation)(x, dim=self.dim, keepdim=self.keepdim)
+
+
 def _split_piece_three_early(blob):
     """The split's third piece, addressed three elements early.
 
@@ -430,7 +443,9 @@ def _batch_norm_graph(shape, eps):
     graph.output(out)
     root = torch.nn.Module()
     root.weight = torch.nn.Parameter(_instance_weight(rows), requires_grad=False)
-    root.bias = torch.nn.Parameter(_instance_weight(rows) * 0.5 - 0.5, requires_grad=False)
+    root.bias = torch.nn.Parameter(
+        _instance_weight(rows) * 0.5 - 0.5, requires_grad=False
+    )
     return _program(torch.fx.GraphModule(root, graph))
 
 
@@ -748,6 +763,7 @@ _W8A16_GEMV = 45
 #: emit this one command.
 _LAYER_NORM = 8
 _TOPKV2_K1 = 27
+_ARG_REDUCTION = 47
 
 
 def _table_ints(oc, ic):
@@ -1746,6 +1762,7 @@ def _cases():
         log_softmax,
         saturated_log_softmax,
         *([attention] if attention is not None else []),
+        *_arg_reduction_cases(),
         *_branch_cases(),
         *_pad_cases(),
         *_elemwise_cases(),
@@ -1776,6 +1793,52 @@ def _sequence(width):
     bound = torch.full((1, _UPPER, width), _POISON, dtype=torch.float16)
     bound[:, :_RUN, :] = live
     return bound
+
+
+def _arg_reduction_cases():
+    cases = []
+    rows = torch.tensor(
+        [
+            [1, 5, 5, 2, 0, 0, 4, 3],
+            [7, 6, 6, 1, -2, -2, 0, 5],
+        ],
+        dtype=torch.float16,
+    )
+    for tag, operation, dim, keepdim in (
+        ("BAX", "argmax", -1, False),
+        ("BAS", "argmin", -1, False),
+        ("BAT", "argmax", -1, True),
+        ("BAU", "argmin", None, False),
+    ):
+        model = _ArgReduction(operation, dim, keepdim)
+        expected = (
+            getattr(torch, operation)(rows, dim=dim, keepdim=keepdim)
+            .numpy()
+            .astype("<i8")
+        )
+        cases.append(
+            _case(
+                tag,
+                model,
+                (rows,),
+                expected,
+                kind="indices",
+            )
+        )
+    for tag, length in (("B63", 63), ("B64", 64), ("B65", 65)):
+        width = torch.zeros((1, length), dtype=torch.float32)
+        width[0, length - 1] = 1.0
+        model = _ArgReduction("argmax", dim=-1)
+        cases.append(
+            _case(
+                tag,
+                model,
+                (width.half(),),
+                np.array([length - 1], dtype=np.int64),
+                kind="indices",
+            )
+        )
+    return cases
 
 
 def _branch_cases():
@@ -2356,7 +2419,8 @@ def _branch_cases():
     #    padding nobody reads.
     select_rows, select_cols = 3, 5
     select_cond = (
-        torch.arange(select_rows * select_cols).reshape(select_rows, select_cols) % 2 == 0
+        torch.arange(select_rows * select_cols).reshape(select_rows, select_cols) % 2
+        == 0
     )
     select_on = (
         torch.arange(1, select_rows * select_cols + 1)
@@ -2621,6 +2685,7 @@ def _swap_the_prefill_nibbles(blob, k, n):
         value = body[offset]
         body[offset] = (value >> 4) | ((value & 0x0F) << 4)
     return bytes(body)
+
 
 #: DSP_OP_RASTER_BLIT and the two param slots of a region that this case moves.
 _RASTER_BLIT_OP = 3
@@ -2969,12 +3034,7 @@ def _condition_at_half_width(blob, op_index=0, value=2):
     everywhere -- so the case's own answer moving is what shows the descriptor
     is being read at all rather than that the bytes happen to agree.
     """
-    at = (
-        _blob.HEADER_SIZE
-        + op_index * _blob.OP_SIZE
-        + 4 * 4
-        + _SELECT_COND_BYTES * 4
-    )
+    at = _blob.HEADER_SIZE + op_index * _blob.OP_SIZE + 4 * 4 + _SELECT_COND_BYTES * 4
     raw = bytearray(blob)
     raw[at : at + 4] = struct.pack("<i", value)
     return bytes(raw)
@@ -3164,6 +3224,22 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         _UPPER,
         100,
     ], "the amax command does not describe the exported bound"
+    for tag, mode, row_size, rows in (
+        ("BAX", 0, 8, 2),
+        ("BAS", 1, 8, 2),
+        ("BAT", 0, 8, 2),
+        ("BAU", 1, 16, 1),
+        ("B63", 0, 63, 1),
+        ("B64", 0, 64, 1),
+        ("B65", 0, 65, 1),
+    ):
+        assert kinds[tag] == [_ARG_REDUCTION], f"{tag}: not the arg-reduction command"
+        assert list(_tagged(cases, tag).commands[0].params[:3]) == [
+            row_size,
+            rows,
+            mode,
+        ], f"{tag}: arg-reduction geometry is wrong"
+        assert _tagged(cases, tag).commands[0].outputs[0].size == rows * 8
     for tag in ("X", "Y", "Z"):
         assert kinds[tag] == [_UNARY], f"{tag}: the clamp family is not the unary one"
     # The sweep's point is that both halves of the kernel's walk are reached, and
@@ -3307,8 +3383,7 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
         "the runtime would copy the wrong number of bytes into it"
     )
     assert [ref.size for ref in select.inputs[1:]] == [30, 30], (
-        "the two value operands are not fp16: "
-        f"{[ref.size for ref in select.inputs]}"
+        "the two value operands are not fp16: " f"{[ref.size for ref in select.inputs]}"
     )
     # The one-element value mode, on the same kernel and the same condition.
     assert kinds["CD"] == [_SELECT], "the scalar-valued select is not a select"
@@ -3329,25 +3404,40 @@ def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
     # The three norms: one layer norm per row the op reduces, and the affine as
     # element-wise commands rather than as the kernel's own gamma, which this
     # backend leaves null everywhere.
-    assert kinds["CM"] == [_LAYER_NORM, _BINARY, _BINARY], (
-        "the group norm is not a norm followed by its two affine commands"
-    )
+    assert kinds["CM"] == [
+        _LAYER_NORM,
+        _BINARY,
+        _BINARY,
+    ], "the group norm is not a norm followed by its two affine commands"
     assert list(next(iter(_tagged(cases, "CM").commands)).params[:2]) == [4, 18], (
         "the group norm does not reduce one (batch, group) row of two channels "
         "by nine values"
     )
-    assert kinds["CN"] == [_LAYER_NORM, _BINARY, _BINARY], (
-        "the instance norm is not a norm followed by its two affine commands"
-    )
-    assert list(next(iter(_tagged(cases, "CN").commands)).params[:2]) == [8, 9], (
-        "the instance norm does not reduce one row per (batch, channel)"
-    )
-    assert kinds["CO"] == [_REDUCTION, _BINARY, _UNARY, _REDUCTION, _UNARY, _BINARY], (
-        "the log softmax is not the shifted log-sum-exp"
-    )
-    assert kinds["CP"] == [_REDUCTION, _BINARY, _UNARY, _REDUCTION, _UNARY, _BINARY], (
-        "the saturated log softmax is not the shifted log-sum-exp"
-    )
+    assert kinds["CN"] == [
+        _LAYER_NORM,
+        _BINARY,
+        _BINARY,
+    ], "the instance norm is not a norm followed by its two affine commands"
+    assert list(next(iter(_tagged(cases, "CN").commands)).params[:2]) == [
+        8,
+        9,
+    ], "the instance norm does not reduce one row per (batch, channel)"
+    assert kinds["CO"] == [
+        _REDUCTION,
+        _BINARY,
+        _UNARY,
+        _REDUCTION,
+        _UNARY,
+        _BINARY,
+    ], "the log softmax is not the shifted log-sum-exp"
+    assert kinds["CP"] == [
+        _REDUCTION,
+        _BINARY,
+        _UNARY,
+        _REDUCTION,
+        _UNARY,
+        _BINARY,
+    ], "the saturated log softmax is not the shifted log-sum-exp"
     answer = _from_bits(_tagged(cases, "BJ").expected.view("uint16").tolist())
     assert np.isnan(answer[3]) and np.isnan(
         answer[95]
@@ -3488,6 +3578,20 @@ def test_every_blob_agrees_three_ways(cases, simulated):
     for case in cases:
         dsp = simulated[f"{case.tag}0"]
         expected = case.expected
+        if case.kind == "indices":
+            want = np.asarray(expected, dtype=np.int64).reshape(-1).tolist()
+            got_host = list(np.frombuffer(bytes(case.host[0]), dtype="<i8"))
+            assert (
+                got_host == want
+            ), f"{case.tag}: the host index bytes disagree with torch"
+            got_dsp = [
+                int(value, 16) if isinstance(value, str) else int(value)
+                for value in dsp
+            ]
+            assert (
+                got_dsp == want
+            ), f"{case.tag}: the DSP index words disagree with torch"
+            continue
         if case.kind == "refused":
             # A control both models are expected to reject outright: the kernel
             # writes nothing, so the slot stays as the arena's fill and the

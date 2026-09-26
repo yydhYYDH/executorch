@@ -51,7 +51,6 @@ contain the operator, so an emitter would have nothing to call.
 | op | why there is no kernel |
 |---|---|
 | `aten.min.dim` reading `.indices` | The values are the minimum reduction, but a reader of the indices puts the node out of reach on the values side too: the reduction kernel computes values, not positions. Same all-readers-are-getitem-0 rule as `aten.max.dim` and `max_pool2d`. The value-only form is covered -- see `OP_SUPPORT.md` |
-| `aten.argmax.default`, `aten.argmin.default` | Every reduction here walks values; `argmax`'s output is positions. `topk` is the one kernel that writes both, and its positions are refused on purpose -- §3 |
 | `aten.prod.default`, `aten.var.correction` | A running product and a second moment are each a different walk from the four reductions that exist (sum, maximum, mean, minimum -- minimum arrived with merge 13). `aten.cumsum.default` moved off this row: a prefix scan is not a reduction the kernel has but a product the kernel does have, against a host mask, so it is wired through `et_hexagon.cumsum.default` |
 | `aten.erf.default` | No `HtpOpsUnaryOpType` entry: the enum is 1..17 (`unary_ops.cc:14-31`) |
 | `aten.leaky_relu.default`, `aten.elu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no `elu` |
@@ -71,10 +70,18 @@ kernel" and "nothing an emitter can call" are different claims: each of them is 
 composition of commands that do exist, so an emitter *can* call something. §3's
 last entry is what that composition is and why it is not the obvious one.
 
+`aten.argmax.default` and `aten.argmin.default` were rows in this table and are
+not any more, and they left it for the other reason. `HtpOpsReductionOpType`
+really has no position-producing mode, so nothing here reused the value-only
+reduction: this branch added one row-wise command of its own,
+`DSP_OP_ARGMAX_FP16`(47), whose one mode parameter answers both overloads and
+whose output is int64. §3 evaluates it, and the part of that evaluation worth
+reading first is that §3's objection to `topk`'s indices does not carry over to it.
+
 ## 2. Kernels present, nothing on the host emits them
 
-`htp_command.h:32-81` declares 48 op types. 43 have a `case` in
-`execute_command.cc`, and the host side emits 22 of them. The other 20 are
+`htp_command.h:32-85` declares 49 op types. 44 have a `case` in
+`execute_command.cc`, and the host side emits 23 of them. The other 20 are
 kernels the skel links and exports with nothing that can reach them:
 
 | value | DSP op | kernel | what an emitter would serve |
@@ -101,33 +108,35 @@ kernels the skel links and exports with nothing that can reach them:
 | 42 | `DSP_OP_MATMUL_W8A16_BLOCK_FP16` | `hmx_matmul_w8a16_block_fp16` | quantized prefill, int8 weights, **wired**. Alongside the int4 prefill entry (22), which the block-scaled int4 form extends, the int8 entry emits command 42 for `M > 1` with a tiled int8 weight and an fp16 per-channel scale tail. The ceiling beside it is the one in §4: `K % 64 == 0`, `N % 32 == 0`, and `K <= 12672` below the dispatcher's `M <= 32` split |
 | 44 | `DSP_OP_VISION_FLASH_ATTENTION_FP16` | `htp_ops_vision_flash_attention_fp16` | a vision attention variant |
 
-Of the 48, 43 have a dispatcher case: the 22 the host emits, the 20 above, and
+Of the 49, 44 have a dispatcher case: the 23 the host emits, the 20 above, and
 `GET_INFO`(20), which the host never emits either. The 5 without one are
 `RESERVED_0`(0), `RESERVED_21`(21), `COMMAND_GROUP`(99) and `MAX`(100) --
 protocol, not gaps -- and `DSP_OP_POST_ATTN_REDUCE_FUSE`(35), which §6 is about.
 
-Three rows have left this table, one per merge: `DSP_OP_TOPKV2_K1_FP16`(27) when
+Four rows have left this table, one per merge: `DSP_OP_TOPKV2_K1_FP16`(27) when
 `topk`'s values half landed, `DSP_OP_MATMUL_Q4A16_FP16`(22) with the int4
-quantized prefill entry, and `DSP_OP_SELECT`(26) with `aten.where.self`. The
-counts above read 21 and 21 where `b7183d9` read 19 and 23: the same table with
-two fewer rows and the command set with two more. Each is worth reading in §3, and
-the two that carry a qualification are there: the prefill entry reaches
-neither the int4 nor the int8 weight above its measured ceiling, and `where` is
-placed while the comparison that produces its condition is not.
+quantized prefill entry, `DSP_OP_SELECT`(26) with `aten.where.self`, and
+`DSP_OP_ARGMAX_FP16`(47) with `argmax`/`argmin`. The counts above read 21 and 21
+where `b7183d9` read 19 and 23: the same table with two fewer rows and the
+command set with three more. Each is worth reading in §3, and the ones that
+carry a qualification are there: the prefill entry reaches neither the int4 nor
+the int8 weight above its measured ceiling, `where` is placed while the
+comparison that produces its condition is not, and the arg reduction walks the
+last axis only.
 
 ## 3. One emitter away, inside a family that is already wired
 
 These are the cheapest real gaps: the kernel is there, the command is there, and
 the only thing missing looks like the line that produces it. What each entry
-records is what that turned out to mean once it was checked. Three are decided
-rather than open -- `sin` and `cos` are wired, `where` is wired, and `topk`'s
-values half is wired -- and they are kept because what each decided is the shape
-the next op in its family will have to decide too. Two were looked at and not
-taken: `expm1`, on a measurement, and `prelu`, which turns out not to be one
-emitter away after all. One is still open and needs a kernel rather than an
-emitter: a one-byte bool output for the comparisons -- but that is the last piece of
-its family and not what is holding the nodes, which is what the entry below now
-says.
+records is what that turned out to mean once it was checked. Four are decided
+rather than open -- `sin` and `cos` are wired, `where` is wired, `topk`'s
+values half is wired, and `argmax`/`argmin` are wired -- and they are kept because
+what each decided is the shape the next op in its family will have to decide too.
+Two were looked at and not taken: `expm1`, on a measurement, and `prelu`, which
+turns out not to be one emitter away after all. One is still open and needs a
+kernel rather than an emitter: a one-byte bool output for the comparisons -- but
+that is the last piece of its family and not what is holding the nodes, which is
+what the entry below now says.
 
 - **`aten.sin` and `aten.cos`**: subtypes `SIN`(14) and `COS`(13) exist, and
   `UNARY_OP_TYPES` carried both before anything emitted them. This was the entry
@@ -212,6 +221,38 @@ says.
   a refusal is unambiguously for, so `topk_is_emittable` keeps the whole node on
   the portable kernels whenever anything reads it. (The width would refuse it
   anyway: the node declares int64 and the kernel writes one int32 a row.)
+- **`aten.argmax.default` and `aten.argmin.default`**: **done**, and the
+  point of the entry is that §3's objection to `topk`'s indices does *not* carry
+  over to it. That objection was two independent claims: the kernel writes a
+  different number from torch, and the width is int32 where the node declares
+  int64. An arg reduction is neither of those. `argmax` and `argmin` break an
+  ordinary tie at the **first** occurrence on the CPU reference -- measured, not
+  assumed, over the tie rows in `test_arg_reduction.py` -- and the kernel's walk
+  is strict (`>` and `<`, not `>=` and `<=`), so the two agree by construction
+  rather than by luck. Upstream MNN's `htp_ops_argmax_fp16` would have carried the
+  width objection forward: it writes int32, so using it would have meant a second
+  command to widen, which is the thing this branch set out not to do. So the
+  kernel is one function, `htp_ops_argmax_fp16(indices, input, rowSize, rows,
+  is_min)`, whose third parameter selects max from min and whose first is an
+  `int64_t*`; the emitter writes one command and no cast, which is what "one
+  kernel" has to mean for a position that ATen declares 64 bits wide.
+  Two cases needed the kernel rather than the max/min walk, and both are
+  measured against torch's own answer. **NaN**: neither `Q6_Vhf_vmax_VhfVhf` nor
+  `Q6_Vhf_vmin_VhfVhf` propagates one, and CPU `argmax` and `argmin` both return
+  the *first* NaN, so the row is pre-scanned for one before any reduction. **Signed
+  zero**: torch treats `-0` and `+0` as one tie, and the HVX instruction's return
+  value carries a sign the instruction chose, so when the reduction lands on zero
+  the row is scanned for its first zero. Neither is an approximation -- both are
+  exact index equality against torch, on the host, in `blob_interpreter.py`, on
+  hexagon-sim and on the phone, with the vector/tail boundary at 64 fp16 elements
+  (`size & -64` in the vector, a strict scalar tail over the rest) exercised at
+  63, 64 and 65 on all three tiers. What stays refused is everything the two
+  int32 words cannot describe: a reduction on any axis but the last, a flattened
+  `dim=None` reduction *is* wired as one row, and a non-fp16 operand, a
+  non-contiguous one, a symbolic extent, a scalar and an empty row are all
+  refused. That is the one-kernel boundary, and it is a boundary rather than a
+  gap: every refusal falls back to a portable kernel that already computes the
+  op.
 - **The three norms**: `aten.native_group_norm.default`,
   `aten._native_batch_norm_legit.no_stats` and `aten._log_softmax.default` all
   landed the same way `topk` did not: no kernel was added and nothing under
@@ -268,7 +309,8 @@ the same node delegates or does not depending on a shape.
 | A constant pad fills its border with a `ZERO` memset, so the fill is zero and nothing else, and it needs a three-level region | a nonzero `value`; a pad on a third axis from the end (a fourth level); a negative pad (that is a slice); an all-zero pad, whose region is the operand at its own strides and which the kernel drops as a self-write | a fill other than zero is a kernel that writes a value; anything past the last two axes is a different region form. `mode='reflect'`/`'replicate'`/`'circular'` are not this node at all: torch lowers them to `arange`/`abs`/`clamp`/`index` programs, so no pad node reaches the partitioner |
 | A command holds three 12-int regions | `permute_copy` (at most 3 groups that advance, no reversal inside one) | a command form with more regions. The permute count is of the groups that spend a loop, not of the axis groups: a batch of one in front of a head split is a fourth group that iterates once and advances nothing, so `[1, tokens, heads, dim] -> [1, heads, tokens, dim]` is three loops and delegates, while the same split on a batch of two is refused -- the difference is an extent, and `permute_region` in `hexagon_ops.py` is where it is decided. `cat` used to sit here too, at most 3 operands, and is not of this kind any more: it splits a longer list over as many blits as the budget needs, so four inputs is two commands and seven is three, every input writing its own disjoint slice |
 | A blit describes one run per row | `slice_copy` with `step != 1` | a strided run, or a different command |
-| A two-output node is placed only when every reader takes the values output | `max.dim` (indices), `max_pool2d_with_indices`, `topk` (indices), `native_layer_norm` (`getitem 0`), `add_rms_norm` (`getitem 0` or 1) | not a rule waiting to be relaxed: `max.dim` and the pool have kernels that compute values rather than positions, and `topk` is the one kernel here that answers both -- and its positions are refused anyway, because the position it writes is the first occurrence of the row maximum while torch writes whichever index its partial sort stops on, which over 200 rows of quantized values is neither the first nor the last 175 times |
+| A two-output node is placed only when every reader takes the values output | `max.dim` (indices), `max_pool2d_with_indices`, `topk` (indices), `native_layer_norm` (`getitem 0`), `add_rms_norm` (`getitem 0` or 1) | not a rule waiting to be relaxed: `max.dim` and the pool have kernels that compute values rather than positions, and `topk` is the one kernel here that answers both -- and its positions are refused anyway, because the position it writes is the first occurrence of the row maximum while torch writes whichever index its partial sort stops on, which over 200 rows of quantized values is neither the first nor the last 175 times. `argmax`/`argmin` are not in this row and are the reason the topk sentence has to say "its": a position *is* their whole output, the kernel writes the first occurrence that torch writes, and the width is the node's own int64 rather than a kernel's int32, so neither reason reaches them |
+| An arg reduction walks contiguous fp16 rows, and the command's two extents are int32 words | `argmax`/`argmin` on any axis but the last; a fp32 or bf16 or integer operand; a non-contiguous operand; a symbolic extent; a scalar; an empty row | a strided walk, which is the same kernel the softmax row above needs, or a second command to stage the operand. A flattened `dim=None` reduction *is* wired, as one row of `numel` |
 | The narrow view rule: a view that would be a partition boundary is copied instead | `view_copy`, `unsqueeze_copy`, `squeeze_copy`, `expand_copy`, `alias_copy` | nothing -- this is the rule working, and its symptom is a delegate one op shorter than it looks |
 
 The convolution and gather rows above are admission geometry rather than
