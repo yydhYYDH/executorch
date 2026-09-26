@@ -76,7 +76,13 @@ and also what makes a count of *targets* a property of whatever corpus was lower
 in that process. In a fresh process on this tree both return `{}`, which is the
 in-tree assertion `test_overload_census2.py:639` makes. A target count therefore
 needs a model corpus, the one `PARTITION_GATES.md` §9 says is not in the tree, so
-this file quotes no target count at all rather than inheriting one.
+this file quotes no target count at all rather than inheriting one. That is a
+decision with a measurement behind it, not a shrug: the one corpus shaped like a
+model that *was* lowered on this tree -- 28 layers, Qwen3-0.6B's geometry, 403
+lowered call nodes into 29 delegates -- returned **`{}`**, **zero** unwired
+targets, and 9 refused ones (`§5`). Whatever the inherited count was, it is not
+reproduced by a corpus of that shape, and a number that does not re-derive is not
+a number this file passes on.
 
 ## 1. The vendored library has no kernel at all
 
@@ -411,7 +417,7 @@ the stable part):
 | gate | accepts | measured refusals | line |
 |---|---|---|---|
 | `pool_spec`: channel count | any `C`, and for a 3-D `(C, H, W)` input it is `shape[0]` that is read | nothing. The DSP blocking is a count of 64-lane blocks, `c4` carries `ceil(C/64)` and the kernel walks every one of them, so a width is `ceil(C/64)` blit regions a side and never a new parameter. A ragged last block is a narrower region plus a `ZERO`; the lanes it pads pool independently and the unpack never reads them. Measured on a phone: C in {64, 96, 128, 192, 256} at batch {1, 2, 3} bit-exact on maxima | `hexagon_ops.py`, `pool_spec` |
-| `pool_spec`: window and counting | any static kernel and stride, `pad >= 0`, every window inside its row. `ceil_mode` runs: `oh` and `ow` are two of the fifteen params and the walk skips whatever falls outside the input, which is torch's own clip, and torch's single decrement of the last output position is what keeps a ceil window from being a window over nothing | `dilation != (1, 1)`, `divisor_override`, and one thing about `ceil_mode`, and **the one thing is `ceil_mode` itself, not a partly saturated window**. Measured over 1970 geometries (size 1..16, k 1..4, stride 1..4, pad 0..min(k,2), both `ceil_mode`, both `count_include_pad`), reading torch's own per-window divisor out of an all-ones pool as `positions / positions-per-divisor`: `_pool_kernel_divisor_holds` is False at exactly the 270 where `ceil_mode` changed the output shape and True at the other 1700, **zero disagreements**. Under `ceil_mode=False` and `count_include_pad=True`, torch's divisor is `kernel_y * kernel_x` in **484/484** swept geometries, including every one whose edge windows are only partly inside the input -- so the kernel's `countType==1` (`pool_fp16.c:74-79`) is right there and a partly saturated pool is not the discriminator. Under `count_include_pad=False` torch's divisor is the window clipped to the raw input in **484/484** floor-mode and **501/501** ceil-mode geometries -- the kernel's own `validCount` -- so that spelling takes `ceil_mode` at any geometry. The refusal is `count_include_pad=True` with `ceil_mode=True`, and in 61 of the 501 such geometries the divisor is a *third* value the command has no param for. The emitter consults the gate only for `count_include_pad=True` (`hexagon_ops.py:4510-4512`), so the node-level refusal is the 135 of those. The geometry an earlier version of this row argued from, 8x8/k3/s3/p0, is not a divergence at all: all four of its windows hold 9 of 9 positions and torch's divisor is 9 in every one of them | `hexagon_ops.py` `_pool_output_extent`, `_pool_kernel_divisor_holds`; the clause comment at `hexagon_partitioner.py:827-835` |
+| `pool_spec`: window and counting | any static kernel and stride, `pad >= 0`, every window inside its row. `ceil_mode` runs: `oh` and `ow` are two of the fifteen params and the walk skips whatever falls outside the input, which is torch's own clip, and torch's single decrement of the last output position is what keeps a ceil window from being a window over nothing | `dilation != (1, 1)`, `divisor_override`, and one thing about `ceil_mode`, and **the one thing is `ceil_mode` itself, not a partly saturated window**. Measured over 1970 geometries (size 1..16, k 1..4, stride 1..4, pad 0..min(k,2), both `ceil_mode`, both `count_include_pad`), reading torch's own per-window divisor out of an all-ones pool as `positions / positions-per-divisor`: `_pool_kernel_divisor_holds` is False at exactly the 270 where `ceil_mode` changed the output shape and True at the other 1700, **zero disagreements**. Under `ceil_mode=False` and `count_include_pad=True`, torch's divisor is `kernel_y * kernel_x` in **484/484** swept geometries, including every one whose edge windows are only partly inside the input -- so the kernel's `countType==1` (`pool_fp16.c:74-79`) is right there and a partly saturated pool is not the discriminator. Under `count_include_pad=False` torch's divisor is the window clipped to the raw input in **484/484** floor-mode and **501/501** ceil-mode geometries -- the kernel's own `validCount` -- so that spelling takes `ceil_mode` at any geometry. The refusal is `count_include_pad=True` with `ceil_mode=True`, and in 61 of the 501 such geometries the divisor is a *third* value the command has no param for. The emitter consults the gate only for `count_include_pad=True` (`hexagon_ops.py:4510-4513`, where `count_type == POOL_COUNT_KERNEL` is the second conjunct), so the node-level refusal is the 135 of those. The geometry an earlier version of this row argued from, 8x8/k3/s3/p0, is not a divergence at all: all four of its windows hold 9 of 9 positions and torch's divisor is 9 in every one of them | `hexagon_ops.py` `_pool_output_extent`, `_pool_kernel_divisor_holds`; the clause comment at `hexagon_partitioner.py:827-835`, which phrases the second refusal as "an average whose `ceil_mode` window divides by the part of itself that is still inside" -- correct about the symptom, and this row is the measurement that says the trigger is `ceil_mode` itself, so the comment is the one place left in the tree that still reads the other way |
 | `conv_spec`: group count | `groups == 1`, the im2col path, at any channel count (3->16 and 64->64 both delegate, with a leading `ZERO` command when `C_in % 64 != 0`); `groups == in_channels == out_channels` with one channel per group, the depthwise kernel; and any count in between as one dense im2col command per group, measured on the host, the simulator and the phone for 2, 3, 4, 8, 16 and 32 groups and for 63, 64 and 65 channels per group | a group count that does not divide the input channels, and a grouped convolution whose height is a run-time length, because the per-group partition emits static extents and the per-group dynamic record is not produced | `hexagon_ops.py` `_emit_grouped_convolution`, `test_grouped_conv.py` |
 | `max_pool2d_with_indices`: readers | every reader takes `getitem 0` | reading the indices leaves the pool on the portable kernels, whatever its shape | `hexagon_ops.py:4170-4181`, called from `hexagon_partitioner.py:787` |
 
@@ -447,8 +453,9 @@ counting a spelling rather than reading a gate.
 
 ## 5. What the gaps cost a model
 
-Qwen3-0.6B, quoted from the README's Status section
-(`README.md:1069-1071`) rather than re-measured here: 1967 nodes reach 29
+Qwen3-0.6B. These node counts are quoted from the README's Status section
+(`README.md:1069-1071`) rather than re-measured here, because re-measuring them
+needs the export and not a reconstruction of it: 1967 nodes reach 29
 delegates (one per layer -- a count that predates the mask refusal in
 `_sdpa_fits_dsp_limits`, so an export whose attention nodes carry a mask
 delegates a count that follows those geometries) and 825
@@ -459,15 +466,30 @@ looks like rather than a gap. That decomposition does sum -- 227 + 114 + 113 + 8
 + 57 + 57 + 57 + 1 = 711, checked here -- but the remainder below it does not, and
 the gap is one node: 825 - 711 = 114, and the two buckets named are 28 + 85 = 113.
 It closes only if the first bucket is 29, one per *delegate*, rather than 28, one
-per layer, which is what "one per layer" says. **UNMEASURED**: the split needs a
-28-layer Qwen3 lowered in a process that reads the census, and the model corpus
-`PARTITION_GATES.md` §9 says is not in the tree. What stays below is small
+per layer, which is what "one per layer" says. **UNMEASURED**: the split needs the
+real Qwen3 export, and no Qwen3 export is in the tree. What stays below is small
 either way:
 
 - **one `view_copy` per layer** (28, or 29 per delegate -- see above), which is the
   boundary rule.
 - **85 int64 `select_copy`**, the sequence-position reads, which belong on the
   host because the patch mechanism needs the value where it is.
+
+What *was* measured here, so this section is not only inherited: a corpus built to
+Qwen3-0.6B's geometry (28 layers, vocab 151936, hidden 1024, intermediate 3072)
+lowered in this tree puts 403 call nodes into **29 delegates**, leaves **374**
+portable, and emits 3532 DSP calls inside the delegates -- `BINARY_ELEMENTWISE`
+649, `RASTER_BLIT` 509, `UNARY` 368, `BATCH_MATMUL` 254, `REDUCTION` 113, and 28
+each of `SOFTMAX` and `SELECT`, one per attention node. Its two censuses read
+`unwired_overload_census() == {}` and nine refused targets (`aten.where.self` 28,
+`aten.unsqueeze_copy.default` 11, `aten.add.Tensor` 3, `aten.slice_copy.Tensor` 3,
+`aten.sub.Tensor` 2, `aten.index.Tensor` 2, and 1 each of `aten.cat.default`,
+`aten.expand_copy.default` and `dim_order_ops._to_dim_order_copy.default`). Two
+things follow, and only two: **zero** unwired targets on a model-shaped corpus, and
+a 29-delegate count that agrees with the README's 29 while its node count does not
+-- 403 is not 1967, because this is a reconstruction of the geometry, not the
+export the README measured. So the 28-vs-29 remainder above stays open and the
+1967 / 825 / 711 figures stay quoted.
 
 The two gaps that are not of that shape:
 
@@ -488,8 +510,8 @@ The two gaps that are not of that shape:
 
 ## 6. Discrepancies noticed while compiling this
 
-- **The README and its own §6 entry had the weight-reorder discrepancy at
-  the wrong line; at `bbe19c9` the README contradicts itself instead.** A grep for
+- **This entry's premise about the weight reorder is no longer true; at
+  `bbe19c9` the README contradicts *itself* instead.** A grep for
   `htp_ops_weight_reorder` over `backends/hexagon` with the vendored tree and the
   sim runners excluded now returns **no README hit at all** -- the name the entry
   used to quote is gone -- and nothing in `runtime/`, `hexagon_ops.py`,
@@ -667,6 +689,12 @@ PYTHONPATH=src python -c 'import ast,sys; t=ast.parse(open(sys.argv[1]).read());
   if isinstance(n,ast.Return) and isinstance(n.value,ast.Constant) and n.value.value is False))' \
   backends/hexagon/partition/hexagon_partitioner.py
 
+# the section 5 corpus: 28 layers, Qwen3-0.6B's geometry, read out of the two
+# censuses in the same process. This is a reconstruction, not the export, which is
+# why the node counts in section 5 are still quoted rather than replaced.
+CENSUS_LAYERS=28 CENSUS_VOCAB=151936 CENSUS_HIDDEN=1024 CENSUS_INTERMEDIATE=3072 \
+  PYTHONPATH=src python backends/hexagon/test/tenrefuse_probe.py
+
 # the pool divisor in section 4: torch's own per-window divisor, read as
 # positions / positions-per-divisor out of an all-ones avg_pool2d, against the
 # command's two candidates (kY*kX, and validCount). No `--timeout` anywhere: an
@@ -679,7 +707,15 @@ Two things this file deliberately does not quote, because nothing in the tree
 re-derives them. **A count of unwired *targets*** needs a model corpus lowered
 in the process that reads `unwired_overload_census()`, and
 `PARTITION_GATES.md` §9 says the 21-graph corpus is hand-written and not in the
-tree; a fresh process returns `{}`. **The per-clause node counts** in
+tree; a fresh process returns `{}`, and the one model-shaped corpus that was
+lowered here returned `{}` as well -- zero, §5. **The per-clause node counts** in
 `PARTITION_GATES.md` are that file's own, pinned to `cef244b`; the clause count
 (56) is re-derived above and matches, and its rows figure (131) is below the 134
 the row tables hold today.
+
+A third: this file runs against a worktree, and a worktree is missing what
+`git worktree add` does not create. `exir/_serialize/program.fbs` and
+`exir/_serialize/scalar_type.fbs` are generated flatbuffers schemas that git
+does not track, and 12 tests in `test_no_emitter_census.py` fail with
+`FileNotFoundError` until both are copied in -- a failure that looks like a
+regression and is not one. No `--timeout=` either, for the reason above it.
