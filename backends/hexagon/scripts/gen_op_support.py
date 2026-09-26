@@ -313,7 +313,7 @@ SUPPORTED: List[OpSupport] = [
         "NaN compares false and -0.0 is not greater than 0.0, while the select "
         "only packs. Broadcasting works through rank 8 on the same descriptor as "
         "the binary rows above. The result is a one-byte-per-element buffer, "
-        "which is a bool the __BT__where__BT__ row above reads as its condition. "
+        "which is a bool the `where` row above reads as its condition. "
         "The Scalar overloads are not here, and neither are eq, ne, ge and le: "
         "htp_ops_binary_is_compare admits only the two op types, and the "
         "subtraction the other four would need is not a comparison at any length.",

@@ -112,8 +112,11 @@ quantized prefill entry, and `DSP_OP_SELECT`(26) with `aten.where.self`. The
 counts above read 21 and 21 where `b7183d9` read 19 and 23: the same table with
 two fewer rows and the command set with two more. Each is worth reading in §3, and
 the two that carry a qualification are there: the prefill entry reaches
-neither the int4 nor the int8 weight above its measured ceiling, and `where` is
-placed while the comparison that produces its condition is not.
+neither the int4 nor the int8 weight above its measured ceiling, and `where` was
+placed while the comparison that produces its condition was not. The `gt` and
+`lt` rows below have since closed that half, so producer and consumer are both
+on the DSP and a `where` reading a delegated comparison is one island rather
+than two.
 
 ## 3. One emitter away, inside a family that is already wired
 
@@ -124,10 +127,10 @@ rather than open -- `sin` and `cos` are wired, `where` is wired, and `topk`'s
 values half is wired -- and they are kept because what each decided is the shape
 the next op in its family will have to decide too. Two were looked at and not
 taken: `expm1`, on a measurement, and `prelu`, which turns out not to be one
-emitter away after all. One is still open and needs a kernel rather than an
-emitter: a one-byte bool output for the comparisons -- but that is the last piece of
-its family and not what is holding the nodes, which is what the entry below now
-says.
+emitter away after all. The comparison entry that used to sit here as "one is
+still open and needs a kernel rather than an emitter" is now closed for two of the
+six, and closed by the same argument: the one-byte bool output it wanted was a
+SELECT at one byte, not a kernel.
 
 - **`aten.sin` and `aten.cos`**: subtypes `SIN`(14) and `COS`(13) exist, and
   `UNARY_OP_TYPES` carried both before anything emitted them. This was the entry
@@ -151,20 +154,36 @@ says.
   which of the two an array takes depends only on its length and no emitter can
   decide it at export. A measurement, not a preference: rewiring it would move a model's
   `expm1(x)` from torch's answer to a constant.
-- **`aten.gt`, `aten.ge`, `aten.lt`, `aten.le`, `aten.eq`, `aten.ne`**: open, and
-  not for the reason this entry used to give. The one-byte mode is real and still
-  missing -- `htp_ops_binary_elementwise` returns -1 for a `bytes` that is not 2 or 4, and
-  the compare arms write fp16 1.0/0.0, fp32 1.0/0.0 or int32 1/0 -- but it is the
-  *last* missing piece, not the first. Two others are ahead of it. One is that the
-  DSP has two comparison op types and not six: `HtpOpsBinaryOpType` carries `GREATER`(9) and `LESS`(10),
-  `htp_ops_binary_is_compare` admits nothing else, and no host emitter ever passes either,
-  so eq, ne, ge and le have no kernel at any width. The other is that the six
-  targets are in neither `EMITTERS` nor `SUPPORTED_TARGETS`, which is where the
-  partitioner actually refuses them -- the first gate in the predicate, ahead of
-  the fp16/fp32 dtype rule and of `operand_dtypes_are_readable`, which is about bool
-  *operands* and returns True on a fp16-operand comparison whose result is bool.
-  `where`'s arrival did not need the one-byte mode because a comparison's result is a
-  `where` input rather than a command's output. `SQUARED_DIFFERENCE`(11) has no ATen node at all.
+- **`aten.gt` and `aten.lt`** against a tensor: **done.** The entry this
+  replaces listed all six as open, for three reasons in an order that was wrong: it
+  put the one-byte output first, then the two comparison op types, then the table
+  row. In that order nothing is actionable, and read backwards the first two turn
+  out not to be obstacles. The DSP's compare arm writes fp16 1.0 and 0.0 at
+  `bytes` 2 whatever `outputIsFloat` says (`eltwise_ops.cc:1166-1173`), so the flag is
+  there already and the one-byte output is a `SELECT` at `bytes` 1 -- an arm the
+  library has always had -- copying between two one-byte constants. Two commands,
+  no new DSP C++, and the one-byte output is the *last* piece rather than the first,
+  as this entry already said. The two op types are the second piece and the table
+  row the third. What is left is the three gates, and only one of them is new: the
+  width gate and `_require_arena_dtype` now read one shared
+  `result_dtype_is_emittable`, because relaxing either alone produces a
+  `RuntimeError: must be fp16 or fp32, got torch.bool` rather than a delegate. The operand
+  rule needed nothing -- `operand_dtypes_are_readable` was already True on a
+  fp16-operand comparison whose result is bool, which is what this entry recorded
+  when it was the reason the nodes were refused.
+- **`aten.ge`, `aten.le`, `aten.eq`, `aten.ne`, and `gt`/
+  `lt` against a Scalar**: open, and now for the arithmetic rather than for
+  the plumbing. `htp_ops_binary_is_compare` admits two op types, so the other four
+  have no kernel at any width, and the subtraction that would stand in for them is
+  not a comparison at any length: `a - b != 0` reads `-0.0` as set because the
+  test is on raw bits, and reads `inf - inf` as set because it is a NaN. For `ge`
+  and `le` the route is De Morgan, and De Morgan does not hold on an unordered
+  pair: with two NaNs neither is greater, so the negation is true where torch says
+  false. Measured on hexagon-sim over sixteen pairs chosen for their order
+  relations, `gt` and `lt` disagree with torch on none of the sixteen.
+  The Scalar overloads fail for a host reason instead: a python literal reaches
+  `ctx.operand` as an fp16 constant, which is a second route nobody has measured.
+  `SQUARED_DIFFERENCE`(11) has no ATen node at all.
 - **`aten.where.self`**: **done.** This was a pure emitter gap plus one
   partitioner predicate rather than a kernel change, and the entry used to ask the
   question the wrong way round -- whether the kernel's condition operand accepts
@@ -174,10 +193,12 @@ says.
   it, whether a `torch.bool` reaches the arena one byte per element, and it does,
   because an input's slot is the size the blob declares for it; that was measured
   on hexagon-sim, with a control that declares the condition two bytes wide and
-  requires the answer to move. The qualification is the half that stayed: no
-  kernel here *writes* a bool, so the comparison that produces a condition is
-  still on the portable kernels and its result enters the delegate as an input or
-  as a bool constant weight. The condition's extent is also bounded by the
+  requires the answer to move. The qualification was the half that stayed: no
+  kernel here *wrote* a bool, so the comparison that produces a condition stayed
+  on the portable kernels and its result entered the delegate as an input or as a
+  bool constant weight. `gt` and `lt` now write one themselves, as a
+  one-byte SELECT at the end of two commands, so a condition is a third source and
+  an in-arena one at that. The condition's extent is also bounded by the
   emitter: it must be the output's element count or a single element, so a
   broadcast shape that is neither still falls back whole.
 - **`aten.prelu`**: `DSP_OP_PRELU`(39) exists and no emitter uses it, because the
@@ -451,11 +472,13 @@ The two gaps that are not of that shape:
    flag per element (`eltwise_ops.cc:2116-2125`) -- and what had to be settled was
    the runtime's side of it, which was measured on hexagon-sim. Note that closing
    this does **not** by itself reach `DSP_OP_PRELU`; see the `aten.prelu` entry in
-   §3. The half that is left is the producer rather than the consumer: no kernel
-   here writes a one-byte bool, so a comparison stays portable. That is a kernel
-   change, but it is not the whole of the producer gap: the comparisons are
-   refused before the width is ever a question (see the comparison entry in §3),
-   and a bool producer would not by itself reach the `where` either, because
+   §3. The half that was left is the producer rather than the consumer: no kernel
+   here wrote a one-byte bool, and the comparisons were refused before the width was
+   ever a question. Both are now settled -- `gt` and `lt` are two commands whose
+   second is a one-byte SELECT, so a bool producer exists and it is a host emitter
+   rather than a kernel. What has not changed is the third clause, and it is the
+   reason the SDPA island is still five nodes: a bool producer would not by itself
+   reach the `where` either, because
    `htp_ops_select`'s own guard admits a condition that is the whole output or a
    single element and the SDPA guard's condition is one flag per query row.
 3. **A masked reduction as a fusion** -- `DSP_OP_MASKED_REDUCTION` is not a node
