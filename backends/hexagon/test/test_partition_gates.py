@@ -106,9 +106,10 @@ GATES = [
     (991, "CLONE_DIM_ORDER_CONTIGUOUS"),
     (995, "DIM_ORDER_KEEPS_BYTES"),
     (997, "UPDATE_CACHE_LAYOUT"),
-    (1005, "CUMSUM_EMITTABLE"),
-    (1012, "ARGUMENT_NOT_A_NODE"),
-    (1024, "GET_ATTR_NOT_FP16"),
+    (1004, "UPDATE_CACHE_APPEND_FITS"),
+    (1012, "CUMSUM_EMITTABLE"),
+    (1019, "ARGUMENT_NOT_A_NODE"),
+    (1031, "GET_ATTR_NOT_FP16"),
 ]
 
 #: The three the inventory inherits rather than measures, and why. A target
@@ -366,8 +367,8 @@ def test_the_table_names_each_clause_once_and_leaves_the_measured_three():
     names = [name for _, name in GATES]
     assert len(names) == len(set(names))
     assert MEASURED_ELSEWHERE <= set(names)
-    assert len(GATES) - len(MEASURED_ELSEWHERE) == 52, (
-        "six clauses are already measured elsewhere; the other 52 are the "
+    assert len(GATES) - len(MEASURED_ELSEWHERE) == 53, (
+        "six clauses are already measured elsewhere; the other 53 are the "
         "inventory"
     )
 
