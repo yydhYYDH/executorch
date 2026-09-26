@@ -5,6 +5,14 @@ A bucket census over the lowered graph counted `aten.add` 3, `aten.sub` 2,
 lists as delegated, and a count records no reasons. Reading the reasons out of
 the partitioner settles it, and the answer is one clause and not five.
 
+Re-measured at `bbe19c9` the count is **nine, not ten**: `aten.cat` is 1, not
+2, so the bucket copied from the older census is one high and `OP_GAPS.md`
+already says 1. `hexagon-fp32cat` (`c8e9634`) is an ancestor and did widen
+`cat_plan`, but the width clause these nodes are refused on is byte-identical
+across it, so the merge is a candidate and not an established cause.
+`test_portable_supported_rows.py` carries the re-measurement, the per-node
+clause, and the controls.
+
 Eight of the nine are the RoPE position arithmetic: `arange` plus an offset, a
 difference of two position slices, a concatenation of one, and the two-axis
 gathers that read the causal mask out of a cumsum. Every one of them produces
@@ -14,7 +22,7 @@ documented limit -- the arena holds two bytes an element -- and it is the same
 refusal that holds back 85 int64 position reads a Qwen3 forward pass already
 carries in `OP_GAPS.md`.
 
-The tenth, `aten.cumsum`, is not a refusal of a supported row at all. The
+The ninth, `aten.cumsum`, is not a refusal of a supported row at all. The
 emitter is registered for `et_hexagon.cumsum`, the fused node `FuseCumsumPass`
 creates, and `aten.cumsum` is not in the emitter table, so the partitioner
 stops at the membership test, before the width gate. The census that found it

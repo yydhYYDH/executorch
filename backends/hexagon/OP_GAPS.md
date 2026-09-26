@@ -411,6 +411,106 @@ table and the unwired one wants a family the table names, and the table names
 that counted the node among "supported rows that are still portable" was
 counting a spelling rather than reading a gate.
 
+### 4.1 The nine, re-measured, and which of them is a gap
+
+Re-derived at `bbe19c9`, `test_portable_supported_rows.py` and the 28-layer census
+behind it. **The count is nine, not ten**: `aten::add` 3, `aten::sub` 2,
+`aten::cat` **1**, `aten::index` 2, `aten::cumsum` 1. The `cat` is the number
+that moved, so a bucket count copied from the older census over-counts by one.
+**The merge is a candidate, not an established cause:** `c8e9634`
+(`hexagon-fp32cat`) is an ancestor of this rev and it did widen `cat_plan` --
+it added a homogeneity clause and an input-count row -- but the width clause
+these nodes are refused on, `result.dtype not in (torch.float16, torch.float32)`,
+is byte-identical across that merge, so the diff does not show it taking a node
+off the portable list. None of this is per layer: all nine are in the prologue, so
+a 1-layer and a 28-layer Qwen3 carry the same nine.
+
+| node | result dtype | clause | own gate, asked separately |
+|---|---|---|---|
+| `aten::add` x3 | int64 | `hexagon_partitioner.py:704` | `_broadcast_fits_dsp_limits` **accepts** |
+| `aten::sub` x2 | int64 | `hexagon_partitioner.py:704` | `_broadcast_fits_dsp_limits` **accepts** |
+| `aten::cat` x1 | int64 | `hexagon_partitioner.py:704` | `cat_plan` refuses at `hexagon_ops.py:1167-1170` -- the width again |
+| `aten::index` x2 | int64 | `hexagon_partitioner.py:704` | `gather_table` refuses; three further reasons below |
+| `aten::cumsum` x1 | int64 | `hexagon_partitioner.py:687` | no emitter for this target |
+
+704 is `elif not result_dtype_is_emittable(dtype, node.target)` and the clause
+that answers it is `hexagon_ops.py:581`, `return dtype in (torch.float16,
+torch.float32)` -- the one-byte `bool` arm is keyed on the target, not on the
+width. 687 is the membership test. Both line numbers move; the clause names do
+not, and `test_portable_supported_rows.py` derives both from the source rather
+than writing them down.
+
+**All nine are category (a): refused with a named clause.** Measured, not
+assumed. The lowered outer graph holds the portable nodes and nothing else, so
+the census asks the support predicate over the *pre-decomposition* graph (where
+an accepted node is visible) and joins the answer to the delegate subgraphs by
+node name -- the inner graph keeps the outer node names, so the join is a name
+lookup and not a guess by target. Over all 28 layers: `aten::add` has 256
+nodes, 3 refused and 253 accepted and **all 253 in delegates**; `aten::cat` has
+58, 1 refused and 57 accepted and **all 57 in delegates**; and **not one node of
+the five families is accepted and in no delegate.** A 4-layer run gives the same
+shape -- 40 adds with 37 delegated, 10 cats with 9 delegated, still zero -- so
+this is a property of the partitioner and not of one graph. That middle category
+differs from a refusal by an order of magnitude of work, and a delegate count
+cannot tell the two apart.
+
+`sub`, `index` and `cumsum` have no accepted node anywhere in this graph, so
+for those three the corpus supplies no control of its own and the controls have
+to be built -- the fp16 twins in the same file, whose blobs are decoded and carry
+`BINARY_ELEMENTWISE`, `RASTER_BLIT` and `SHARED_GATHER`. `add` and `cat` do
+supply one: the same target, the same graph, accepted and refused, and the
+clause is what tells them apart.
+
+**None of the nine is a gap.** Eight are the documented arena limit, which the
+row above already carries and already says belongs on the host. The ninth is a
+census categorisation error. The one thing here that IS worth writing down is
+what the gather row leaves out.
+
+### 4.2 `aten.index.Tensor`: the reason the row does not state
+
+`OP_SUPPORT.md` describes the row in operand terms: an **fp16 table**, a table
+that is a **parameter, buffer or lifted constant**, **exactly one index**, on
+axis 0. Both Qwen3 nodes fail four of those tests, and two of the four are
+stated:
+
+1. **two index entries** -- stated, in the row and in the refusals table. `gather_table`
+   returns at `hexagon_ops.py:8278` because `_gather_operands` returned
+   `(None, None)` at `hexagon_ops.py:8374-8375`.
+2. **the table is not fp16** -- stated, in the row's own dtype column.
+3. **the table is a computed node**, the `cumsum` above it, so
+   `is_constant(table_arg)` is false at `hexagon_ops.py:8285`. Stated for
+   `embedding`, inherited here by "as embedding.default".
+4. **the table is ONE-DIMENSIONAL, which the row never says.** `gather_table`
+   requires `table_value.dim() == 2` at `hexagon_ops.py:8307-8308`, and the
+   Qwen3 table is the `[1, 3]` int64 row the causal mask is cumsummed into, not
+   a matrix. Isolated: a **1-D fp16** buffer table with a single int32 index
+   produces an **fp16** result, so the width clause is not involved, and it is
+   still refused at 8308; the same graph with a 2-D table delegates one
+   `SHARED_GATHER`. The two differ in nothing but the table's rank.
+
+And the clause that actually fires first is neither of these: it is 704, the
+**result** width, because a gather's result has the table's width and the row
+describes only operand widths. The consequence for the row is worth stating
+plainly: `SHARED_GATHER` is a row about *operands*, while the gate that keeps
+these two nodes portable is a gate about the *result*, and nothing on the row
+points at it. `test_portable_supported_rows.py` breaks the two apart by holding
+one fixed: an **int64 index** with an fp16 table delegates, an **int64 table**
+with an int32 index is refused at 704.
+
+### 4.3 The cumsum spelling hides a second width
+
+`aten.cumsum` stops at 687 because the emitter is registered for
+`et_hexagon.cumsum`. That is the first reason, and the interesting part is what
+is behind it: the fused node's own predicate `cumsum_is_emittable`
+(`cumsum.py:100`) wants a contiguous **fp16** operand of rank two or more with
+a static last extent that is a positive multiple of `SCAN_ALIGNMENT`, and
+Qwen3's cumsum operand is a **bool** `[1, 3]` row. Measured: `cumsum_is_emittable`
+accepts an fp16 `[2, 64]` and refuses both the bool `[1, 3]` and an int64
+`[1, 64]`. So **turning `FuseCumsumPass` on would not make this node
+delegate** -- the width would refuse it one clause later, and the result is
+int64 besides. The spelling is real and it is worth fixing so the two censuses
+stop being blind, but it is not a missing kernel.
+
 ## 5. What the gaps cost a model
 
 Qwen3-0.6B, from the README's Status section: 1967 nodes reach 29 delegates (one
