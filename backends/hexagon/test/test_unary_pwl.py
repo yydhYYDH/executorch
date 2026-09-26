@@ -194,6 +194,14 @@ _GOLDEN = {
     },
 }
 
+#: tanh at 64 is the only place in this file where the device can settle how the
+#: chord's product is rounded, and it does: replayed through execute() with the
+#: kernel's fp16 multiply the seventeen bits above all match, and with the same
+#: multiply carried in fp32 fifteen do, losing index 2 (-3.5, 0xBBFC where the
+#: model says 0xBBFD) and index 14 (3.5, 0x3BFC against 0x3BFD) -- one
+#: representable step each, one on either side of zero. The gelu and sigmoid sets
+#: match both roundings exactly, so they are not evidence for either.
+
 #: The worst absolute distance from the definition each of the three may have, at
 #: the buffer length the walk covers the whole of. The measured values are 6.1e-3
 #: for gelu, 2.4e-3 for sigmoid and 6.3e-3 for tanh, and the ceilings sit just
