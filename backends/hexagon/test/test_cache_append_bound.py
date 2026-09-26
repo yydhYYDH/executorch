@@ -188,9 +188,9 @@ def _verdict(ep, node):
     return support.is_node_supported({}, node), _REFUSED.get(node)
 
 
-def _owned(position, rows=1, dtype=torch.int64, seq=SEQ):
-    value = _x(BATCH, rows, HEADS, DIM)
-    ep = _edge(_OwnedAdvance(position, dtype), (_x(BATCH, seq, HEADS, DIM), value))
+def _owned(position, rows=1, dtype=torch.int64, seq=SEQ, heads=HEADS, dim=DIM):
+    value = _x(BATCH, rows, heads, dim)
+    ep = _edge(_OwnedAdvance(position, dtype), (_x(BATCH, seq, heads, dim), value))
     return ep, _advance_node(ep), value
 
 
@@ -264,6 +264,56 @@ def test_a_position_the_program_does_not_own_is_refused_at_the_append_gate(
         assert not accepted, f"position {position} was accepted with no value for it"
         assert line == APPEND_GATE, f"refused at {line}, not at the append gate"
         assert update_cache_layout(node) is not None
+
+
+@pytest.mark.parametrize(
+    "seq,heads,dim,position,rows,accepted",
+    [
+        # The bound is the cache LENGTH, not a number this file happens to use:
+        # a longer cache admits positions the five-row one refuses.
+        (8, 2, 32, 5, 1, True),
+        (8, 2, 32, 7, 1, True),
+        (8, 2, 32, 8, 1, False),
+        # And it is a geometry, not the one geometry above: a single-head cache
+        # of a different width at a different length moves the boundary with it.
+        (4, 1, 32, 3, 1, True),
+        (4, 1, 32, 4, 1, False),
+        (6, 4, 48, 5, 1, True),
+        (6, 4, 48, 6, 1, False),
+        (5, 2, 32, 3, 2, True),
+        (5, 2, 32, 4, 2, False),
+    ],
+    ids=[
+        "seq8_pos5",
+        "seq8_pos7",
+        "seq8_pos8",
+        "one_head_pos3",
+        "one_head_pos4",
+        "four_heads_pos5",
+        "four_heads_pos6",
+        "two_rows_pos3",
+        "two_rows_pos4",
+    ],
+)
+def test_the_bound_is_the_cache_length_and_not_a_number(
+    instrumented, seq, heads, dim, position, rows, accepted
+):
+    """Four geometries, and the boundary moves with the cache rather than with a constant.
+
+    Every row is the same clause and the same program, and only the geometry and
+    the position differ, so a bound implemented as a number this file happens to
+    use, or as a fixed fraction of the cache, fails here. The two positive rows
+    are the control: without them a clause that refused everything would pass the
+    negative half.
+    """
+    ep, node, _ = _owned(position, rows, seq=seq, heads=heads, dim=dim)
+    verdict, line = _verdict(ep, node)
+    if accepted:
+        assert verdict, f"seq {seq} pos {position} rows {rows} fits and was refused at {line}"
+        return
+    assert not verdict
+    assert line == APPEND_GATE, f"refused at {line}, not at the append gate"
+    assert update_cache_layout(node) is not None
 
 
 def test_a_support_object_without_the_program_refuses_the_case_that_fits(
