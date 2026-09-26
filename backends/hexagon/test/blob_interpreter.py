@@ -1029,13 +1029,19 @@ _COND_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32}
 
 
 def _run_select(command: Command, params: List[int], arena: Arena) -> None:
-    """htp_ops_select (eltwise_ops.cc:2380): `cond ? in1 : in2`, element by element.
+    """htp_ops_select (eltwise_ops.cc): `cond ? in1 : in2`, element by element.
 
-    The kernel picks its walk from three sizes: an operand of one element is
-    broadcast, the output's own size is read along, and anything else is the
-    per-channel mode this backend never emits. The condition is the one operand
-    whose width is a parameter rather than two bytes, which is what makes a
-    one-byte torch.bool readable.
+    All three operands take the same three walks, derived from their own size
+    against the output's: one element is broadcast, the output's own size is
+    read along, and anything else is the per-channel plane (index / innerSize)
+    % channelSize. The third is what a staircase mask's condition is, and the
+    same guard as the kernel's: a per-channel operand has to name the plane,
+    and channelSize has to be its own size. A descriptor the kernel would
+    refuse is refused here too, rather than answered with a walk the kernel
+    never takes.
+
+    The condition is the one operand whose width is a parameter rather than two
+    bytes, which is what makes a one-byte torch.bool readable.
 
     The operands are read out of the arena from their own addresses rather than
     out of the reference's own slice, because that is what the kernel does: it is
@@ -1045,17 +1051,28 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
     the encoding does not matter.
     """
     out_size, cond_size, in1_size, in2_size, bytes_, cond_bytes = params[:6]
+    channel, inner = (params[6], params[7]) if len(params) > 7 else (0, 0)
+    if out_size <= 0:
+        # The kernel returns before it walks anything.
+        return
     if bytes_ != FP16_BYTES or cond_bytes not in _COND_DTYPES:
         raise UnsupportedOp(
             f"blob: a select over {bytes_}-byte values with {cond_bytes}-byte "
             "conditions is not modelled"
         )
-    if in1_size not in (1, out_size) or in2_size not in (1, out_size):
-        # A value of any other size is the kernel's per-channel mode, which reads
-        # params[6] and params[7]; this emitter never produces one.
-        raise UnsupportedOp(
-            "blob: a select with a per-channel value operand is not modelled"
-        )
+
+    def walk(size: int, what: str) -> np.ndarray:
+        """The per-output-element index into an operand of this size."""
+        if size == 1:
+            return np.zeros(out_size, dtype=np.intp)
+        if size == out_size:
+            return np.arange(out_size, dtype=np.intp)
+        if channel <= 0 or inner <= 0 or size != channel:
+            raise UnsupportedOp(
+                f"blob: a select whose {what} is {size} elements needs a channel "
+                f"size of its own, and params name {channel} and {inner}"
+            )
+        return (np.arange(out_size, dtype=np.intp) // inner) % channel
 
     cond_ref = command.inputs[0]
     in1_ref, in2_ref = command.inputs[1], command.inputs[2]
@@ -1068,15 +1085,17 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
             raise UnsupportedOp("blob: a select reads an operand past the arena")
         return np.frombuffer(bytes(arena.bytes[at : at + count * width]), dtype=dtype)
 
-    cond_step = 0 if cond_size == 1 else 1
-    cond = read(cond_ref, _COND_DTYPES[cond_bytes], cond_step * (out_size - 1) + 1)
-    in1 = read(in1_ref, np.uint16, 1 if in1_size == 1 else out_size)
-    in2 = read(in2_ref, np.uint16, 1 if in2_size == 1 else out_size)
-
-    at = np.arange(out_size) * cond_step
-    on = np.zeros(out_size, dtype=np.intp) if in1_size == 1 else np.arange(out_size)
-    off = np.zeros(out_size, dtype=np.intp) if in2_size == 1 else np.arange(out_size)
-    _store(arena, arena.address(out_ref), np.where(cond[at] != 0, in1[on], in2[off]).tobytes())
+    cond_at = walk(cond_size, "condition")
+    in1_at = walk(in1_size, "true value")
+    in2_at = walk(in2_size, "false value")
+    cond = read(cond_ref, _COND_DTYPES[cond_bytes], int(cond_at.max()) + 1)
+    in1 = read(in1_ref, np.uint16, int(in1_at.max()) + 1)
+    in2 = read(in2_ref, np.uint16, int(in2_at.max()) + 1)
+    _store(
+        arena,
+        arena.address(out_ref),
+        np.where(cond[cond_at] != 0, in1[in1_at], in2[in2_at]).tobytes(),
+    )
 
 
 def _run_conv_depthwise2d(command: Command, params: List[int], arena: Arena) -> None:

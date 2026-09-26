@@ -235,11 +235,13 @@ def test_a_where_the_kernel_cannot_walk_stays_portable():
     """The refusals, each of which would otherwise be a wrong number.
 
     Two of them are shapes the command cannot describe, and both have a
-    kernel-side reason rather than a policy one: the command's own guard admits a
-    condition that is the whole output or a single element, so a broadcast
-    condition is out, and a bool *result* has no writer here at all because the
-    arena holds two bytes per element. In both cases the node stays on the
-    portable kernels, which is the whole graph and not an error.
+    kernel-side reason rather than a policy one: a condition broadcast over a
+    middle axis has no walk at all, because the kernel's third one repeats the
+    condition over the output's *innermost* axes and a condition that is one
+    element wide on an outer axis as well is not that walk; and a bool *result*
+    has no writer here at all because the arena holds two bytes per element. In
+    both cases the node stays on the portable kernels, which is the whole graph
+    and not an error.
 
     The third is the condition's dtype, and it is unreachable through `export`:
     `aten.where.self`'s own schema requires a bool predicate, so no graph the
@@ -250,16 +252,37 @@ def test_a_where_the_kernel_cannot_walk_stays_portable():
     on = torch.arange(1, 9, dtype=torch.float16).reshape(2, 4)
     off = -on
 
-    class _BroadcastCondition(torch.nn.Module):
-        """The condition is (2, 1) and the values are (2, 4)."""
+    class _MiddleAxisCondition(torch.nn.Module):
+        """The condition is (1, 3, 1): one element wide on two axes, and the
+        middle one is not an axis the output repeats over."""
 
         def forward(self, cond, a, b):
             return torch.where(cond, a, b)
 
-    columns = torch.tensor([[True], [False]])
+    class _Rows(torch.nn.Module):
+        """The control for the same model at the shape the walk describes."""
+
+        def forward(self, cond, a, b):
+            return torch.where(cond, a, b)
+
+    middle = torch.zeros(1, 3, 1, dtype=torch.bool)
+    middle[0, 0, 0] = True
+    plane = torch.zeros(2, 3, 1, dtype=torch.bool)
+    plane[0, 0, 0] = True
+    plane[0, 2, 0] = True
+    plane[1, 1, 0] = False
+    wide = torch.randn(2, 3, 4, dtype=torch.float16)
+    wide_off = -wide
     assert (
-        _where_support(_BroadcastCondition(), (columns, on, off))[0] == 0
+        _where_support(_MiddleAxisCondition(), (middle, wide, wide_off))[0] == 0
     ), "a condition the command's own guard rejects reached the delegate"
+    # The control: the same rank, the same element count, the same innermost
+    # axis, and a condition that is narrow on no axis but that one. The refusal
+    # above is about which axis the broadcast is on, not about the rank or the
+    # sizes.
+    assert (
+        _where_support(_Rows(), (plane, wide, wide_off))[0] == 1
+    ), "a condition on the output's innermost axis did not reach a kernel"
 
     class _BoolResult(torch.nn.Module):
         def forward(self, cond):
@@ -279,6 +302,90 @@ def test_a_where_the_kernel_cannot_walk_stays_portable():
     # refusals above are about their own operand and not about `where` in
     # general.
     assert _where_support(_Where(), (flags, on, off))[0] == 1
+
+
+def test_a_staircase_condition_reaches_the_kernel_with_its_plane():
+    """The condition the SDPA mask chain produces, and the parameters it needs.
+
+    `scaled_dot_product_attention` over a mask lowers to a chain whose last
+    node is a `where` whose condition is one flag per query row -- a condition
+    whose element count is the output's divided by the context length. The
+    command describes that as a per-channel plane, and the two numbers the
+    kernel reads are the condition's own size and the repeat. So this asserts
+    all three at once, because each of them alone is satisfiable by a mistake:
+    that the node delegates, that the delegate's blob carries one SELECT, and
+    that the SELECT's last two parameters are the plane the shapes say.
+
+    The middle-axis control sits beside it so a predicate that refused every
+    broadcast condition would fail here rather than pass quietly.
+    """
+    q = torch.randn(1, 2, 3, 8, dtype=torch.float16)
+    mask = torch.triu(torch.ones(1, 1, 3, 3, dtype=torch.bool), diagonal=1)
+    program = _program(_MaskedAttention(), (q, q, q, mask))
+    assert _delegates(program), "the masked attention reached no kernel at all"
+
+    selects = []
+    for call in _delegates(program):
+        sub = program.graph_module.get_submodule(call.args[0].target)
+        for node in sub.original_module.graph_module.graph.nodes:
+            if (
+                node.op == "call_function"
+                and node.target is exir_ops.edge.aten.where.self
+                and node.args[0].meta["val"].numel() < node.meta["val"].numel()
+            ):
+                header, commands = read_blob(bytes(sub._processed_bytes))
+                selects.extend(
+                    (node, command) for command in commands if command.type == _DSP_OP_SELECT
+                )
+    assert len(selects) == 1, f"expected the staircase's one SELECT, got {selects}"
+    node, command = selects[0]
+    assert command.params == [
+        18,
+        6,
+        18,
+        18,
+        2,
+        1,
+        6,
+        3,
+    ], f"the command does not name the plane: {command.params}"
+    # The condition slot is six bytes, so the mask is not widened to the
+    # output's size: the whole point of the plane is that the repeat costs
+    # nothing.
+    assert command.inputs[0].size == 6, command.inputs[0].size
+    assert command.inputs[1].size == 36 and command.inputs[2].size == 36
+
+
+class _MaskedAttention(torch.nn.Module):
+    def forward(self, q, k, v, mask):
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask
+        )
+
+
+def test_the_staircase_select_answers_torch_on_the_host_model():
+    """The same command, run through the host model, against torch.
+
+    The model and the kernel are two implementations of one walk, and a model
+    that did not implement the third one would either refuse this descriptor or
+    read the condition as if it were the output's size. Both are caught here:
+    the descriptor is the one the emitter produces, the reference is torch's own
+    broadcast, and a condition whose element count divides the output is
+    compared element for element.
+    """
+    cond = torch.tensor([True, False, True, True, False, False]).reshape(1, 2, 3, 1)
+    on = torch.arange(1, 19, dtype=torch.float16).reshape(1, 2, 3, 3)
+    off = -on
+    program = _program(_Where(), (cond, on, off))
+    assert len(_delegates(program)) == 1
+
+    sub = program.graph_module.get_submodule(_delegates(program)[0].args[0].target)
+    blob = bytes(sub._processed_bytes)
+    got = execute(blob, [cond.numpy(), on.numpy(), off.numpy()])[0]
+    expected = torch.where(cond, on, off)
+    assert np.array_equal(
+        np.frombuffer(got, dtype=np.float16), expected.numpy().reshape(-1)
+    )
 
 
 def _node_where(cond_dtype):

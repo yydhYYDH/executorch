@@ -2409,6 +2409,63 @@ def _branch_cases():
         )
     )
 
+    # 12. The select's third condition walk: a condition whose element count
+    #     divides the output's, which is what the SDPA staircase mask is -- one
+    #     flag per query row against a mask the context axis repeats over. The
+    #     kernel reaches it through the same (index / innerSize) % channelSize it
+    #     already used for a per-channel value, and the two descriptors below
+    #     share one blob's bytes and slots, so what separates their answers is
+    #     the parameters alone.
+    #
+    #     Three things are being settled, and each is visible in one of the three
+    #     cases rather than in the emitter:
+    #
+    #      * SQ1 is the claim, and its reference is torch's own broadcast of the
+    #        condition into the output shape. A model of the walk that tiled the
+    #        condition along the wrong axis would answer a different number.
+    #      * SQ2 moves innerSize by one and nothing else. A walk that ignored
+    #        innerSize, or that read the condition at its own stride, would make
+    #        the two answers the same and the case would be testing nothing.
+    #      * SQ3 complements every flag and reuses SQ1's descriptor. A kernel that
+    #        read past the condition's declared size would see the 0xFF the padded
+    #        slot carries and answer SQ1's numbers, so SQ3 has to come back as
+    #        SQ1's complement -- which the test below reads the two answers for.
+    #
+    # The condition is six flags and the output eighteen values, which is the SDPA
+    # chain's own ratio: one flag per query row, three values per context step.
+    stair_cond = torch.tensor([True, False, True, True, False, False]).reshape(
+        1, 2, 3, 1
+    )
+    stair_on = torch.arange(1, 19).reshape(1, 2, 3, 3).half()
+    stair_off = -stair_on
+    cases.append(
+        _case(
+            "SQ1",
+            _Where(),
+            (stair_cond, stair_on, stair_off),
+            _bits(torch.where(stair_cond, stair_on, stair_off)),
+        )
+    )
+    cases.append(
+        _case(
+            "SQ2",
+            None,
+            (stair_cond, stair_on, stair_off),
+            _bits(torch.where(stair_cond, stair_on, stair_off)),
+            blob=_stair_inner_size(cases, "SQ1", 2),
+            kind="teeth",
+        )
+    )
+    cases.append(
+        _case(
+            "SQ3",
+            None,
+            (~stair_cond, stair_on, stair_off),
+            _bits(torch.where(~stair_cond, stair_on, stair_off)),
+            blob=_tagged(cases, "SQ1").blob,
+        )
+    )
+
     # 12. The M > 1 quantized prefill entry, in the five shapes that decide
     #    whether its two blits and its weight layout are right:
     #
@@ -2958,6 +3015,30 @@ _SELECT = 26
 #: The index of SELECT's condBytes in its parameter vector
 #: (execute_command.cc:646-651 passes intParams[0..7] in order).
 _SELECT_COND_BYTES = 5
+#: And of the channelSize and innerSize the per-channel walk reads.
+_SELECT_CHANNEL_SIZE = 6
+_SELECT_INNER_SIZE = 7
+
+
+def _stair_inner_size(cases, tag, value, op_index=0):
+    """The same blob with SELECT's innerSize set to a number of its own.
+
+    The walk is (index / innerSize) % channelSize, so a different repeat is a
+    different answer and a different broadcast, and the blob it produces is
+    byte-for-byte CE's apart from that one parameter. The case exists to show
+    the repeat is read: without a control of this shape, an answer that agreed
+    with torch would not say whether the kernel divided by the number the
+    descriptor carried or by any other.
+    """
+    at = (
+        _blob.HEADER_SIZE
+        + op_index * _blob.OP_SIZE
+        + 4 * 4
+        + _SELECT_INNER_SIZE * 4
+    )
+    raw = bytearray(_tagged(cases, tag).blob)
+    raw[at : at + 4] = struct.pack("<i", value)
+    return bytes(raw)
 
 
 def _condition_at_half_width(blob, op_index=0, value=2):
@@ -3097,6 +3178,32 @@ def test_a_flip_blob_carries_a_negative_source_stride(cases):
         params = list(case.commands[0].params)
         assert min(params[9:12]) < 0, f"{case.tag} has no negative stride: {params[:15]}"
         assert max(params[12:15]) > 0, f"{case.tag} writes backwards: {params[:15]}"
+
+
+def test_the_staircase_cases_separate_the_repeat_from_the_stride(cases, simulated):
+    """SQ1 against SQ2 and SQ3, which is what makes SQ1's answer mean anything.
+
+    SQ1 and SQ2 share every byte of the blob and differ in one parameter, so an
+    answer that ignored innerSize would make the two the same and the claim
+    untested. SQ1 and SQ3 share one descriptor and differ in the condition's
+    bytes, so a kernel that read the 0xFF the padded slot carries would make
+    SQ3 repeat SQ1. The relation is read here rather than asserted on one case,
+    because a single case cannot see either.
+    """
+    def answer(tag):
+        words = simulated.get(f"{tag}0")
+        assert words, f"{tag}: the simulator printed no answer"
+        return np.asarray(_from_bits(words))
+
+    claim, repeat, inverted = answer("SQ1"), answer("SQ2"), answer("SQ3")
+    assert not np.array_equal(claim, repeat), (
+        "the repeat is not load-bearing: a kernel that ignored innerSize would "
+        "pass this case"
+    )
+    assert not np.array_equal(claim, inverted), (
+        "the condition slot is not being read: SQ3 repeated SQ1, so the kernel "
+        "read the padding after the condition rather than the condition"
+    )
 
 
 def test_the_blobs_contain_the_ops_we_mean_to_run(cases):
