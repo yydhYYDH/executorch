@@ -42,10 +42,12 @@ from torch.export import export
 
 _EDGE = exir_ops.edge.aten
 
-#: Every comparison the edge dialect spells as a tensor-tensor overload. All
-#: six refuse, and they are the six an `a == b` written in torch lowers to.
+#: The six comparisons an `a OP b` lowers to, named by the overload the graph
+#: actually carries. `Tensor` and not `default`: both exist for every one of
+#: them, and a table written against the wrong overload asserts about an object
+#: no node ever has, which is a test that cannot fail.
 COMPARISON_TARGETS = {
-    name: getattr(_EDGE, name).default
+    name: getattr(_EDGE, name).Tensor
     for name in ("gt", "lt", "eq", "ne", "ge", "le")
 }
 
@@ -60,7 +62,11 @@ CONTROL_TARGETS = {
     "where": _EDGE.where.self,
 }
 
-_CONTROL_OP_NAMES = ("add", "relu", "maximum")
+_CONTROL_TARGETS = (
+    _EDGE.add.Tensor,
+    _EDGE.relu.default,
+    _EDGE.maximum.default,
+)
 
 
 def _node(result_dtype, operand_dtypes, numel=(4, 8)):
@@ -194,7 +200,9 @@ def _verdicts():
 
     The lowered graph is the wrong place to read this: partitioning has already
     replaced the three wired nodes with one `executorch_call_delegate`, so their
-    verdicts are gone and a count read there is a count of leftovers.
+    verdicts are gone and a count read there is a count of leftovers. The keys
+    are the nodes' own targets, so the table of six is checked against the graph
+    rather than against a hand-written list that could name a different overload.
     """
     edge_program = to_edge(
         export(_ComparisonsAndThreeControls(), _inputs()),
@@ -205,8 +213,7 @@ def _verdicts():
     for node in edge_program.graph_module.graph.nodes:
         if node.op != "call_function":
             continue
-        name = node.target.__name__ if hasattr(node.target, "__name__") else str(node.target)
-        out[name] = support.is_node_supported(edge_program.graph_module, node)
+        out[node.target] = support.is_node_supported(edge_program.graph_module, node)
     return out
 
 
@@ -236,19 +243,18 @@ def test_six_comparisons_refuse_and_three_wired_ops_of_the_same_geometry_do_not(
     """
     verdicts = _verdicts()
     comparisons = {
-        name: value
-        for name, value in verdicts.items()
-        if name.split(".")[1] in ("eq", "ne", "ge", "le", "gt", "lt")
+        target: value
+        for target, value in verdicts.items()
+        if target in set(COMPARISON_TARGETS.values())
     }
-    controls = {name: verdicts[name] for name in verdicts if name.split(".")[1] in _CONTROL_OP_NAMES}
-    assert sorted(comparisons) == [
-        "aten.eq.Tensor",
-        "aten.ge.Tensor",
-        "aten.gt.Tensor",
-        "aten.le.Tensor",
-        "aten.lt.Tensor",
-        "aten.ne.Tensor",
-    ]
+    controls = {
+        target: verdicts[target]
+        for target in verdicts
+        if target in set(_CONTROL_TARGETS)
+    }
+    assert set(comparisons) == set(COMPARISON_TARGETS.values()), sorted(
+        str(t) for t in comparisons
+    )
     assert sum(comparisons.values()) == 0, comparisons
     assert len(controls) == 3, controls
     assert all(controls.values()), controls
@@ -279,3 +285,129 @@ def test_the_control_graph_delegates_and_its_stream_carries_no_comparison():
     assert ops.DSP_OP_BINARY_ELEMENTWISE in types, types
     compare_types = {9: "GREATER", 10: "LESS"}
     assert not [t for t in types if t in compare_types], types
+
+
+class _CompareAndAdd(torch.nn.Module):
+    def forward(self, a, b):
+        return a > b, a + b
+
+
+class _AddOnly(torch.nn.Module):
+    def forward(self, a, b):
+        return a + b
+
+
+def _probe_greater_emitter(node, ctx):
+    """A comparison emitter of the shape one would actually write.
+
+    The `_require_arena_dtype` line is not decoration: all nineteen other
+    emitters in this backend open with it, and it is the line the experiment
+    below turns into a failure.
+    """
+    ops._require_arena_dtype(node, "probe greater")
+    numel = ops._numel(node)
+    return ctx.emit(
+        node,
+        ops.Op(
+            type=ops.DSP_OP_BINARY_ELEMENTWISE,
+            inputs=[ctx.operand(node.args[0]), ctx.operand(node.args[1])],
+            outputs=[ctx.result_for(node, numel, torch.bool)],
+            params=[numel, numel, numel, 1, ops.FP16_BYTES, ops.FP16_BYTES, 0, 0]
+            + [ops.BINARY_OP_TYPES["greater"]]
+            + [8, 8, 0, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 0, 0, 0],
+        ),
+    )
+
+
+def _lower(model, inputs):
+    return to_edge_transform_and_lower(
+        export(model, inputs),
+        partitioner=[HexagonPartitioner()],
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+
+
+def _delegate_count(program):
+    return sum(
+        1
+        for node in program.graph_module.graph.nodes
+        if node.target is torch.ops.higher_order.executorch_call_delegate
+    )
+
+
+def test_the_width_gate_is_the_only_clause_refusing_a_bool_result(monkeypatch):
+    """Relax it and the node is accepted; the operand rule never held it.
+
+    The `unwired` census stays empty either way and is blind here: it counts a
+    family `EMITTERS` already names, and `gt` is not one, so a node refused at
+    the width gate is counted nowhere by it. The `refused` census does name the
+    node, and it does not fall back to empty when the node is accepted, because
+    it keys on the node rather than on the call. Both are asserted so the next
+    reader knows which counter can see this change and which cannot.
+    """
+    edge_program = to_edge(
+        export(_CompareAndAdd(), _inputs()),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    support = HexagonOperatorSupport(_data_placeholders(edge_program))
+    node = next(
+        n
+        for n in edge_program.graph_module.graph.nodes
+        if n.target is _EDGE.gt.Tensor
+    )
+    monkeypatch.setitem(ops.EMITTERS, _EDGE.gt.Tensor, _probe_greater_emitter)
+    assert node.target in partition.SUPPORTED_TARGETS
+    assert ops.operand_dtypes_are_readable(node) is True
+    partition.reset_unwired_overload_census()
+    partition.reset_refused_overload_census()
+    assert support.is_node_supported(edge_program.graph_module, node) is False
+    assert partition.unwired_overload_census() == {}
+    assert partition.refused_overload_census() == {"aten.gt.Tensor": 1}
+
+    real = partition._dtype_of
+    monkeypatch.setattr(
+        partition,
+        "_dtype_of",
+        lambda n: torch.float16 if real(n) is torch.bool else real(n),
+    )
+    assert support.is_node_supported(edge_program.graph_module, node) is True
+    # The verdict moved and neither census did, and that is the measurement
+    # rather than an omission: the counters key on the node, so a node refused
+    # once and accepted afterwards still reads as refused. A census read after a
+    # lowering would report this pair as a loss when it is a gain.
+    assert partition.unwired_overload_census() == {}
+    assert partition.refused_overload_census() == {"aten.gt.Tensor": 1}
+
+
+def test_admitting_bool_without_touching_the_emitter_turns_a_fallback_into_a_raise(
+    monkeypatch,
+):
+    """The export that works today is the one that raises after the edit.
+
+    Three steps, each measured. With no table row the comparison is not in the
+    emitter table at all and the export falls back. With a row and the width
+    gate left alone it still falls back, because the gate refuses the bool
+    result before any emitter runs. Relax the gate and the emitter runs, and the
+    first thing it says is that a bool is not a width the arena holds. The
+    control is an fp16-result add under the same relaxation, which still
+    delegates -- so what raises is the bool, not the relaxation.
+    """
+    inputs = _inputs()
+
+    # The export as it stands today.
+    assert _delegate_count(_lower(_CompareAndAdd(), inputs)) == 1
+
+    # A table row on its own changes nothing, because the gate still refuses.
+    monkeypatch.setitem(ops.EMITTERS, _EDGE.gt.Tensor, _probe_greater_emitter)
+    assert _delegate_count(_lower(_CompareAndAdd(), inputs)) == 1
+
+    real = partition._dtype_of
+    monkeypatch.setattr(
+        partition,
+        "_dtype_of",
+        lambda n: torch.float16 if real(n) is torch.bool else real(n),
+    )
+    with pytest.raises(RuntimeError, match="must be fp16 or fp32"):
+        _lower(_CompareAndAdd(), inputs)
+    # The same relaxation, an fp16 result: the add still delegates.
+    assert _delegate_count(_lower(_AddOnly(), inputs)) == 1
