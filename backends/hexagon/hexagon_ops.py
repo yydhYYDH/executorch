@@ -699,6 +699,82 @@ def select_region(node: torch.fx.Node):
     return [0, index * inner, 0, 1, rows, inner, 0, shape[dim] * inner, 1, 0, inner, 1]
 
 
+def expand_region(node: torch.fx.Node) -> list[int] | None:
+    """The blit region for an `expand_copy` that repeats, or None.
+
+    An expand that grows nothing is a view, and then the alias path re-points
+    the operand because the result describes the operand's own bytes. An
+    expand that grows an axis is a broadcast: the result holds more elements
+    than the operand, so the bytes have to be written out, and the only
+    question left is whether a three-level region can address them.
+
+    It can exactly when the shape's per-axis plain/broadcast pattern has at
+    most three runs of equal values. A run of axes is one level: a plain run
+    advances the source by the pitch of the axis that ends it, and a
+    broadcast run holds the source still and advances the result instead,
+    which is the per-side stride doing the work the alias path cannot. An
+    expand only ever turns a one into a larger extent, so the result is a
+    dense buffer and its own strides are the ones the region walks; the
+    innermost level is therefore always destination stride one.
+
+    A fourth run is the refusal, and it is a descriptor with three levels
+    rather than a kernel that is missing: an axis that is broadcast, then one
+    that is not, then one that is, needs four levels of walk.
+    """
+    source = node.args[0] if node.args else None
+    if not isinstance(source, torch.fx.Node):
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    shape = list(source_value.shape)
+    result = list(result_value.shape)
+    if len(shape) != len(result) or not source_value.is_contiguous():
+        return None
+    if any(grown < plain or grown % plain for plain, grown in zip(shape, result)):
+        return None
+    if source_value.numel() == result_value.numel():
+        return None
+
+    broadcasts = [grown > plain for plain, grown in zip(shape, result)]
+    boundaries = [0]
+    for axis in range(1, len(broadcasts)):
+        if broadcasts[axis] != broadcasts[axis - 1]:
+            boundaries.append(axis)
+    boundaries.append(len(broadcasts))
+    if len(boundaries) - 1 > 3:
+        return None
+
+    sizes, source_strides, result_strides = [], [], []
+    for start, stop in zip(boundaries, boundaries[1:]):
+        count = 1
+        for extent in result[start:stop]:
+            count *= extent
+        source_pitch = 1
+        for extent in shape[stop:]:
+            source_pitch *= extent
+        result_pitch = 1
+        for extent in result[stop:]:
+            result_pitch *= extent
+        sizes.append(count)
+        source_strides.append(0 if broadcasts[start] else source_pitch)
+        result_strides.append(result_pitch)
+    # The last run is the innermost level, because the region's third level
+    # walks the result's own innermost axis, so a run short of three leaves
+    # its unused levels on the outside where a neutral one cannot shorten the
+    # walk.
+    while len(sizes) < 3:
+        sizes.insert(0, 1)
+        source_strides.insert(0, 0)
+        result_strides.insert(0, 0)
+
+    # srcIndex, srcOffset, dstOffset, size[xyz], srcStride[xyz], dstStride[xyz]
+    return [0, 0, 0] + sizes + source_strides + result_strides
+
+
 def _emit_select_copy(node: torch.fx.Node, ctx) -> TensorRef:
     """A select that narrows writes a buffer; one that does not re-points.
 
@@ -706,6 +782,28 @@ def _emit_select_copy(node: torch.fx.Node, ctx) -> TensorRef:
     than by splitting the target in the op table.
     """
     region = select_region(node)
+    if region is None:
+        return _emit_alias(node, ctx)
+    out = ctx.result_for(node, _numel(node))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_RASTER_BLIT,
+            inputs=[ctx.operand(node.args[0])],
+            outputs=[out],
+            params=[1, FP16_BYTES, 1] + region,
+        ),
+    )
+    return ctx.record(node, out)
+
+
+def _emit_expand_copy(node: torch.fx.Node, ctx) -> TensorRef:
+    """A broadcast expand writes a buffer; an expand that grows nothing does not.
+
+    The same two forms as the narrowing select, decided here rather than by
+    splitting the target in the op table.
+    """
+    region = expand_region(node)
     if region is None:
         return _emit_alias(node, ctx)
     out = ctx.result_for(node, _numel(node))
@@ -8365,7 +8463,7 @@ EMITTERS = {
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
     exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
     exir_ops.edge.aten.view_copy.default: _emit_alias,
-    exir_ops.edge.aten.expand_copy.default: _emit_alias,
+    exir_ops.edge.aten.expand_copy.default: _emit_expand_copy,
     TO_DIM_ORDER_COPY: _emit_alias,
     CLONE_DIM_ORDER: _emit_clone_copy,
     exir_ops.edge.aten.select_copy.int: _emit_select_copy,
@@ -8449,6 +8547,10 @@ SLICE_TARGETS = frozenset({exir_ops.edge.aten.slice_copy.Tensor})
 # Reaches _emit_select_copy, which takes the narrowing form as a blit and leaves
 # the same-bytes form to the alias path.
 SELECT_TARGETS = frozenset({exir_ops.edge.aten.select_copy.int})
+
+# Reaches _emit_expand_copy, which takes the broadcasting form as a blit with a
+# zero source stride and leaves the view form to the alias path.
+EXPAND_TARGETS = frozenset({exir_ops.edge.aten.expand_copy.default})
 
 CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
 

@@ -98,6 +98,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     REPEAT_TARGETS,
     sdpa_mask_fits_dsp_limits,
     sdpa_targets,
+    expand_region,
+    EXPAND_TARGETS,
     select_region,
     SELECT_TARGETS,
     slice_region,
@@ -935,9 +937,13 @@ class HexagonOperatorSupport(OperatorSupportBase):
                     if source is None or not add_rms_norm_is_emittable(source):
                         return False
         if _emits_no_command(node) and not _alias_keeps_the_same_bytes(node):
-            # A narrowing select reaches the same emitter through its own region
-            # rather than by re-pointing, so the alias test is not the last word.
-            if node.target not in SELECT_TARGETS or select_region(node) is None:
+            # A narrowing select and a broadcasting expand reach the same emitters
+            # through their own regions rather than by re-pointing, so the alias
+            # test is not the last word.
+            if (
+                (node.target not in SELECT_TARGETS or select_region(node) is None)
+                and (node.target not in EXPAND_TARGETS or expand_region(node) is None)
+            ):
                 return False
         if node.target in SLICE_TARGETS and slice_region(node) is None:
             return False

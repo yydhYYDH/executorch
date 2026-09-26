@@ -1011,10 +1011,12 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.expand_copy.default",
-        None,
+        BLIT,
         ARENA_FP16,
-        "View: re-points the operand; contiguous, equal element count (a real "
-        "broadcast is not described by the operand's TensorRef).",
+        "A broadcast is a blit whose region holds the source still (a zero "
+        "source stride) on the axes that repeat, so it needs the axes' "
+        "plain/broadcast pattern to make at most three runs; the form that "
+        "keeps the operand's bytes re-points it and emits nothing.",
     ),
     OpSupport(
         "aten._to_copy.default",
