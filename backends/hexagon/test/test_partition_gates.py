@@ -48,65 +48,67 @@ CFG = EdgeCompileConfig(_check_ir_validity=False)
 #: (line in hexagon_partitioner.py, short name), in _verdict's own order. The
 #: lines are this checkout's; PARTITION_GATES.md is the prose.
 GATES = [
-    (674, "NOT_CALL_FUNCTION"),
-    (680, "TARGET_NOT_IN_TABLE"),
-    # Added by the arg-reduction merge. It has to run before
-    # RESULT_DTYPE below, which would otherwise reject every
-    # int64 index before it reached the row-geometry predicate.
-    (688, "ARG_REDUCTION_GEOMETRY"),
-    (695, "RESULT_DTYPE"),
-    (700, "OPERAND_DTYPES_READABLE"),
-    (706, "WHERE_EMITTABLE"),
-    (713, "SDPA_FITS_DSP_LIMITS"),
-    (715, "BINARY_BROADCAST_FITS"),
-    (717, "MM_OPERANDS_FLAT"),
-    (719, "BMM_OPERANDS_FLAT"),
-    (721, "ADDMM_FITS_FLAT_PATH"),
-    (728, "QUANTIZED_MATMUL_REFUSED"),
-    (731, "MEAN_REDUCES_ONE_SPAN"),
-    (738, "MEAN_RESULT_WIDTH"),
-    (742, "POW_IS_SQUARE"),
-    (745, "POW_TENSOR_TENSOR_NO_PROGRAM"),
-    (753, "POW_TENSOR_TENSOR_EMITTABLE"),
-    (759, "REDUCTION_DIMS"),
-    (761, "SUM_DIM_EMITTABLE"),
-    (763, "MAX_DIM_EMITTABLE"),
-    (765, "MIN_DIM_EMITTABLE"),
-    (769, "MAX_POOL_EMITTABLE"),
-    (776, "TOPK_EMITTABLE"),
-    (786, "REPEAT_FLIP_EMITTABLE"),
-    (796, "NEAREST_UPSAMPLE_EMITTABLE"),
-    (805, "SPLIT_EMITTABLE"),
-    (812, "POOL_SPEC"),
-    (827, "CONV_SPEC"),
-    (836, "GATHER_TABLE"),
-    (842, "LAYER_NORM_EPS_CONST"),
-    (844, "LAYER_NORM_TRAILING_DIMS"),
-    (846, "NATIVE_LAYER_NORM_EMITTABLE"),
-    (848, "ADD_RMS_NORM_EMITTABLE"),
-    (856, "VISION_ATTENTION_EMITTABLE"),
-    (858, "SOFTMAX_INNER_AXIS"),
-    (868, "LOG_SOFTMAX_WITHIN_ARENA"),
-    (876, "GROUP_NORM_ONE_GROUP_PER_ROW"),
-    (882, "BATCH_NORM_ONE_SPAN"),
-    (896, "GETITEM_NORM_PRODUCER"),
-    (918, "GETITEM_PRODUCER"),
-    (923, "ALIAS_BYTES_OR_SELECT"),
-    (925, "SLICE_REGION"),
-    (927, "CAT_PLAN"),
-    (929, "PERMUTE_REGION"),
-    (932, "LEAKY_RELU_SLOPE_CONST"),
-    (938, "PRELU_SOURCE"),
-    (940, "PRELU_SLOPE_RANK"),
-    (943, "PRELU_SLOPE_NUMEL"),
-    (945, "REFLECT_PAD_REGIONS"),
-    (953, "CONSTANT_PAD_REGION"),
-    (964, "CLONE_DIM_ORDER_CONTIGUOUS"),
-    (968, "DIM_ORDER_KEEPS_BYTES"),
-    (970, "UPDATE_CACHE_LAYOUT"),
-    (978, "CUMSUM_EMITTABLE"),
-    (985, "ARGUMENT_NOT_A_NODE"),
-    (997, "GET_ATTR_NOT_FP16"),
+    (681, "NOT_CALL_FUNCTION"),
+    (687, "TARGET_NOT_IN_TABLE"),
+    # Added by the arg-reduction merge: it must run before RESULT_DTYPE, which
+    (695, "ARG_REDUCTION_GEOMETRY"),
+    (704, "RESULT_DTYPE"),
+    (709, "OPERAND_DTYPES_READABLE"),
+    (715, "WHERE_EMITTABLE"),
+    (722, "SDPA_FITS_DSP_LIMITS"),
+    (724, "BINARY_BROADCAST_FITS"),
+    # Added by the zero-cost merge, with the clamp composition it gates.
+    (730, "CLAMP_TENSOR_FITS"),
+    # Added by the zero-cost merge, with the elu composition it gates.
+    (736, "ELU_FITS"),
+    (738, "MM_OPERANDS_FLAT"),
+    (740, "BMM_OPERANDS_FLAT"),
+    (742, "ADDMM_FITS_FLAT_PATH"),
+    (749, "QUANTIZED_MATMUL_REFUSED"),
+    (752, "MEAN_REDUCES_ONE_SPAN"),
+    (759, "MEAN_RESULT_WIDTH"),
+    (763, "POW_IS_SQUARE"),
+    (766, "POW_TENSOR_TENSOR_NO_PROGRAM"),
+    (774, "POW_TENSOR_TENSOR_EMITTABLE"),
+    (780, "REDUCTION_DIMS"),
+    (782, "SUM_DIM_EMITTABLE"),
+    (784, "MAX_DIM_EMITTABLE"),
+    (786, "MIN_DIM_EMITTABLE"),
+    (790, "MAX_POOL_EMITTABLE"),
+    (797, "TOPK_EMITTABLE"),
+    (807, "REPEAT_FLIP_EMITTABLE"),
+    (817, "NEAREST_UPSAMPLE_EMITTABLE"),
+    (826, "SPLIT_EMITTABLE"),
+    (835, "POOL_SPEC"),
+    (850, "CONV_SPEC"),
+    (859, "GATHER_TABLE"),
+    (865, "LAYER_NORM_EPS_CONST"),
+    (867, "LAYER_NORM_TRAILING_DIMS"),
+    (869, "NATIVE_LAYER_NORM_EMITTABLE"),
+    (871, "ADD_RMS_NORM_EMITTABLE"),
+    (879, "VISION_ATTENTION_EMITTABLE"),
+    (881, "SOFTMAX_INNER_AXIS"),
+    (891, "LOG_SOFTMAX_WITHIN_ARENA"),
+    (899, "GROUP_NORM_ONE_GROUP_PER_ROW"),
+    (905, "BATCH_NORM_ONE_SPAN"),
+    (919, "GETITEM_NORM_PRODUCER"),
+    (941, "GETITEM_PRODUCER"),
+    (950, "ALIAS_BYTES_OR_SELECT"),
+    (952, "SLICE_REGION"),
+    (954, "CAT_PLAN"),
+    (956, "PERMUTE_REGION"),
+    (959, "LEAKY_RELU_SLOPE_CONST"),
+    (965, "PRELU_SOURCE"),
+    (967, "PRELU_SLOPE_RANK"),
+    (970, "PRELU_SLOPE_NUMEL"),
+    (972, "REFLECT_PAD_REGIONS"),
+    (980, "CONSTANT_PAD_REGION"),
+    (991, "CLONE_DIM_ORDER_CONTIGUOUS"),
+    (995, "DIM_ORDER_KEEPS_BYTES"),
+    (997, "UPDATE_CACHE_LAYOUT"),
+    (1005, "CUMSUM_EMITTABLE"),
+    (1012, "ARGUMENT_NOT_A_NODE"),
+    (1024, "GET_ATTR_NOT_FP16"),
 ]
 
 #: The three the inventory inherits rather than measures, and why. A target
@@ -119,6 +121,8 @@ MEASURED_ELSEWHERE = {
     "RESULT_DTYPE",
     "GET_ATTR_NOT_FP16",
     "ARG_REDUCTION_GEOMETRY",
+    "CLAMP_TENSOR_FITS",
+    "ELU_FITS",
 }
 
 _REFUSED = weakref.WeakKeyDictionary()
@@ -212,74 +216,74 @@ def _refusals(module, inputs):
 #: row here was measured to refuse at the named line before it was written; a
 #: clause the tree has since widened is a failing row rather than a silent one.
 CASES = [
-    (680, "aten.prod.default", _M(lambda a: torch.prod(a)), (_x(2, 3),)),
+    (687, "aten.prod.default", _M(lambda a: torch.prod(a)), (_x(2, 3),)),
     (
-        695,
+        704,
         "dim_order_ops._to_dim_order_copy.default",
         _M(lambda a: a.to(torch.int32)),
         (_x(2, 3),),
     ),
     (
-        700,
+        709,
         "dim_order_ops._to_dim_order_copy.default",
         _M(lambda a: (a > 0) + a),
         (_x(2, 3),),
     ),
     (
-        706,
+        715,
         "aten.where.self",
         _M(lambda a: F.scaled_dot_product_attention(a, a, a)),
         (_x(1, 2, 4, 8),),
     ),
     (
-        715,
+        724,
         "aten.add.Tensor",
         _M(lambda a: a + a[:, :1]),
         (_x(1, 2, 3, 4, 5, 6, 7, 8, 9),),
     ),
-    (731, "aten.mean.dim", _M(lambda a: torch.mean(a, dim=(0, 2))), (_x(2, 3, 4),)),
+    (752, "aten.mean.dim", _M(lambda a: torch.mean(a, dim=(0, 2))), (_x(2, 3, 4),)),
     (
-        738,
+        759,
         "aten.mean.dim",
         _M(lambda a: torch.mean(a, dim=1, dtype=torch.float32)),
         (_x(2, 3, 4),),
     ),
-    (742, "aten.pow.Tensor_Scalar", _M(lambda a: torch.pow(a, 3)), (_x(2, 3),)),
-    (753, "aten.pow.Tensor_Tensor", _M(lambda a: torch.pow(a, _k(2, 3))), (_x(2, 3),)),
-    (759, "aten.sum.dim_IntList", _M(lambda a: torch.sum(a, dim=(0, 2))), (_x(2, 3, 4),)),
+    (763, "aten.pow.Tensor_Scalar", _M(lambda a: torch.pow(a, 3)), (_x(2, 3),)),
+    (774, "aten.pow.Tensor_Tensor", _M(lambda a: torch.pow(a, _k(2, 3))), (_x(2, 3),)),
+    (780, "aten.sum.dim_IntList", _M(lambda a: torch.sum(a, dim=(0, 2))), (_x(2, 3, 4),)),
     (
-        761,
+        782,
         "aten.sum.dim_IntList",
         _M(lambda a: torch.sum(a, dim=1, dtype=torch.float32)),
         (_x(2, 3, 4),),
     ),
     (
-        763,
+        784,
         "aten.max.dim",
         _M(lambda a: torch.max(a, dim=1, keepdim=True)),
         (_x(2, 3, 4),),
     ),
     (
-        769,
+        790,
         "aten.max_pool2d_with_indices.default",
         _M(lambda a: F.max_pool2d(a, 2, return_indices=True)),
         (_x(1, 64, 8, 8),),
     ),
-    (776, "aten.topk.default", _M(lambda a: torch.topk(a, 2, dim=1)), (_x(2, 3, 4),)),
+    (797, "aten.topk.default", _M(lambda a: torch.topk(a, 2, dim=1)), (_x(2, 3, 4),)),
     (
-        786,
+        807,
         "aten.repeat.default",
         _M(lambda a: a.repeat(2, 3, 1, 1)),
         (_x(1, 3, 4, 5),),
     ),
     (
-        796,
+        817,
         "aten.upsample_nearest2d.vec",
         _M(lambda a: F.interpolate(a, scale_factor=1.5, mode="nearest")),
         (_x(1, 4, 8, 8),),
     ),
     (
-        812,
+        835,
         "aten.avg_pool2d.default",
         _M(lambda a: F.avg_pool2d(a, 2, ceil_mode=True)),
         (_x(1, 64, 8, 8),),
@@ -288,34 +292,42 @@ CASES = [
         # The table is a graph input, not a parameter: GATHER_TABLE refuses a
         # table whose bytes this layer cannot see at export, and the index width
         # is not what it is refusing -- the host narrows that either way.
-        836,
+        859,
         "aten.embedding.default",
         _M(lambda table, index: F.embedding(index, table)),
         (torch.randn(4, 8, dtype=F16), torch.tensor([0, 2], dtype=torch.int64)),
     ),
     (
-        868,
+        891,
         "aten._log_softmax.default",
         _M(lambda a: torch.log_softmax(a, 1)),
         (_x(2, 70000, 3),),
     ),
-    (918, "getitem", _M(lambda a: torch.sort(a)[0]), (_x(4, 3),)),
-    (923, "aten.expand_copy.default", _M(lambda a: a.expand(2, 3, 4)), (_x(1, 3, 4),)),
-    (925, "aten.slice_copy.Tensor", _M(lambda a: a[0, ::2]), (_x(4, 6),)),
+    (941, "getitem", _M(lambda a: torch.sort(a)[0]), (_x(4, 3),)),
+    # The expand_copy row that sat here is gone because it stopped being true. This
+    # clause is the select-or-expand region gate, and the broadcasting-expand merge
+    # widened its expand arm until nothing this file can build reaches it: a grow
+    # on any one axis, on two axes, in five and six dimensions, and a grow on an
+    # interior axis were each measured and each now delegates. Its select arm is
+    # reachable only for a select the region cannot express, and no such geometry
+    # was found either, so the clause is unreachable from here rather than gone.
+    # A row is not invented to fill the gap; §7 is where a census run would find a
+    # geometry that still turns it away.
+    (952, "aten.slice_copy.Tensor", _M(lambda a: a[0, ::2]), (_x(4, 6),)),
     (
-        953,
+        980,
         "aten.constant_pad_nd.default",
         _M(lambda a: F.pad(a, (1, 1, 1, 1, 1, 1))),
         (_x(2, 3, 4),),
     ),
     (
-        964,
+        991,
         "dim_order_ops._clone_dim_order.default",
         _M(lambda a: a.clone(memory_format=torch.channels_last)),
         (_x(1, 4, 3, 3),),
     ),
     (
-        968,
+        995,
         "dim_order_ops._to_dim_order_copy.default",
         _M(lambda a: a.to(memory_format=torch.channels_last)),
         (_x(1, 4, 3, 3),),
@@ -355,7 +367,7 @@ def test_the_table_names_each_clause_once_and_leaves_the_measured_three():
     assert len(names) == len(set(names))
     assert MEASURED_ELSEWHERE <= set(names)
     assert len(GATES) - len(MEASURED_ELSEWHERE) == 52, (
-        "four clauses are already measured elsewhere; the other 52 are the "
+        "six clauses are already measured elsewhere; the other 52 are the "
         "inventory"
     )
 
@@ -426,5 +438,5 @@ def test_a_refused_getitem_names_the_producer_it_is_standing_behind(instrumented
     getitem = by_name["getitem"]
     assert not support.is_node_supported({}, sort)
     assert not support.is_node_supported({}, getitem)
-    assert _REFUSED[getitem] == 918
-    assert _REFUSED[sort] == 680
+    assert _REFUSED[getitem] == 941
+    assert _REFUSED[sort] == 687

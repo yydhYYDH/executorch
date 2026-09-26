@@ -165,13 +165,10 @@ def _named(fn, args):
 #: or fail to match.
 _ROWS = [
     ("erf", lambda a: torch.erf(a), "aten::erf.out"),
-    ("elu", lambda a: torch.nn.functional.elu(a), "aten::elu.out"),
     ("prod", lambda a: torch.prod(a), "aten::prod.out"),
     ("var", lambda a: torch.var(a), "aten::var.correction_out"),
     ("expm1", lambda a: torch.expm1(a), "aten::expm1.out"),
     ("zeros_like", lambda a: torch.zeros_like(a), "aten::full_like.out"),
-    ("clamp.Tensor", lambda a: torch.clamp(a, min=a), "aten::clamp.Tensor_out"),
-    ("gt.Tensor", lambda a: torch.gt(a, a), "aten::gt.Tensor_out"),
     ("eq.Tensor", lambda a: torch.eq(a, a), "aten::eq.Tensor_out"),
 ]
 
@@ -180,13 +177,16 @@ _ROWS = [
 #: the blit its flattened input needed, not a scan. Putting it in the row would
 #: assert a falsehood to keep a list tidy; the test below pins what it does.
 #:
-#: `argmax` and `argmin` left this table the other way round. The row said they
-#: reach no command and keep a portable `aten::argmax.out` spelling, and both
-#: halves were true when it was written. The arg-reduction command now takes
-#: them: a contiguous fp16 row reaches exactly `DSP_OP_ARGMAX_FP16`, and
-#: because the node delegates there is no host spelling left to fall back on
-#: at all. The row is not deleted to keep the list tidy -- its claim inverted
-#: into a falsehood, so it is replaced by the positive claim below.
+#: Five families have left this table the other way round: `argmax`/`argmin`,
+#: `elu`, `clamp.Tensor` and `gt.Tensor`. Each row said the family reaches no
+#: command and keeps a portable host spelling, and both halves were true when
+#: the row was written. Each then got an emitter, and once a node delegates
+#: there is no host spelling left either, so the row is false in both halves at
+#: once. No row is deleted merely to keep the list tidy: each claim inverted
+#: into a falsehood, so each is replaced by the positive claim below, which
+#: pins the command types rather than a count of zero. `eq.Tensor` is still a
+#: row: only `gt` and `lt` have a kernel, and the other four comparisons do not
+#: have one at any width.
 
 
 @pytest.mark.parametrize(
@@ -211,24 +211,54 @@ def test_the_family_reaches_no_dsp_command_but_has_a_portable_fallback(
     )
 
 
-@pytest.mark.parametrize(
-    "label,forward", [("argmax", torch.argmax), ("argmin", torch.argmin)]
-)
-def test_the_arg_reductions_reached_the_opposite_conclusion_and_the_test_says_so(
-    tmp_path, label, forward
-):
-    """The row this replaced, stated as the claim that is true instead.
+#: The rows above, as the claim that is true instead. The command types are
+#: pinned rather than a count, because "reaches six commands" would still pass
+#: if the composition were rebuilt out of the wrong six.
+_WIRED = [
+    ("argmax", torch.argmax, ["DSP_OP_ARGMAX_FP16"]),
+    ("argmin", torch.argmin, ["DSP_OP_ARGMAX_FP16"]),
+    ("clamp.Tensor", lambda a: torch.clamp(a, min=a), ["DSP_OP_BINARY_ELEMENTWISE"]),
+    (
+        "gt.Tensor",
+        lambda a: torch.gt(a, a),
+        ["DSP_OP_BINARY_ELEMENTWISE", "DSP_OP_SELECT"],
+    ),
+    (
+        "lt.Tensor",
+        lambda a: torch.lt(a, a),
+        ["DSP_OP_BINARY_ELEMENTWISE", "DSP_OP_SELECT"],
+    ),
+    (
+        "elu",
+        lambda a: torch.nn.functional.elu(a),
+        [
+            "DSP_OP_UNARY",
+            "DSP_OP_BINARY_ELEMENTWISE",
+            "DSP_OP_BINARY_ELEMENTWISE",
+            "DSP_OP_UNARY",
+            "DSP_OP_UNARY",
+            "DSP_OP_BINARY_ELEMENTWISE",
+        ],
+    ),
+]
 
-    Zero commands and a portable spelling were both correct for argmax when the
-    row above was written, and both are false now in the same direction: the node
-    reaches one command, and the runtime has no operator of its own left to look
-    up because the whole graph became the delegate.
+
+@pytest.mark.parametrize("label,forward,expected", _WIRED, ids=[r[0] for r in _WIRED])
+def test_the_family_left_this_table_and_the_test_pins_what_it_does_now(
+    tmp_path, label, forward, expected
+):
+    """Each row this replaced, stated as the claim that is true instead.
+
+    Zero commands and a portable spelling were both correct for every one of
+    these when the row was written, and both are false now in the same
+    direction: the node reaches commands, and the runtime has no operator of
+    its own left to look up because the whole graph became the delegate.
     """
     args = (torch.randn(1, 64, 8, 8, dtype=F16),)
-    count, names = _named(lambda a: forward(a), args)
-    assert count == 1, f"{label} reaches {count} commands, not the one it should"
-    assert names == ["DSP_OP_ARGMAX_FP16"]
-    assert _host_operators(tmp_path, lambda a: forward(a), args) == []
+    count, names = _named(forward, args)
+    assert count == len(expected), f"{label} reaches {count} commands"
+    assert names == expected
+    assert _host_operators(tmp_path, forward, args) == []
 
 
 def test_the_control_delegates_so_a_refusing_partitioner_cannot_pass_this_file():

@@ -96,6 +96,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     REDUCTION_TARGETS,
     repeat_region,
     REPEAT_TARGETS,
+    result_dtype_is_emittable,
     sdpa_mask_fits_dsp_limits,
     sdpa_targets,
     expand_region,
@@ -688,16 +689,18 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in ARG_REDUCTION_TARGETS:
             if dtype is not torch.int64 or not arg_reduction_is_emittable(node):
                 # An index result is int64 and the row command writes that width
-                # directly. This gate must run before the generic fp16/fp32
-                # result check, which would otherwise reject every valid index
-                # before it reaches the row-geometry predicate.
+                # directly. This gate must run before the shared width check
+                # below, which answers False for int64 and would therefore reject
+                # every valid index before it reached the row-geometry predicate.
                 return False
-        elif dtype not in (torch.float16, torch.float32):
-            # Both widths the arena holds are emittable: every kernel reads and
-            # writes two bytes per element, the runtime narrows a fp32 operand on
-            # the way in and widens a fp32 result on the way out, so one declared
-            # fp32 emits the same commands as its fp16 twin. Any other width
-            # would leave the kernels reading int64 bits as half floats.
+        elif not result_dtype_is_emittable(dtype, node.target):
+            # A comparison's result is a torch.bool and the one byte-wide result a
+            # command here writes: the DSP's own GREATER and LESS leave an fp16 1.0
+            # or 0.0, and the select that follows copies a byte at a time. Every
+            # other width would leave the kernels reading int64 bits as half floats.
+            # result_dtype_is_emittable is the emitters' own answer to the same
+            # question, so a node admitted here cannot fail the export for want of
+            # one -- which is the failure a relaxed gate alone produces.
             return False
         if not operand_dtypes_are_readable(node):
             # A bool operand is one byte per element where the kernels read two,

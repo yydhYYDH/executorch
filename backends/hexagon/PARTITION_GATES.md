@@ -23,11 +23,11 @@ re-derived here.
 
 | brief | at a47 | the fact |
 |---|---|---|
-| `SUPPORTED_TARGETS` IS `EMITTERS`, hexagon_backend.py:21 | `hexagon_backend.py:37` | `SUPPORTED_TARGETS: Dict[Callable, Callable] = EMITTERS`, so "the partitioner does not know this target" and "no emitter exists" are one clause, line 680 |
-| the width gate reads the RESULT dtype, hexagon_partitioner.py:316 | `hexagon_partitioner.py:679-695` | `dtype = _dtype_of(node)` reads `node.meta["val"]`, the result. The operand width is a *different* clause, line 700 |
-| `_require_arena_dtype` raises, hexagon_ops.py:192-202 | `hexagon_ops.py:546-556` | `raise RuntimeError(...)`, not a fallback, which is why admitting a width at line 695 without touching it converts a working export into a failed one |
+| `SUPPORTED_TARGETS` IS `EMITTERS`, hexagon_backend.py:21 | `hexagon_backend.py:37` | `SUPPORTED_TARGETS: Dict[Callable, Callable] = EMITTERS`, so "the partitioner does not know this target" and "no emitter exists" are one clause, line 687 |
+| the width gate reads the RESULT dtype, hexagon_partitioner.py:316 | `hexagon_partitioner.py:679-704` | `dtype = _dtype_of(node)` reads `node.meta["val"]`, the result. The operand width is a *different* clause, line 709 |
+| `_require_arena_dtype` raises, hexagon_ops.py:192-202 | `hexagon_ops.py:546-556` | `raise RuntimeError(...)`, not a fallback, which is why admitting a width at line 704 without touching it converts a working export into a failed one |
 
-The other half of the third fact is line 997, which is in this inventory and is the partitioner's
+The other half of the third fact is line 1024, which is in this inventory and is the partitioner's
 own copy of the same width rule for constant operands. It is marked measured because the pairing is
 the finding.
 
@@ -88,83 +88,83 @@ consequences, and fixing them means fixing the other end of the same island.
 
 | line | clause | models | rows | total | head-on | shadow | what it turned away |
 |---|---|---|---|---|---|---|---|
-| 680 | `TARGET_NOT_IN_TABLE` | 298 | 30 | 328 | – | 298 | _native_batch_norm_legit_no_training 160, logical_not 42, full_like 24, eq 21, any 21 |
-| 918 | `GETITEM_PRODUCER` | 160 | 2 | 162 | 0 | 160 | getitem 162 — every one behind a refused batch norm |
-| 923 | `ALIAS_BYTES_OR_SELECT` | 58 | 1 | 59 | 58 | 0 | expand_copy 59 |
-| 695 | `RESULT_DTYPE` | 52 | 3 | 55 | 2 | 50 | unsqueeze_copy 25, add 6, slice_copy 6, sub 5, index 4 |
-| 706 | `WHERE_EMITTABLE` | 21 | 0 | 21 | 0 | 21 | where 21, all inside the sdpa fully-masked-row guard |
-| 812 | `POOL_SPEC` | 2 | 2 | 4 | 2 | 0 | max_pool2d_with_indices 3, avg_pool2d 1 |
-| 776 | `TOPK_EMITTABLE` | 0 | 3 | 3 | – | – | topk 3 |
-| 836 | `GATHER_TABLE` | 1 | 2 | 3 | 1 | 0 | index.Tensor 2, embedding 1 |
-| 968 | `DIM_ORDER_KEEPS_BYTES` | 2 | 1 | 3 | 0 | 2 | _to_dim_order_copy 3 |
-| 759 | `REDUCTION_DIMS` | 0 | 2 | 2 | – | – | sum.dim_IntList 1, amax 1 |
-| 700 | `OPERAND_DTYPES_READABLE` | 0 | 1 | 1 | – | – | _to_dim_order_copy 1 |
-| 721 | `ADDMM_FITS_FLAT_PATH` | 0 | 1 | 1 | – | – | addmm 1 |
-| 731 | `MEAN_REDUCES_ONE_SPAN` | 0 | 1 | 1 | – | – | mean.dim 1 |
-| 738 | `MEAN_RESULT_WIDTH` | 0 | 1 | 1 | – | – | mean.dim 1 |
-| 742 | `POW_IS_SQUARE` | 0 | 1 | 1 | – | – | pow.Tensor_Scalar 1 |
-| 753 | `POW_TENSOR_TENSOR_EMITTABLE` | 0 | 1 | 1 | – | – | pow.Tensor_Tensor 1 |
-| 761 | `SUM_DIM_EMITTABLE` | 0 | 1 | 1 | – | – | sum.dim_IntList 1 |
-| 763 | `MAX_DIM_EMITTABLE` | 0 | 1 | 1 | – | – | max.dim 1 |
-| 769 | `MAX_POOL_EMITTABLE` | 0 | 1 | 1 | – | – | max_pool2d_with_indices 1 |
-| 868 | `LOG_SOFTMAX_WITHIN_ARENA` | 0 | 1 | 1 | – | – | _log_softmax 1 |
-| 925 | `SLICE_REGION` | 0 | 1 | 1 | – | – | slice_copy 1 |
-| 964 | `CLONE_DIM_ORDER_CONTIGUOUS` | 0 | 1 | 1 | – | – | _clone_dim_order 1 |
-| 674 | `NOT_CALL_FUNCTION` | 0 | 0 | 0 | – | – | not an op clause; see §6 |
-| 688 | `ARG_REDUCTION_GEOMETRY` | not in this census | – | – | – | – | added after the two corpora above were taken. It refuses an arg reduction whose result is not int64 or whose row geometry the command cannot express, and the row is here with no counts rather than with invented ones: measuring it needs the same 21-graph run, which is what §7 is for |
-| 713, 715, 717, 719, 728, 745, 765, 786, 796, 805, 827, 842, 844, 846, 848, 856, 858, 876, 882, 896, 927, 929, 932, 938, 940, 943, 945, 953, 970, 978, 985, 997 | 32 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
+| 687 | `TARGET_NOT_IN_TABLE` | 298 | 30 | 328 | – | 298 | _native_batch_norm_legit_no_training 160, logical_not 42, full_like 24, eq 21, any 21 |
+| 941 | `GETITEM_PRODUCER` | 160 | 2 | 162 | 0 | 160 | getitem 162 — every one behind a refused batch norm |
+| 950 | `ALIAS_BYTES_OR_SELECT` | 58 | 1 | 59 | 58 | 0 | expand_copy 59 |
+| 704 | `RESULT_DTYPE` | 52 | 3 | 55 | 2 | 50 | unsqueeze_copy 25, add 6, slice_copy 6, sub 5, index 4 |
+| 715 | `WHERE_EMITTABLE` | 21 | 0 | 21 | 0 | 21 | where 21, all inside the sdpa fully-masked-row guard |
+| 835 | `POOL_SPEC` | 2 | 2 | 4 | 2 | 0 | max_pool2d_with_indices 3, avg_pool2d 1 |
+| 797 | `TOPK_EMITTABLE` | 0 | 3 | 3 | – | – | topk 3 |
+| 859 | `GATHER_TABLE` | 1 | 2 | 3 | 1 | 0 | index.Tensor 2, embedding 1 |
+| 995 | `DIM_ORDER_KEEPS_BYTES` | 2 | 1 | 3 | 0 | 2 | _to_dim_order_copy 3 |
+| 780 | `REDUCTION_DIMS` | 0 | 2 | 2 | – | – | sum.dim_IntList 1, amax 1 |
+| 709 | `OPERAND_DTYPES_READABLE` | 0 | 1 | 1 | – | – | _to_dim_order_copy 1 |
+| 742 | `ADDMM_FITS_FLAT_PATH` | 0 | 1 | 1 | – | – | addmm 1 |
+| 752 | `MEAN_REDUCES_ONE_SPAN` | 0 | 1 | 1 | – | – | mean.dim 1 |
+| 759 | `MEAN_RESULT_WIDTH` | 0 | 1 | 1 | – | – | mean.dim 1 |
+| 763 | `POW_IS_SQUARE` | 0 | 1 | 1 | – | – | pow.Tensor_Scalar 1 |
+| 774 | `POW_TENSOR_TENSOR_EMITTABLE` | 0 | 1 | 1 | – | – | pow.Tensor_Tensor 1 |
+| 782 | `SUM_DIM_EMITTABLE` | 0 | 1 | 1 | – | – | sum.dim_IntList 1 |
+| 784 | `MAX_DIM_EMITTABLE` | 0 | 1 | 1 | – | – | max.dim 1 |
+| 790 | `MAX_POOL_EMITTABLE` | 0 | 1 | 1 | – | – | max_pool2d_with_indices 1 |
+| 891 | `LOG_SOFTMAX_WITHIN_ARENA` | 0 | 1 | 1 | – | – | _log_softmax 1 |
+| 952 | `SLICE_REGION` | 0 | 1 | 1 | – | – | slice_copy 1 |
+| 991 | `CLONE_DIM_ORDER_CONTIGUOUS` | 0 | 1 | 1 | – | – | _clone_dim_order 1 |
+| 681 | `NOT_CALL_FUNCTION` | 0 | 0 | 0 | – | – | not an op clause; see §6 |
+| 695 | `ARG_REDUCTION_GEOMETRY` | not in this census | – | – | – | – | added after the two corpora above were taken. It refuses an arg reduction whose result is not int64 or whose row geometry the command cannot express, and the row is here with no counts rather than with invented ones: measuring it needs the same 21-graph run, which is what §7 is for |
+| 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1005, 1012, 1024 | 32 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
 
 The other 32 rows, in `_verdict`'s own order, with what each clause is and whether it is safe to
 remove:
 
 | line | clause | what it is | verdict |
 |---|---|---|---|
-| 713 | `SDPA_FITS_DSP_LIMITS` | a mask the FLASH_ATTN kernel will apply, 4-D operands, batch 1, start_pos readable | unsafe; a mask the emitter got wrong is a different function, not a no-op |
-| 715 | `BINARY_BROADCAST_FITS` | the binary descriptor has output extents and two stride tables but no per-operand extents | unsafe; it can repeat singleton axes, not address a smaller non-singleton tile |
-| 717 | `MM_OPERANDS_FLAT` | contiguous 2-D operands with the contraction lined up | unsafe; unexercised — `to_edge` folds a batch into M and `FoldConstantTransposes` makes a transposed weight contiguous, so on this path the clause is nearly unreachable |
-| 719 | `BMM_OPERANDS_FLAT` | contiguous 3-D stacks, no broadcast batch | unsafe; the emitter derives one tile geometry from the shapes |
-| 728 | `QUANTIZED_MATMUL_REFUSED` | a weight-only matmul whose conditions the flat path does not decide | unsafe |
-| 745 | `POW_TENSOR_TENSOR_NO_PROGRAM` | a support object built without the program | unsafe, but the failure it prevents is an `AttributeError` on `None.graph_module`, not a wrong number. `partition` always passes the program, so this clause is unreachable from the partitioner; the two in-tree callers that omit it are test helpers |
-| 765 | `MIN_DIM_EMITTABLE` | every reader takes the values, not the positions | unsafe; same rule as 763 |
-| 786 | `REPEAT_FLIP_EMITTABLE` | the region walk exists for this repeat or flip | unsafe; a shape with no region reaches a blit that reads the wrong elements |
-| 796 | `NEAREST_UPSAMPLE_EMITTABLE` | one region per destination phase, only at an exact integer ratio | unsafe |
-| 805 | `SPLIT_EMITTABLE` | pieces that add up to the axis, each piece's offset and extent baked into the command | unsafe |
-| 827 | `CONV_SPEC` | neither kernel here can run this weight order, group count or staging | unsafe; a middle group count like `Conv2d(16, 32, groups=16)` is the case |
-| 842 | `LAYER_NORM_EPS_CONST` | a run-time epsilon is not a number the command carries | unsafe |
-| 844 | `LAYER_NORM_TRAILING_DIMS` | the kernel's outer-times-inner view of the input | unsafe |
-| 846 | `NATIVE_LAYER_NORM_EMITTABLE` | every reader takes the output the kernel writes | unsafe |
-| 848 | `ADD_RMS_NORM_EMITTABLE` | every reader takes one of the two outputs it writes | unsafe |
-| 856 | `VISION_ATTENTION_EMITTABLE` | batch, head count and head width are params the run-time length cannot refresh | unsafe |
-| 858 | `SOFTMAX_INNER_AXIS` | a last-axis softmax always; another axis only when the row is under `SOFTMAX_VECTOR_WIDTH` and both permute regions exist | unsafe, and the emitter re-checks it — see §5 |
-| 876 | `GROUP_NORM_ONE_GROUP_PER_ROW` | the groups divide the channels and the normalized shape is the trailing dims | unsafe |
-| 882 | `BATCH_NORM_ONE_SPAN` | one contiguous span per channel | unsafe; a batch wider than one normalizes over the batch too |
-| 896 | `GETITEM_NORM_PRODUCER` | the norm this getitem reads is itself emittable | unsafe by construction: it is the norm's own gate, one node over |
-| 927 | `CAT_PLAN` | one blit per piece, extents baked in | unsafe |
-| 929 | `PERMUTE_REGION` | a permutation the three-level region can describe | unsafe; §8.44's rule, a fourth level for a third-from-last axis |
-| 932 | `LEAKY_RELU_SLOPE_CONST` | the slope is a number the command can carry | **unexercised and, as far as this torch goes, unreachable**: `F.leaky_relu(x, tensor)` raises `TypeError: negative_slope must be Number` at export, measured |
-| 938 | `PRELU_SOURCE` | a contiguous source of rank 2 or more | unexercised; a `permute`d source measured as accepted, so the copy the alias emitter needs is emitted first |
-| 940 | `PRELU_SLOPE_RANK` | the slope is 1-D and contiguous | unsafe; a 0-D slope measured refused at this line |
-| 943 | `PRELU_SLOPE_NUMEL` | the slope is one value or one per channel | unexercised; the only construction that violates it is one `F.prelu` itself rejects |
-| 945 | `REFLECT_PAD_REGIONS` | a contiguous source, a positive pad narrower than the axis it reflects | unsafe; a pad at least as wide as the axis wraps around |
-| 953 | `CONSTANT_PAD_REGION` | the region's three levels reach a pad on the last two axes, and the memset writes zero and nothing else | unsafe; a third-axis pad, a negative pad, a symbolic extent or a nonzero value |
-| 970 | `UPDATE_CACHE_LAYOUT` | the cache-advance lowering's operands and geometry | unexercised: **the corpus builds no KV cache at all** (`use_cache=False` throughout), and a cached decode is the common LLM deployment shape |
-| 978 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 680 instead, measured |
-| 985 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
-| 997 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
+| 722 | `SDPA_FITS_DSP_LIMITS` | a mask the FLASH_ATTN kernel will apply, 4-D operands, batch 1, start_pos readable | unsafe; a mask the emitter got wrong is a different function, not a no-op |
+| 724 | `BINARY_BROADCAST_FITS` | the binary descriptor has output extents and two stride tables but no per-operand extents | unsafe; it can repeat singleton axes, not address a smaller non-singleton tile |
+| 738 | `MM_OPERANDS_FLAT` | contiguous 2-D operands with the contraction lined up | unsafe; unexercised — `to_edge` folds a batch into M and `FoldConstantTransposes` makes a transposed weight contiguous, so on this path the clause is nearly unreachable |
+| 740 | `BMM_OPERANDS_FLAT` | contiguous 3-D stacks, no broadcast batch | unsafe; the emitter derives one tile geometry from the shapes |
+| 749 | `QUANTIZED_MATMUL_REFUSED` | a weight-only matmul whose conditions the flat path does not decide | unsafe |
+| 766 | `POW_TENSOR_TENSOR_NO_PROGRAM` | a support object built without the program | unsafe, but the failure it prevents is an `AttributeError` on `None.graph_module`, not a wrong number. `partition` always passes the program, so this clause is unreachable from the partitioner; the two in-tree callers that omit it are test helpers |
+| 786 | `MIN_DIM_EMITTABLE` | every reader takes the values, not the positions | unsafe; same rule as 784 |
+| 807 | `REPEAT_FLIP_EMITTABLE` | the region walk exists for this repeat or flip | unsafe; a shape with no region reaches a blit that reads the wrong elements |
+| 817 | `NEAREST_UPSAMPLE_EMITTABLE` | one region per destination phase, only at an exact integer ratio | unsafe |
+| 826 | `SPLIT_EMITTABLE` | pieces that add up to the axis, each piece's offset and extent baked into the command | unsafe |
+| 850 | `CONV_SPEC` | neither kernel here can run this weight order, group count or staging | unsafe; a middle group count like `Conv2d(16, 32, groups=16)` is the case |
+| 865 | `LAYER_NORM_EPS_CONST` | a run-time epsilon is not a number the command carries | unsafe |
+| 867 | `LAYER_NORM_TRAILING_DIMS` | the kernel's outer-times-inner view of the input | unsafe |
+| 869 | `NATIVE_LAYER_NORM_EMITTABLE` | every reader takes the output the kernel writes | unsafe |
+| 871 | `ADD_RMS_NORM_EMITTABLE` | every reader takes one of the two outputs it writes | unsafe |
+| 879 | `VISION_ATTENTION_EMITTABLE` | batch, head count and head width are params the run-time length cannot refresh | unsafe |
+| 881 | `SOFTMAX_INNER_AXIS` | a last-axis softmax always; another axis only when the row is under `SOFTMAX_VECTOR_WIDTH` and both permute regions exist | unsafe, and the emitter re-checks it — see §5 |
+| 899 | `GROUP_NORM_ONE_GROUP_PER_ROW` | the groups divide the channels and the normalized shape is the trailing dims | unsafe |
+| 905 | `BATCH_NORM_ONE_SPAN` | one contiguous span per channel | unsafe; a batch wider than one normalizes over the batch too |
+| 919 | `GETITEM_NORM_PRODUCER` | the norm this getitem reads is itself emittable | unsafe by construction: it is the norm's own gate, one node over |
+| 954 | `CAT_PLAN` | one blit per piece, extents baked in | unsafe |
+| 956 | `PERMUTE_REGION` | a permutation the three-level region can describe | unsafe; §8.44's rule, a fourth level for a third-from-last axis |
+| 959 | `LEAKY_RELU_SLOPE_CONST` | the slope is a number the command can carry | **unexercised and, as far as this torch goes, unreachable**: `F.leaky_relu(x, tensor)` raises `TypeError: negative_slope must be Number` at export, measured |
+| 965 | `PRELU_SOURCE` | a contiguous source of rank 2 or more | unexercised; a `permute`d source measured as accepted, so the copy the alias emitter needs is emitted first |
+| 967 | `PRELU_SLOPE_RANK` | the slope is 1-D and contiguous | unsafe; a 0-D slope measured refused at this line |
+| 970 | `PRELU_SLOPE_NUMEL` | the slope is one value or one per channel | unexercised; the only construction that violates it is one `F.prelu` itself rejects |
+| 972 | `REFLECT_PAD_REGIONS` | a contiguous source, a positive pad narrower than the axis it reflects | unsafe; a pad at least as wide as the axis wraps around |
+| 980 | `CONSTANT_PAD_REGION` | the region's three levels reach a pad on the last two axes, and the memset writes zero and nothing else | unsafe; a third-axis pad, a negative pad, a symbolic extent or a nonzero value |
+| 997 | `UPDATE_CACHE_LAYOUT` | the cache-advance lowering's operands and geometry | unexercised: **the corpus builds no KV cache at all** (`use_cache=False` throughout), and a cached decode is the common LLM deployment shape |
+| 1005 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 687 instead, measured |
+| 1012 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
+| 1024 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
 
 ## 5. Both ends of the largest island, named separately
 
-**918 `GETITEM_PRODUCER` holds 162 nodes and none of them is work.** All 160 in the models corpus
-sit behind a producer refused at 680, and 160 of 298 of 680's nodes are themselves
+**941 `GETITEM_PRODUCER` holds 162 nodes and none of them is work.** All 160 in the models corpus
+sit behind a producer refused at 687, and 160 of 298 of 687's nodes are themselves
 `aten._native_batch_norm_legit_no_training.default` — inference-mode batch norm, one
 `running_mean`/`running_var` getitem each, across resnet18 (4 graphs × 20) and mobilenet_v2
 (2 graphs × 40). So the 162 and the 160 are the same fact read from two ends: the getitem is a
-consequence of the batch-norm gap and disappears with it. **Aiming a fix at 918 is aiming at the
+consequence of the batch-norm gap and disappears with it. **Aiming a fix at 941 is aiming at the
 shadow.** The fix is `FoldBatchNormIntoConv` in the caller's `transform_passes`, which on
 `cnn_mobilenetv2` takes 80 refused nodes to 0 and changes no command, because the batch norm was
 never reaching a command either way.
 
-**923 `ALIAS_BYTES_OR_SELECT` holds 59 nodes and every one of them is head-on.** Measured
+**950 `ALIAS_BYTES_OR_SELECT` holds 59 nodes and every one of them is head-on.** Measured
 geometry, on a one-layer Qwen3 at the census's hidden 1024: the RoPE frequency tensor is
 `(1, 8, 1, 32, 128)` fp16, contiguous, and expanded to `(1, 8, 2, 32, 128)` — the half-rotary
 `repeat_interleave`, once for `cos` and once for `sin`. The producer is accepted. The alias
@@ -174,7 +174,7 @@ census and 2 in the 1-layer, which is the count exactly.
 
 This is the largest clause in the inventory that is holding a node up on its own, and it is the
 cheapest kind of gap: the blit region's per-side stride already expresses a zero source stride, so
-a broadcast along one axis is a region and no kernel. **Removing 923 without adding that region
+a broadcast along one axis is a region and no kernel. **Removing 950 without adding that region
 would not be safe** — a `TensorRef` re-pointed from a 32768-element buffer to a 65536-element
 strided result reads the wrong elements, and nothing downstream would notice.
 
@@ -186,18 +186,18 @@ between a geometry a program can produce and a kernel that would compute somethi
 between that geometry and a crash. Three are worth separating out, because the failure they prevent
 is loud rather than silent, which changes their priority and nothing else:
 
-- **674 `NOT_CALL_FUNCTION`** is not an op clause at all. It refuses the graph's own scaffolding —
+- **681 `NOT_CALL_FUNCTION`** is not an op clause at all. It refuses the graph's own scaffolding —
   placeholders, `get_attr`, `output` — and the census only ever asks about `call_function`
   nodes, so its count is zero by construction rather than by measurement. Its two `return False`
   neighbours are the two entry gates, so removing this one moves every non-op node into the target
   table check.
-- **745** and **985** convert a clean fallback into an `AttributeError` if removed. They are the
+- **766** and **1012** convert a clean fallback into an `AttributeError` if removed. They are the
   two clauses where the cost of keeping is zero and the cost of removing is a stack trace.
 
 Four clauses are *unexercised and, as far as this measurement goes, unreachable by a program torch
-can execute* rather than merely unexercised: **932** (a tensor `negative_slope` does not export),
-**943** (the only violating slope is one `F.prelu` rejects), **978** (the target is a custom op) and
-**938** (a permuted source measures as accepted). Those four are where a removal is most likely to
+can execute* rather than merely unexercised: **959** (a tensor `negative_slope` does not export),
+**970** (the only violating slope is one `F.prelu` rejects), **1005** (the target is a custom op) and
+**965** (a permuted source measures as accepted). Those four are where a removal is most likely to
 be safe in practice and are also where the claim would be cheapest to get wrong, so they are called
 out rather than folded into the unsafe list.
 
@@ -226,9 +226,9 @@ on an older rev. Recorded here so the correction travels with the measurement.
   `REDUCTION`, `BINARY_ELEMENTWISE`. That is the same fact the README's own device finding states
   from the other side: the standalone command is wrong for rows longer than one HVX vector, and
   the emitter now gates on the width. A middle-axis softmax is a blit, a `DSP_OP_SOFTMAX` over the
-  permuted inner width, and the inverse blit, which is what clause 858 is for. The emitter branches
+  permuted inner width, and the inverse blit, which is what clause 881 is for. The emitter branches
   on `channel < SOFTMAX_VECTOR_WIDTH` itself, so the clause and the emitter agree and neither is
-  the single line of defence — which is why 858 is listed as unsafe but not as a hole.
+  the single line of defence — which is why 881 is listed as unsafe but not as a hole.
 
 ## 8. What this file is not
 
@@ -236,7 +236,7 @@ It is not a claim that any of these clauses should go. It is a count of what eac
 two corpora, the reason each gives, and the reachability of each — the map an op gap needs before it
 is a project. A clause that holds zero nodes on 6545 model nodes and 131 designed rows is not
 shown to be unnecessary; it is shown to be unexercised by the only two corpora in this tree, and
-970 is the clearest case, since a census with no KV cache cannot say anything about the clause that
+997 is the clearest case, since a census with no KV cache cannot say anything about the clause that
 governs one.
 
 ## 9. Where each number comes from, and what a reader has to rebuild

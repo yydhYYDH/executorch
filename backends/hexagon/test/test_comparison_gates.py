@@ -88,12 +88,19 @@ def _node(result_dtype, operand_dtypes, numel=(4, 8)):
 def test_supported_targets_is_the_emitter_table_and_not_a_second_one():
     """One object, so the wiring question is asked once and answered once."""
     assert partition.SUPPORTED_TARGETS is ops.EMITTERS
-    # 90 when this branch was written, 92 now: the arg-reduction merge added the
-    # two reductions to the same table. The count is a census rather than a
-    # constant of the design, so it is re-derived rather than loosened.
-    assert len(partition.SUPPORTED_TARGETS) == len(ops.EMITTERS) == 92
-    for target in COMPARISON_TARGETS.values():
-        assert target not in ops.EMITTERS
+    # 90 when this branch was written, 96 now: the arg-reduction merge added the
+    # two reductions to the same table and the comparison merge added four more.
+    # The count is a census rather than a constant of the design, so it is
+    # re-derived rather than loosened.
+    assert len(partition.SUPPORTED_TARGETS) == len(ops.EMITTERS) == 96
+    for name, target in COMPARISON_TARGETS.items():
+        # Two of the six are wired since this file was written, so the absence is
+        # the narrower claim now, and the narrower one is the useful one: eq, ne,
+        # ge and le have no kernel at any width and never will on this path.
+        if name in ("gt", "lt"):
+            assert target in ops.EMITTERS
+        else:
+            assert target not in ops.EMITTERS
     for target in CONTROL_TARGETS.values():
         assert target in ops.EMITTERS
 
@@ -238,10 +245,17 @@ def _inputs():
     return (torch.randn(8, 8, dtype=torch.float16), torch.randn(8, 8, dtype=torch.float16))
 
 
-def test_six_comparisons_refuse_and_three_wired_ops_of_the_same_geometry_do_not():
+def test_two_comparisons_are_wired_and_four_refuse_and_three_wired_ops_do_not():
     """The number for what the backend does with a comparison today.
 
-    Zero of six and three of three, in one graph and against one support
+    Was zero of six when this file was written and is two of six now: the
+    comparison merge wired `gt` and `lt` against a tensor and left the other
+    four alone, which is the split its own section 3 argues for from the DSP
+    side. `test_comparisons.py` owns the detail of what the two emit; this
+    file still owns the count, because the count is what a reader of the gap
+    document is checking.
+
+    Two of six and three of three, in one graph and against one support
     object, which is what makes the zero a measurement rather than an object
     that refuses everything. The control has to name the three by name: a
     control that is merely "some node was accepted" would also be satisfied by
@@ -261,21 +275,36 @@ def test_six_comparisons_refuse_and_three_wired_ops_of_the_same_geometry_do_not(
     assert set(comparisons) == set(COMPARISON_TARGETS.values()), sorted(
         str(t) for t in comparisons
     )
-    assert sum(comparisons.values()) == 0, comparisons
+    assert sum(comparisons.values()) == 2, comparisons
+    assert sorted(
+        str(t) for t, v in comparisons.items() if v
+    ) == sorted(
+        str(COMPARISON_TARGETS[name]) for name in ("gt", "lt")
+    ), comparisons
     assert len(controls) == 3, controls
     assert all(controls.values()), controls
 
 
-def test_a_graph_of_comparisons_alone_produces_no_delegate_and_no_command():
-    """Six comparisons, zero delegates, zero commands."""
+def test_a_graph_of_six_comparisons_now_delegates_and_still_omits_four_of_them():
+    """Six comparisons, one delegate, and four of the six still portable.
+
+    This was zero delegates and zero commands. The comparison merge made it one
+    delegate, and the interesting half is that it is one: a delegate carrying
+    only the two wired comparisons is a different thing from six delegates, and
+    a graph whose four unwired comparisons had been absorbed would show up here
+    as a stream naming a command the DSP has no route for.
+    """
     program = _lowered(_SixComparisons(), _inputs())
     delegates = [
         node
         for node in program.graph_module.graph.nodes
         if node.target is torch.ops.higher_order.executorch_call_delegate
     ]
-    assert delegates == []
-    assert _commands(program) == []
+    assert len(delegates) == 1, delegates
+    names = {str(command.type) for command in _commands(program)}
+    assert not any(
+        name in names for name in ("eq", "ne", "ge", "le")
+    ), f"an unwired comparison reached a command: {names}"
 
 
 def test_the_control_graph_delegates_and_its_stream_carries_no_comparison():
@@ -341,79 +370,58 @@ def _delegate_count(program):
     )
 
 
-def test_the_width_gate_is_the_only_clause_refusing_a_bool_result(monkeypatch):
-    """Relax it and the node is accepted; the operand rule never held it.
+def test_the_width_gate_admits_a_bool_result_only_for_a_wired_comparison():
+    """The clause that refused a bool result now admits it, and only where it should.
 
-    The `unwired` census stays empty either way and is blind here: it counts a
-    family `EMITTERS` already names, and `gt` is not one, so a node refused at
-    the width gate is counted nowhere by it. The `refused` census does name the
-    node, and it does not fall back to empty when the node is accepted, because
-    it keys on the node rather than on the call. Both are asserted so the next
-    reader knows which counter can see this change and which cannot.
+    This asserted the opposite and the comparison merge is what overturned it. The
+    probe emitter it installed on `gt.Tensor` to get past the membership test is
+    now a real one, and the width gate reads the same shared predicate the
+    emitters do, so a bool result is admitted for a comparison and refused
+    everywhere else. That is the narrower claim and the one the tree now makes:
+    `result_dtype_is_emittable` answers True for torch.bool only when the target
+    is in COMPARISON_TARGETS, so the gate is still a gate rather than a removal.
+
+    What is no longer measurable here is the old sequence, refuse-then-accept on
+    one node, because nothing in this graph is refused at the width gate any more.
+    `test_comparisons.py` owns the forward-looking behaviour; the property this
+    file still pins is that a bool result is a per-target decision.
     """
-    edge_program = to_edge(
-        export(_CompareAndAdd(), _inputs()),
-        compile_config=EdgeCompileConfig(_check_ir_validity=False),
-    ).exported_program()
-    support = HexagonOperatorSupport(_data_placeholders(edge_program))
-    node = next(
-        n
-        for n in edge_program.graph_module.graph.nodes
-        if n.target is _EDGE.gt.Tensor
-    )
-    monkeypatch.setitem(ops.EMITTERS, _EDGE.gt.Tensor, _probe_greater_emitter)
-    assert node.target in partition.SUPPORTED_TARGETS
-    assert ops.operand_dtypes_are_readable(node) is True
-    partition.reset_unwired_overload_census()
-    partition.reset_refused_overload_census()
-    assert support.is_node_supported(edge_program.graph_module, node) is False
-    assert partition.unwired_overload_census() == {}
-    assert partition.refused_overload_census() == {"aten.gt.Tensor": 1}
-
-    real = partition._dtype_of
-    monkeypatch.setattr(
-        partition,
-        "_dtype_of",
-        lambda n: torch.float16 if real(n) is torch.bool else real(n),
-    )
-    assert support.is_node_supported(edge_program.graph_module, node) is True
-    # The verdict moved and neither census did, and that is the measurement
-    # rather than an omission: the counters key on the node, so a node refused
-    # once and accepted afterwards still reads as refused. A census read after a
-    # lowering would report this pair as a loss when it is a gain.
-    assert partition.unwired_overload_census() == {}
-    assert partition.refused_overload_census() == {"aten.gt.Tensor": 1}
+    assert ops.result_dtype_is_emittable(torch.bool, _EDGE.gt.Tensor) is True
+    assert ops.result_dtype_is_emittable(torch.bool, _EDGE.lt.Tensor) is True
+    for name in ("eq", "ne", "ge", "le"):
+        target = COMPARISON_TARGETS[name]
+        assert ops.result_dtype_is_emittable(torch.bool, target) is False, name
+    assert (
+        ops.result_dtype_is_emittable(torch.bool, _EDGE.add.Tensor) is False
+    ), "a bool result on a non-comparison is still refused"
 
 
-def test_admitting_bool_without_touching_the_emitter_turns_a_fallback_into_a_raise(
-    monkeypatch,
-):
-    """The export that works today is the one that raises after the edit.
+def test_the_comparison_merge_performed_the_experiment_this_test_described():
+    """What this test walked through by hand is now just the tree.
 
-    Three steps, each measured. With no table row the comparison is not in the
-    emitter table at all and the export falls back. With a row and the width
-    gate left alone it still falls back, because the gate refuses the bool
-    result before any emitter runs. Relax the gate and the emitter runs, and the
-    first thing it says is that a bool is not a width the arena holds. The
-    control is an fp16-result add under the same relaxation, which still
-    delegates -- so what raises is the bool, not the relaxation.
+    It was three steps measured against a probe emitter: no table row and the
+    export falls back; a row and the width gate still refuses, because the gate
+    runs before any emitter; relax the gate and the emitter runs and the first
+    thing it says is that a bool is not a width the arena holds. The comparison
+    merge then did exactly those three steps and kept the result, so the third
+    state is no longer reachable here: the shared predicate admits the bool
+    result for a comparison and the emitter knows the width.
+
+    What is left to measure is the end state, and the control that made the
+    original third step a claim about the bool rather than about the
+    relaxation: an fp16-result add under the same shapes still delegates.
+
+    The six-comparison count is the part that is easy to get wrong in the other
+    direction. A width gate relaxed far enough to admit a bool everywhere would
+    still pass both delegate counts above and still fail this one, because a
+    delegate carrying all six would name a command the DSP has no route for.
     """
     inputs = _inputs()
 
-    # The export as it stands today.
     assert _delegate_count(_lower(_CompareAndAdd(), inputs)) == 1
-
-    # A table row on its own changes nothing, because the gate still refuses.
-    monkeypatch.setitem(ops.EMITTERS, _EDGE.gt.Tensor, _probe_greater_emitter)
-    assert _delegate_count(_lower(_CompareAndAdd(), inputs)) == 1
-
-    real = partition._dtype_of
-    monkeypatch.setattr(
-        partition,
-        "_dtype_of",
-        lambda n: torch.float16 if real(n) is torch.bool else real(n),
-    )
-    with pytest.raises(RuntimeError, match="must be fp16 or fp32"):
-        _lower(_CompareAndAdd(), inputs)
-    # The same relaxation, an fp16 result: the add still delegates.
     assert _delegate_count(_lower(_AddOnly(), inputs)) == 1
+
+    program = _lower(_SixComparisons(), inputs)
+    assert _delegate_count(program) == 1
+    names = {str(command.type) for command in _commands(program)}
+    assert not any(name in names for name in ("eq", "ne", "ge", "le"))

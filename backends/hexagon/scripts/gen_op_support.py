@@ -316,6 +316,43 @@ SUPPORTED: List[OpSupport] = [
         "`mul(sigmoid(x), x)`. The fusion pass matches equal-shaped fp16 "
         "operands; the command itself supports broadcast through rank 8.",
     ),
+    # --- the comparisons, two commands each -----------------------------
+    OpSupport(
+        "aten.gt.Tensor",
+        f"{BINARY} / {SELECT}",
+        "fp16 operands, one byte per result",
+        "The DSP's own GREATER(9) and LESS(10) op types write fp16 1.0 and 0.0, "
+        "and at bytes 2 the compare arm takes that form whatever outputIsFloat "
+        "says, so the first command leaves a flag at two bytes. The second is "
+        "SELECT at bytes 1, whose one-byte arm copies a byte at a time and whose "
+        "two sources are the one-byte constants 1 and 0. Both halves are load "
+        "bearing and they are not the same half: GREATER and LESS are IEEE, so a "
+        "NaN compares false and -0.0 is not greater than 0.0, while the select "
+        "only packs. Broadcasting works through rank 8 on the same descriptor as "
+        "the binary rows above. The result is a one-byte-per-element buffer, "
+        "which is a bool the `where` row above reads as its condition. "
+        "The Scalar overloads are not here, and neither are eq, ne, ge and le: "
+        "htp_ops_binary_is_compare admits only the two op types, and the "
+        "subtraction the other four would need is not a comparison at any length.",
+    ),
+    OpSupport(
+        "aten.lt.Tensor",
+        f"{BINARY} / {SELECT}",
+        "fp16 operands, one byte per result",
+        "The DSP's own GREATER(9) and LESS(10) op types write fp16 1.0 and 0.0, "
+        "and at bytes 2 the compare arm takes that form whatever outputIsFloat "
+        "says, so the first command leaves a flag at two bytes. The second is "
+        "SELECT at bytes 1, whose one-byte arm copies a byte at a time and whose "
+        "two sources are the one-byte constants 1 and 0. Both halves are load "
+        "bearing and they are not the same half: GREATER and LESS are IEEE, so a "
+        "NaN compares false and -0.0 is not greater than 0.0, while the select "
+        "only packs. Broadcasting works through rank 8 on the same descriptor as "
+        "the binary rows above. The result is a one-byte-per-element buffer, "
+        "which is a bool the `where` row above reads as its condition. "
+        "The Scalar overloads are not here, and neither are eq, ne, ge and le: "
+        "htp_ops_binary_is_compare admits only the two op types, and the "
+        "subtraction the other four would need is not a comparison at any length.",
+    ),
     # --- the element-wise select (DSP_OP_SELECT) -------------------------
     OpSupport(
         "aten.where.self",
@@ -327,11 +364,11 @@ SUPPORTED: List[OpSupport] = [
         "the output's element count or a single element, and both modes are "
         "reachable: `masked_fill` reaches it with a one-element value. The kernel's "
         "per-channel value mode needs a channel count and an inner size this emitter "
-        "does not compute, so it stays portable. The comparison that produces a "
-        "condition is not delegated -- it is in neither EMITTERS nor "
-        "SUPPORTED_TARGETS -- so the condition arrives as a delegate input or as a "
-        "bool constant weight, and a broadcast condition is refused by the extent "
-        "rule above whether it arrives from a comparison or from a graph input. "
+        "does not compute, so it stays portable. A condition arrives as a "
+        "delegate input, as a bool constant weight, or from the comparison row "
+        "above when the graph writes one inside the same island, and a broadcast "
+        "condition is refused by the extent rule above whichever of the three it "
+        "is. "
         "The SDPA-through-CPU-flash guard is the shape that shows this up in a "
         "census: eq -> logical_not -> any(-1) -> logical_not -> where, whose "
         "condition is one flag per query row, so the where is refused on the extent "
@@ -1202,21 +1239,21 @@ NOT_SUPPORTED = [
         "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
     ),
     (
-        "aten.eq / ne / gt / lt / ge / le",
+        "aten.eq / ne / ge / le, and gt/lt against a Scalar",
         "No target here is in EMITTERS, so SUPPORTED_TARGETS refuses each of them "
-        "at the first gate in the predicate and neither the dtype rule nor the "
-        "one-byte question is ever reached. Behind that, the DSP's own comparison "
-        "is two op types and not six: HtpOpsBinaryOpType carries GREATER(9) and "
-        "LESS(10) and htp_ops_binary_is_compare admits nothing else, so eq, ne, ge "
-        "and le have no kernel at any width. The output width is a real limit and "
-        "not the first one: htp_ops_binary_elementwise returns -1 for a bytes that "
-        "is not 2 or 4, and the compare arms write fp16 1.0/0.0, fp32 1.0/0.0 or "
-        "int32 1/0. A bool *operand* is a separate rule and the one "
-        "operand_dtypes_are_readable states, about a misread rather than an "
-        "overrun, with SELECT the exception because it declares the width it "
-        "reads. A comparison that reached a delegate would hand its bool to a "
-        "where inside the same arena, so the one-byte mode is worth having "
-        "eventually; it is not what is holding these nodes.",
+        "at the first gate in the predicate. The DSP's own comparison is two op "
+        "types and not six: HtpOpsBinaryOpType carries GREATER(9) and LESS(10) "
+        "and htp_ops_binary_is_compare admits nothing else, so eq, ne, ge and le "
+        "have no kernel at any width, and the two above are reached only against a "
+        "tensor because that is the route measured. The subtraction the other four "
+        "would need is not a comparison at any length: a - b != 0 reads -0.0 as "
+        "set, inf - inf as a NaN, and a >= b written as not (b > a) fails De "
+        "Morgan on an unordered pair. The Scalar overloads fail for a host reason "
+        "instead -- a python literal reaches ctx.operand as an fp16 constant, "
+        "which is a second route nobody has measured. A bool *operand* is a "
+        "separate rule and the one operand_dtypes_are_readable states, about a "
+        "misread rather than an overrun, with SELECT the exception because it "
+        "declares the width it reads.",
     ),
     (
         "aten.sin / cos / expm1 defaults, and aten.erf.default",
@@ -1234,9 +1271,10 @@ NOT_SUPPORTED = [
     (
         "aten.prelu.default",
         "No emitter and no fusion pass: the node does not survive export, and the "
-        "partitioner sees `gt`, `mul` and `where` in its place. The `mul` and the "
-        "`where` delegate today as one multiply and one select, and the comparison "
-        "stays on the portable kernels because it is in neither EMITTERS nor SUPPORTED_TARGETS. `DSP_OP_PRELU` "
+        "partitioner sees `gt`, `mul` and `where` in its place. All three delegate "
+        "today, as two commands, one multiply, one select and the comparison that "
+        "feeds it, so the whole decomposed form is on the DSP and only the single "
+        "command is not. `DSP_OP_PRELU` "
         "(39) exists in the library and nothing reaches it: fusing the three nodes "
         "back into one command is a pass of the `mul_silu.py` kind, not another "
         "emitter.",

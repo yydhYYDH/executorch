@@ -167,12 +167,14 @@ class _PositionArithmetic(torch.nn.Module):
         )
 
 
-#: The two lines that decide these nodes. Re-derived from the tree after the
-#: arg-reduction merge inserted a clause above them, which is what moved 686 to
-#: 695 and 678 to 680; the file failed loudly on that move, which is the point
-#: of pinning a line rather than asserting a clause by name.
-WIDTH_GATE = 695
-UNWIRED_GATE = 680
+#: The two lines that decide these nodes, re-derived from the tree. 686 and 678
+#: when this branch was written, 695 and 680 after the arg-reduction merge put a
+#: clause above each, and 704 and 687 after the comparison merge replaced the
+#: width gate with the shared predicate. That is three re-derivations in one
+#: merge series, which is the argument for deriving these two at import time by
+#: reading _verdict's own text rather than writing them down.
+WIDTH_GATE = 704
+UNWIRED_GATE = 687
 
 
 def test_every_supported_row_node_in_the_position_prologue_is_refused_at_one_line():
