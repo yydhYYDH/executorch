@@ -956,7 +956,14 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "cache and value fp16 and contiguous, rank >= 3, value.shape[2:] == "
         "cache.shape[2:]. Emitted as two blits; the destination row is patched from "
-        "the position tensor scaled by one cached position's element count.",
+        "the position tensor scaled by one cached position's element count, so the "
+        "position also has to BOUND the write: it has to be a one-element int32 or "
+        "int64 tensor the program owns, and it has to satisfy `position * inner + "
+        "rows * run <= numel`. The shape check says nothing about where the write "
+        "lands, and a position the export does not own carries no value to bound it "
+        "with, so the ordinary decode -- one new token appended at the cache length "
+        "-- is refused rather than writing a whole cached position past the output "
+        "it was given.",
     ),
     # --- attention -------------------------------------------------------
     OpSupport(

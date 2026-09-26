@@ -112,9 +112,9 @@ consequences, and fixing them means fixing the other end of the same island.
 | 991 | `CLONE_DIM_ORDER_CONTIGUOUS` | 0 | 1 | 1 | – | – | _clone_dim_order 1 |
 | 681 | `NOT_CALL_FUNCTION` | 0 | 0 | 0 | – | – | not an op clause; see §6 |
 | 695 | `ARG_REDUCTION_GEOMETRY` | not in this census | – | – | – | – | added after the two corpora above were taken. It refuses an arg reduction whose result is not int64 or whose row geometry the command cannot express, and the row is here with no counts rather than with invented ones: measuring it needs the same 21-graph run, which is what §7 is for |
-| 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1005, 1012, 1024 | 32 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
+| 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1004, 1012, 1019, 1031 | 33 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
 
-The other 32 rows, in `_verdict`'s own order, with what each clause is and whether it is safe to
+The other 33 rows, in `_verdict`'s own order, with what each clause is and whether it is safe to
 remove:
 
 | line | clause | what it is | verdict |
@@ -148,9 +148,10 @@ remove:
 | 972 | `REFLECT_PAD_REGIONS` | a contiguous source, a positive pad narrower than the axis it reflects | unsafe; a pad at least as wide as the axis wraps around |
 | 980 | `CONSTANT_PAD_REGION` | the region's three levels reach a pad on the last two axes, and the memset writes zero and nothing else | unsafe; a third-axis pad, a negative pad, a symbolic extent or a nonzero value |
 | 997 | `UPDATE_CACHE_LAYOUT` | the cache-advance lowering's operands and geometry | unexercised: **the corpus builds no KV cache at all** (`use_cache=False` throughout), and a cached decode is the common LLM deployment shape |
-| 1005 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 687 instead, measured |
-| 1012 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
-| 1024 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
+| 1004 | `UPDATE_CACHE_APPEND_FITS` | a one-element int32/int64 position the program OWNS, and `position * inner + rows * run <= numel` | **unsafe without it, measured**: 997 admits a cache advance by shape alone, and the emitter writes the value's rows at `position * inner`, so a decode step appending at the cache length — the ordinary one — places the write a whole cached position past the end of the output. Read off the emitted command stream through `blob_interpreter`'s numpy model, which is host tier and a model of the region walk rather than of the kernels. A position the export does not own is refused whatever its value, because it carries none to bound the write with; a program-owned position that fits is accepted, and that is the positive control |
+| 1012 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 687 instead, measured |
+| 1019 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
+| 1031 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
 
 ## 5. Both ends of the largest island, named separately
 
@@ -180,8 +181,8 @@ strided result reads the wrong elements, and nothing downstream would notice.
 
 ## 6. No clause here is safe to remove as written, and the three that are closest
 
-Stated plainly because the brief asked for it and the answer is not the expected one. Of the 56
-clauses, 52 are the inventory, and **none of the 52 is safe to remove**: every one either stands
+Stated plainly because the brief asked for it and the answer is not the expected one. Of the 59
+clauses, 53 are the inventory, and **none of the 53 is safe to remove**: every one either stands
 between a geometry a program can produce and a kernel that would compute something else, or stands
 between that geometry and a crash. Three are worth separating out, because the failure they prevent
 is loud rather than silent, which changes their priority and nothing else:
@@ -191,12 +192,22 @@ is loud rather than silent, which changes their priority and nothing else:
   nodes, so its count is zero by construction rather than by measurement. Its two `return False`
   neighbours are the two entry gates, so removing this one moves every non-op node into the target
   table check.
-- **766** and **1012** convert a clean fallback into an `AttributeError` if removed. They are the
+- **766** and **1019** convert a clean fallback into an `AttributeError` if removed. They are the
   two clauses where the cost of keeping is zero and the cost of removing is a stack trace.
+
+One clause is a third thing again, and it is the only one whose removal is a **memory-safety
+defect** rather than a wrong answer or a crash. **1004 `UPDATE_CACHE_APPEND_FITS`** is not in
+either census and never was: 997 admits a cache advance by shape alone, and the emitter places the
+value's rows at `position * inner` with nothing above it, so a decode step appending at the cache
+length writes past the end of the output. Measured, not derived — `test_cache_append_bound.py` runs
+the emitted command stream through `blob_interpreter`'s numpy model and gets
+`RegionOutOfBounds`, and the same file's mutation test relaxes the clause and watches the node come
+back. It is also the one clause where the shape rule above is not enough: the position is a run-time
+tensor, so a cache advance the export does not own a position for is refused whatever the geometry.
 
 Four clauses are *unexercised and, as far as this measurement goes, unreachable by a program torch
 can execute* rather than merely unexercised: **959** (a tensor `negative_slope` does not export),
-**970** (the only violating slope is one `F.prelu` rejects), **1005** (the target is a custom op) and
+**970** (the only violating slope is one `F.prelu` rejects), **1012** (the target is a custom op) and
 **965** (a permuted source measures as accepted). Those four are where a removal is most likely to
 be safe in practice and are also where the claim would be cheapest to get wrong, so they are called
 out rather than folded into the unsafe list.
