@@ -256,7 +256,7 @@ the same node delegates or does not depending on a shape.
 
 | limit | ops it holds back | what it would take |
 |---|---|---|
-| The arena holds two bytes per element | every op: fp16 only. int64 casts, `select_copy` on int64 (85 of them per Qwen3 forward pass, all sequence-position reads), and any `torch.bool` operand | a wider dtype on the DSP, or keeping these on the host, which is where they belong |
+| The arena holds two bytes per element | every op: fp16 only. int64 casts, `select_copy` on int64 (85 of them per Qwen3 forward pass, all sequence-position reads), and any `torch.bool` operand. Also the eight non-`select_copy` int64 position nodes a 28-layer Qwen3 leaves portable on *supported* rows -- `add` 3, `sub` 2, `cat` 1, `index` 2 -- which the width gate turns away before any op-specific clause is read, so the `add` and `sub` there would have passed their own broadcast gate and the width is the whole reason rather than the first of two. `test_supported_row_refusals.py` pins each clause | a wider dtype on the DSP, or keeping these on the host, which is where they belong |
 | Binary broadcast has an 8-D representation | every binary op at rank 9 | a wider broadcast table; the 25-entry tail plus the 9-int command head uses 33 or 34 of the 40-int budget, so rank 8 fits but rank 9 has no representation |
 | One contiguous `[outside][reduce][inside]` span per reduction | `mean.dim` and `sum.dim_IntList` with non-adjacent reduced dims, `amax` the same way | a strided reduction, which is the same kernel the softmax row below needs |
 | Softmax takes only a contiguous middle axis below channel 64, plus the last axis | `_softmax` over a non-last axis with a non-contiguous source, a permutation that needs more than three advancing region groups, or a channel at or above 64 | a wider safe middle-axis command or a more expressive permutation region; the old strided reduction is not used |
@@ -300,6 +300,19 @@ in the model is no longer needed, and the portable `_to_copy` would not have run
 it anyway -- its type switch names no integer type
 (`kernels/portable/cpu/op_to_copy.cpp`), so the documented workaround was a graph
 the runtime could not execute.
+
+A supported row can still be portable for a reason the row does not state, and a
+bucket census cannot tell the two apart. Eight int64 position nodes on `add`,
+`sub`, `cat` and `index` are one such case, and the width gate is the whole
+reason (the row above). One is not a refusal at all: `aten.cumsum` is absent
+from the emitter table, because the emitter is registered for
+`et_hexagon.cumsum`, the node `FuseCumsumPass` fuses and which is opt-in, so a
+stock export stops at the membership test rather than at a width. It is also
+invisible to both partitioner censuses -- the refused one wants a target in the
+table and the unwired one wants a family the table names, and the table names
+`et_hexagon::cumsum` while this node's family is `aten::cumsum`. So a census
+that counted the node among "supported rows that are still portable" was
+counting a spelling rather than reading a gate.
 
 ## 5. What the gaps cost a model
 
