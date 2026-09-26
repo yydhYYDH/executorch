@@ -2241,17 +2241,77 @@ def _emit_alias(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+NO_SELECT_PLANE = (0, 0)
+
+
+def select_condition_plane(
+    cond_shape: Tuple[int, ...], out_shape: Tuple[int, ...]
+) -> Optional[Tuple[int, int]]:
+    """The (channelSize, innerSize) to put in the command, or None to refuse.
+
+    htp_ops_select reads its third mode as (index / innerSize) % channelSize, so
+    the question is whether torch's own broadcast of this condition into the
+    output shape is that walk. It is exactly when the axes the condition is
+    broadcast over -- the ones its own shape pins to one -- are a suffix of the
+    output's axes: the walk then reduces to the output's flat index divided by
+    the repeat, and the remainder never bites because the axes left over carry
+    the whole extent. A staircase mask is that shape, with the repeat on the
+    context axis. A condition broadcast over a middle axis, such as (1,2,1,3)
+    against (1,2,4,3), is not: its index is not a function of index/innerSize
+    alone, and no plane describes it.
+
+    A one-element condition and a whole-output condition are the two walks that
+    name no plane, and (0, 0) is what the kernel reads as "none asked for".
+
+    A symbolic extent is refused rather than read off the example. The plane is
+    a ratio of extents, and the ratio of two symbols is not a number the export
+    knows; taking the example's would make the command stream a function of the
+    shape it was traced with while the graph claimed to be dynamic, and it is
+    outside the trailer the emitter patches the other params from.
+    """
+    if any(isinstance(dim, torch.SymInt) for dim in cond_shape + out_shape):
+        return None
+    rank = len(out_shape)
+    padded = (1,) * (rank - len(cond_shape)) + tuple(cond_shape)
+    if len(padded) != rank or any(
+        c not in (1, o) for c, o in zip(padded, out_shape)
+    ):
+        return None
+    inner = 1
+    axis = rank
+    while axis > 0 and padded[axis - 1] == 1:
+        inner *= out_shape[axis - 1]
+        axis -= 1
+    if axis == rank:
+        return NO_SELECT_PLANE
+    for c, o in zip(padded[:axis], out_shape[:axis]):
+        if c != o:
+            return None
+    channel = 1
+    for extent in padded[:axis]:
+        channel *= extent
+    return (channel, inner) if channel != 1 else NO_SELECT_PLANE
+
+
 def where_is_emittable(node: torch.fx.Node) -> bool:
     """Whether this `where` is the shape htp_ops_select can walk.
 
-    The command takes one condition, two values and a size for each, and its own
-    guard admits a condition that is either the whole output or a single element
-    (eltwise_ops.cc:2403-2407). The values are admitted at the whole output, at
-    one element, or at a per-channel run, and the per-channel form is what the
-    prelu path uses -- it needs a channel count and an inner size this emitter
-    does not compute. So the form taken here is the strict one: all three
-    operands either match the output's element count or are a single element,
-    and the per-channel form stays on the portable kernels.
+    The command takes a condition, two values and a size for each, and the
+    kernel gives every one of them the same three walks: a single element is
+    broadcast, the output's own size is read along, and anything else is the
+    per-channel plane (index / innerSize) % channelSize (eltwise_ops.cc). Only
+    the condition's third walk is asked for here. It is what a
+    block-diffusion staircase mask is -- one flag per query row against a mask
+    that is one row per context step -- and it is admitted by
+    `select_condition_plane`, which derives the plane from the two shapes
+    rather than assuming it.
+
+    A per-channel *value* is a different question and is not asked. It needs a
+    channel count that means something about the layout -- a prelu slope is one
+    element per channel of a feature plane -- and nothing here knows which axis
+    of the output is the channel. A condition has no such reading: its plane is
+    the run of innermost axes the output repeats over, which the two shapes say
+    outright. So the values stay at the whole output or a single element.
 
     The condition's dtype is checked as well as its width, because a
     torch.bool *is* one byte and any other one-byte tensor is not a flag the
@@ -2267,7 +2327,9 @@ def where_is_emittable(node: torch.fx.Node) -> bool:
     cond_value = _value_of(cond)
     if cond_value.dtype is not torch.bool:
         return False
-    for operand in node.args[:3]:
+    if select_condition_plane(tuple(cond_value.shape), tuple(result.shape)) is None:
+        return False
+    for operand in node.args[1:3]:
         if not isinstance(operand, torch.fx.Node):
             return False
         value = _value_of(operand)
@@ -2284,9 +2346,16 @@ def _emit_where(node: torch.fx.Node, ctx) -> TensorRef:
     tags a bool input at its own width, so one byte per element lands in the
     arena and condBytes says so. Reading it as fp16 would take each element's
     neighbour for its high half.
+
+    The plane is the one thing here that is a reading of the shapes rather than
+    a copy of them, so it comes from the predicate's own function: a node the
+    predicate admitted cannot reach an emitter that computed a different plane.
     """
     cond, lhs, rhs = node.args[0], node.args[1], node.args[2]
     out_numel = _numel(node)
+    plane = select_condition_plane(
+        tuple(_value_of(cond).shape), tuple(_value_of(node).shape)
+    )
     out = ctx.result_for(node, out_numel)
     op_index = ctx.emit(
         node,
@@ -2305,10 +2374,13 @@ def _emit_where(node: torch.fx.Node, ctx) -> TensorRef:
                 # A torch.bool is one byte per element, and the kernel's `!= 0`
                 # test is the test torch makes.
                 BOOL_BYTES,
-                # The channel and inner sizes are read only by the per-channel
-                # input mode, which this emitter never asks for.
-                0,
-                0,
+                # The channel and inner sizes the kernel's per-channel walk
+                # reads. A condition on that walk is the staircase mask, and
+                # the plane is the run of innermost axes the output repeats
+                # over; a condition read along the output or broadcast from one
+                # element needs neither, and zero says so.
+                0 if plane is None else plane[0],
+                0 if plane is None else plane[1],
             ],
         ),
     )

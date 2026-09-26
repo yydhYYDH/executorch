@@ -2131,6 +2131,7 @@ typedef struct {
   int condStep;
   int in1Step;
   int in2Step;
+  int condMode;
   int in1Mode;
   int in2Mode;
   int channelSize;
@@ -2161,7 +2162,10 @@ static inline void htp_ops_select_compute_range(HtpOpsSelectTaskState* state, in
     for (int32_t i = start; i < end; ++i) {
       int in1Index = htp_ops_select_input_index(i, state->in1Step, state->in1Mode, state->channelSize, state->innerSize);
       int in2Index = htp_ops_select_input_index(i, state->in2Step, state->in2Mode, state->channelSize, state->innerSize);
-      out[i] = htp_ops_select_cond_at(state->cond, i * state->condStep, state->condBytes)
+      out[i] = htp_ops_select_cond_at(state->cond,
+                                          htp_ops_select_input_index(i, state->condStep, state->condMode,
+                                                                    state->channelSize, state->innerSize),
+                                          state->condBytes)
                    ? in1[in1Index]
                    : in2[in2Index];
     }
@@ -2174,7 +2178,10 @@ static inline void htp_ops_select_compute_range(HtpOpsSelectTaskState* state, in
     for (int32_t i = start; i < end; ++i) {
       int in1Index = htp_ops_select_input_index(i, state->in1Step, state->in1Mode, state->channelSize, state->innerSize);
       int in2Index = htp_ops_select_input_index(i, state->in2Step, state->in2Mode, state->channelSize, state->innerSize);
-      out[i] = htp_ops_select_cond_at(state->cond, i * state->condStep, state->condBytes)
+      out[i] = htp_ops_select_cond_at(state->cond,
+                                          htp_ops_select_input_index(i, state->condStep, state->condMode,
+                                                                    state->channelSize, state->innerSize),
+                                          state->condBytes)
                    ? in1[in1Index]
                    : in2[in2Index];
     }
@@ -2186,7 +2193,10 @@ static inline void htp_ops_select_compute_range(HtpOpsSelectTaskState* state, in
   for (int32_t i = start; i < end; ++i) {
     int in1Index = htp_ops_select_input_index(i, state->in1Step, state->in1Mode, state->channelSize, state->innerSize);
     int in2Index = htp_ops_select_input_index(i, state->in2Step, state->in2Mode, state->channelSize, state->innerSize);
-    out[i] = htp_ops_select_cond_at(state->cond, i * state->condStep, state->condBytes)
+    out[i] = htp_ops_select_cond_at(state->cond,
+                                          htp_ops_select_input_index(i, state->condStep, state->condMode,
+                                                                    state->channelSize, state->innerSize),
+                                          state->condBytes)
                  ? in1[in1Index]
                  : in2[in2Index];
   }
@@ -2291,8 +2301,14 @@ static void htp_ops_select_prelu_channel_fp16_worker(void* data, int worker_inde
   worker_pool_synctoken_jobdone(&(state->sync_ctx));
 }
 
+/* Both vector paths read the condition as a whole-length plane -- one flag
+ * per output element, and a uint32 each. They are therefore admitted on
+ * condMode, not on condStep: a per-channel condition has condStep 1 and would
+ * otherwise be read out of bounds. condMode == 1 is the same condition the old
+ * condStep == 1 test expressed, because a condStep of 1 with a mode other than
+ * 1 is a descriptor the guard above used to refuse outright. */
 static inline bool htp_ops_select_try_prelu_channel_fp16(HtpOpsSelectTaskState* state) {
-  if (state->bytes != 2 || state->condBytes != 4 || state->condStep != 1 ||
+  if (state->bytes != 2 || state->condBytes != 4 || state->condMode != 1 ||
       state->in1Mode != 2 || state->in2Mode != 0 || state->channelSize <= 0 ||
       state->innerSize <= 0) {
     return false;
@@ -2364,7 +2380,7 @@ static void htp_ops_select_same_fp16_i32_cond_worker(void* data, int worker_inde
 }
 
 static inline bool htp_ops_select_try_same_fp16_i32_cond_parallel(HtpOpsSelectTaskState* state) {
-  if (state->bytes != 2 || state->condBytes != 4 || state->condStep != 1 ||
+  if (state->bytes != 2 || state->condBytes != 4 || state->condMode != 1 ||
       state->in1Mode != 1 || state->in2Mode != 1) {
     return false;
   }
@@ -2398,9 +2414,19 @@ AEEResult htp_ops_select(uint8_t* dst, uint8_t* cond_ptr, uint8_t* src1_ptr, uin
   if (outSize <= 0) {
     return 0;
   }
+  /* The condition takes the same three walks a value does: one element is
+   * broadcast, the output's own size is read along, and anything else is the
+   * per-channel plane (index / innerSize) % channelSize. A caller that wants
+   * the third has to name the plane, and the modulo is what keeps the read
+   * inside the condition whatever innerSize is: the index never exceeds
+   * channelSize - 1, which is condSize - 1. Whether that repeated pattern is
+   * the caller's broadcasting rule is the caller's question, not this
+   * function's; a ratio that does not divide the output is answered, not
+   * refused. */
+  const int condMode = (condSize == 1) ? 0 : ((condSize == outSize) ? 1 : 2);
   const int in1Mode = (in1Size == 1) ? 0 : ((in1Size == outSize) ? 1 : 2);
   const int in2Mode = (in2Size == 1) ? 0 : ((in2Size == outSize) ? 1 : 2);
-  if (!((condSize == outSize || condSize == 1) &&
+  if (!((condMode != 2 || (channelSize > 0 && innerSize > 0 && condSize == channelSize)) &&
         (in1Mode != 2 || (channelSize > 0 && innerSize > 0 && in1Size == channelSize)) &&
         (in2Mode != 2 || (channelSize > 0 && innerSize > 0 && in2Size == channelSize)))) {
     return -2;
@@ -2415,6 +2441,7 @@ AEEResult htp_ops_select(uint8_t* dst, uint8_t* cond_ptr, uint8_t* src1_ptr, uin
   state.condStep = condStep;
   state.in1Step = in1Step;
   state.in2Step = in2Step;
+  state.condMode = condMode;
   state.in1Mode = in1Mode;
   state.in2Mode = in2Mode;
   state.channelSize = channelSize;
