@@ -175,7 +175,162 @@ def probe_blit_prefix_scan():
     return Result("raster-blit prefix scan", True, detail)
 
 
-PROBES = [probe_blit_prefix_scan]
+
+# --- probe 2: a delegate count is a count of containers, not of coverage
+
+
+def _commands(blob):
+    """The command types a delegate blob carries, which is the only coverage read
+    that means what it says."""
+    import struct
+
+    header_size = 4 * 4 + 4 * 4
+    try:
+        from blob_interpreter import read_blob
+    except ImportError:
+        return None
+    _, cmds = read_blob(bytes(blob))
+    return [c.type for c in cmds]
+
+
+def _lower(fn, inputs):
+    """The real lowering, through the real partitioner."""
+    import torch
+    from executorch.backends.hexagon.partition.hexagon_partitioner import (
+        HexagonPartitioner,
+    )
+    from executorch.exir import to_edge_transform_and_lower
+    from executorch.exir.lowered_backend_module import LoweredBackendModule
+
+    class _M(torch.nn.Module):
+        def __init__(self, body):
+            super().__init__()
+            self.body = body
+
+        def forward(self, *a):
+            return self.body(*a)
+
+    args = tuple(torch.randn(*s, dtype=torch.float16) for s in inputs)
+    lowered = to_edge_transform_and_lower(
+        torch.export.export(_M(fn).eval(), args),
+        partitioner=[HexagonPartitioner()],
+    ).exported_program()
+    mods = [
+        m for m in lowered.graph_module.modules()
+        if isinstance(m, LoweredBackendModule)
+    ]
+    names, cmds = set(), []
+    for m in mods:
+        names |= {n.name for n in m.original_module.graph_module.graph.nodes}
+        cmds += _commands(m.processed_bytes) or []
+    return len(mods), len(names), cmds
+
+
+def probe_delegate_count_is_not_coverage():
+    """A model report that says one delegate carries no coverage information.
+
+    The control is the same measurement on a graph whose command count has to
+    be larger; if the delegate count moves with it the probe would be looking
+    at coverage after all, and the two numbers are the same number.
+    """
+    import torch
+
+    small, small_names, small_cmds = _lower(
+        lambda a: torch.relu(a), [(4, 8)],
+    )
+    big, big_names, big_cmds = _lower(
+        lambda a, b: torch.relu(a + b) * torch.relu(a + b), [(4, 8), (4, 8)],
+    )
+    if not small_cmds or not big_cmds:
+        return Result("delegate count vs coverage", False,
+                      "a graph produced no commands; cannot measure")
+    if small != big:
+        return Result("delegate count vs coverage", True,
+                      "the delegate count moved with the command count here, "
+                      "so this tree is not the case the probe is about")
+    return Result(
+        "delegate count vs coverage",
+        True,
+        "delegates=" + str(small) + " for " + str(len(small_cmds))
+        + " commands and delegates=" + str(big) + " for "
+        + str(len(big_cmds)) + " commands: the same count on both, so it "
+        + "cannot see what the command list sees",
+    )
+
+
+# --- probe 3: a bare support object is not the predicate the partitioner runs
+
+
+def probe_bare_support_is_blind_on_weight_reading_ops():
+    """A refusal asserted with HexagonOperatorSupport() proves nothing.
+
+    Whether a weight is a constant is a fact about the program signature, so a
+    support object built without the signature refuses every op whose weight is
+    read at export -- at the geometry the backend supports as well as at one it
+    refuses. The control is the weightless family, where the bare object does
+    still discriminate; without it the probe would be reporting a global claim
+    from one family.
+    """
+    import torch
+    from executorch.backends.hexagon.partition.hexagon_partitioner import (
+        HexagonOperatorSupport, _data_placeholders,
+    )
+    from executorch.exir import to_edge
+
+    def verdicts(model, inputs):
+        args = tuple(
+            torch.randn(*s, dtype=torch.float16) for s in inputs
+        )
+        ep = to_edge(
+            torch.export.export(model.half().eval(), args)
+        ).exported_program()
+        placeholders = _data_placeholders(ep)
+        bare = HexagonOperatorSupport()
+        real = HexagonOperatorSupport(placeholders, ep)
+        out = {}
+        for node in ep.graph.nodes:
+            if node.op != "call_function":
+                continue
+            name = str(node.target).replace("aten.", "").split(".")[0]
+            out[name] = (
+                bare.is_node_supported(None, node),
+                real.is_node_supported(None, node),
+            )
+        return out
+
+    weight_reading = verdicts(
+        torch.nn.Conv2d(64, 64, 1), [(1, 64, 8, 8)],
+    )
+    weightless = verdicts(torch.nn.ReLU(), [(4, 8)],
+                          ) if hasattr(torch.nn, "ReLU") else {}
+    if not weight_reading:
+        return Result("bare support is blind", False, "no call_function found")
+    blind = [
+        n for n, (b, r) in weight_reading.items() if b is False and r is True
+    ]
+    sees = [n for n, (b, r) in weightless.items() if b is True]
+    if not blind:
+        return Result(
+            "bare support is blind",
+            True,
+            "no weight-reading op disagreed on this tree, so the hazard is "
+            "not present here",
+        )
+    return Result(
+        "bare support is blind",
+        True,
+        "bare said False where the real signature said True for "
+        + str(sorted(blind)) + "; the control, a weightless family, the bare "
+        + ("object still accepts " + str(sorted(sees)) if sees else "accepts nothing")
+        + ", so the blindness is scoped to the weight-reading families",
+    )
+
+
+PROBES = [
+    probe_blit_prefix_scan,
+    probe_delegate_count_is_not_coverage,
+    probe_bare_support_is_blind_on_weight_reading_ops,
+]
 
 
 def main(argv=None):
@@ -186,18 +341,14 @@ def main(argv=None):
         try:
             result = probe()
         except Exception as error:
-            result = Result(probe.__name__, False, "the probe raised: " + repr(error))
+            result = Result(
+                probe.__name__,
+                False,
+                "the probe raised: " + repr(error),
+            )
         results.append(result)
         print(result)
-        if not result.ok:
-            for line in scan_offenders():
-                print(line)
     return 0 if all(r.ok for r in results) else 1
-
-
-def scan_offenders():
-    recognised, offenders = scan_expected_types(POW_SIM.read_text(), "tree")
-    return offenders
 
 
 if __name__ == "__main__":
