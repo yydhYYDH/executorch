@@ -48,6 +48,7 @@ import torch
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
+import blob_interpreter  # noqa: E402
 import hexagon_sim  # noqa: E402
 from blob_interpreter import Arena, execute, read_blob  # noqa: E402
 from test_blob_on_sim import (  # noqa: E402
@@ -120,14 +121,28 @@ IN_FEATURES = 4
 CLASSES = 8
 
 #: The worst the sequence may differ from an fp64 evaluation of the same
-#: weights, over the length below, on the simulator and not the host
-#: interpreter. Measured: 1.76e-3 at four steps and 1.85e-3 at eight for an
-#: LSTM, 1.43e-3 and 1.72e-3 for a GRU, so the error does not compound with the
-#: sequence -- the recurrence contracts what the gates hand it. The bound sits
-#: just above those and well below what one companded16 gate costs against the
-#: kernel's own scalar path, so a gate that stopped using the PWL tables, or a
-#: stitch that stopped running at all, could not meet it.
-SIM_BOUND = 2.5e-3
+#: weights, over the lengths below. One constant and not two because the host
+#: interpreter and the simulator are the same number now: `165482b` gave
+#: `_run_unary` the learned8 companded16 banks, so a gate buffer of at least
+#: `_PWL_GRAIN` elements is answered by the walk on both sides, and
+#: `test_the_sim_answer_is_the_host_model_bit_for_bit` holds them identical bit
+#: for bit. What is left to bound is one quantity, so it is fitted once.
+#:
+#: Measured over 16 seeded weight draws at each of 1, 2, 4, 8 and 16 steps --
+#: 160 sequences, worst 3.52e-3 (a GRU at 16) and 2.65e-3 over the 1..8 range
+#: these tests use. That error is the walk's and not the arithmetic around it:
+#: with the walk suppressed and op 4 given the exact formula `a47e948` had, the
+#: same 160 sequences are worst 2.07e-4, a tenth of this. That tenth is the
+#: number the 2.0e-3 this replaced was fitted against, and it is why that bound
+#: stopped holding. The error does rise with the length rather than staying
+#: flat -- the per-cell mean runs 9.0e-4 to 2.2e-3 over 1 to 16 steps for an
+#: LSTM -- but slowly, because the gates contract what the step before them
+#: hands on.
+#:
+#: The ceiling sits below what one companded16 gate costs against the kernel's
+#: own scalar path, so a gate that stopped using the PWL tables, or a stitch
+#: that stopped running at all, still could not meet it.
+PWL_BOUND = 4.0e-3
 
 #: What one companded16 gate costs on this kernel against the scalar path it
 #: replaces: 1.71e-3 for sigmoid and 5.86e-3 for tanh, measured over the same
@@ -451,17 +466,26 @@ def test_the_sequence_tracks_fp64_over_its_whole_length(kind, steps):
     and the lengths are chosen to double, so a cost that grew with the sequence
     would show up as a growing bound rather than as a constant one.
 
-    This is the host interpreter, which models sigmoid and tanh with the exact
-    formula the kernel's own scalar path evaluates; it measures the wiring, not
-    the companded16 PWL the vector path uses, which is measured on the simulator
-    by the gate tests in `test_unary_sim` and compounds from there.
+    This is the host interpreter, and it used to be told that it models sigmoid
+    and tanh with the exact formula of the kernel's scalar path, so that what it
+    measured here was the wiring and not the companded16 walk. That stopped being
+    true at `165482b`, the merge that transcribed the learned8 banks into
+    `_run_unary`: a gate buffer of at least `_PWL_GRAIN` elements is answered by
+    the walk, and this net's gate buffers are `HIDDEN` = 64 elements, which is
+    the grain. So the walk's error is in this measurement now, `PWL_BOUND` is
+    fitted to it, and the shape and finiteness checks below are what is left of
+    the wiring: the answer has the shape the graph asked for, and no value of it
+    is a non-finite one, which is what an unwired gate or a stitch that wrote
+    nowhere would leave behind.
     """
     model = _PredictionNet(kind, steps).half()
     x = _input(steps, seed=steps)
     got = _dsp_answer(model, x).astype(np.float64)
     want = _reference(model, x)
+    assert got.shape == want.shape, f"{kind} at {steps} steps: {got.shape} for {want.shape}"
+    assert np.isfinite(got).all(), f"{kind} at {steps} steps: a value is not finite"
     error = np.abs(got - want).max()
-    assert error < 2.0e-3, f"{kind} at {steps} steps: max {error:.3e}"
+    assert error < PWL_BOUND, f"{kind} at {steps} steps: max {error:.3e}"
 
 
 def _sim_fixture(kind: str, steps: int):
@@ -531,40 +555,110 @@ def test_the_prediction_net_runs_on_hexagon_sim(kind):
     for name in ("LSTM", "GRU"):
         model, x = models[name]
         error = np.abs(_sim_answer(answers, name, model, x) - _reference(model, x))
-        assert error.max() < SIM_BOUND, (
+        assert error.max() < PWL_BOUND, (
             f"{name} over {SIM_STEPS} steps: max {error.max():.3e} at step"
             f" {int(error.reshape(SIM_STEPS, -1).max(axis=1).argmax())}"
         )
 
+def _gate_commands(blob: bytes):
+    """The blob's own unary commands that are a cell's gates.
+
+    Read off the bytes and matched by the subtype `hexagon_ops` numbers, so that
+    "this gate is at the walk's grain" is a statement about the command the
+    kernel receives rather than about the emitter table having an entry.
+    """
+    _header, commands = read_blob(blob)
+    gates = {
+        hexagon_ops.UNARY_OP_TYPES["sigmoid"],
+        hexagon_ops.UNARY_OP_TYPES["tanh"],
+    }
+    return [
+        command
+        for command in commands
+        if command.type == hexagon_ops.DSP_OP_UNARY and command.params[1] in gates
+    ]
+
+
+def _exact_gate_answer(model, x: torch.Tensor) -> np.ndarray:
+    """The same blob through a host model whose gates are the scalar formulas.
+
+    The control that says the agreement below is about the walk and not about
+    two sides that both ignore it. `_run_unary` chooses on `op_type in
+    _PWL_SLOPE and numel >= _PWL_GRAIN`, so a grain no buffer can reach turns
+    the walk off for the whole blob; op 4 then needs `a47e948`'s exact sigmoid,
+    because `_sigmoid` splits at the grain internally and would otherwise still
+    answer these 64-element buffers with the chords. Both attributes are put
+    back before this returns, so a control cannot leak into the test after it.
+    """
+    saved_grain = blob_interpreter._PWL_GRAIN
+    saved_sigmoid = blob_interpreter._UNARY[4]
+    blob_interpreter._PWL_GRAIN = 1 << 40
+    blob_interpreter._UNARY[4] = lambda x: 1.0 / (1.0 + np.exp(-x))
+    try:
+        return _dsp_answer(model, x).astype(np.float64)
+    finally:
+        blob_interpreter._PWL_GRAIN = saved_grain
+        blob_interpreter._UNARY[4] = saved_sigmoid
+
 
 @pytest.mark.parametrize("kind", ["LSTM", "GRU"])
-def test_the_sim_answer_is_not_the_host_model(kind):
-    """A control: the PWL gates have to be visible in the answer.
+def test_the_sim_answer_is_the_host_model_bit_for_bit(kind):
+    """The control: the gates are at the walk's grain, and the walk is the answer.
 
-    The host interpreter evaluates sigmoid and tanh with the formula the
-    kernel's own scalar path uses, so a simulator that agreed with it to fp16
-    noise would say the gates never took the companded16 path.
+    This test held the opposite until `165482b`. It asserted that the
+    simulator's answer and the host model's answer differ at the first step,
+    because the host interpreter evaluated the gates with the kernel's scalar
+    formula and only the simulator had the companded16 chords. That was true
+    when `87f092f` wrote it, and the merge that transcribed the learned8 banks
+    into `blob_interpreter` ended it: both sides take the walk now, and they
+    agree to the bit over all eight steps -- zero, not "within noise".
 
-    The claim is made on the first time step only, where the output is a
-    function of one step's gates and nothing earlier. Over the whole sequence
-    the two implementations drift apart by a weight-dependent amount, measured
-    at 1.40e-3 and 2.81e-3 for the same GRU under two seeds, and a bound fitted
-    to either of those would be a bound fitted to noise.
-
-    The lower bar is above what the exact-gate model itself is from fp64 at the
-    first step, which is 8.1e-5 for an LSTM, so the difference is the gates and
-    not the arithmetic around them. The upper bar is one tanh's own PWL cost
-    against the kernel's scalar path, measured on this kernel at 5.86e-3: a
-    first step cannot differ by more than the gates it evaluates.
+    The replacement is a stronger claim in three parts, and none of the three
+    would be worth anything alone. The blob's gate buffers are at or above the
+    grain, which is what makes the agreement about the walk; the kernel's
+    answer and the model's are the same fp16 bits; and turning the walk off in
+    the model moves the first step by more than fp16 noise and by no more than
+    one gate's own cost, which is what says the walk is what produced the
+    agreement. Move the grain clause and the first assertion goes red; refit a
+    chord and the second does; take the walk off the host side only and the
+    second goes red while the control's two bars stay where they are, and that
+    separation is the reason both are here.
     """
     fixture, model, x = _sim_fixture(kind, SIM_STEPS)
+    gates = _gate_commands(fixture.blob)
+    assert gates, f"{kind}: the blob carries no sigmoid or tanh command"
+    widths = {command.params[0] for command in gates}
+    assert widths == {HIDDEN}, (
+        f"{kind}: gate buffers of {sorted(widths)} elements, not {HIDDEN}"
+    )
+    assert HIDDEN >= blob_interpreter._PWL_GRAIN, (
+        f"{kind}: a {HIDDEN}-element gate is below the walk's grain of"
+        f" {blob_interpreter._PWL_GRAIN}, so this net does not take the walk"
+        " and the agreement below is not about it"
+    )
+
     answers = _sim_run([fixture])
     dsp = _sim_answer(answers, kind, model, x)
     modelled = _dsp_answer(model, x).astype(np.float64)
-    first = float(np.abs(dsp[:, 0, :] - modelled[:, 0, :]).max())
+    apart = float(np.abs(dsp - modelled).max())
+    assert np.array_equal(dsp, modelled), (
+        f"{kind}: the kernel and the host model differ by {apart:.3e}"
+        f" somewhere in {SIM_STEPS} steps"
+    )
+
+    # The first step alone, because that is the only one whose output is a
+    # function of one step's gates and nothing earlier: over a whole sequence a
+    # weight-dependent amount accumulates, and a bound fitted to that would be a
+    # bound fitted to noise. The lower bar is above what the exact-gate model is
+    # itself from fp64 at the first step, 8.1e-5 for an LSTM, so the difference is
+    # the gates and not the arithmetic around them.
+    exact = _exact_gate_answer(model, x)
+    first = float(np.abs(dsp[:, 0, :] - exact[:, 0, :]).max())
     assert first > 1.0e-4, (
-        f"{kind}: the DSP and the exact-gate model differ by {first:.3e}"
-        " at the first step, which is what a scalar path would give"
+        f"{kind}: turning the walk off moves the first step by {first:.3e},"
+        " which is not what a companded16 gate costs, so the control cannot"
+        " tell the walk from the scalar path and the agreement above is not"
+        " evidence of anything"
     )
     assert first <= GATE_PWL_COST, (
         f"{kind}: the first step differs by {first:.3e}, more than one"
