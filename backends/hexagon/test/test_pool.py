@@ -30,6 +30,8 @@ from executorch.backends.hexagon.hexagon_ops import (  # noqa: E402
     _channel_block_regions,
     _channel_blocks,
     _conv_layouts_agree,
+    _pool_kernel_divisor_holds,
+    _pool_output_extent,
     _pool_window_intersects,
     pool_spec,
 )
@@ -56,6 +58,12 @@ _COUNT_KERNEL = 1
 
 #: One HVX vector of fp16.
 _PACK = 64
+
+#: The two pool targets a refusal can be read off, spelled out because a node's
+#: argument list is positional and the two do not line up: ceil_mode is the fifth
+#: argument of a maximum and the fourth of an average.
+_MAX_POOL2D = exir_ops.edge.aten.max_pool2d_with_indices.default
+_AVG_POOL2D = exir_ops.edge.aten.avg_pool2d.default
 
 #: torch's own max_pool2d padding limit, which is what makes a window that
 #: misses the input unreachable through the functional API.
@@ -391,17 +399,18 @@ def test_the_pack_region_is_the_permutation_the_dsp_pack_path_takes():
     "shape, kind, kwargs",
     [
         ((1, 64, 8, 8), "max", {"dilation": 2}),  # no dilation in the kernel
-        ((1, 64, 7, 7), "max", {"ceil_mode": True}),  # windows past the input
+        ((1, 64, 8, 8), "avg", {"ceil_mode": True}),  # divisor is a clipped window
         ((1, 64, 8, 8), "avg", {"divisor_override": 2}),  # divisor has no param
     ],
 )
 def test_a_pool_the_kernel_cannot_run_stays_on_the_host(shape, kind, kwargs):
     """A refusal, and the numbers it still has to produce.
 
-    Each of these is a form the command cannot describe -- a channel count that
-    is not one block, a dilation the window walk does not have, a divisor with no
+    Each of these is a form the command cannot describe -- a dilation the window
+    walk does not have, a divisor that is not the whole kernel, a divisor with no
     param slot -- so the node stays portable rather than reaching an emitter that
-    would read it wrong.
+    would read it wrong. A channel count is no longer on this list: the command
+    counts 64-lane blocks and takes any C.
     """
     model = _Pool(kind, 3, 2, 1, **kwargs)
     x = torch.randn(*shape, dtype=torch.float16)
@@ -416,6 +425,176 @@ def test_a_pool_the_kernel_cannot_run_stays_on_the_host(shape, kind, kwargs):
     expected = model(x)
     assert expected.dtype is torch.float16
     assert torch.isfinite(expected).all()
+
+
+def test_the_output_extent_is_torchs_own_on_both_modes():
+    """The command's oh and ow, evaluated against torch rather than read off it.
+
+    Ceil mode is not the numerator's ceiling: torch adds stride - 1 and then
+    drops the last output position once, when it would start at or past
+    size + pad. The decrement is what keeps the last window from being a window
+    over nothing, so this has to be torch's number exactly or the command
+    describes an output the graph never had.
+
+    A geometry torch itself refuses is skipped, because the claim is about the
+    geometries a graph can carry, and both counts are reported so a sweep that
+    quietly checked almost nothing cannot look like one that checked a lot.
+    """
+    checked = 0
+    refused = 0
+    for size in range(1, 14):
+        for kernel in (1, 2, 3, 4):
+            for stride in (1, 2, 3, 4):
+                for pad in (0, 1):
+                    if 2 * pad >= kernel or stride > kernel:
+                        continue
+                    for ceil_mode in (False, True):
+                        try:
+                            want = torch.nn.functional.max_pool2d(
+                                torch.zeros(1, 1, size, size),
+                                kernel,
+                                stride,
+                                pad,
+                                ceil_mode=ceil_mode,
+                            ).shape[-1]
+                        except RuntimeError:
+                            refused += 1
+                            continue
+                        got = _pool_output_extent(
+                            size, kernel, stride, pad, ceil_mode
+                        )
+                        assert got == want, (
+                            f"{size=} {kernel=} {stride=} {pad=} {ceil_mode=}: "
+                            f"{got} != torch's {want}"
+                        )
+                        checked += 1
+    assert checked > 200, f"the sweep only reached {checked} geometries"
+    assert refused < checked // 4, f"{refused} of the geometries were skipped"
+
+
+@pytest.mark.parametrize(
+    "kind, kernel, stride, padding, count_include_pad, size",
+    [
+        ("max", 3, 3, 0, True, 7),
+        ("max", 3, 2, 1, True, 10),
+        ("max", 2, 2, 0, True, 9),
+        ("avg", 3, 3, 0, False, 8),
+        ("avg", 3, 2, 1, False, 10),
+        ("avg", 2, 3, 0, False, 7),
+        ("avg", 3, 4, 1, False, 12),
+    ],
+)
+def test_a_ceil_mode_window_runs_on_this_command(
+    kind, kernel, stride, padding, count_include_pad, size
+):
+    """A window that runs off the edge, end to end, against torch.
+
+    Every size here is one where ceil mode changes the answer rather than merely
+    spelling it differently, and the first size is the sharp one: at 8x8 with a
+    3x3 window at stride 3 the last window holds a 2x2 of the 3x3. The host
+    interpreter is a model of the kernel rather than the kernel, so what this
+    establishes is that the command describes torch's geometry.
+    """
+    x = torch.randn(1, 64, size, size, dtype=torch.float16)
+    kwargs = {"ceil_mode": True}
+    if kind == "avg":
+        kwargs["count_include_pad"] = count_include_pad
+    model = _Pool(kind, kernel, stride, padding, **kwargs)
+    floor = _Pool(kind, kernel, stride, padding)
+    assert model(x).shape != floor(x).shape, "this shape does not exercise ceil"
+    blob, commands = _lowered(model, x)
+    assert [command.type for command in commands] == [_BLIT, _POOL, _BLIT]
+    assert list(commands[1].params[3:5]) == list(model(x).shape[-2:])
+    got = _run(blob, x)
+    expected = model(x).numpy().reshape(-1)
+    if kind == "max":
+        assert got.tobytes() == expected.tobytes()
+    else:
+        np.testing.assert_allclose(got, expected, rtol=2e-3, atol=2e-3)
+
+
+def test_a_ceil_mode_average_over_the_whole_kernel_is_refused_exactly_when_ceil_changes_the_shape():
+    """The one thing about ceil mode this command has no param for.
+
+    `count_include_pad` divides by the window clipped to the padded input, so a
+    window that hangs off the padded edge divides by the part still inside, and
+    countType 1 divides by kernel_y * kernel_x. The two below are the same
+    window and the same channel count: one is refused, the other runs, and the
+    refusal has to be the divisor rather than the geometry.
+
+    The sweep is the reason this can be said so simply. The divisor test holds
+    exactly when ceil mode does not change the shape, over every geometry in
+    range, so an average that counts the padding is refused precisely when it
+    would have been a different answer -- which is why there is no average in
+    the list above that both changes the shape and runs.
+    """
+    disagreements = 0
+    checked = 0
+    for size in range(1, 20):
+        for kernel in (1, 2, 3, 4, 5):
+            for stride in (1, 2, 3, 4, 5):
+                for pad in (0, 1, 2):
+                    if 2 * pad >= kernel:
+                        continue
+                    floor = _pool_output_extent(size, kernel, stride, pad, False)
+                    ceiling = _pool_output_extent(size, kernel, stride, pad, True)
+                    if ceiling < 1:
+                        continue
+                    checked += 1
+                    holds = _pool_kernel_divisor_holds(
+                        size, size, ceiling, ceiling, kernel, kernel,
+                        stride, stride, pad, pad,
+                    )
+                    if holds is not (ceiling == floor):
+                        disagreements += 1
+    assert checked > 400, f"the sweep only reached {checked} geometries"
+    assert disagreements == 0, (
+        f"{disagreements} of {checked} geometries separate the divisor test from "
+        "the shape it is supposed to track"
+    )
+
+    x = torch.randn(1, 64, 8, 8, dtype=torch.float16)
+    included = _Pool("avg", 3, 3, 0, ceil_mode=True, count_include_pad=True)
+    excluded = _Pool("avg", 3, 3, 0, ceil_mode=True, count_include_pad=False)
+    assert included(x).shape == excluded(x).shape
+    assert _delegates(_lowered_program(included, x)) == [], (
+        "an average whose last window hangs off the padded edge reached the DSP"
+    )
+    blob, commands = _lowered(excluded, x)
+    assert commands[1].params[13] == _COUNT_VALID
+    expected = excluded(x).numpy().reshape(-1)
+    np.testing.assert_allclose(_run(blob, x), expected, rtol=2e-3, atol=2e-3)
+
+
+def test_the_divisor_test_cannot_move_a_floor_mode_pool():
+    """The regression guard: floor mode satisfies it by construction.
+
+    `(oh - 1) * stride <= ih + 2 * pad - kernel` is the floor formula, so this
+    is vacuous everywhere the old gate passed. A sweep says it rather than an
+    argument, because the failure it prevents is the floor command silently
+    starting to be refused. Ceil mode is deliberately not claimed here: at a
+    size where it changes the answer this test is meant to fail, and that is
+    the other test's subject.
+    """
+    checked = 0
+    for size in range(1, 14):
+        for kernel in (1, 2, 3, 4):
+            for stride in (1, 2, 3, 4):
+                for pad in (0, 1):
+                    if 2 * pad >= kernel or stride > kernel:
+                        continue
+                    output = _pool_output_extent(size, kernel, stride, pad, False)
+                    if output < 1:
+                        continue
+                    checked += 1
+                    assert _pool_kernel_divisor_holds(
+                        size, size, output, output, kernel, kernel,
+                        stride, stride, pad, pad,
+                    ), (
+                        f"floor mode would now refuse {size=} {kernel=} "
+                        f"{stride=} {pad=}"
+                    )
+    assert checked > 100, f"the sweep only reached {checked} geometries"
 
 
 def test_a_pool_over_a_batch_less_operand():
@@ -519,21 +698,30 @@ def test_pool_spec_reads_the_command_out_of_a_node_that_fits():
 
 
 @pytest.mark.parametrize(
-    "args, source_shape, result_shape",
+    "args, source_shape, result_shape, target",
     [
-        (([2, 2], [2, 2]), (1, 64, 1, 8, 8), (1, 64, 1, 4, 4)),  # rank 5
-        (([3, 3], [2, 2], [1, 1], [2, 2]), (1, 64, 8, 8), (1, 64, 3, 3)),  # dilation
-        (([8, 8], [8, 8], [0, 0], [1, 1], True), (1, 64, 8, 8), (1, 64, 1, 1)),
+        (([2, 2], [2, 2]), (1, 64, 1, 8, 8), (1, 64, 1, 4, 4), _MAX_POOL2D),  # rank 5
+        (([3, 3], [2, 2], [1, 1], [2, 2]), (1, 64, 8, 8), (1, 64, 3, 3), _MAX_POOL2D),  # dilation
         # The next is the shape check rather than an argument: the result is the
         # size a nonzero padding would give, which this geometry does not describe.
-        (([2, 2], [2, 2], [0, 0], [1, 1], False), (1, 64, 8, 8), (1, 64, 3, 3)),
+        (([2, 2], [2, 2], [0, 0], [1, 1], False), (1, 64, 8, 8), (1, 64, 3, 3), _MAX_POOL2D),
         # And this one is the window guard: the geometry its padding implies has
         # windows that fall entirely outside the input.
-        (([2, 2], [1, 1], [3, 3], [1, 1], False), (1, 64, 8, 8), (1, 64, 13, 13)),
+        (([2, 2], [1, 1], [3, 3], [1, 1], False), (1, 64, 8, 8), (1, 64, 13, 13), _MAX_POOL2D),
+        # A ceil window that hangs off the padded edge, averaged over the whole
+        # kernel. The divisor torch wants is the part still inside, and the
+        # command has no divisor that is not kernel_y * kernel_x, so this is the
+        # one thing about ceil mode the emitter cannot describe.
+        (
+            ([3, 3], [3, 3], [0, 0], True, True),
+            (1, 64, 8, 8),
+            (1, 64, 3, 3),
+            _AVG_POOL2D,
+        ),
     ],
 )
 def test_pool_spec_refuses_what_the_command_cannot_describe(
-    args, source_shape, result_shape
+    args, source_shape, result_shape, target
 ):
     """Every refusal the partitioner depends on, on the node it reads.
 
@@ -541,7 +729,7 @@ def test_pool_spec_refuses_what_the_command_cannot_describe(
     refused for one of its arguments or for its rank, and there is no channel
     count left over to be refused.
     """
-    assert pool_spec(_pool_node(args, source_shape, result_shape)) is None
+    assert pool_spec(_pool_node(args, source_shape, result_shape, target)) is None
 
 
 @pytest.mark.parametrize("extent, output, window", [(63, 21, 3), (64, 32, 2), (65, 13, 5)])

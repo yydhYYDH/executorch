@@ -1118,14 +1118,22 @@ def _swap_the_nibble_pair(blob, k, n):
 
 
 class _Pool(torch.nn.Module):
-    def __init__(self, kind, kernel, stride, padding, count_include_pad=True):
+    def __init__(
+        self, kind, kernel, stride, padding, count_include_pad=True, ceil_mode=False
+    ):
         super().__init__()
         self.kind = kind
         if kind == "max":
-            self.pool = torch.nn.MaxPool2d(kernel, stride, padding)
+            self.pool = torch.nn.MaxPool2d(
+                kernel, stride, padding, ceil_mode=ceil_mode
+            )
         else:
             self.pool = torch.nn.AvgPool2d(
-                kernel, stride, padding, count_include_pad=count_include_pad
+                kernel,
+                stride,
+                padding,
+                count_include_pad=count_include_pad,
+                ceil_mode=ceil_mode,
             )
 
     def forward(self, x):

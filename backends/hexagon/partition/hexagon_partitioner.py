@@ -805,10 +805,12 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target in POOL_TARGETS and pool_spec(node) is None:
             # The kernel walks its activation in the DSP's 64-channel blocked
-            # layout, and only the C == 64 form of it is one this backend
-            # rearranges; a dilation, a ceil_mode window, a divisor this kernel
-            # cannot take, or a shape whose windows would fall outside the input
-            # all have to stay on a portable kernel rather than reach it.
+            # layout, and the backend rearranges any channel count into it; what
+            # it cannot do is describe the window. A dilation, a divisor this
+            # kernel cannot take, an average whose ceil_mode window divides by
+            # the part of itself that is still inside, or a shape whose windows
+            # would fall outside the input all have to stay on a portable kernel
+            # rather than reach it.
             return False
         if (
             node.target in CONV_TARGETS

@@ -3832,6 +3832,59 @@ def _int_pair(value, default) -> Optional[tuple]:
     return None
 
 
+def _pool_output_extent(
+    size: int, kernel: int, stride: int, pad: int, ceil_mode: bool
+) -> int:
+    """torch's output size along one axis, in torch's own arithmetic.
+
+    Floor mode is `(size + 2 * pad - kernel) // stride + 1`. Ceil mode adds
+    `stride - 1` to the numerator and then drops the last output position once
+    when it would start at or past `size + pad`
+    (`pooling_output_shape_pad_lr`), so a ceil window may hang off the far edge
+    but the last one always starts inside the padded input. That decrement is
+    the whole reason a ceil window is safe for this kernel: it is what stops the
+    last position being a window over nothing, which `_pool_window_intersects`
+    exists to rule out.
+    """
+    output = (size + 2 * pad - kernel + (stride - 1 if ceil_mode else 0)) // stride + 1
+    if ceil_mode and (output - 1) * stride >= size + pad:
+        output -= 1
+    return output
+
+
+def _pool_kernel_divisor_holds(
+    ih: int,
+    iw: int,
+    oh: int,
+    ow: int,
+    kernel_y: int,
+    kernel_x: int,
+    stride_y: int,
+    stride_x: int,
+    pad_y: int,
+    pad_x: int,
+) -> bool:
+    """Whether every window still holds a whole kernel of the padded input.
+
+    `count_include_pad` divides by the window clipped to the **padded** input,
+    so the divisor is `kY * kX` for every window except one that hangs off the
+    padded edge, where it is the part that is still inside. The kernel's
+    countType 1 divides by `kY * kX` unconditionally
+    (`pool_fp16.c:74-79`), so it is that window's divisor only when nothing
+    hangs off. A window's clipped length is `min(k, size + 2 * pad - o * stride)`,
+    which falls as `o` grows, so the last output position is the tightest on
+    each axis and the test is two comparisons rather than a walk.
+
+    Floor mode satisfies this by construction -- `(oh - 1) * stride <= ih + 2 *
+    pad - kernel` is the floor formula -- which is why the divisor only becomes
+    a question once ceil mode can push a window off the padded edge.
+    """
+    return (
+        ih + 2 * pad_y - (oh - 1) * stride_y >= kernel_y
+        and iw + 2 * pad_x - (ow - 1) * stride_x >= kernel_x
+    )
+
+
 def _pool_window_intersects(
     size: int, output: int, kernel: int, stride: int, pad: int
 ) -> bool:
@@ -3955,21 +4008,42 @@ def pool_spec(node: torch.fx.Node) -> Optional[PoolSpec]:
             return None
         count_type = POOL_COUNT_KERNEL if count_include_pad else POOL_COUNT_VALID
         pool_type = POOL_AVERAGE
-    if ceil_mode:
-        # ceil_mode adds windows past the input that this kernel's geometry (one
-        # window per output position at oy * stride - pad) does not describe.
-        return None
 
     oh, ow = result.shape[-2], result.shape[-1]
-    # torch's floor-mode output size, which is also the one the emitter is about
-    # to describe with strides.
-    if oh != (ih + 2 * padding[0] - kernel[0]) // stride[0] + 1:
+    # torch's output size on each axis, which is also the one the emitter is
+    # about to describe with strides. ceil mode is this command's own geometry,
+    # not a second one: oh and ow are parameters (pool_fp16.c:9) and the window
+    # at each position is [oy * strideY - padY, +kernelY) with whatever falls
+    # outside skipped (pool_fp16.c:26-43), which is the clip torch does.
+    if oh != _pool_output_extent(ih, kernel[0], stride[0], padding[0], ceil_mode):
         return None
-    if ow != (iw + 2 * padding[1] - kernel[1]) // stride[1] + 1:
+    if ow != _pool_output_extent(iw, kernel[1], stride[1], padding[1], ceil_mode):
         return None
     if not _pool_window_intersects(ih, oh, kernel[0], stride[0], padding[0]):
         return None
     if not _pool_window_intersects(iw, ow, kernel[1], stride[1], padding[1]):
+        return None
+    if (
+        pool_type == POOL_AVERAGE
+        and count_type == POOL_COUNT_KERNEL
+        and not _pool_kernel_divisor_holds(
+            ih,
+            iw,
+            oh,
+            ow,
+            kernel[0],
+            kernel[1],
+            stride[0],
+            stride[1],
+            padding[0],
+            padding[1],
+        )
+    ):
+        # An average over a window that hangs off the padded input divides by
+        # what is left of it, and the command has no divisor that is not
+        # kY * kX. count_include_pad=False divides by the window clipped to the
+        # raw input, which is the kernel's validCount, so that one takes ceil
+        # mode at any geometry.
         return None
 
     return PoolSpec(
