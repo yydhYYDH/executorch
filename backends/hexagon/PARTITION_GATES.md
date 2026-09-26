@@ -210,9 +210,14 @@ on an older rev. Recorded here so the correction travels with the measurement.
 
 - **"Pooling delegates only on exactly 64 channels."** `pool_spec` no longer says that. Its own
   comment now states that the channel axis is a packing granularity and that the walk loops over
-  all the 64-lane blocks, so any channel count is a number of blocks. Measured: `avg_pool2d(2)` over
-  **32** channels is accepted; the refusal that does fire on the published resnet18 stem pool is
-  `ceil_mode=True`, and on the same graph with `ceil_mode=False` the pool delegates.
+  all the 64-lane blocks, so any channel count is a number of blocks. **Measured by decoding the
+  blob:** `max_pool2d(2)` over 32, 17, 64 and 96 channels is one delegate each, carrying
+  `RASTER_BLIT, POOL2D_FP16, RASTER_BLIT` and — for every count that is not a multiple of 64 — a
+  `ZERO` ahead of the pack, because the fill reads whole 64-lane vectors and the lanes past the
+  last channel would otherwise hold whatever the arena last held. What does refuse is
+  `ceil_mode=True`, at 0 delegates for both `max_pool2d` and `avg_pool2d`, which is what the
+  published resnet18 stem pool does and why `cnn_resnet18` and `cnn_resnet18_staticpool` differ by
+  exactly that node.
 - **"A 197-wide last-axis softmax emits one `DSP_OP_SOFTMAX`."** Stale, and the correction has the
   same shape as the pool one. Measured at a47 by decoding the blob with the runtime's own reader:
   a `(1, 33)` last-axis softmax is one `DSP_OP_SOFTMAX [1, 33, 1, 2]`, while `(1, 197)` and
@@ -232,3 +237,15 @@ is a project. A clause that holds zero nodes on 6545 model nodes and 131 designe
 shown to be unnecessary; it is shown to be unexercised by the only two corpora in this tree, and
 960 is the clearest case, since a census with no KV cache cannot say anything about the clause that
 governs one.
+
+## 9. Where each number comes from, and what a reader has to rebuild
+
+The rows corpus is in this tree: it is the `_ROWS` and `_QUANTIZED_ROWS` tables of
+`test_overload_census.py` and `test_overload_census2.py`, driven through the same instrument.
+The models corpus is not — the nineteen geometries are hand-written and live in a scratch
+directory, and `Qwen3ForCausalLM` is built from a `transformers` config, so a reader has to
+rebuild it to re-derive §4. That is a real limitation of a census whose point is to be re-derived,
+and it is worth fixing before the next round rather than after: the geometries belong next to the
+other model fixtures, and the instrument and both drivers belong beside
+`test_partition_gates.py`, which already carries the instrument and the controls so that a
+reader does not have to rebuild those to know the census is sound.
