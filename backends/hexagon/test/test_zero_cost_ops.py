@@ -369,6 +369,41 @@ def test_elu_keeps_a_nan_activation():
     ), (got, want)
 
 
+def test_the_elu_bound_is_absolute_and_its_relative_error_is_not_small():
+    # The bound above is an absolute one, and an absolute bound is blind to the
+    # one place the composition is worst in relative terms. exp(x) - 1 in fp16
+    # cancels near zero exactly the way `aten.expm1` does -- which is why §3 of
+    # OP_GAPS keeps expm1 unwired -- and a relative error of 1.0 is what a
+    # cancellation buys. Here it is contained: the answer stays within two fp16
+    # steps, and the negative branch saturates at -alpha * scale, so the error is
+    # 0.2% of the branch's range for F.elu and 0.1% for nn.SELU. Both halves are
+    # asserted because either one alone is a claim a reader could not check.
+    alpha, scale = 1.0, 1.0
+    xs = torch.tensor([[-0.01, -0.1, -1.0, -3.3, -30.0]], dtype=F16)
+    want = torch.ops.aten.elu.default(xs, alpha, scale, 1.0).float()
+    composed = torch.clamp(xs, 0, None) * scale + torch.clamp(
+        (torch.exp(xs) - 1.0) * alpha * scale, None, 0
+    )
+    absolute = (composed.float() - want).abs()
+    assert absolute.max().item() <= 2.0 * ONE_STEP_AT_EIGHT, absolute
+    assert (2.0**-9) / (alpha * scale) < 2.0e-3, "the bound is no longer small"
+    # The cancellation, read off rather than asserted in prose: at x = -0.01 the
+    # answer is about -9.95e-3 and the composition is 2.4e-4 away from it, which
+    # is a few per cent relative. A model that consumed this band as a ratio
+    # would see it, and that is the reason this test is here at all.
+    relative = absolute / want.abs()
+    assert 0.01 < relative[0, 0].item() < 0.1, relative[0, 0].item()
+    # And below about 3e-4 the answer is smaller than one fp16 step of exp(0), so
+    # the relative error is 1.0 -- the same statement OP_GAPS makes for expm1,
+    # with the difference that here the absolute error is bounded by a branch
+    # that saturates one order of magnitude above it.
+    tiny = torch.tensor([[-3.0e-4]], dtype=F16)
+    tiny_want = torch.ops.aten.elu.default(tiny, alpha, scale, 1.0).float()
+    tiny_got = torch.clamp(tiny, 0, None) + torch.clamp((torch.exp(tiny) - 1.0) * alpha, None, 0)
+    assert (tiny_got.float() - tiny_want).abs().item() <= 2.0 * ONE_STEP_AT_EIGHT
+    assert abs(tiny_want.item()) < 2.0**-9, "the band is empty now"
+
+
 @pytest.mark.parametrize(
     "alpha, scale, input_scale",
     [(-1.0, 1.0, 1.0), (1.0, -1.0, 1.0), (1.0, 1.0, 2.0)],
