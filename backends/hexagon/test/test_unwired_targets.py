@@ -121,13 +121,6 @@ _GAPS = [
         "aten.div.Tensor_mode",
     ),
     (
-        "clamp against a tensor bound",
-        lambda a, b: torch.clamp(a, min=b),
-        _XY,
-        "aten::clamp",
-        "aten.clamp.Tensor",
-    ),
-    (
         "a dtype reinterpretation",
         lambda a, b: a.view(torch.float32),
         _XY,
@@ -190,10 +183,13 @@ def test_the_cost_of_a_gap_is_a_whole_graph_on_the_host():
     """Two of the rows above cost the whole model its delegate.
 
     The census reports a missing emitter, and this is what that means at the end
-    of the pipeline: `2.0 ** a` and a tensor-bounded clamp produce no delegate at
-    all, so a model built out of them runs every node on the portable kernels.
+    of the pipeline: `2.0 ** a` and a scalar `fmod` produce no delegate at all, so
+    a model built out of them runs every node on the portable kernels. A
+    tensor-bounded clamp was the second example here and is not any more:
+    `aten.clamp.Tensor` has an emitter, so it is one delegate of two binary
+    commands, and its row came out of `_GAPS` with it.
     """
-    for forward in (lambda a, b: 2.0**a, lambda a, b: torch.clamp(a, min=b)):
+    for forward in (lambda a, b: 2.0**a, lambda a, b: torch.fmod(a, 2.0)):
         assert _delegates(_lower(forward, _XY)) == 0
 
 
