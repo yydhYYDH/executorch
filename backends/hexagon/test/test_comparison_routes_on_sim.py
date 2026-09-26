@@ -77,6 +77,7 @@ def ran():
         raise AssertionError(f"hexagon-sim did not run the runner: {error}")
     for tag in (
         "A", "B", "SUB", "GT", "LT", "NEBYTE", "EQBYTE", "GTBYTE", "GEBYTE",
+        "LEBYTE", "SUBABS", "NEABS", "EQABS", "SUBABSV", "EQABSV",
         "REDONE", "REDTWO", "REDMAX", "REDIN", "REDOUT",
     ):
         # A missing tag and an empty result are the same dict lookup, so every
@@ -104,7 +105,7 @@ def test_select_at_one_byte_really_writes_a_one_byte_result(ran):
     two-byte arm would have written sixteen bytes and left the first eight
     looking like fp16 garbage rather than flags.
     """
-    for tag in ("NEBYTE", "EQBYTE", "GTBYTE", "GEBYTE"):
+    for tag in ("NEBYTE", "EQBYTE", "GTBYTE", "GEBYTE", "LEBYTE", "NEABS", "EQABS"):
         assert len(ran[tag]) == len(_A), tag
         assert set(ran[tag]) <= {0, 1}, (tag, ran[tag])
     # The condition is tested on the raw bits, so the expected value is derived
@@ -170,6 +171,56 @@ def test_a_nonzero_test_of_the_difference_is_not_equality(ran):
     assert int(difference[1].view(torch.uint16)) == 0x8000, "the signed zero pair"
     assert torch.isnan(difference[5]) and torch.isnan(difference[6])
 
+
+
+
+
+def test_less_or_equal_is_the_mirror_and_misses_the_same_pair(ran):
+    """le measured, not inferred from ge.
+
+    Same command, operands swapped, same negation, same single miss on the NaN
+    pair. Saying so without running it would be the one number in this file
+    that nobody looked at.
+    """
+    a, b = torch.tensor(_A, dtype=torch.float16), torch.tensor(_B, dtype=torch.float16)
+    want = [1 if bool(x) else 0 for x in a <= b]
+    mismatch = [i for i, (w, g) in enumerate(zip(want, ran["LEBYTE"])) if w != g]
+    assert mismatch == [4], mismatch
+    assert torch.isnan(a[4]) and torch.isnan(b[4])
+
+
+def test_the_repair_for_the_signed_zero_depends_on_the_length(ran):
+    """The third command of the subtract-based route, run at two lengths.
+
+    abs of the difference is the only unary op that reaches the signed zero, and
+    it does not reach it the same way twice. Below 64 elements the unary kernel
+    uses its scalar tail, which is `x < 0 ? -x : x` and leaves -0.0 alone; from
+    64 it uses a mask of 0x7fff, which does not. So the same three commands on
+    the same operands answer differently at 16 and at 128, and at 16 the repair
+    repairs nothing. The two infinities survive at both lengths, so equality is
+    not a subtraction at any length.
+    """
+    a, b = torch.tensor(_A, dtype=torch.float16), torch.tensor(_B, dtype=torch.float16)
+    want_eq = [1 if bool(x) else 0 for x in a == b]
+    want_ne = [0 if bool(x) else 1 for x in want_eq]
+
+    # At sixteen elements the unary kernel takes its scalar tail, and that tail
+    # is `x < 0 ? -x : x`, which leaves -0.0 alone because -0.0 is not less than
+    # zero. So the repair fixes nothing here.
+    assert int(_as_half(ran["SUBABS"])[1].view(torch.uint16)) == 0x8000
+    assert [i for i, (w, g) in enumerate(zip(want_eq, ran["EQABS"])) if w != g] == [1, 5, 6]
+    assert [i for i, (w, g) in enumerate(zip(want_ne, ran["NEABS"])) if w != g] == [1, 5, 6]
+    # The one it fixed, named, so a later edit that loses it again is visible.
+    assert [i for i, (w, g) in enumerate(zip(want_eq, ran["EQBYTE"])) if w != g] == [1, 5, 6]
+
+    # At 128 the same three commands take the vector path, which is a mask of
+    # 0x7fff rather than a comparison, and there -0.0 does become +0.0. The two
+    # answers differ on the same elements of the same operands, so the repair is
+    # a function of the tensor's length. Neither list is the equality, because
+    # the two infinities survive both.
+    assert int(_as_half(ran["SUBABSV"])[1].view(torch.uint16)) == 0x0000
+    assert [i for i, (w, g) in enumerate(zip(want_eq, ran["EQABSV"])) if w != g] == [5, 6]
+    assert torch.isnan(_as_half(ran["SUBABSV"])[5])
 
 def test_the_reduction_refuses_one_byte_and_takes_two(ran):
     """The route that is refused, refused by the kernel and not by a clause.

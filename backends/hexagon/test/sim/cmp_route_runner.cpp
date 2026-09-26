@@ -17,6 +17,8 @@ extern "C" int htp_ops_binary_elementwise(uint8_t *dst, uint8_t *src0, uint8_t *
                                            int32_t inputIsFloat, int32_t outputIsFloat,
                                            const int32_t *broadcastParams,
                                            int32_t broadcastParamCount);
+extern "C" int htp_ops_unary(uint8_t *dst, uint8_t *src, int32_t size, int32_t opType,
+                             int32_t bytes);
 extern "C" int htp_ops_select(uint8_t *dst, uint8_t *cond_ptr, uint8_t *src1_ptr,
                               uint8_t *src2_ptr, int32_t outSize, int32_t condSize,
                               int32_t in1Size, int32_t in2Size, int32_t bytes,
@@ -55,8 +57,8 @@ static_assert(__alignof__(D) == kVectorBytes, "D is written a vector at a time")
 static_assert(__alignof__(OUT) == kVectorBytes, "OUT is written a vector at a time");
 
 /* index  pair                                  what it is for
- *  0     0.0   vs  0.0        equal, both signs equal
- *  1    -0.0   vs  0.0        equal under IEEE, apart under a total order
+ *  0     0.0   vs  0.0        equal, both zeros unsigned
+ *  1    -0.0   vs  0.0        equal under IEEE, apart under a bit test
  *  2     1.0   vs  1.0        equal, ordinary
  *  3    -1.0   vs  1.0        ordered, sign
  *  4     NaN   vs  NaN        unordered against itself
@@ -79,10 +81,31 @@ static const float B_IN[N] = {0.0f,  0.0f,  1.0f,  1.0f,  0.0f / 0.0f, 1.0f / 0.
                               -1.0f / 0.0f, 1.0f, -1.0f, 0.25f, -0.25f, 3.0f, 1.0e-4f,
                               1.0e-4f, -65504.0f, 65504.0f};
 
+/* The same sixteen pairs repeated to 128, which is the length at which the
+ * unary kernel takes its vector path: 128 / sizeof(__fp16) is 64 lanes and
+ * `vec_end = size & -vec_len` is zero for anything shorter. */
+#define BIG (8 * N)
+static _Float16 Abig[BIG] __attribute__((aligned(kVectorBytes)));
+static _Float16 Bbig[BIG] __attribute__((aligned(kVectorBytes)));
+static _Float16 Dbig[BIG] __attribute__((aligned(kVectorBytes)));
+static uint8_t OUTBIG[BIG] __attribute__((aligned(kVectorBytes)));
+static_assert(__alignof__(Abig) == kVectorBytes, "Abig is read a vector at a time");
+static_assert(__alignof__(Bbig) == kVectorBytes, "Bbig is read a vector at a time");
+static_assert(__alignof__(Dbig) == kVectorBytes, "Dbig is written a vector at a time");
+static_assert(__alignof__(OUTBIG) == kVectorBytes, "OUTBIG is written a vector at a time");
+
 static _Float16 RED_IN[ROWS * COLS] __attribute__((aligned(kVectorBytes)));
 static _Float16 RED_OUT[ROWS] __attribute__((aligned(kVectorBytes)));
 static_assert(__alignof__(RED_IN) == kVectorBytes, "RED_IN is read a vector at a time");
 static_assert(__alignof__(RED_OUT) == kVectorBytes, "RED_OUT is written a vector at a time");
+
+/* op 2 is SUB, 9 is GREATER and 10 is LESS, all three already in the enum the
+ * DSP ships. outIsFloat=1 is what makes the two compare arms write 1.0 and 0.0
+ * rather than int32 1 and 0. */
+static void compare_two(int op, const _Float16 *lhs, const _Float16 *rhs) {
+  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)lhs, (uint8_t *)rhs, N, N, N, op, 2,
+                             2, 0, 1, NULL, 0);
+}
 
 int main(void) {
   for (int i = 0; i < N; ++i) {
@@ -92,37 +115,57 @@ int main(void) {
   print_h("A", A, N);
   print_h("B", Bv, N);
 
-  /* op 2 is SUB, op 9 is GREATER and op 10 is LESS, all three already in the
-   * enum the DSP ships. outIsFloat=1 is what makes the two compare arms write
-   * 1.0 and 0.0 rather than int32 1 and 0. */
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)A, (uint8_t *)Bv, N, N, N, 2, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(2, A, Bv);
   print_h("SUB", D, N);
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)A, (uint8_t *)Bv, N, N, N, 9, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(9, A, Bv);
   print_h("GT", D, N);
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)A, (uint8_t *)Bv, N, N, N, 10, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(10, A, Bv);
   print_h("LT", D, N);
 
   /* ne: the difference is the condition, one byte out. */
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)A, (uint8_t *)Bv, N, N, N, 2, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(2, A, Bv);
   htp_ops_select(OUT, (uint8_t *)D, &ONE, &ZERO, N, N, 1, 1, B, 2, 0, 0);
   print_b("NEBYTE", OUT, N);
   /* eq: the same two sources the other way round. */
   htp_ops_select(OUT, (uint8_t *)D, &ZERO, &ONE, N, N, 1, 1, B, 2, 0, 0);
   print_b("EQBYTE", OUT, N);
   /* gt packed: the DSP's own GREATER as a one-byte result. */
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)A, (uint8_t *)Bv, N, N, N, 9, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(9, A, Bv);
   htp_ops_select(OUT, (uint8_t *)D, &ONE, &ZERO, N, N, 1, 1, B, 2, 0, 0);
   print_b("GTBYTE", OUT, N);
   /* ge: the same comparison with the sources swapped, so !(b > a). */
-  htp_ops_binary_elementwise((uint8_t *)D, (uint8_t *)Bv, (uint8_t *)A, N, N, N, 9, 2,
-                             2, 0, 1, NULL, 0);
+  compare_two(9, Bv, A);
   htp_ops_select(OUT, (uint8_t *)D, &ZERO, &ONE, N, N, 1, 1, B, 2, 0, 0);
   print_b("GEBYTE", OUT, N);
+  /* le: the mirror of ge, and it is measured rather than inferred from it. */
+  compare_two(10, Bv, A);
+  htp_ops_select(OUT, (uint8_t *)D, &ZERO, &ONE, N, N, 1, 1, B, 2, 0, 0);
+  print_b("LEBYTE", OUT, N);
+
+  /* The strongest repair available to the subtract-based route: clear the sign
+   * of the difference first, which is the one of the three misses a unary op
+   * can reach. ABS is 1 in the unary enum. */
+  compare_two(2, A, Bv);
+  htp_ops_unary((uint8_t *)D, (uint8_t *)D, N, 1, 2);
+  print_h("SUBABS", D, N);
+  htp_ops_select(OUT, (uint8_t *)D, &ONE, &ZERO, N, N, 1, 1, B, 2, 0, 0);
+  print_b("NEABS", OUT, N);
+  htp_ops_select(OUT, (uint8_t *)D, &ZERO, &ONE, N, N, 1, 1, B, 2, 0, 0);
+  print_b("EQABS", OUT, N);
+
+  /* The same three commands at a length the unary kernel vectorises. The first
+   * sixteen words are the first sixteen of the run above, so the two answers
+   * are directly comparable. */
+  for (int i = 0; i < BIG; ++i) {
+    Abig[i] = A[i % N];
+    Bbig[i] = Bv[i % N];
+  }
+  htp_ops_binary_elementwise((uint8_t *)Dbig, (uint8_t *)Abig, (uint8_t *)Bbig, BIG, BIG,
+                             BIG, 2, 2, 2, 0, 1, NULL, 0);
+  htp_ops_unary((uint8_t *)Dbig, (uint8_t *)Dbig, BIG, 1, 2);
+  print_h("SUBABSV", Dbig, N);
+  htp_ops_select(OUTBIG, (uint8_t *)Dbig, &ZERO, &ONE, BIG, BIG, 1, 1, B, 2, 0, 0);
+  print_b("EQABSV", OUTBIG, N);
 
   /* The reduction's own guard, asked the question the route asks of it. */
   int red1 = htp_ops_reduction(OUT, (uint8_t *)A, 1, N, 1, 2, B);
