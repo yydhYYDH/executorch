@@ -1,0 +1,10 @@
+[lockrun:device] 槽 0 已获取（等待 0s，可用 6834MB）
+Welcome to VyOS
+CASE=w8_m40_k25216_n64 RUNNER_EXIT=0
+CASE=w8_m40_k25216_n64 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_m40_k25216_n64-0.bin OUTPUT_BYTES=10240 SHA256=0767421e36f87e3ec9b2d247903d93b3
+CASE=w8_m40_k25216_n64 enter d0: ops=3
+CASE=w8_m40_k25216_n64 exit d0: ok
+[hexagon] pool: new block 4044800 bytes (#1)
+[hexagon] enter d0: ops=3 act=2022400 scratch=4044800 first=0 count=3
+[hexagon] exit d0: ok
+[lockrun:device] 槽 0 释放，退出码 0
