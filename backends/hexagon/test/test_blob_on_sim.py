@@ -27,8 +27,10 @@ the fixtures or the runner.
 """
 
 import operator
+import os
 import pathlib
 import struct
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -36,28 +38,39 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+# The checkout directory is itself named executorch, so putting its parent on
+# the path makes "import executorch" resolve to this tree; the editable install
+# in this environment points at a different checkout with an older backend.
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import blob_interpreter
-import hexagon_sim
-from blob_interpreter import (
+import blob_interpreter  # noqa: E402
+import hexagon_sim  # noqa: E402
+from blob_interpreter import (  # noqa: E402
     ABSENT,
     Arena,
     execute,
     read_blob,
     UnsupportedOp,
 )
-from executorch.backends.hexagon.hexagon_backend import HexagonBackend
-from executorch.backends.hexagon.prelu import PreservePRelu
-from executorch.backends.hexagon.reflect_pad import PreserveReflectPad
-from executorch.backends.hexagon.serialization import blob as _blob
-from executorch.backends.hexagon import hexagon_ops
-from executorch.backends.hexagon.hexagon_ops import sdpa_targets
-from executorch.backends.hexagon.quantizer import get_hexagon_quantizer
-from executorch.backends.hexagon.partition.hexagon_partitioner import HexagonPartitioner
-from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower
-from executorch.exir.dialects._ops import ops as exir_ops
-from torch.export import Dim, export
-from torchao.quantization.pt2e.quantize_pt2e import (
+from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
+from executorch.backends.hexagon.prelu import PreservePRelu  # noqa: E402
+from executorch.backends.hexagon.reflect_pad import PreserveReflectPad  # noqa: E402
+from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
+from executorch.backends.hexagon import hexagon_ops  # noqa: E402
+from executorch.backends.hexagon.hexagon_ops import sdpa_targets  # noqa: E402
+from executorch.backends.hexagon.quantizer import get_hexagon_quantizer  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
+    HexagonPartitioner,
+)
+from executorch.exir import (  # noqa: E402
+    EdgeCompileConfig,
+    to_edge,
+    to_edge_transform_and_lower,
+)
+from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
+from torch.export import Dim, export  # noqa: E402
+from torchao.quantization.pt2e.quantize_pt2e import (  # noqa: E402
     convert_pt2e,
     prepare_pt2e,
 )
@@ -296,7 +309,12 @@ class _Scale(torch.nn.Module):
 
 
 class _SoftmaxAt(torch.nn.Module):
-    """A contiguous softmax along a middle axis, before the host-side reshape."""
+    """A contiguous softmax along a middle axis, before the host-side reshape.
+
+    That axis is neither first nor last, and that is the only shape of it that
+    gives the kernel a real inside extent; a last-axis softmax has inside 1 and
+    takes a different path.
+    """
 
     def forward(self, x):
         return torch.softmax(x, 1)
