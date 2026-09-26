@@ -843,6 +843,22 @@ _PWL_BIAS = {
 #: eight intervals at build time (pwl.cc:9-12), which is not transcribed here, so
 #: a buffer long enough to take the walk is refused instead of answered with the
 #: scalar form the kernel would not have used.
+#:
+#: This dict is also where a second bank for an op that already has one would have
+#: to be refused rather than added, and the reason is worth carrying. A merge once
+#: left two transcriptions of sigmoid's chords in this file -- this one, and a
+#: private copy under a name of its own -- which were not the same function: the
+#: private one carried the chord multiply in fp32, while htp_ops_pwl_eval's
+#: Q6_Vqf16_vmpy_VhfVhf rounds it to fp16 first (pwl.h:91). Over every finite fp16
+#: in [-8, 8) the two differ on 978 of 36866, by up to 4.8828125e-04. What made
+#: that survivable instead of a wrong answer shipping was the shape of the
+#: dispatch: _run_unary sent numel >= _PWL_GRAIN here and the sub-grain remainder
+#: to _UNARY, and on a sub-grain remainder the private copy's own vec_end was
+#: zero, so it was DEAD -- unreachable, and the interpreter's output was already
+#: the kernel's. A dead duplicate and a live second answer are different problems
+#: wearing the same diff, and only the dispatch tells them apart. So when a second
+#: bank turns up here, find out which one _run_unary reaches before assuming the
+#: numbers come out the same either way.
 _PWL_UNTRANSCRIBED = {7: "silu's learned8 bank"}
 
 
