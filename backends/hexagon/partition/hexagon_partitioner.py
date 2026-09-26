@@ -37,6 +37,10 @@ from executorch.backends.hexagon.hexagon_ops import (
     CAST_TARGETS,
     cat_plan,
     CAT_TARGETS,
+    clamp_tensor_fits,
+    CLAMP_TENSOR_TARGETS,
+    elu_fits,
+    ELU_TARGETS,
     constant_pad_region,
     reflect_pad_regions,
     conv_spec,
@@ -703,6 +707,18 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target in sdpa and not _sdpa_fits_dsp_limits(node):
             return False
         if node.target in BINARY_TARGETS and not _broadcast_fits_dsp_limits(node):
+            return False
+        if node.target in CLAMP_TENSOR_TARGETS and not clamp_tensor_fits(node):
+            # A bound the broadcast stride table cannot read, a bound that is not
+            # a graph operand, and a clamp with no bound at all: the first two
+            # have no command form and the third is the identity the unary form
+            # already answers.
+            return False
+        if node.target in ELU_TARGETS and not elu_fits(node):
+            # A negative coefficient, and an input_scale other than one. Both
+            # make the op a function the relu-plus-min split does not compute, so
+            # the node keeps a portable kernel rather than reaching a command that
+            # would answer a different function.
             return False
         if node.target in MM_TARGETS and not _mm_operands_fit_flat_path(node):
             return False

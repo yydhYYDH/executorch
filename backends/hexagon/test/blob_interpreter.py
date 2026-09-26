@@ -89,6 +89,10 @@ REDUCTION_MEAN = 3
 #: of their own: params[3] and params[4] are its two fp16 bounds.
 _UNARY_CLAMP = 15
 
+#: HTP_OPS_UNARY_SCALE, the other: params[3] is an fp32 bit pattern rather than an
+#: fp16 one, and the kernel widens the element before it multiplies.
+_UNARY_SCALE = 17
+
 #: The DSP pool kernel's two selectors and its channel block
 #: (`hvx_pool2d_fp16`).
 POOL_MAX = 0
@@ -884,6 +888,16 @@ def _run_unary(command: Command, params: List[int], arena: Arena) -> None:
         out = np.where(isnan, values, clamped).astype(np.float16)
         _store(arena, arena.address(refs[1]), out.tobytes())
         return
+    if op_type == _UNARY_SCALE:
+        # The third entry point htp_ops_unary takes rather than an op type:
+        # params[3] is an fp32 bit pattern, and htp_ops_scale_fp32 widens each
+        # element, multiplies in fp32 and narrows once (unary_ops.cc:711-742,
+        # dispatched from execute_command.cc:390). This is what `aten.mul.Scalar`
+        # writes, and without it a blob carrying one cannot be run here at all.
+        scale = np.array([params[3]], dtype=np.int32).view(np.float32)[0]
+        out = (source.astype(np.float32) * np.float32(scale)).astype(np.float16)
+        _store(arena, arena.address(refs[1]), out.tobytes())
+        return
     if op_type not in _UNARY:
         raise UnsupportedOp(
             f"blob: unary op {op_type} has no transcription in this file"
@@ -900,8 +914,13 @@ _BINARY = {
     2: lambda a, b: a - b,
     3: lambda a, b: a * b,
     4: lambda a, b: (a.astype(np.float32) / b.astype(np.float32)).astype(np.float16),
-    5: lambda a, b: np.maximum(a, b),
-    6: lambda a, b: np.minimum(a, b),
+    # max and min are the kernel's `a > b ? a : b` and `a < b ? a : b`, which is
+    # not what numpy's maximum and minimum do: an unordered pair hands back the
+    # SECOND operand, so a NaN in the first one is dropped rather than propagated.
+    # Written out rather than called, because the operand order is the whole
+    # difference and a reader has to be able to see which one survives.
+    5: lambda a, b: np.where(a > b, a, b),
+    6: lambda a, b: np.where(a < b, a, b),
     7: lambda a, b: (  # mul_silu
         a.astype(np.float32)
         * b.astype(np.float32)

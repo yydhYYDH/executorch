@@ -259,6 +259,12 @@ BOOL_BYTES = 1
 #: The element-wise select. The library's only ATen node for it.
 WHERE = exir_ops.edge.aten.where.self
 
+#: A clamp whose bounds are tensors rather than numbers, and the exponential
+#: linear unit. Both are compositions of commands the table above already emits,
+#: which is why they cost no kernel; the docstrings on the emitters say which.
+CLAMP_TENSOR = exir_ops.edge.aten.clamp.Tensor
+ELU = exir_ops.edge.aten.elu.default
+
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
 NATIVE_LAYER_NORM = exir_ops.edge.aten.native_layer_norm.default
@@ -1846,30 +1852,46 @@ def dim_order_keeps_the_bytes(node: torch.fx.Node) -> bool:
     return order is None or list(order) == list(range(result_value.dim()))
 
 
+def _unary_command(
+    node: torch.fx.Node, ctx, src: TensorRef, out: TensorRef, numel: int, op_name: str
+) -> None:
+    """DSP_OP_UNARY over a source and destination of ours.
+
+    The source and the destination are arguments rather than the node's own
+    because the elu composition runs `exp` over an intermediate it made; the
+    kernel does not care where the value came from, only how wide it is.
+    """
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[src],
+            outputs=[out],
+            # size is in elements, not bytes.
+            params=[numel, UNARY_OP_TYPES[op_name], FP16_BYTES],
+        ),
+    )
+    _patch_dynamic_numel(ctx, op_index, node)
+
+
 def _unary(op_name: str):
     def emit(node: torch.fx.Node, ctx) -> TensorRef:
         src = node.args[0]
         _require_arena_dtype(node, f"unary {op_name} input")
         numel = _numel(node)
         out = ctx.result_for(node, numel)
-        op_index = ctx.emit(
+        _unary_command(
             node,
-            Op(
-                type=DSP_OP_UNARY,
-                inputs=[ctx.operand(src)],
-                outputs=[out],
-                # size is in elements, not bytes.
-                params=[
-                    _upper_product(tuple(_value_of(node).shape), ctx),
-                    UNARY_OP_TYPES[op_name],
-                    FP16_BYTES,
-                ],
-            ),
+            ctx,
+            ctx.operand(src),
+            out,
+            _upper_product(tuple(_value_of(node).shape), ctx),
+            op_name,
         )
-        _patch_dynamic_numel(ctx, op_index, node)
         return ctx.record(node, out)
 
     return emit
+
 
 
 def _clamp_bound_bits(bound, unbounded: float) -> int:
@@ -1881,6 +1903,34 @@ def _clamp_bound_bits(bound, unbounded: float) -> int:
     """
     value = unbounded if bound is None else float(bound)
     return int(torch.tensor(value, dtype=torch.float16).view(torch.uint16).item())
+
+
+def _clamp_command(
+    node: torch.fx.Node, ctx, src: TensorRef, out: TensorRef, numel: int, lower, upper
+) -> None:
+    """DSP_OP_UNARY's clamp entry point over a source and destination of ours.
+
+    The source and the destination are arguments rather than the node's own
+    because the elu composition clamps two intermediates of its own: the kernel
+    does not care where the values came from, only how wide they are.
+    """
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[src],
+            outputs=[out],
+            # size is in elements, not bytes, as in _unary.
+            params=[
+                numel,
+                UNARY_OP_TYPES["clamp"],
+                FP16_BYTES,
+                _clamp_bound_bits(lower, float("-inf")),
+                _clamp_bound_bits(upper, float("inf")),
+            ],
+        ),
+    )
+    _patch_dynamic_numel(ctx, op_index, node)
 
 
 def _emit_clamp_bounds(node: torch.fx.Node, ctx, lower, upper) -> TensorRef:
@@ -1897,23 +1947,15 @@ def _emit_clamp_bounds(node: torch.fx.Node, ctx, lower, upper) -> TensorRef:
     _require_arena_dtype(node, "clamp input")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.emit(
+    _clamp_command(
         node,
-        Op(
-            type=DSP_OP_UNARY,
-            inputs=[ctx.operand(src)],
-            outputs=[out],
-            # size is in elements, not bytes, as in _unary.
-            params=[
-                _upper_product(tuple(_value_of(node).shape), ctx),
-                UNARY_OP_TYPES["clamp"],
-                FP16_BYTES,
-                _clamp_bound_bits(lower, float("-inf")),
-                _clamp_bound_bits(upper, float("inf")),
-            ],
-        ),
+        ctx,
+        ctx.operand(src),
+        out,
+        _upper_product(tuple(_value_of(node).shape), ctx),
+        lower,
+        upper,
     )
-    _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
 
 
@@ -1941,6 +1983,229 @@ def _emit_relu(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_clamp_bounds(node, ctx, 0.0, None)
 
 
+def clamp_tensor_bounds(node: torch.fx.Node) -> Tuple[Optional[torch.fx.Node], Optional[torch.fx.Node]]:
+    """`aten.clamp.Tensor`'s min and max operands, or None for an absent one."""
+
+    return (
+        node.args[1] if len(node.args) > 1 else None,
+        node.args[2] if len(node.args) > 2 else None,
+    )
+
+
+def clamp_tensor_fits(node: torch.fx.Node) -> bool:
+    """Whether both bounds are operands the binary stride table can read.
+
+    The two commands are the ordinary binary max and min, so each bound has to
+    satisfy what `_broadcast_fits_dsp_limits` asks of a binary's own operands:
+    either a single element or the whole output, at rank 8 or below. A clamp with
+    neither bound is the identity, which `_emit_clamp` already answers with the
+    infinities, and a bound that is a literal belongs to that overload rather than
+    to this one.
+    """
+    if not node.args or not isinstance(node.args[0], torch.fx.Node):
+        return False
+    out_shape = tuple(_value_of(node).shape)
+    if len(out_shape) > MAX_BROADCAST_RANK:
+        return False
+    lower, upper = clamp_tensor_bounds(node)
+    if lower is None and upper is None:
+        return False
+    for bound in (lower, upper):
+        if bound is None:
+            continue
+        if not isinstance(bound, torch.fx.Node):
+            return False
+        value = _value_of(bound)
+        if value.dtype not in (torch.float16, torch.float32):
+            return False
+        if len(value.shape) > MAX_BROADCAST_RANK:
+            return False
+        try:
+            _broadcast_strides(tuple(value.shape), out_shape, _UPPER_SHAPE)
+        except ValueError:
+            return False
+    return True
+
+
+def _emit_clamp_tensor(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.clamp.Tensor as the two binary commands a clamp already is.
+
+    `min(max(x, lo), hi)`, one `BINARY_ELEMENTWISE` per bound, and therefore
+    wire-exact: a max and a min pick one of their two operands and compute
+    nothing, so every element of the answer is a pair of bytes the graph already
+    had. A one-sided clamp is the one command, not a pair.
+
+    The bound goes in as the FIRST operand on purpose. The kernel's max is
+    `a > b ? a : b` and its min `a < b ? a : b` (eltwise_ops.cc:152-155), so
+    what survives an unordered pair is the second one, and the activation is the
+    second operand here -- so a NaN activation comes back as a NaN, as torch's
+    clamp has it. A NaN *bound* is the one case this drops rather than
+    propagates; so does the two-select form, because the comparison in front of
+    it is what drops it, and so does the portable kernel's own answer differ.
+    """
+    src = node.args[0]
+    _require_arena_dtype(node, "clamp.Tensor input")
+    out_shape = tuple(_value_of(node).shape)
+    if any(isinstance(dim, torch.SymInt) for dim in out_shape):
+        raise RuntimeError("hexagon: clamp.Tensor requires static dimensions")
+    out_numel = _upper_product(out_shape, ctx)
+    out = ctx.result_for(node, out_numel)
+    lower, upper = clamp_tensor_bounds(node)
+    value = ctx.operand(src)
+    if lower is not None:
+        bound_shape = tuple(_value_of(lower).shape)
+        held = out if upper is None else ctx.activation_for_shape(out_shape)
+        _emit_binary_refs(
+            node,
+            ctx,
+            ctx.operand(lower),
+            value,
+            _upper_product(bound_shape, ctx),
+            out_numel,
+            bound_shape,
+            out_shape,
+            out_shape=out_shape,
+            op_name="max",
+            out=held,
+        )
+        value = held
+    if upper is not None:
+        bound_shape = tuple(_value_of(upper).shape)
+        _emit_binary_refs(
+            node,
+            ctx,
+            ctx.operand(upper),
+            value,
+            _upper_product(bound_shape, ctx),
+            out_numel,
+            bound_shape,
+            out_shape,
+            out_shape=out_shape,
+            op_name="min",
+            out=out,
+        )
+    return ctx.record(node, out)
+
+#: The three coefficients `aten.elu` carries, read off the node in the positions
+#: its schema puts them in: `alpha`, `scale` and `input_scale`.
+def elu_coefficients(node: torch.fx.Node):
+    return (
+        _scalar_arg(node, "alpha", 1, 1.0),
+        _scalar_arg(node, "scale", 2, 1.0),
+        _scalar_arg(node, "input_scale", 3, 1.0),
+    )
+
+
+def elu_fits(node: torch.fx.Node) -> bool:
+    """Whether this elu is the split the DSP's commands can compute.
+
+    torch's kernel is `a < 0 ? expm1(a * input_scale) * (alpha * scale) : a *
+    scale` (ATen/native/cpu/Elu.h:25-31), and the composition here is that read
+    as `max(a, 0) * scale + min(exp(a) - 1) * (alpha * scale), 0)`. The rewrite is
+    the identity only when the second term is non-positive wherever the first is
+    not, so both coefficients have to be non-negative; and `input_scale` has to
+    be one, because the DSP has no `expm1` to fold an argument scale into. The
+    unary table has no elu of its own (1..17, unary_ops.cc:14-31) and the binary
+    table no slope form (1..12): the reason this op is cheap is the composition,
+    which is what makes the three refusals here the whole of the gate.
+    """
+    alpha, scale, input_scale = elu_coefficients(node)
+    if None in (alpha, scale, input_scale):
+        return False
+    if input_scale != 1.0:
+        return False
+    return all(math.isfinite(value) and value >= 0.0 for value in (alpha, scale))
+
+
+def _emit_elu(node: torch.fx.Node, ctx) -> TensorRef:
+    """aten.elu as six commands, or seven when it carries a `scale`.
+
+    `max(x, 0) * scale + min((exp(x) - 1) * alpha * scale, 0)`: the clamp entry
+    point is the relu and the min, the unary table's `exp` is the exponential,
+    and the two binaries are the `exp(x) - 1` and its scale. No command here is
+    new to this backend and no kernel is new to the DSP.
+
+    The clamp kernel restores a NaN input by a bit test (unary_ops.cc:498-541),
+    so both halves hand a NaN back as a NaN and the add of two NaNs is the NaN
+    torch's kernel has already made by the time it narrows. The cost is the
+    fp16 step at every stage: measured against `F.elu` on `randn * 2` the
+    largest difference is 9.766e-04, which is one fp16 step at the top of that
+    range, and over a grid from -30 to 8 it is the same figure.
+    """
+    src = node.args[0]
+    _require_arena_dtype(node, "elu input")
+    out_shape = tuple(_value_of(node).shape)
+    if any(isinstance(dim, torch.SymInt) for dim in out_shape):
+        raise RuntimeError("hexagon: elu requires static dimensions")
+    alpha, scale, _ = elu_coefficients(node)
+    numel = _upper_product(out_shape, ctx)
+    out = ctx.result_for(node, numel)
+    value = ctx.operand(src)
+
+    exponential = ctx.activation_for_shape(out_shape)
+    _unary_command(node, ctx, value, exponential, numel, "exp")
+    shifted = ctx.activation_for_shape(out_shape)
+    _emit_binary_refs(
+        node, ctx, exponential, ctx.scalar(1.0), numel, 1, out_shape, (), out_shape, "sub", shifted
+    )
+    scaled = ctx.activation_for_shape(out_shape)
+    _emit_binary_refs(
+        node,
+        ctx,
+        shifted,
+        ctx.scalar(alpha * scale),
+        numel,
+        1,
+        out_shape,
+        (),
+        out_shape,
+        "mul",
+        scaled,
+    )
+    negative = ctx.activation_for_shape(out_shape)
+    _clamp_command(node, ctx, scaled, negative, numel, None, 0.0)
+    positive = ctx.activation_for_shape(out_shape)
+    _clamp_command(node, ctx, value, positive, numel, 0.0, None)
+    if scale != 1.0:
+        # torch's positive branch is `a * scale` computed in fp32 and rounded
+        # once, which is what the mul_scalar entry point is for; a fp16 multiply
+        # here would round twice.
+        widened = ctx.activation_for_shape(out_shape)
+        _mul_scalar_command(node, ctx, positive, widened, numel, scale)
+        positive = widened
+    _emit_binary_refs(
+        node, ctx, positive, negative, numel, numel, out_shape, out_shape, out_shape, "add", out
+    )
+    return ctx.record(node, out)
+
+
+def _mul_scalar_command(
+    node: torch.fx.Node, ctx, src: TensorRef, out: TensorRef, numel: int, scale: float
+) -> None:
+    """DSP_OP_UNARY's mul_scalar entry point over a ref pair of ours.
+
+    params[3] is the scale as an fp32 bit pattern, because widening to fp32 is
+    the whole point of the entry point: torch multiplies a half tensor by a
+    python float in fp32 and rounds the product back.
+    """
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[src],
+            outputs=[out],
+            params=[
+                numel,
+                UNARY_OP_TYPES["mul_scalar"],
+                FP16_BYTES,
+                struct.unpack("<i", struct.pack("<f", float(scale)))[0],
+                0,
+            ],
+        ),
+    )
+    _patch_dynamic_numel(ctx, op_index, node)
+
+
 def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
     """A fp16 tensor times a python float, widened to fp32 to multiply.
 
@@ -1955,22 +2220,14 @@ def _emit_mul_scalar(node: torch.fx.Node, ctx) -> TensorRef:
     _require_arena_dtype(node, "mul scalar")
     numel = _numel(node)
     out = ctx.result_for(node, numel)
-    op_index = ctx.emit(
+    _mul_scalar_command(
         node,
-        Op(
-            type=DSP_OP_UNARY,
-            inputs=[ctx.operand(values)],
-            outputs=[out],
-            params=[
-                _upper_product(tuple(_value_of(node).shape), ctx),
-                UNARY_OP_TYPES["mul_scalar"],
-                FP16_BYTES,
-                struct.unpack("<i", struct.pack("<f", float(scale)))[0],
-                0,
-            ],
-        ),
+        ctx,
+        ctx.operand(values),
+        out,
+        _upper_product(tuple(_value_of(node).shape), ctx),
+        scale,
     )
-    _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
 
 
@@ -2003,6 +2260,33 @@ def _emit_row_guard(node: torch.fx.Node, ctx) -> TensorRef:
     )
     _patch_dynamic_numel(ctx, op_index, node)
     return ctx.record(node, out)
+
+
+#: The widest broadcast the binary descriptor can name: the tail after params[8] is
+#: a rank, the output extents, and one stride list per operand, all inside the
+#: 40-int command budget (9 for the head, 25 for the tail, and a rank 9 needs 33).
+MAX_BROADCAST_RANK = 8
+
+
+class _UpperShape:
+    """The upper bound of a shape, for the stride check outside a lowering.
+
+    `_broadcast_strides` asks a context for the upper bound of every extent it
+    walks, because a run-time length is a number the runtime refills. A support
+    predicate has no context, and the export's own bound is the right answer
+    there: it is the largest extent the node can be given.
+    """
+
+    @staticmethod
+    def upper_shape(shape):
+        return tuple(
+            eval_upper_bound(extent) if isinstance(extent, torch.SymInt)
+            else int(extent)
+            for extent in shape
+        )
+
+
+_UPPER_SHAPE = _UpperShape()
 
 
 def _shape_of(operand) -> tuple:
@@ -7820,6 +8104,12 @@ EMITTERS = {
     exir_ops.edge.aten.silu.default: _unary("silu"),
     exir_ops.edge.aten.clamp.default: _emit_clamp,
     exir_ops.edge.aten.clamp.out: _emit_clamp,
+    # The bounds as tensors, which the scalar form above cannot hold: two binary
+    # commands where the scalar form is one unary. See _emit_clamp_tensor.
+    CLAMP_TENSOR: _emit_clamp_tensor,
+    # No unary subtype is an elu (1..17) and no binary one is a slope (1..12), so
+    # this is six or seven commands of types the table already has. See _emit_elu.
+    ELU: _emit_elu,
     # torch computes hardtanh as clamp and gives min_val/max_val the slots
     # clamp's min/max occupy, so one emitter covers both (and relu6, which is
     # F.hardtanh(x, 0, 6)).
@@ -7958,6 +8248,12 @@ BINARY_TARGETS = frozenset(
 # Same reasoning as BINARY_TARGETS: mm derives its strides from the operand
 # shapes, which is only right for contiguous 2-D tiles.
 MM_TARGETS = frozenset({exir_ops.edge.aten.mm.default})
+
+# A clamp against tensor bounds, and an elu. Both gates live in hexagon_ops
+# (`clamp_tensor_fits`, `elu_fits`) because both emitters read the same things
+# those decide: the bounds' strides, and the three coefficients.
+CLAMP_TENSOR_TARGETS = frozenset({CLAMP_TENSOR})
+ELU_TARGETS = frozenset({ELU})
 
 # The one target whose condition operand is legitimately one byte wide, which is
 # why operand_dtypes_are_readable has to know its name.
