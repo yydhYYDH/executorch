@@ -67,6 +67,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
+import executorch.backends.hexagon.partition.hexagon_partitioner as _PARTITIONER_MODULE  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
 )
@@ -426,6 +427,24 @@ _FUNCTIONS_YAML = (
 )
 
 
+def _assert_measuring_this_checkout():
+    """The precondition, as an assertion rather than a printed path.
+
+    The editable install puts a finder on `sys.meta_path`, which is consulted
+    before `sys.path`, and it points at a different checkout. Measured here it
+    loses anyway -- every module in this file resolves under this tree -- but
+    that is an ordering accident, not a guarantee, and a print is a line
+    nobody has to read. A negative attribute control cannot stand in for it:
+    `hasattr(hexagon_ops, "DSP_OP_MATMUL_Q4A16_FP16") is False` holds on a tree
+    262 commits behind this one and is True on this one, because int4 prefill
+    has since been wired up.
+    """
+    root = os.fspath(pathlib.Path(__file__).resolve().parents[3])
+    for module in (hexagon_ops, _PARTITIONER_MODULE, _blob):
+        where = os.fspath(pathlib.Path(module.__file__))
+        assert where.startswith(root + os.sep), f"measuring {where}, not {root}"
+
+
 def _portable_spellings():
     return {
         "aten::" + line.split("op: ", 1)[1].strip()
@@ -480,6 +499,7 @@ def test_sort_is_the_one_family_here_with_no_portable_spelling_to_fall_back_on(
     claim, and the registry read is paired with the names the rows above
     already depend on, so a reader that returned nothing could not pass.
     """
+    _assert_measuring_this_checkout()
     args = (torch.randn(1, 64, dtype=F16),)
 
     count, names = _named(_sorted, args)
@@ -521,6 +541,7 @@ def test_the_unpacked_spelling_is_what_cannot_be_written_and_that_is_not_about_k
     runtime will look up: `topk` writes one and is registered, and `sort`
     writes one and is not.
     """
+    _assert_measuring_this_checkout()
     args = (torch.randn(1, 64, dtype=F16),)
 
     for label, namedtuple_op in (
