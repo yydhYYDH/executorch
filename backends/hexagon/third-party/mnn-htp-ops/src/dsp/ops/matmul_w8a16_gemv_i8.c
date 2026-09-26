@@ -49,14 +49,21 @@
 // -------- helpers (mirror matmul_q4block_gemv_i8.c) -------------------------
 
 // fp16 -> signed int16, round-to-nearest. On v81+ the native Q6_Vh_vcvt_Vhf maps
-// to a single instruction; on v79 and earlier the compiler lowers it to a runtime
-// helper (__qf_convert_hf_to_h_rne) that is not present in the DSP skel, so use
-// Q6_Vh_equals_Vhf there (available on all HVX arches; same fp16->int16 convert).
+// to a single instruction. Below v81 there is no round-to-nearest convert:
+// Q6_Vh_equals_Vhf_rnd is declared only under __HVX_ARCH__ >= 81, and
+// Q6_Vh_vcvt_Vhf lowers to the runtime helper __qf_convert_hf_to_h_rne. So bias
+// by a half-ulp away from zero and let the truncating convert finish the job;
+// it ties to even only where the input is exactly *.5.
 static inline HVX_Vector vhf_to_h_round(HVX_Vector s) {
 #if defined(HTP_OPS_SKEL_ARCH) && (HTP_OPS_SKEL_ARCH >= 0x81)
   return Q6_Vh_vcvt_Vhf(s);
 #else
-  return Q6_Vh_equals_Vhf(s);
+  const HVX_Vector     zero_v   = Q6_V_vzero();
+  const HVX_Vector     pos_half = Q6_Vh_vsplat_R(0x3800);  // fp16  0.5
+  const HVX_Vector     neg_half = Q6_Vh_vsplat_R(0xB800);  // fp16 -0.5
+  const HVX_VectorPred neg      = Q6_Q_vcmp_gt_VhfVhf(zero_v, s);
+  const HVX_Vector     bias     = Q6_V_vmux_QVV(neg, neg_half, pos_half);
+  return Q6_Vh_equals_Vhf(Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(s, bias)));
 #endif
 }
 
