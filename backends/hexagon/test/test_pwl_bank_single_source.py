@@ -121,32 +121,42 @@ def _int_seq(node):
 def _bank_bits(node):
     """The uint16 bit patterns a definition denotes, however it spells them.
 
-    Two spellings are in the tree for the same sixteen bits: the bare tuple of hex
-    literals blob_interpreter writes, and an np.array of uint16 seen through a
-    `.view(np.float16)`, which a test file wants because it indexes the table
-    straight with the chord index. The reader takes the literals out of either one
-    rather than caring which a file picked, because the question is which bits a
-    file holds, not how it holds them.
+    Three spellings are in the tree for the same sixteen bits: the bare tuple of hex
+    literals blob_interpreter writes, and an np.array of uint16 with or without the
+    trailing `.view(np.float16)`, which a test file wants because it indexes the
+    table straight with the chord index. The reader takes the literals out of any of
+    them rather than caring which one a file picked, because the question is which
+    bits a file holds, not how it holds them -- and the `view` is optional on
+    purpose: requiring it left a hand-written `np.array([...], dtype=np.uint16)` as
+    a copy the guard could not see, which is the one way this reader was allowed to
+    be wrong.
+
+    What it cannot do is read a bank assembled some other way, at run time rather
+    than as literals. A person transcribing sixteen numbers writes literals; if that
+    stops being true this reader has to be taught the new spelling, and the control
+    below is what tells you it has not been.
     """
     direct = _int_seq(node)
     if direct is not None:
         return direct
+    if not isinstance(node, ast.Call):
+        return None
+    # np.array([...]) is the bank; np.array([...]).view(np.float16) is the bank
+    # behind a view, so unwrap the view before deciding.
+    inner = (
+        node.func.value
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "view"
+        else node
+    )
     if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "view"
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Attribute)
+        and inner.func.attr in ("array", "asarray")
+        and inner.args
+        and isinstance(inner.args[0], ast.List)
     ):
         return None
-    array = node.func.value
-    if not (
-        isinstance(array, ast.Call)
-        and isinstance(array.func, ast.Attribute)
-        and array.func.attr == "array"
-        and array.args
-        and isinstance(array.args[0], ast.List)
-    ):
-        return None
-    return _int_seq(ast.Tuple(elts=array.args[0].elts, ctx=ast.Load()))
+    return _int_seq(ast.Tuple(elts=inner.args[0].elts, ctx=ast.Load()))
 
 
 def _table_banks(node):
@@ -261,12 +271,17 @@ def test_a_copy_that_is_put_back_is_found(tmp_path):
     """The guard below, shown red on a tree that does hold a second copy.
 
     Built in a temporary directory and out of the bits the reader already found, so
-    no bank is written out a second time anywhere in this file. Three files: one
-    restating a transcribed bank in the np.array spelling, one restating it in the
-    bare-tuple spelling, and one holding sixteen ints that are not a bank. The
-    first two have to be named and the third must not be, because a guard that
-    reports any sixteen-int table is a guard that gets switched off the first time
-    it is wrong.
+    no bank is written out a second time anywhere in this file. Five files: three
+    restating a transcribed bank, in the `.view(np.float16)` spelling, in the plain
+    `np.array` spelling and in the bare-tuple spelling; one holding sixteen ints
+    that are not a bank; and one that *derives* the same bits by indexing the dict
+    and must not be reported, because deriving it from blob_interpreter is the thing
+    a second copy is supposed to become.
+
+    The five matter in both directions. A guard that reports any sixteen-int table
+    gets switched off the first time it is wrong, and a guard that cannot tell a
+    transcription from a derivation is a guard that fails the file everyone is being
+    told to write.
     """
     slope = transcribed_banks()[f"_PWL_SLOPE[{_SIGMOID}]"]
     literals = ", ".join(str(value) for value in slope)
@@ -275,8 +290,16 @@ def test_a_copy_that_is_put_back_is_found(tmp_path):
             "import numpy as np\n"
             f"_PRIVATE_SLOPE = np.array([{literals}], dtype=np.uint16).view(np.float16)\n"
         ),
+        "array_no_view.py": (
+            "import numpy as np\n"
+            f"_PRIVATE_SLOPE_PLAIN = np.array([{literals}], dtype=np.uint16)\n"
+        ),
         "tuple_spelling.py": f"_PRIVATE_BIAS = {tuple(_PWL_BIAS[_SIGMOID])!r}\n",
         "unrelated.py": f"_SOMETHING_ELSE = {tuple(range(16))!r}\n",
+        "derived.py": (
+            "import numpy as np\n"
+            f"_DERIVED = np.asarray(_PWL_SLOPE[{_SIGMOID}], np.uint16).view(np.float16)\n"
+        ),
     }
     for name, text in files.items():
         (tmp_path / name).write_text(text)
@@ -285,6 +308,7 @@ def test_a_copy_that_is_put_back_is_found(tmp_path):
         (path.name, path.read_text()) for path in sorted(tmp_path.glob("*.py"))
     )
     assert sorted(hits) == [
+        ("array_no_view.py", "_PRIVATE_SLOPE_PLAIN", f"_PWL_SLOPE[{_SIGMOID}]"),
         ("array_spelling.py", "_PRIVATE_SLOPE", f"_PWL_SLOPE[{_SIGMOID}]"),
         ("tuple_spelling.py", "_PRIVATE_BIAS", f"_PWL_BIAS[{_SIGMOID}]"),
     ], f"{hits}"
