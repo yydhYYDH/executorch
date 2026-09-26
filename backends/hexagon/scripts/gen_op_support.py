@@ -515,13 +515,18 @@ SUPPORTED: List[OpSupport] = [
         "any channel count: the DSP activation blocking is a count of 64-lane "
         "blocks rather than a shape, c4 carries ceil(C/64) and the kernel walks "
         "every one of them, so a wider pool is the same command with a larger c4. "
-        "Also 3-D or 4-D operand; static shapes; dilation 1, ceil_mode false, and "
-        "every window holding at least one input element. Three commands per "
-        "three blocks: one blit carrying a region per block into the blocked "
-        "layout, the pool, one blit back out (a 1x1 spatial extent over whole "
-        "blocks and a batch of one needs neither, the layouts already agree), "
-        "plus a ZERO before the pack when C is not a multiple of 64, because the "
-        "kernel loads whole vectors out of lanes the pack does not write.",
+        "Also 3-D or 4-D operand; static shapes; dilation 1, and every window "
+        "holding at least one input element. ceil_mode is the same command at a "
+        "different size: oh and ow are two of the fifteen params and the walk "
+        "skips whatever falls outside the input, which is torch's own clip. torch "
+        "drops the last output position when it would start at or past the padded "
+        "input, so a ceil window runs off the edge without ever being a window "
+        "over nothing. Three commands per three blocks: one blit carrying a "
+        "region per block into the blocked layout, the pool, one blit back out (a "
+        "1x1 spatial extent over whole blocks and a batch of one needs neither, "
+        "the layouts already agree), plus a ZERO before the pack when C is not a "
+        "multiple of 64, because the kernel loads whole vectors out of lanes the "
+        "pack does not write.",
     ),
     OpSupport(
         "aten.max_pool2d_with_indices.default",
@@ -539,7 +544,14 @@ SUPPORTED: List[OpSupport] = [
         "fp16 (arena); fp32 narrowed on entry",
         "As max_pool2d.default. count_include_pad selects the divisor the kernel "
         "takes (the window's area, or the positions that landed inside); "
-        "divisor_override has no command form and keeps the node portable.",
+        "divisor_override has no command form and keeps the node portable. Under "
+        "ceil_mode a window that hangs off the padded edge divides by the part "
+        "still inside it, which is a third divisor the command has no param for: "
+        "an average that counts the padding is portable exactly when ceil_mode "
+        "changes the shape, and at every geometry where ceil_mode is a no-op it "
+        "runs. count_include_pad=False divides by the window clipped to the raw "
+        "input, which is the kernel's own count, so that one takes ceil mode at "
+        "any geometry.",
     ),
     OpSupport(
         "aten._adaptive_avg_pool2d.default",

@@ -149,26 +149,32 @@ class _Embedding(nn.Module):
 
 
 class _Pool(nn.Module):
-    """`nn.MaxPool2d(2)` or `nn.AvgPool2d(2)` over `channels` channels at 16x16.
+    """`nn.MaxPool2d` or `nn.AvgPool2d` over `channels` channels at 16x16.
 
     Built as the module and not as `functional.max_pool2d`, so the row is the
     spelling a model has: the two go through the same gate, but the module is the
     one the spelling census measured, and it has no indexing node of its own.
+    The kernel and stride are arguments because a 2x2 at stride 2 over an even
+    16x16 is the one geometry ceil mode cannot change, so a row that is about
+    ceil mode has to be able to ask for a stride the size does not divide.
     """
 
-    def __init__(self, channels, kind="max", **kwargs):
+    def __init__(self, channels, kind="max", kernel=2, stride=2, size=16, **kwargs):
         super().__init__()
         self.channels = channels
         pool = nn.MaxPool2d if kind == "max" else nn.AvgPool2d
-        self.pool = pool(2, 2, **kwargs)
+        self.pool = pool(kernel, stride, **kwargs)
+        self.size = size
 
     def forward(self, x):
         return self.pool(x)
 
 
-def _pool(channels, kind="max", **kwargs):
-    return _Pool(channels, kind, **kwargs), (
-        torch.randn(1, channels, 16, 16, dtype=F16),
+def _pool(channels, kind="max", size=16, **kwargs):
+    kernel = kwargs.pop("kernel_size", 2)
+    stride = kwargs.pop("stride", 2)
+    return _Pool(channels, kind, kernel, stride, size, **kwargs), (
+        torch.randn(1, channels, size, size, dtype=F16),
     )
 
 
@@ -188,15 +194,27 @@ _ROWS = [
     ("max pool at 64 channels", *_pool(64), {}, 1),
     ("average pool at 3 channels", *_pool(3, kind="avg"), {}, 1),
     ("average pool at 64 channels", *_pool(64, kind="avg"), {}, 1),
+    # ceil mode used to be refused outright. It is the same command at a
+    # different size, so these two are delegates; the first is a size where the
+    # window runs off the edge and the second is one where it does not.
     (
-        "max pool at 64 channels with dilation: the kernel has none",
-        *_pool(64, dilation=2),
-        {MAX_POOL: 1},
+        "max pool with ceil_mode: the last window runs off the edge",
+        *_pool(64, size=8, kernel_size=3, stride=3, ceil_mode=True),
+        {},
+        1,
+    ),
+    (
+        "average pool with ceil_mode over a clipped window: the divisor is not",
+        *_pool(
+            64, kind="avg", size=8, kernel_size=3, stride=3, ceil_mode=True,
+            count_include_pad=True,
+        ),
+        {AVG_POOL: 1},
         0,
     ),
     (
-        "max pool at 64 channels with ceil_mode",
-        *_pool(64, ceil_mode=True),
+        "max pool at 64 channels with dilation: the kernel has none",
+        *_pool(64, dilation=2),
         {MAX_POOL: 1},
         0,
     ),
@@ -380,7 +398,10 @@ def test_the_diagnostic_cannot_change_a_verdict(monkeypatch):
     corpus = [
         ("pool 3", *_pool(3, dilation=2)),
         ("pool 64", *_pool(64)),
-        ("avg pool 3", *_pool(3, kind="avg", ceil_mode=True)),
+        (
+            "avg pool ceil",
+            *_pool(3, kind="avg", size=8, kernel_size=3, stride=3, ceil_mode=True),
+        ),
         (
             "conv depthwise",
             _Conv(16, 16, groups=16),

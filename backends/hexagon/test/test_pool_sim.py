@@ -84,25 +84,36 @@ _SHAPES = [
 ]
 
 
-def _operands(channels, batch, seed):
+def _operands(channels, batch, seed, size=8):
     """Values in [-4, 4) from a generator this file pins.
 
     The reference and the blob have to see the same bytes, which they do because
     both are built from this one call rather than from two torch calls.
     """
     gen = torch.Generator().manual_seed(seed)
-    return (torch.rand(batch, channels, 8, 8, generator=gen) * 8 - 4).to(torch.float16)
-
-
-def _out_shape(ih, iw, kernel, stride, padding):
-    """torch's floor-mode output size, which is the geometry the command carries."""
     return (
-        (ih + 2 * padding - kernel) // stride + 1,
-        (iw + 2 * padding - kernel) // stride + 1,
-    )
+        torch.rand(batch, channels, size, size, generator=gen) * 8 - 4
+    ).to(torch.float16)
 
 
-def _reference(x, kind, kernel, stride, padding, count_include_pad):
+def _out_shape(ih, iw, kernel, stride, padding, ceil_mode=False):
+    """torch's output size, which is the geometry the command carries.
+
+    Ceil mode is torch's own arithmetic and not the numerator's ceiling: it adds
+    stride - 1 and then drops the last output position once, when that window
+    would start at or past size + pad.
+    """
+    out_h = (ih + 2 * padding - kernel + (stride - 1 if ceil_mode else 0)) // stride + 1
+    out_w = (iw + 2 * padding - kernel + (stride - 1 if ceil_mode else 0)) // stride + 1
+    if ceil_mode:
+        if (out_h - 1) * stride >= ih + padding:
+            out_h -= 1
+        if (out_w - 1) * stride >= iw + padding:
+            out_w -= 1
+    return out_h, out_w
+
+
+def _reference(x, kind, kernel, stride, padding, count_include_pad, ceil_mode=False):
     """torch's answer, computed in fp64 and rounded once.
 
     This is not the kernel's arithmetic -- the kernel accumulates in fp16 and
@@ -111,10 +122,17 @@ def _reference(x, kind, kernel, stride, padding, count_include_pad):
     """
     wide = x.to(torch.float64)
     if kind == "max":
-        out = torch.nn.functional.max_pool2d(wide, kernel, stride, padding)
+        out = torch.nn.functional.max_pool2d(
+            wide, kernel, stride, padding, ceil_mode=ceil_mode
+        )
     else:
         out = torch.nn.functional.avg_pool2d(
-            wide, kernel, stride, padding, count_include_pad=count_include_pad
+            wide,
+            kernel,
+            stride,
+            padding,
+            count_include_pad=count_include_pad,
+            ceil_mode=ceil_mode,
         )
     return out.to(torch.float16)
 
@@ -276,3 +294,128 @@ def test_one_block_and_two_blocks_are_the_same_kernel_on_the_dsp():
     assert two[:, 64:].tobytes() == one.tobytes(), (
         "the second block is not the first one"
     )
+
+
+#: The ceil-mode shapes, one letter each in a range this file owns. Every one of
+#: them is a size where ceil mode changes the answer, which is the point: the
+#: floor cases above already pin the window walk, and a case where ceil equals
+#: floor would test the spelling rather than the geometry.
+#:
+#: (tag, channels, kind, kernel, stride, padding, count_include_pad, size).
+_CEIL_SHAPES = [
+    ("Q0", 64, "max", 3, 3, 0, True, 7),   # the last window holds 1x1 of 3x3
+    ("Q1", 64, "max", 3, 2, 1, True, 10),  # a stride of two at a resnet stem size
+    ("Q2", 128, "max", 2, 2, 0, True, 9),  # two whole blocks
+    ("Q3", 96, "max", 3, 2, 1, True, 10),  # a ragged block and a padding
+    ("Q4", 64, "avg", 3, 3, 0, False, 8),  # the divisor is the 2x2 that is left
+    ("Q5", 64, "avg", 3, 2, 1, False, 10),
+    ("Q6", 96, "avg", 2, 3, 0, False, 7),  # a stride wider than the kernel stride
+    ("Q7", 65, "avg", 3, 4, 1, False, 12), # a narrow tail at a wide stride
+    ("Q8", 128, "avg", 2, 2, 0, True, 9),  # counts the padding, and does not
+]                                             # change: the floor control
+
+
+def _ceil_cases():
+    cases = []
+    for tag, channels, kind, kernel, stride, padding, cip, size in _CEIL_SHAPES:
+        x = _operands(channels, 1, 3000 + size * 10 + kernel, size=size)
+        model = _Pool(
+            kind, kernel, stride, padding, count_include_pad=cip, ceil_mode=True
+        )
+        expected = _reference(
+            x, kind, kernel, stride, padding, cip, ceil_mode=True
+        )
+        floor = _Pool(kind, kernel, stride, padding, count_include_pad=cip)
+        assert expected.shape != floor(x).shape, (
+            f"{tag}: ceil mode does not change this shape, so it is not a case"
+        )
+        cases.append(
+            _case(
+                tag,
+                model,
+                (x,),
+                _bits(expected),
+                kind="close" if kind == "avg" else "bits",
+                tolerance=_AVERAGE_TOLERANCE if kind == "avg" else None,
+            )
+        )
+    return cases
+
+
+@pytest.fixture(scope="module")
+def ceil_cases():
+    return _ceil_cases()
+
+
+@pytest.fixture(scope="module")
+def ceil_simulated(ceil_cases):
+    hexagon_sim._check()
+    return _run(ceil_cases)
+
+
+def test_a_ceil_mode_blob_carries_torchs_own_extents(ceil_cases):
+    """The command is the one floor mode emits, at a different size.
+
+    Ceil mode is not a second command: it is the same fifteen params with oh and
+    ow replaced by torch's numbers, so a case whose blob carried anything else
+    would be measuring the emitter rather than the kernel.
+    """
+    for case, shape in zip(ceil_cases, _CEIL_SHAPES):
+        tag, channels, kind, kernel, stride, padding, cip, size = shape
+        pool = next(c for c in case.commands if c.type == _POOL)
+        want = _reference(
+            _operands(channels, 1, 3000 + size * 10 + kernel, size=size),
+            kind,
+            kernel,
+            stride,
+            padding,
+            cip,
+            ceil_mode=True,
+        )
+        assert int(pool.params[1]) == size and int(pool.params[2]) == size
+        assert (int(pool.params[3]), int(pool.params[4])) == tuple(
+            want.shape[-2:]
+        ), f"{tag}: the command does not carry torch's ceil extent"
+        assert int(pool.params[6]) == kernel and int(pool.params[7]) == kernel
+        assert int(pool.params[13]) == (0 if kind == "avg" and not cip else 1), (
+            f"{tag}: the divisor is not the one this shape asks for"
+        )
+
+
+@pytest.mark.parametrize(
+    "tag, channels, kind, kernel, stride, padding, cip, size",
+    _CEIL_SHAPES,
+    ids=[shape[0] for shape in _CEIL_SHAPES],
+)
+def test_the_dsp_pools_a_window_that_runs_off_the_edge(
+    ceil_simulated, ceil_cases, tag, channels, kind, kernel, stride, padding, cip, size
+):
+    """This tier's whole reason to exist.
+
+    The host interpreter models pool_fp16.c, so a green host case says the
+    command is shaped the way the kernel's source reads and nothing about the
+    kernel. Here the DSP walks a window whose last row or column is past the
+    input, and the answer is torch's: the clip at pool_fp16.c:36-43, the
+    divisor at :74-79, and the output extent are all three exercised by a case
+    where floor mode would have produced a different tensor.
+    """
+    case = next(c for c in ceil_cases if c.tag == tag)
+    dsp = ceil_simulated[tag + "0"]
+    assert dsp, f"{tag}: the simulator returned nothing for this fixture"
+    shape = (1, channels) + _out_shape(size, size, kernel, stride, padding, True)
+    got = _from_bits(dsp).reshape(shape)
+    expected = _from_bits(
+        [int(v) for v in case.expected.view(np.uint16).tolist()]
+    ).reshape(shape)
+    if kind == "max":
+        assert got.tobytes() == expected.tobytes(), (
+            f"{tag}: the DSP disagrees with the fp64 reference"
+        )
+    else:
+        np.testing.assert_allclose(
+            got.astype(np.float64),
+            expected.astype(np.float64),
+            rtol=_AVERAGE_TOLERANCE,
+            atol=_AVERAGE_TOLERANCE,
+            err_msg=f"{tag}: the DSP disagrees with the fp64 reference",
+        )
