@@ -53,7 +53,8 @@ COMPARISON_TARGETS = {
 
 #: Targets that are wired, at the geometry the comparisons above are refused at.
 #: A refusal assertion is vacuous against a support object that refuses
-#: everything, so every count below is read beside these.
+#: everything, so every count below is read beside these. Three of them reach
+#: the graph in the census test; the other two are here for the table check.
 CONTROL_TARGETS = {
     "add": _EDGE.add.Tensor,
     "sub": _EDGE.sub.Tensor,
@@ -62,7 +63,9 @@ CONTROL_TARGETS = {
     "where": _EDGE.where.self,
 }
 
-_CONTROL_TARGETS = (
+#: The three the census graph carries, so a control that is merely "some node was
+#: accepted" cannot be satisfied by a placeholder.
+_GRAPH_CONTROLS = (
     _EDGE.add.Tensor,
     _EDGE.relu.default,
     _EDGE.maximum.default,
@@ -250,7 +253,7 @@ def test_six_comparisons_refuse_and_three_wired_ops_of_the_same_geometry_do_not(
     controls = {
         target: verdicts[target]
         for target in verdicts
-        if target in set(_CONTROL_TARGETS)
+        if target in set(_GRAPH_CONTROLS)
     }
     assert set(comparisons) == set(COMPARISON_TARGETS.values()), sorted(
         str(t) for t in comparisons
