@@ -32,8 +32,8 @@ from blob_interpreter import read_blob
 import sys as _sys
 
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from second_opinion import own_gate_report  # noqa: E402
-from own_clause import own_gate_clause  # noqa: E402
+from tenrefuse_second_opinion import own_gate_report  # noqa: E402
+from tenrefuse_own_clause import own_gate_clause  # noqa: E402
 
 DELEGATE = torch.ops.higher_order.executorch_call_delegate
 
