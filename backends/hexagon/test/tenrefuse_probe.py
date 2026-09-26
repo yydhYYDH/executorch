@@ -23,14 +23,26 @@ from executorch.backends.hexagon.partition import hexagon_partitioner as HP
 from executorch.backends.hexagon.partition.hexagon_partitioner import (
     HexagonOperatorSupport,
     HexagonPartitioner,
+    _data_placeholders,
 )
 from executorch.backends.hexagon.hexagon_backend import SUPPORTED_TARGETS, EMITTERS
 from executorch.exir import to_edge_transform_and_lower
 from blob_interpreter import read_blob
 
+import sys as _sys
+
+_sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from second_opinion import own_gate_report  # noqa: E402
+from own_clause import own_gate_clause  # noqa: E402
+
 DELEGATE = torch.ops.higher_order.executorch_call_delegate
 
 WATCHED = {"aten::add", "aten::sub", "aten::cat", "aten::index", "aten::cumsum"}
+
+#: Set to "all" to watch every target in the emitter table rather than the five
+#: the census named, which is how the sweep asks whether the ten are the whole
+#: set of supported-row refusals or a sample of one.
+WATCH = os.environ.get("PROBE_WATCH", "five")
 
 
 def target_name(node) -> str:
@@ -100,7 +112,9 @@ class RefusalTrace:
         def wrapped(support, submodules, node):
             trace.calls += 1
             name = target_name(node)
-            watched = name in WATCHED and node.op == "call_function"
+            watched = node.op == "call_function" and (
+                name in WATCHED if WATCH == "five" else node.target in SUPPORTED_TARGETS
+            )
             lines = []
             if watched:
 
@@ -128,7 +142,12 @@ class RefusalTrace:
                         "in_emitters": node.target in EMITTERS,
                     },
                 )
+                # Which of the partitioner's two censuses counted this node:
+                # a REFUSAL is a supported row turned away, an UNWIRED entry is
+                # a target with no emitter at all. The ten cannot be read without
+                # telling them apart, because the second kind is not a gate.
                 rec["args"] = arg_repr(node)
+                rec["_node"] = node
                 rec["out"] = shape_repr(val_of(node))
                 rec["calls"] = rec.get("calls", 0) + 1
                 rec["verdict"] = verdict
@@ -183,11 +202,29 @@ def main():
     ids = torch.tensor([[17, 91, 5]], dtype=torch.int64)
     exported = export(model, (ids,))
 
+    HP.reset_refused_overload_census()
+    HP.reset_unwired_overload_census()
     trace = RefusalTrace()
     with trace:
         lowered = to_edge_transform_and_lower(
             exported, partitioner=[HexagonPartitioner()]
         ).exported_program()
+    refused_census = HP.refused_overload_census()
+    unwired_census = HP.unwired_overload_census()
+
+    # The traced verdict is the first reason. This asks each refused node\'s OWN
+    # gate directly, so a width that excuses a node on its own is not confused
+    # with a width that happens to arrive first in front of a second problem.
+    support = HexagonOperatorSupport(
+        frozenset(_data_placeholders(exported)), exported
+    )
+    for rec in trace.records.values():
+        node = rec.get("_node")
+        if node is not None and not rec["verdict"]:
+            rec.update(own_gate_report(node, support))
+            clause = own_gate_clause(node, support)
+            if clause is not None:
+                rec["own_gate_clause"] = clause
 
     gm = lowered.graph_module
     graph = gm.graph
@@ -227,7 +264,7 @@ def main():
     )
     records = []
     for rec in trace.records.values():
-        r = dict(rec)
+        r = {k: v for k, v in rec.items() if k != "_node"}
         r["refuse_source"] = line_text(rec["refuse_line"]) if "refuse_line" in rec else None
         r["in_delegate"] = rec["name"] in inner_names
         records.append(r)
@@ -243,6 +280,8 @@ def main():
             "portable_targets": dict(portable_targets),
         },
         "census_buckets_recomputed": census_buckets,
+        "refused_overload_census": refused_census,
+        "unwired_overload_census": unwired_census,
         "support_calls": trace.calls,
         "watched_records": records,
     }
