@@ -823,16 +823,21 @@ _ROWS = [
         [("aten.ne.Tensor", "unwired")],
     ),
     (
+        # The two order relations the DSP's own op types answer, as a binary
+        # compare and a one-byte select. The Scalar overload of the same source
+        # expression is the row below, and it stays unwired because a python
+        # literal reaches ctx.operand as an fp16 constant rather than as a
+        # tensor the compare can read.
         "gt.Tensor",
         lambda a, b: a > b,
         (_x(8), _x(8)),
-        [("aten.gt.Tensor", "unwired")],
+        [("aten.gt.Tensor", "wired")],
     ),
     (
         "lt.Tensor",
         lambda a, b: a < b,
         (_x(8), _x(8)),
-        [("aten.lt.Tensor", "unwired")],
+        [("aten.lt.Tensor", "wired")],
     ),
     (
         "ge.Tensor",
