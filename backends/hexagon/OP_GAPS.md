@@ -29,6 +29,15 @@ exist, which is also why §3's last entry is a composition rather than a kernel.
 | **refused** | the predicate rejects this node, which falls back to a portable kernel. That is the intended outcome, not a failure: the alternative is an emitter reading an operand it does not understand |
 | **unwired** | no emitter at all. `is_node_supported` returns `False` before it reads anything, so no line of the graph says why |
 
+A **refused** node has a reason, and `PARTITION_GATES.md` is where that reason is: the
+fifty-six clauses of `HexagonOperatorSupport._verdict`, fifty-five of them each with the
+nodes it held on a 21-graph model corpus and on the census rows below, and whether
+removing it would be safe. The arg-reduction gate is the one without counts, because it
+was added after those two corpora were taken and is listed with none rather than with
+invented ones.
+`test_partition_gates.py` asserts the two agree, so a clause added to the partitioner shows
+up there rather than only in the source.
+
 The distinction matters because only the last one is a gap that hides. A refused
 node costs speed; an unwired op costs speed and leaves nothing to grep for.
 `unwired_overload_census()` (`partition/hexagon_partitioner.py`) records every
