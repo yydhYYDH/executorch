@@ -124,7 +124,7 @@ def test_the_table_row_is_the_supported_target_row_too():
     assert COMPARISON_TARGETS == frozenset({GREATER_THAN, LESS_THAN})
 
 
-def test_the_four_comparisons_left_out_are_absent_and_the_two_kept_are_not():
+def test_the_four_comparisons_left_out_are_absent_and_the_two_kept_are_present():
     """The stop-at-gt-and-lt boundary, with a control that is present.
 
     eq, ne, ge and le are out for arithmetic reasons rather than spelling ones,
