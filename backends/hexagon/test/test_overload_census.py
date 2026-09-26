@@ -450,7 +450,11 @@ _ROWS = [
         [
             ("dim_order_ops._clone_dim_order.default", "wired"),
             ("dim_order_ops._clone_dim_order.default", "wired"),
-            ("aten.clamp.Tensor", "unwired"),
+            # Was `unwired`, and the predicate does not refuse it: a lifted
+            # constant bound is a single element, which is the flat path. The
+            # clamp is min(max(x, lo), hi), so it costs two binary commands
+            # where the scalar overload costs one unary one, and it delegates.
+            ("aten.clamp.Tensor", "wired"),
         ],
     ),
     (
@@ -466,10 +470,10 @@ _ROWS = [
         [("aten.leaky_relu.default", "wired")],
     ),
     (
-        "elu",
+        "elu, which is a composition and not a unary subtype",
         lambda a: torch.nn.functional.elu(a),
         (_x(8),),
-        [("aten.elu.default", "unwired")],
+        [("aten.elu.default", "wired")],
     ),
     (
         "prelu decomposes, and both halves of it are wired",

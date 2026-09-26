@@ -192,6 +192,20 @@ SUPPORTED: List[OpSupport] = [
         "Same kernel as clamp.default; the out= variant is registered separately.",
     ),
     OpSupport(
+        "aten.clamp.Tensor",
+        BINARY,
+        ARENA_FP16,
+        "Bounds are tensors rather than the params the unary clamp carries, so "
+        "this is `min(max(x, lo), hi)`: one BINARY_ELEMENTWISE per bound, and a "
+        "max or a min picks one of its operands without computing, so the answer "
+        "is wire-exact. One bound is one command. Each bound is either a single "
+        "element or the whole output, at rank 8 or below, and the bound goes in as "
+        "the first operand so that an unordered pair -- a NaN activation -- "
+        "leaves the activation in place, as torch's clamp does. A NaN *bound* is "
+        "dropped rather than propagated, which is what the comparison in front of "
+        "a select-based form does too.",
+    ),
+    OpSupport(
         "aten.mul.Scalar",
         UNARY,
         ARENA_FP16,
@@ -519,6 +533,22 @@ SUPPORTED: List[OpSupport] = [
         "torch computes hardtanh as clamp, so one emitter covers both. `relu6` is "
         "this op with (0, 6) -- `F.relu6`, `nn.ReLU6` and `nn.Hardtanh` all "
         "arrive here.",
+    ),
+    OpSupport(
+        "aten.elu.default",
+        UNARY + " / " + BINARY,
+        ARENA_FP16,
+        "No unary subtype is an elu (1..17) and no binary one a slope (1..12), "
+        "so this is a composition: `max(x, 0) * scale + min((exp(x) - 1) * "
+        "alpha * scale, 0)`, which is six commands -- the unary exp, a binary "
+        "subtract of one, a binary multiply by `alpha * scale`, the clamp entry "
+        "point twice for the relu and the min, and a binary add. Seven when `scale` "
+        "is not 1, which is how `nn.SELU` arrives; the extra one is the "
+        "`mul_scalar` entry point, because torch's positive branch is `a * scale` "
+        "in fp32 rounded once. The rewrite is only the identity when the negative "
+        "term is non-positive wherever the positive one is not, so `alpha` and "
+        "`scale` must both be non-negative, and `input_scale` must be 1 because "
+        "the DSP has no expm1 to fold an argument scale into. Static extents only.",
     ),
     OpSupport(
         "aten.pow.Tensor_Scalar",
@@ -1224,22 +1254,23 @@ NOT_SUPPORTED = [
         "one command, so the shape is refused rather than half applied.",
     ),
     (
-        "aten.elu.default",
-        "No kernel: elu needs a scale and an input-sign branch the unary table "
-        "does not carry, and no composition of the existing commands evaluates "
-        "it. Leaky ReLU, which shares that shape of problem, is wired instead "
-        "because the relu kernel does carry the slope.",
+        "aten.prod.default",
+        "No kernel. The reduction table has sum, maximum, mean and minimum; a "
+        "running product is a different walk. The log/sum/exp substitute that "
+        "stands in for it is inexact as well, and a sixteen-element product of "
+        "values in [2, 3] already reaches 2**16 and overflows fp16 to infinity.",
     ),
     (
-        "aten.prod.default, aten.var.correction",
-        "No kernel. The reduction table has sum, maximum and mean; a running "
-        "product and a second moment are each a different walk.",
-    ),
-    (
-        "aten.clamp.Tensor",
-        "The operand is the parameter: clamp's entry point carries its bounds as "
-        "two fp16 params and cannot hold a tensor, so the node stays portable "
-        "rather than being read as a scalar operand.",
+        "aten.var.correction",
+        "No kernel, and no composition of the existing commands is a substitute "
+        "for it. The two-pass form -- mean, subtract, square, mean, scale -- is "
+        "four or five commands of types the table already has and reproduces the "
+        "fp16 two-pass bit for bit, but it is not `torch.var`: measured against "
+        "torch on fp16 the two differ by 6.2e-04 relative on centred data and "
+        "2.5e-03 on data with a mean of 200, and the square is materialised in "
+        "fp16, so a deviation past 256 overflows to infinity where torch's "
+        "accumulator, which is fp32 throughout, does not. The export cannot bound "
+        "the deviation, so the node keeps a portable kernel.",
     ),
     (
         "aten.pow.Tensor_Tensor outside {-1, 0, 1, 2, 3, 4}",
