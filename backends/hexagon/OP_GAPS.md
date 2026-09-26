@@ -8,18 +8,28 @@
      question, and what either costs a real model. Every claim below names the
      file it was read from, so a reader can tell a measurement from a reading. -->
 
-Computed against `53369ff` on 2026-09-24 and re-measured as the parallel branches
-landed -- `topk`'s values half before `b7183d9`, then the element-wise select, the
-quantized prefill entry, the zero-filling pad, the split, the transposed
-convolution and the three norms, and then the second batch: the run-time convolution
-extents, the batch-norm fold, the mask an SDPA node carries, the permutation
-gate, the integer nearest resize, and the prefill ceiling the device work measured
-(`K <= 12672` under the dispatcher's `M <= 32` split). The library inventory below is
-the vendored tree, which none of them changed. Section 2 counts two commands more
-than `b7183d9` did, because two kernels have left its table: `DSP_OP_SELECT`(26)
-and `DSP_OP_MATMUL_Q4A16_FP16`(22). Section 1 lost a row for a different reason:
-`_log_softmax` gained no kernel, but it is a composition of commands that already
-exist, which is also why §3's last entry is a composition rather than a kernel.
+Computed against `bbe19c9` on 2026-09-27. Every count below was re-derived on
+that tree rather than carried forward, and the appendix names the command for each
+one: the census rows and op verdicts, the command-type partition in §2, the clause
+count behind `PARTITION_GATES.md`, and the pool divisor in §4. The earlier bases --
+`53369ff` on 2026-09-24, then `b7183d9` -- are history and their numbers are not
+repeated here. What landed between: `topk`'s values half before `b7183d9`, then
+the element-wise select, the quantized prefill entries, the zero-filling pad, the
+split, the transposed convolution and the three norms, and then the second batch --
+the run-time convolution extents, the batch-norm fold, the mask an SDPA node
+carries, the permutation gate, the integer nearest resize, the arg reduction,
+`clamp` and `elu`, the `gt`/`lt` comparison, and the prefill ceiling the device
+work measured (`K <= 12672` under the dispatcher's `M <= 32` split). The library
+inventory below is the vendored tree, which none of them changed. §2's table is now
+21 rows and 26 command types are named by an emitter site, where the header used to
+say 20 and 23: four have left the table since -- `DSP_OP_SELECT`(26),
+`DSP_OP_MATMUL_Q4A16_FP16`(22), `DSP_OP_ARGMAX_FP16`(47), and the comparison rows
+`gt`/`lt`, which reach `DSP_OP_BINARY_ELEMENTWISE`(19) followed by a one-byte
+`DSP_OP_SELECT`(26) rather than a kernel of their own -- while
+`DSP_OP_MATMUL_W8A16_BLOCK_FP16`(42) has entered it as a row that says it is
+wired. §1 lost a row for a different reason: `_log_softmax` gained no kernel, but
+it is a composition of commands that already exist, which is also why §3's last
+entry is a composition rather than a kernel.
 
 ## The three verdicts
 
@@ -30,27 +40,43 @@ exist, which is also why §3's last entry is a composition rather than a kernel.
 | **unwired** | no emitter at all. `is_node_supported` returns `False` before it reads anything, so no line of the graph says why |
 
 A **refused** node has a reason, and `PARTITION_GATES.md` is where that reason is: the
-fifty-six clauses of `HexagonOperatorSupport._verdict`, fifty-five of them each with the
+fifty-six clauses of `HexagonOperatorSupport._verdict` -- counted here as the
+`return False` that closes a top-level `if` in that method, 56 of them in
+`partition/hexagon_partitioner.py:679-1025` -- fifty-five of them each with the
 nodes it held on a 21-graph model corpus and on the census rows below, and whether
 removing it would be safe. The arg-reduction gate is the one without counts, because it
 was added after those two corpora were taken and is listed with none rather than with
 invented ones.
 `test_partition_gates.py` asserts the two agree, so a clause added to the partitioner shows
 up there rather than only in the source.
+Two of the numbers that sentence rests on are `PARTITION_GATES.md`'s own and are
+**not** re-derived here: its header pins itself to `cef244b` on `hexagon-gateinv`,
+and its §9 says the 21-graph model corpus is hand-written and not in the tree. The
+clause count above is; the per-clause node counts are inherited, and its own rows
+figure (131 designed rows) is below the 134 those tables hold today.
 
 The distinction matters because only the last one is a gap that hides. A refused
 node costs speed; an unwired op costs speed and leaves nothing to grep for.
 `unwired_overload_census()` (`partition/hexagon_partitioner.py`) records every
 target absent from the table while its family is present, and
-`test_overload_census.py` + `test_overload_census2.py` pin 126 census rows whose
-187 op verdicts are 112 wired, 37 refused and 38 unwired. That count is one
+`test_overload_census.py` + `test_overload_census2.py` pin 134 census rows whose
+196 op verdicts are 140 wired, 29 refused, 25 unwired and 2 accepted. That count is one
 verdict per op listed in the row tables those two files are parametrized over --
 the rule the appendix writes out, so the numbers can be re-derived rather than
-believed; the same two files collect 149 tests, because 23 of them assert inside
-a body instead of once per row. The row figure is the one that rule yields --
-103 + 17 + 6, the two `_ROWS` tables and `_QUANTIZED_ROWS` -- and the sentence it
-replaces read 127, which is three more rows than those tables hold at any revision
-measured: 122 at `7dc3368` and 124 at `b7183d9`, the two counting the same way.
+believed; the same two files collect 155 tests, of which 134 are the one-per-row
+cases and 21 assert inside a body instead. The row figure is the one that rule
+yields -- 107 + 17 + 10, the two `_ROWS` tables and `_QUANTIZED_ROWS`, the
+third being new since this file was written -- and the four verdict kinds have to
+sum to the verdict count, which they do: 140 + 29 + 25 + 2 = 196. A decomposition
+with no arithmetic on it is a list, not a census.
+Both censuses are per-process accumulators keyed by node (`_UNWIRED_NODES` is a
+`weakref.WeakSet`, so a node is counted once however many times the partitioner
+asks about it), which is what makes them node counts rather than call counts --
+and also what makes a count of *targets* a property of whatever corpus was lowered
+in that process. In a fresh process on this tree both return `{}`, which is the
+in-tree assertion `test_overload_census2.py:639` makes. A target count therefore
+needs a model corpus, the one `PARTITION_GATES.md` §9 says is not in the tree, so
+this file quotes no target count at all rather than inheriting one.
 
 ## 1. The vendored library has no kernel at all
 
@@ -65,7 +91,7 @@ contain the operator, so an emitter would have nothing to call.
 | `aten.erf.default` | No `HtpOpsUnaryOpType` entry: the enum is 1..17 (`unary_ops.cc:14-31`) |
 | `aten.leaky_relu.default` | The binary table has no slope form (`eltwise_ops.cc:27-38`) and the unary table no leaky relu. Leaky ReLU is a supported row now and `aten.elu.default` is not: the elu composition is `max(x, 0) * scale + min((exp(x) - 1) * alpha * scale, 0)`, six commands of types the table already has, and the split is only the identity when the negative term is non-positive wherever the positive one is not, so a negative `alpha` or `scale` is refused rather than emitted as a different function |
 | `aten.convolution.default` with a group count above 1, not the depthwise form, and a height that is a run-time length | A group count needs no channel mapping on the kernel at all once the host partitions it, so the rest of this family is a supported row: a plain grouped convolution is one dense im2col command per group (`_emit_grouped_convolution` in `hexagon_ops.py`; 48 commands at `groups == 8` over 32 input channels to 64 outputs, `test_grouped_conv.py`), a grouped transposed one is the same partition behind the zero-insert (24 commands at `groups == 4`), and a dilated transposed window keeps its dilation on the kernel, since the im2col walk consumes the fields directly (`conv_spec`, 4 commands at `dilation == 2`). A run-time height is affine in the length for a single walk, which is why a stride-1 plain convolution and the depthwise form both still delegate with one (`test_conv_dynamic_height.py`). It is not affine per group: each group's plane extents and its own slice offsets reach a different command, so the patch would need a record per command rather than the one record the run-time length gets, and the case stays on the portable kernels rather than being emitted with the export's example extent baked in |
-| `aten.conv3d.default` with a genuinely three-dimensional window, `aten.conv_transpose3d.input` | `Im2ColParameter` is `padX`, `padY`, `dilateX`, `dilateY`, `strideX`, `strideY`, `kernelX`, `kernelY`, `iw`, `ih`, `ow`, `oh` -- no depth axis exists (`ops.h:45`), so nothing here walks a volume. 3-D is a different kernel rather than another parameter set, and the two-dimensional identity above cannot be stretched to it. A rank-5 input does reach the two-dimensional kernel, but only through the rank-5 fold `conv_spec` already has (`hexagon_ops.py:4327-4370`): the window must be 1x1xK with stride 1, padding 0 and dilation 1 on the dropped axis, that axis must be 1 in input and output, and the other kept extent must be 1 as well -- a 1x1x3 window over `[1, C, 1, 1, W]` delegates as `[24, 3, 12, 3]`, while a 1xKx1 window (`Conv3d(3, 5, (3, 1, 1))` on `[1, 3, 5, 1, 9]`) is refused. `aten.conv_transpose3d.input` is refused for every geometry: the transposed branch returns before the fold. `test_conv_3d.py` pins the refusals and `test_decompose_conv3d.py` the opt-in 1x1xK depthwise rewrite |
+| `aten.conv3d.default` with a genuinely three-dimensional window, `aten.conv_transpose3d.input` | `Im2ColParameter` is `padX`, `padY`, `dilateX`, `dilateY`, `strideX`, `strideY`, `kernelX`, `kernelY`, `iw`, `ih`, `ow`, `oh` -- no depth axis exists (`ops.h:45`), so nothing here walks a volume. 3-D is a different kernel rather than another parameter set, and the two-dimensional identity above cannot be stretched to it. A rank-5 input does reach the two-dimensional kernel, but only through the rank-5 fold `conv_spec` already has (`hexagon_ops.py:5043-5087`): the window must be 1x1xK with stride 1, padding 0 and dilation 1 on the dropped axis, that axis must be 1 in input and output, and the other kept extent must be 1 as well -- a 1x1x3 window over `[1, C, 1, 1, W]` delegates as `[24, 3, 12, 3]`, while a 1xKx1 window (`Conv3d(3, 5, (3, 1, 1))` on `[1, 3, 5, 1, 9]`) is refused. `aten.conv_transpose3d.input` is refused for every geometry: the transposed branch returns before the fold. `test_conv_3d.py` pins the refusals and `test_decompose_conv3d.py` the opt-in 1x1xK depthwise rewrite |
 | `aten.upsample_bilinear2d.vec` | No sampling command: `DSPOpType` (`htp_command.h:32`) has no upsample case and no kernel source mentions interpolation, and bilinear is arithmetic rather than an index map -- its taps alternate with the output row's parity, so it is neither a shift-invariant filter nor the constant-kernel transposed convolution that would let the convolution walk carry it. Nearest was in this row and is not any more: at an exact integer ratio its replication is a set of `s * s` destination-phase regions, each an affine map that reads the whole plane at the same strides, so `aten.upsample_nearest2d.vec` is a supported row now (`upsample_regions` in `hexagon_ops.py`). The ratio that is not an integer multiple is a refusal rather than a gap -- the runs of repeated source elements are then of unequal length, so the phases stop being a constant stride apart -- and `test_upsample.py` pins both sides. `nearest-exact` and `upsample_bicubic2d` are not this row at all: export decomposes them into arithmetic, and the nearest-exact spelling reaches the portable kernels on two `aten.arange.start_step` nodes that have no emitter (measured on `interpolate(..., mode="nearest-exact")`) |
 | `aten.repeat.default` with two or more axes above one | One repeated axis is `cat([x] * factor, dim=axis)`: two loops, so one region, with the factor on a level's extent rather than on a region per phase -- which is why a factor of 64 costs the same single region a factor of two does, and why nothing here needs a region count past the one a serialised command already holds. Two repeated axes are four loops against a region's three levels. The host composes them from successive single-axis repeats exactly, so the shape is a refusal rather than a gap, and a refusal rather than a half-applied axis. A zero-filling `constant_pad_nd` was listed here and is not of this kind: it is a `DSP_OP_ZERO` memset plus one region, both already emitted for other ops, so it is a supported row now (`constant_pad_region` in `hexagon_ops.py`). A pad on a third axis from the end, a nonzero `value` and a negative pad still stay on the portable kernels -- the region is three levels and `htp_ops_zero` writes zero and nothing else |
 | `aten.pow.Tensor_Tensor` with a base that is not a static value | No pow kernel: the supported exponents lower to the existing unary or binary elementwise commands, and the gate that decides which (`pow_tensor_tensor_is_emittable`) asks for a base the export can read as a value, so a base computed at run time is refused. With a static base and a uniform integral exponent in `{-1, 0, 1, 2, 3, 4}` the node is a supported row; anything outside that set, a non-integral or non-uniform exponent, and a non-finite base stay portable. `test_pow_tensor_tensor.py` covers both sides at the command stream |
@@ -94,15 +120,21 @@ tensor, so a bound that is an operand becomes `min(max(x, lo), hi)` -- one
 `BINARY_ELEMENTWISE` per bound, and a max and a min pick one of their operands
 without computing, so the result is wire-exact rather than close. Putting the
 *bound* first is what carries a NaN activation through the kernel's
-`a > b ? a : b` (`eltwise_ops.cc:152`); putting it second would have dropped the
+`a > b ? a : b` (`eltwise_ops.cc:153`); putting it second would have dropped the
 NaN, and a NaN *bound* is dropped either way, which is the one input on which
 this is not `torch.clamp` and is pinned in `test_zero_cost_ops.py`.
 
 ## 2. Kernels present, nothing on the host emits them
 
 `htp_command.h:32-85` declares 49 op types. 44 have a `case` in
-`execute_command.cc`, and the host side emits 23 of them. The other 20 are
-kernels the skel links and exports with nothing that can reach them:
+`execute_command.cc`, and 26 of them are named by a `type=` site in
+`hexagon_ops.py` -- the set `test_blob_interpreter.py` pins, and the only reading
+of "the host emits" used here that is derived rather than believed. It counts
+command types an emitter site can name, not commands a graph has produced: it
+includes `DSP_OP_RELU`(37) and `DSP_OP_PRELU`(39), which two rows below say
+nothing reaches. The other 21 rows are kernels the skel links and exports with
+nothing that can reach them -- except `DSP_OP_MATMUL_W8A16_BLOCK_FP16`(42), whose
+row says it is wired:
 
 | value | DSP op | kernel | what an emitter would serve |
 |---|---|---|---|
@@ -110,14 +142,14 @@ kernels the skel links and exports with nothing that can reach them:
 | 6 | `DSP_OP_LOOP_BLIT` | `htp_ops_loop_blit` | unread |
 | 7 | `DSP_OP_TENSOR_CONVERT` | `htp_ops_tensor_convert` | deliberately unused: the cast table has no FP32 forms, and the runtime converts at the arena boundary instead |
 | 9 | `DSP_OP_LAYER_NORM_PACKED` | `htp_ops_layer_norm_packed` | a packed-input form of a norm that is already wired |
-| 10 | `DSP_OP_WEIGHT_REORDER` | `htp_ops_weight_reorder` | see §6: the README says init uses this; nothing calls it |
-| 11 | `DSP_OP_WEIGHT_REORDER_INT4` | `htp_ops_weight_reorder_int4` | same |
+| 10 | `DSP_OP_WEIGHT_REORDER` | `htp_ops_weight_reorder` | unread. The README used to name this one as an init step and no longer names it anywhere; nothing under `runtime/`, the emitters or the partitioner emits it -- §6 |
+| 11 | `DSP_OP_WEIGHT_REORDER_INT4` | `htp_ops_weight_reorder_int4` | same. The README's one surviving mention of a reorder command is this constant, at line 521, and the sentence it carries describes a delegation the host does not do -- §6 |
 | 13 | `DSP_OP_SCALE` | `htp_ops_scale` | unread. `aten.mul.Scalar` goes through `UNARY`'s `SCALE`(17) subtype, not this op type |
 | 15 | `DSP_OP_ROPE_FUSE_LAYERNORM` | `htp_ops_rope_fuse_layernorm` | a fused rope + norm, one command where two are emitted now |
 | 17 | `DSP_OP_CONV1X1_DIRECT_FP16` | `htp_ops_conv1x1_direct_fp16` | wired, and it adds no kernel: the name is a second entry for `hmx_im2col_convolution_fp16` (`im2col_convolution_fp16.cc:1840`), and the emitter's `conv_1x1_direct_applies` picks 17 only for the geometry whose 1x1 activation fill is the plane copy or the strided gather, falling back to 12 for a padded, dilated, batched, ragged, depthwise, transposed or non-1x1 window. §6.1 |
 | 25 | `DSP_OP_CAST` | `htp_ops_cast` | deliberately unused, as 7 |
 | 30 | `DSP_OP_RELU6` | `htp_ops_relu6` | deliberately unused: `relu6` is `hardtanh(0, 6)` and goes through `UNARY`/`CLAMP`, the entry point that restores a NaN by a bit test |
-| 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | not an emitter: the kernel wants a separate fp16 `[O][R]` predicate operand (`eltwise_ops.cc:2959`) that no ATen node carries, and the graphs that come closest already answer correctly as two commands. A fusion target, not a missing line -- §7 |
+| 31 | `DSP_OP_MASKED_REDUCTION` | `htp_ops_masked_reduction` | not an emitter: the kernel wants a separate fp16 `[O][R]` predicate operand (`eltwise_ops.cc:2957`) that no ATen node carries, and the graphs that come closest already answer correctly as two commands. A fusion target, not a missing line -- §7 |
 | 32 | `DSP_OP_TMAC_A16W1` | `htp_ops_tmac_a16w1_fp16` | 1-bit weights |
 | 33 | `DSP_OP_FLASH_ATTENTION_BLOCK` | `htp_ops_flash_attention_block` | a blockwise attention |
 | 34 | `DSP_OP_MATMUL_Q4A16_BLOCK_FP16` | `htp_ops_matmul_q4block_a16_fp16` | quantized prefill, block-scaled form |
@@ -128,20 +160,22 @@ kernels the skel links and exports with nothing that can reach them:
 | 42 | `DSP_OP_MATMUL_W8A16_BLOCK_FP16` | `hmx_matmul_w8a16_block_fp16` | quantized prefill, int8 weights, **wired**. Alongside the int4 prefill entry (22), which the block-scaled int4 form extends, the int8 entry emits command 42 for `M > 1` with a tiled int8 weight and an fp16 per-channel scale tail. The ceiling beside it is the one in §4: `K % 64 == 0`, `N % 32 == 0`, and `K <= 12672` below the dispatcher's `M <= 32` split |
 | 44 | `DSP_OP_VISION_FLASH_ATTENTION_FP16` | `htp_ops_vision_flash_attention_fp16` | a vision attention variant |
 
-Of the 49, 44 have a dispatcher case: the 23 the host emits, the 20 above, and
-`GET_INFO`(20), which the host never emits either. The 5 without one are
-`RESERVED_0`(0), `RESERVED_21`(21), `COMMAND_GROUP`(99) and `MAX`(100) --
-protocol, not gaps -- and `DSP_OP_POST_ATTN_REDUCE_FUSE`(35), which §6 is about.
+Of the 49, 44 have a dispatcher case, and the partition is exact rather than
+approximate: the 26 an emitter site names, the 21 rows above, and `GET_INFO`(20),
+which no emitter names and no row claims -- 26 + 21 + 1 less the four rows that are
+in both sets (17, 37, 39, 42) is 44, with nothing left over on either side. The 5
+without a case are `RESERVED_0`(0), `RESERVED_21`(21), `COMMAND_GROUP`(99) and
+`MAX`(100) -- protocol, not gaps -- and `DSP_OP_POST_ATTN_REDUCE_FUSE`(35), which
+§6 is about.
 
-Four rows have left this table, one per merge: `DSP_OP_TOPKV2_K1_FP16`(27) when
-`topk`'s values half landed, `DSP_OP_MATMUL_Q4A16_FP16`(22) with the int4
 Five rows have left this table, one per merge: `DSP_OP_TOPKV2_K1_FP16`(27) when
 `topk`'s values half landed, `DSP_OP_MATMUL_Q4A16_FP16`(22) with the int4
 quantized prefill entry, `DSP_OP_SELECT`(26) with `aten.where.self`,
 `DSP_OP_ARGMAX_FP16`(47) with `argmax`/`argmin`, and the comparison rows with
-`gt`/`lt`. The counts above read 21 and 21 where `b7183d9` read 19 and 23: the
-same table with two fewer rows and the command set with four more. Each is worth
-reading in §3, and the ones that carry a qualification are there: the prefill
+`gt`/`lt`. The counts above read 26 and 21; the header used to read 23 and 20,
+and the sentence that placed them against `b7183d9`'s 19 and 23 is not re-derived
+here. Each is worth reading in §3, and the ones that carry a qualification are
+there: the prefill
 entry reaches neither the int4 nor the int8 weight above its measured ceiling,
 `where` is placed while the comparison that produces its condition is not, and the
 arg reduction walks the last axis only. The `gt` and `lt` rows close that last
@@ -231,7 +265,7 @@ one byte, not a kernel.
   question the wrong way round -- whether the kernel's condition operand accepts
   what a comparison writes. It does: `htp_ops_select` carries a `condBytes` and
   `htp_ops_select_cond_at` reads flagwise when it is one
-  (`eltwise_ops.cc:2116-2125`). What had to be settled was the runtime's side of
+  (`eltwise_ops.cc:2116-2124`). What had to be settled was the runtime's side of
   it, whether a `torch.bool` reaches the arena one byte per element, and it does,
   because an input's slot is the size the blob declares for it; that was measured
   on hexagon-sim, with a control that declares the condition two bytes wide and
@@ -250,7 +284,7 @@ one byte, not a kernel.
   put"). Reaching the kernel would take a fusion pass of the `mul_silu.py` kind,
   not an emitter, and **two things are missing, not one**: the pass builds the
   node, and the emitter that consumes it needs `plane` / `channel` / `pack` /
-  `batch` (`execute_command.cc:693-699`) -- the channel geometry that
+  `batch` (`execute_command.cc:699-707`) -- the channel geometry that
   `where_is_emittable` deliberately does not compute and that exists nowhere else
   to borrow. So this is a further step out than the `sin`/`cos` entries above,
   which really were one emitter each. The decomposition itself is exact and two
@@ -377,9 +411,9 @@ the stable part):
 | gate | accepts | measured refusals | line |
 |---|---|---|---|
 | `pool_spec`: channel count | any `C`, and for a 3-D `(C, H, W)` input it is `shape[0]` that is read | nothing. The DSP blocking is a count of 64-lane blocks, `c4` carries `ceil(C/64)` and the kernel walks every one of them, so a width is `ceil(C/64)` blit regions a side and never a new parameter. A ragged last block is a narrower region plus a `ZERO`; the lanes it pads pool independently and the unpack never reads them. Measured on a phone: C in {64, 96, 128, 192, 256} at batch {1, 2, 3} bit-exact on maxima | `hexagon_ops.py`, `pool_spec` |
-| `pool_spec`: window and counting | any static kernel and stride, `pad >= 0`, every window inside its row. `ceil_mode` runs: `oh` and `ow` are two of the fifteen params and the walk skips whatever falls outside the input, which is torch's own clip, and torch's single decrement of the last output position is what keeps a ceil window from being a window over nothing | `dilation != (1, 1)`, `divisor_override`, and one thing about `ceil_mode`: an average that counts the padding and hangs its last window off the *padded* input, because torch divides that window by the part still inside and the command's divisor is `kernel_y * kernel_x`. The two halves are equivalent -- the test holds exactly when `ceil_mode` does not change the shape -- so `count_include_pad=False` takes `ceil_mode` at any geometry and `count_include_pad=True` takes it only where it is a no-op | `hexagon_ops.py` `_pool_output_extent`, `_pool_kernel_divisor_holds` |
+| `pool_spec`: window and counting | any static kernel and stride, `pad >= 0`, every window inside its row. `ceil_mode` runs: `oh` and `ow` are two of the fifteen params and the walk skips whatever falls outside the input, which is torch's own clip, and torch's single decrement of the last output position is what keeps a ceil window from being a window over nothing | `dilation != (1, 1)`, `divisor_override`, and one thing about `ceil_mode`, and **the one thing is `ceil_mode` itself, not a partly saturated window**. Measured over 1970 geometries (size 1..16, k 1..4, stride 1..4, pad 0..min(k,2), both `ceil_mode`, both `count_include_pad`), reading torch's own per-window divisor out of an all-ones pool as `positions / positions-per-divisor`: `_pool_kernel_divisor_holds` is False at exactly the 270 where `ceil_mode` changed the output shape and True at the other 1700, **zero disagreements**. Under `ceil_mode=False` and `count_include_pad=True`, torch's divisor is `kernel_y * kernel_x` in **484/484** swept geometries, including every one whose edge windows are only partly inside the input -- so the kernel's `countType==1` (`pool_fp16.c:74-79`) is right there and a partly saturated pool is not the discriminator. Under `count_include_pad=False` torch's divisor is the window clipped to the raw input in **484/484** floor-mode and **501/501** ceil-mode geometries -- the kernel's own `validCount` -- so that spelling takes `ceil_mode` at any geometry. The refusal is `count_include_pad=True` with `ceil_mode=True`, and in 61 of the 501 such geometries the divisor is a *third* value the command has no param for. The emitter consults the gate only for `count_include_pad=True` (`hexagon_ops.py:4510-4512`), so the node-level refusal is the 135 of those. The geometry an earlier version of this row argued from, 8x8/k3/s3/p0, is not a divergence at all: all four of its windows hold 9 of 9 positions and torch's divisor is 9 in every one of them | `hexagon_ops.py` `_pool_output_extent`, `_pool_kernel_divisor_holds`; the clause comment at `hexagon_partitioner.py:827-835` |
 | `conv_spec`: group count | `groups == 1`, the im2col path, at any channel count (3->16 and 64->64 both delegate, with a leading `ZERO` command when `C_in % 64 != 0`); `groups == in_channels == out_channels` with one channel per group, the depthwise kernel; and any count in between as one dense im2col command per group, measured on the host, the simulator and the phone for 2, 3, 4, 8, 16 and 32 groups and for 63, 64 and 65 channels per group | a group count that does not divide the input channels, and a grouped convolution whose height is a run-time length, because the per-group partition emits static extents and the per-group dynamic record is not produced | `hexagon_ops.py` `_emit_grouped_convolution`, `test_grouped_conv.py` |
-| `max_pool2d_with_indices`: readers | every reader takes `getitem 0` | reading the indices leaves the pool on the portable kernels, whatever its shape | `hexagon_partitioner.py:607` |
+| `max_pool2d_with_indices`: readers | every reader takes `getitem 0` | reading the indices leaves the pool on the portable kernels, whatever its shape | `hexagon_ops.py:4170-4181`, called from `hexagon_partitioner.py:787` |
 
 The gather's index width was a gate like that and is not any more. `embedding`,
 `index_select` and `index.Tensor` take an int32 index tensor or an int64 one, and
@@ -413,15 +447,25 @@ counting a spelling rather than reading a gate.
 
 ## 5. What the gaps cost a model
 
-Qwen3-0.6B, from the README's Status section: 1967 nodes reach 29 delegates (one
-per layer -- a count that predates the mask refusal in `_sdpa_fits_dsp_limits`,
-so an export whose attention nodes carry a mask delegates fewer than 28) and 825
+Qwen3-0.6B, quoted from the README's Status section
+(`README.md:1069-1071`) rather than re-measured here: 1967 nodes reach 29
+delegates (one per layer -- a count that predates the mask refusal in
+`_sdpa_fits_dsp_limits`, so an export whose attention nodes carry a mask
+delegates a count that follows those geometries) and 825
 stay on the portable kernels. 711 of those 825 are shape
 guards (`_assert_scalar` 227, `getitem` 114, `le` 113, `_local_scalar_dense` 85,
 `lt` 57, `ge` 57, `add` 57, `sym_size` 1), which is what a dynamic-shape export
-looks like rather than a gap. The real remainder is small:
+looks like rather than a gap. That decomposition does sum -- 227 + 114 + 113 + 85
++ 57 + 57 + 57 + 1 = 711, checked here -- but the remainder below it does not, and
+the gap is one node: 825 - 711 = 114, and the two buckets named are 28 + 85 = 113.
+It closes only if the first bucket is 29, one per *delegate*, rather than 28, one
+per layer, which is what "one per layer" says. **UNMEASURED**: the split needs a
+28-layer Qwen3 lowered in a process that reads the census, and the model corpus
+`PARTITION_GATES.md` §9 says is not in the tree. What stays below is small
+either way:
 
-- **one `view_copy` per layer**, which is the boundary rule above.
+- **one `view_copy` per layer** (28, or 29 per delegate -- see above), which is the
+  boundary rule.
 - **85 int64 `select_copy`**, the sequence-position reads, which belong on the
   host because the patch mechanism needs the value where it is.
 
@@ -444,24 +488,28 @@ The two gaps that are not of that shape:
 
 ## 6. Discrepancies noticed while compiling this
 
-- **`README.md:40` says init delegates a runtime weight reorder to
-  `htp_ops_weight_reorder`.** Outside the vendored tree the name appears in
-  prose only -- `README.md:40` and `README.md:458` -- and nothing in
-  `runtime/`, the emitters or the partitioner emits `DSP_OP_WEIGHT_REORDER` or
-  `DSP_OP_WEIGHT_REORDER_INT4`. Either the sentence describes a fallback that has
-  never had a caller, or the reorder this backend relies on happens at export in
-  the Python packers and the sentence is stale. Worth a decision rather than a
-  silent fix. The decision, after a grep for `WEIGHT_REORDER` and
-  `weight_reorder` over `backends/hexagon` with the vendored tree and the sim
-  runners excluded, which returns this file and `README.md` alone: stale, and
-  narrowly so. The README's own init list
-  (`README.md:44-53`) names compile-spec, the resident block, the weight copy and
-  the group array, with no reorder step in it, and the reorder that does happen is
-  host-side at export (`hexagon_ops.py:2292`, `pack_q4a16_prefill`), which is what
-  `README.md:479` already says about the int4 tile order. So the line at 40
-  describes a runtime init step this backend never performs, while line 479's
-  claim about the int4 order is true with the location implied by 40 being wrong.
-  The sentence is left as written, deliberately: this file records the verdict.
+- **The README and its own §6 entry had the weight-reorder discrepancy at
+  the wrong line; at `bbe19c9` the README contradicts itself instead.** A grep for
+  `htp_ops_weight_reorder` over `backends/hexagon` with the vendored tree and the
+  sim runners excluded now returns **no README hit at all** -- the name the entry
+  used to quote is gone -- and nothing in `runtime/`, `hexagon_ops.py`,
+  `partition/`, `hexagon_backend.py` or `serialization/` emits
+  `DSP_OP_WEIGHT_REORDER` or `DSP_OP_WEIGHT_REORDER_INT4`; the only occurrence of
+  the C name outside `third-party/` is a docstring in the packer. What the README
+  says now: line 40 is the opposite of what this entry used to quote, "**No DSP
+  weight-reorder command is emitted at init**", and the one surviving mention of a
+  reorder constant is `DSP_OP_WEIGHT_REORDER_INT4` at `README.md:521`, whose
+  sentence -- "so weight packing can be delegated to the DSP at init rather than
+  reimplemented on the host" -- describes exactly the runtime step line 40 denies.
+  So the stale sentence did not disappear, it moved from line 40 to line 521 and
+  now contradicts its own file. The rest of the verdict stands: the README's init
+  list (`README.md:47-51`, under the heading at 44) names compile-spec, the
+  resident block, the weight copy and the group array, with no reorder step in it,
+  and the reorder that does happen is host-side at export
+  (`hexagon_ops.py:3440`, `pack_q4a16_prefill_weight`, whose tile order is a port
+  of the vendored reorder), which is what `README.md:39-40` already says. Line 40
+  is right and line 521 is the stale one. Neither is edited here: this file records
+  the verdict rather than making it.
 - **`DSP_OP_POST_ATTN_REDUCE_FUSE`(35) is declared and has no `case`** in
   `execute_command.cc`. Which of the two is missing has not been established.
 - **The q4a16 and w8a16 packers have not been checked against a DSP here.** The
@@ -558,7 +606,7 @@ The two gaps that are not of that shape:
    open question was whether the kernel's condition operand accepts what a
    comparison writes; that question was the wrong way round and is now closed. The
    kernel side holds -- `htp_ops_select` takes a `condBytes` and reads a one-byte
-   flag per element (`eltwise_ops.cc:2116-2125`) -- and what had to be settled was
+   flag per element (`eltwise_ops.cc:2116-2124`) -- and what had to be settled was
    the runtime's side of it, which was measured on hexagon-sim. Note that closing
    this does **not** by itself reach `DSP_OP_PRELU`; see the `aten.prelu` entry in
    §3. The half that was left is the producer rather than the consumer: no kernel
@@ -591,22 +639,47 @@ The two gaps that are not of that shape:
 ```sh
 # the generated half, and the guard that keeps it equal to EMITTERS
 PYTHONPATH=src python -m pytest backends/hexagon/test/test_op_support.py
-PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py
+PYTHONPATH=src python backends/hexagon/scripts/gen_op_support.py --check
 
 # the census counts in the header: one verdict per op listed in the row tables
 # these two files are parametrized over (_ROWS, _QUANTIZED_ROWS), not per
-# collected test -- 126 rows and 187 verdicts against 149 collected, where the
-# 126 is len(_ROWS) in each file plus _QUANTIZED_ROWS: 103 + 17 + 6
+# collected test -- 134 rows and 196 verdicts against 155 collected, where the
+# 134 is len(_ROWS) in each file plus _QUANTIZED_ROWS: 107 + 17 + 10
 PYTHONPATH=src python -m pytest \
   backends/hexagon/test/test_overload_census.py \
   backends/hexagon/test/test_overload_census2.py
 
-# the op-type counts in section 2. The emitted set is the one the interpreter
-# test pins -- 21 op types after the select and prefill entries, which is what
-# makes the table 21 rows; the 43 are htp_command.h's types that have a case
-# in the dispatcher. The grep below is a superset of the emitted set: it counts
+# the op-type counts in section 2. The command types an emitter site names is
+# the set the interpreter test pins -- 26 of them, read out of every `type=`
+# argument in hexagon_ops.py -- and the 44 are htp_command.h's types that have a
+# case in the dispatcher. The grep below is a superset of that set: it counts
 # the names in these docs too, which is why it is not the count itself.
 PYTHONPATH=src python -m pytest \
   backends/hexagon/test/test_blob_interpreter.py::test_the_ops_actually_emitted_are_the_ones_we_think
 git grep -n 'DSP_OP_' -- backends/hexagon ':!backends/hexagon/third-party'
+
+# the 56 clauses behind the PARTITION_GATES.md sentence: the `return False` that
+# closes a top-level `if` inside HexagonOperatorSupport._verdict
+grep -c 'return False' backends/hexagon/partition/hexagon_partitioner.py
+PYTHONPATH=src python -c 'import ast,sys; t=ast.parse(open(sys.argv[1]).read()); \
+  v=[n for n in ast.walk(t) if isinstance(n,ast.FunctionDef) and n.name=="_verdict"][0]; \
+  print(v.lineno, v.end_lineno, sum(1 for s in v.body if isinstance(s,ast.If) for n in ast.walk(s) \
+  if isinstance(n,ast.Return) and isinstance(n.value,ast.Constant) and n.value.value is False))' \
+  backends/hexagon/partition/hexagon_partitioner.py
+
+# the pool divisor in section 4: torch's own per-window divisor, read as
+# positions / positions-per-divisor out of an all-ones avg_pool2d, against the
+# command's two candidates (kY*kX, and validCount). No `--timeout` anywhere: an
+# unrecognised flag is exit 4 with zero tests run, which in a quiet log is
+# indistinguishable from a green suite.
+PYTHONPATH=src python -m pytest backends/hexagon/test/test_pool.py
 ```
+
+Two things this file deliberately does not quote, because nothing in the tree
+re-derives them. **A count of unwired *targets*** needs a model corpus lowered
+in the process that reads `unwired_overload_census()`, and
+`PARTITION_GATES.md` §9 says the 21-graph corpus is hand-written and not in the
+tree; a fresh process returns `{}`. **The per-clause node counts** in
+`PARTITION_GATES.md` are that file's own, pinned to `cef244b`; the clause count
+(56) is re-derived above and matches, and its rows figure (131) is below the 134
+the row tables hold today.
