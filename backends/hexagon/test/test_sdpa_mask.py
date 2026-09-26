@@ -39,6 +39,7 @@ neither whether the suite thinks the llama op is registered nor the size of the
 """
 
 import contextlib
+import inspect
 import struct
 
 import numpy as np
@@ -637,3 +638,94 @@ def test_a_mask_that_hides_a_key_the_clamp_kept_moves_the_answer():
     unmasked = _run(_attention(_lower(False, _tensors())[1])[0], _tensors())
     moved = np.abs(got.astype(np.float32) - unmasked.astype(np.float32)).max()
     assert moved > 0.1, f"hiding every key but the first moved the answer by {moved}"
+
+
+
+# ---------------------------------------------------------------------------
+# Which clause refuses what.
+
+#: The batch clause, spelled as it appears in the predicate's own source. It is
+#: asserted present before it is replaced, so a reformat that renames it fails
+#: the experiment loudly instead of leaving it a no-op that reads as a negative.
+_BATCH_CLAUSE = "if val.shape[0] != 1:"
+
+
+def _predicate_with(batch_clause):
+    """The real predicate, with its batch clause replaced by a constant.
+
+    A test that names a clause is load-bearing only if the clause moves the
+    verdict it is about, so the clause is relaxed in the source and re-executed
+    rather than taken on the comment's word.
+    """
+    from executorch.backends.hexagon.partition import hexagon_partitioner as module
+
+    source = inspect.getsource(module._sdpa_fits_dsp_limits)
+    assert _BATCH_CLAUSE in source, "the batch clause is no longer spelled this way"
+    namespace = dict(vars(module))
+    exec(
+        compile(source.replace(_BATCH_CLAUSE, batch_clause), "<relaxed>", "exec"),
+        namespace,
+    )
+    return namespace["_sdpa_fits_dsp_limits"]
+
+
+def test_the_batch_clause_is_the_only_thing_that_refuses_a_batched_query():
+    """Drop the clause and a batched node delegates; the batch-one rows do not move.
+
+    The paired verdicts are the measurement. A batch of two is refused now and
+    accepted with the clause dropped, so the clause is load-bearing for exactly
+    the case the batch test above names. Every batch-of-one node keeps the
+    verdict it had, which is the other half of the question: the batch clause
+    does no refusing at batch one, so a batch-of-one node that is refused is
+    refused by a clause of its own -- and the four that are, are the four the
+    mask predicate names (one query row, a row count that is not the query's,
+    a stride narrower than the cache, and a query extent past the block size).
+    """
+    without = _predicate_with("if False:")
+    cases = (
+        ("b1-unmasked", _node(None), True, True),
+        ("b1-mask", _node((_QO_LEN, _MAX_KV_LEN)), True, True),
+        ("b1-one-query-row", _node((1, _MAX_KV_LEN), qo_len=1), False, False),
+        ("b1-mask-row-count", _node((_QO_LEN + 1, _MAX_KV_LEN)), False, False),
+        ("b1-mask-narrow", _node((_QO_LEN, _MAX_KV_LEN - 1)), False, False),
+        ("b1-past-the-block", _node((65, _MAX_KV_LEN), qo_len=65), False, False),
+        ("b2-unmasked", _node(None, batch=2), False, True),
+        ("b2-mask", _node((_QO_LEN, _MAX_KV_LEN), batch=2), False, True),
+        ("b3-unmasked", _node(None, batch=3), False, True),
+    )
+    for label, node, now, relaxed in cases:
+        assert _sdpa_fits_dsp_limits(node) is now, label
+        assert without(node) is relaxed, label
+
+
+def test_the_batch_refusal_is_stated_at_the_emitter_as_well():
+    """The same reason at the second door, so the refusal does not rest on one line.
+
+    The gate decides delegation; the emitter decides whether a command can be
+    written at all. Both refuse a batch, and both refuse it for the reason the
+    comment gives -- the command carries one row count and no batch axis. A node
+    that reached the emitter without passing the gate therefore fails the export
+    instead of computing one batch and leaving the rest, which is a different
+    outcome from the portable fallback the gate produces. upper_bound is the one
+    context call the batch check is behind, so the stub allows it and refuses
+    everything after, which also pins where in the emitter the refusal sits.
+    """
+
+    class _Refusing:
+        def upper_bound(self, extent):
+            return int(extent)
+
+        def __getattr__(self, name):
+            raise AssertionError("the emitter reached ctx." + name + " past the check")
+
+    for batch in (2, 3):
+        with pytest.raises(RuntimeError, match="no batch axis"):
+            _emit_sdpa(_node(None, batch=batch), _Refusing())
+    for batch in (2, 3):
+        with pytest.raises(RuntimeError, match="no batch axis"):
+            _emit_sdpa(_node(None, batch=batch), _Refusing())
+    # The control: the same node at batch one gets past the check and reaches the
+    # context, so the raise above is the batch clause and not a stub that refuses
+    # everything.
+    with pytest.raises(AssertionError, match="past the check"):
+        _emit_sdpa(_node(None), _Refusing())
