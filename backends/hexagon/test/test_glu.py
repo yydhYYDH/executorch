@@ -45,7 +45,7 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
 # The test directory is not a package, so the interpreter is importable by name.
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-from blob_interpreter import execute, read_blob  # noqa: E402
+from blob_interpreter import _PWL_BIAS, _PWL_SLOPE, execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
@@ -69,24 +69,24 @@ _BINARY = 19
 
 #: The companded16 sigmoid table the skel is built with
 #: (`unary_ops.cc:225-237`, `pwl.h:47-71`): sixteen fp16 chords over `[0, 8]`,
-#: 0.25-wide below 2, 0.5-wide to 4, 1.0-wide to 8. The bits are the table's own,
-#: read out of the source rather than restated, and the evaluation is an fp16
+#: 0.25-wide below 2, 0.5-wide to 4, 1.0-wide to 8. The evaluation is an fp16
 #: multiply then an fp16 add (`pwl.h:90-93`) -- two roundings, which is what the
 #: phone's bits show (`hex_workstreams/GELU-report.md`, device tier).
-_SIGMOID_SLOPE = np.array(
-    [
-        0x33F5, 0x33B7, 0x3343, 0x32A4, 0x31EB, 0x3128, 0x3067, 0x2F62,
-        0x2D8C, 0x2B47, 0x28A3, 0x25CD, 0x21C8, 0x1C52, 0x1665, 0x10B7,
-    ],
-    dtype=np.uint16,
-).view(np.float16)
-_SIGMOID_BIAS = np.array(
-    [
-        0x3800, 0x3804, 0x3812, 0x3830, 0x385E, 0x389B, 0x38E4, 0x3933,
-        0x39A9, 0x3A42, 0x3AC0, 0x3B22, 0x3B7F, 0x3BC7, 0x3BE8, 0x3BF6,
-    ],
-    dtype=np.uint16,
-).view(np.float16)
+#:
+#: The bits are `blob_interpreter`'s, because that is where the one transcription
+#: of the C++ table lives and the interpreter reads it from there. This file used
+#: to spell the sixteen slopes and the sixteen biases out in hex underneath a
+#: comment claiming they had been read out of the source rather than restated, and
+#: moving either table by one ulp left all four sigmoid test files green -- the
+#: copy was checked by nothing, including this one. `test_pwl_bank_single_source.py`
+#: is what now refuses a second copy anywhere in the test tree.
+#:
+#: A GLU is not a GELU, which is the question the name raises and the answer to:
+#: `F.glu`'s single unary command is HTP_OPS_UNARY_SIGMOID, read out of a real
+#: delegate over `[1, 64, 1, 48]` as numel 1536, op_type 4. So this is sigmoid's
+#: bank under its own name, and the bank to add for a GELU is `_PWL_SLOPE[3]`.
+_SIGMOID_SLOPE = np.asarray(_PWL_SLOPE[4], np.uint16).view(np.float16)
+_SIGMOID_BIAS = np.asarray(_PWL_BIAS[4], np.uint16).view(np.float16)
 
 #: `htp_ops_unary_compute_fp16_chunk` hands `[0, numel & ~63)` to the vector
 #: walk and the last `numel % 64` to the fp32 scalar form (`unary_ops.cc:455-491`),

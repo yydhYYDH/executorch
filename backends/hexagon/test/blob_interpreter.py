@@ -859,6 +859,24 @@ _PWL_BIAS = {
 #: wearing the same diff, and only the dispatch tells them apart. So when a second
 #: bank turns up here, find out which one _run_unary reaches before assuming the
 #: numbers come out the same either way.
+#:
+#: The other half of that pair was removed by b43dbc0, and this dict is what caught
+#: it. It cannot catch the same mistake in a test file, and one was there:
+#: test_glu.py held a third transcription of sigmoid's chords under _SIGMOID_SLOPE
+#: and _SIGMOID_BIAS, identical bit for bit, and it was worse than the dead one
+#: because nothing about it was dead. Moving that copy by one ulp turned nothing red
+#: in any of the four files that talk about sigmoid, because the file holding it
+#: only ever compared its own table against its own scalar reference. Moving THIS
+#: table by one ulp turned exactly one test red, in test_sigmoid_grain.py, and left
+#: test_glu.py green. The tables agreed and the tree could not see it, which is the
+#: failure this dict was meant to prevent anywhere rather than only here.
+#:
+#: A dict in this file cannot reach into a sibling directory, so the tree-wide half
+#: lives where the tree is: test_pwl_bank_single_source.py reads every module under
+#: the test directory with ast and fails naming any that restates a bank above,
+#: including the case that is not a dict at all. It cannot see a copy outside that
+#: directory either, so a second transcription of one of these tables elsewhere in
+#: the tree is still only caught by whoever goes looking.
 _PWL_UNTRANSCRIBED = {7: "silu's learned8 bank"}
 
 
