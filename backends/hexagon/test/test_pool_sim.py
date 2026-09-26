@@ -311,8 +311,19 @@ _CEIL_SHAPES = [
     ("Q5", 64, "avg", 3, 2, 1, False, 10),
     ("Q6", 96, "avg", 2, 3, 0, False, 7),  # a stride wider than the kernel stride
     ("Q7", 65, "avg", 3, 4, 1, False, 12), # a narrow tail at a wide stride
-    ("Q8", 128, "avg", 2, 2, 0, True, 9),  # counts the padding, and does not
-]                                             # change: the floor control
+    ("Q8", 128, "avg", 3, 2, 1, False, 10), # the same window over two blocks
+]
+
+#: The one average that counts the padding *and* delegates. It is here because
+#: the refusal above is exactly this row with a size where ceil mode changes the
+#: answer: the divisor test holds precisely when ceil mode does not change the
+#: shape, so an average over the whole kernel is portable iff it would have been
+#: a different answer. At 9x9 with a 3x3 window at stride 4, ceil mode and floor
+#: both give 3, the divisor is the whole kernel, and the node runs -- which is
+#: the half of the equivalence no case above reaches.
+_CEIL_NOOP_SHAPES = [
+    ("Q9", 64, "avg", 3, 4, 1, True, 9),
+]
 
 
 def _ceil_cases():
@@ -339,6 +350,28 @@ def _ceil_cases():
                 tolerance=_AVERAGE_TOLERANCE if kind == "avg" else None,
             )
         )
+    for tag, channels, kind, kernel, stride, padding, cip, size in _CEIL_NOOP_SHAPES:
+        x = _operands(channels, 1, 3000 + size * 10 + kernel, size=size)
+        model = _Pool(
+            kind, kernel, stride, padding, count_include_pad=cip, ceil_mode=True
+        )
+        expected = _reference(
+            x, kind, kernel, stride, padding, cip, ceil_mode=True
+        )
+        floor = _Pool(kind, kernel, stride, padding, count_include_pad=cip)
+        assert expected.shape == floor(x).shape, (
+            f"{tag}: ceil mode changes this shape, so it is not a control"
+        )
+        cases.append(
+            _case(
+                tag,
+                model,
+                (x,),
+                _bits(expected),
+                kind="close",
+                tolerance=_AVERAGE_TOLERANCE,
+            )
+        )
     return cases
 
 
@@ -358,9 +391,11 @@ def test_a_ceil_mode_blob_carries_torchs_own_extents(ceil_cases):
 
     Ceil mode is not a second command: it is the same fifteen params with oh and
     ow replaced by torch's numbers, so a case whose blob carried anything else
-    would be measuring the emitter rather than the kernel.
+    would be measuring the emitter rather than the kernel. The divisor is read
+    rather than assumed, and the two tables between them cover both of its
+    values -- the averages above are all countType 0 and this one is countType 1.
     """
-    for case, shape in zip(ceil_cases, _CEIL_SHAPES):
+    for case, shape in zip(ceil_cases, _CEIL_SHAPES + _CEIL_NOOP_SHAPES):
         tag, channels, kind, kernel, stride, padding, cip, size = shape
         pool = next(c for c in case.commands if c.type == _POOL)
         want = _reference(
@@ -384,8 +419,8 @@ def test_a_ceil_mode_blob_carries_torchs_own_extents(ceil_cases):
 
 @pytest.mark.parametrize(
     "tag, channels, kind, kernel, stride, padding, cip, size",
-    _CEIL_SHAPES,
-    ids=[shape[0] for shape in _CEIL_SHAPES],
+    _CEIL_SHAPES + _CEIL_NOOP_SHAPES,
+    ids=[shape[0] for shape in _CEIL_SHAPES + _CEIL_NOOP_SHAPES],
 )
 def test_the_dsp_pools_a_window_that_runs_off_the_edge(
     ceil_simulated, ceil_cases, tag, channels, kind, kernel, stride, padding, cip, size
@@ -397,7 +432,8 @@ def test_the_dsp_pools_a_window_that_runs_off_the_edge(
     kernel. Here the DSP walks a window whose last row or column is past the
     input, and the answer is torch's: the clip at pool_fp16.c:36-43, the
     divisor at :74-79, and the output extent are all three exercised by a case
-    where floor mode would have produced a different tensor.
+    where floor mode would have produced a different tensor, plus the one case
+    where an average over the whole kernel delegates because it does not.
     """
     case = next(c for c in ceil_cases if c.tag == tag)
     dsp = ceil_simulated[tag + "0"]
