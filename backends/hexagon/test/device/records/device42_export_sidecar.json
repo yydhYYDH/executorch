@@ -1,0 +1,552 @@
+{
+  "tree_revision": "cef244b",
+  "rows": [
+    {
+      "case": "w8_m4_k4096_n128",
+      "m": 4,
+      "k": 4096,
+      "n": 128,
+      "seed": 0,
+      "pte_bytes": 527172,
+      "pte_sha256": "16fb4aaf97aa45f03cf15cd46363aaf087de674917997b830a1920d309d2b1c1",
+      "delegates": [
+        {
+          "index": 0,
+          "blob_bytes": 526020,
+          "blob_sha256": "ae8e4b0aa4452f18b6d5a5b952eb01c252e43ef92576553b09fb1ef562fb3fe9",
+          "commands": [
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                64,
+                4,
+                64,
+                64,
+                4096,
+                1,
+                256,
+                64,
+                1
+              ]
+            },
+            {
+              "type": 42,
+              "name": "DSP_OP_MATMUL_W8A16_BLOCK_FP16",
+              "params": [
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1024,
+                128,
+                4,
+                4,
+                4,
+                1,
+                256,
+                64,
+                64,
+                512,
+                4096,
+                4096,
+                128,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1024,
+                1,
+                0
+              ]
+            },
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                2,
+                4,
+                64,
+                256,
+                64,
+                1,
+                64,
+                128,
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "left_on_portable": [],
+      "inputs": [
+        {
+          "shape": [
+            4,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "bytes": 65536
+        }
+      ],
+      "outputs": [
+        {
+          "shape": [
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "bytes": 2048
+        }
+      ],
+      "role": "measurement",
+      "command_types": [
+        3,
+        42,
+        3
+      ]
+    },
+    {
+      "case": "w8_m33_k4096_n128",
+      "m": 33,
+      "k": 4096,
+      "n": 128,
+      "seed": 0,
+      "pte_bytes": 527172,
+      "pte_sha256": "5da68e0b61caddddf5f00d06edfb7e00f704c0f1f5ed36a64936f355defe420b",
+      "delegates": [
+        {
+          "index": 0,
+          "blob_bytes": 526020,
+          "blob_sha256": "b0653b9ceb7b8dcfdc222d2a819616d92bc2637c324c0e562241d20028f6a87d",
+          "commands": [
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                64,
+                33,
+                64,
+                64,
+                4096,
+                1,
+                2112,
+                64,
+                1
+              ]
+            },
+            {
+              "type": 42,
+              "name": "DSP_OP_MATMUL_W8A16_BLOCK_FP16",
+              "params": [
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1024,
+                128,
+                33,
+                33,
+                33,
+                1,
+                2112,
+                64,
+                64,
+                4224,
+                4096,
+                4096,
+                128,
+                1,
+                1,
+                0,
+                0,
+                1,
+                8448,
+                1,
+                0
+              ]
+            },
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                2,
+                33,
+                64,
+                2112,
+                64,
+                1,
+                64,
+                128,
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "left_on_portable": [],
+      "inputs": [
+        {
+          "shape": [
+            33,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "bytes": 540672
+        }
+      ],
+      "outputs": [
+        {
+          "shape": [
+            33,
+            128
+          ],
+          "dtype": "torch.float32",
+          "bytes": 16896
+        }
+      ],
+      "role": "measurement",
+      "command_types": [
+        3,
+        42,
+        3
+      ]
+    },
+    {
+      "case": "w8_m197_k768_n576",
+      "m": 197,
+      "k": 768,
+      "n": 576,
+      "seed": 0,
+      "pte_bytes": 446148,
+      "pte_sha256": "67d3545aca42d6a51f36598f2fdc490cf30a5a80e71ec8a7b4d1823675fbbd76",
+      "delegates": [
+        {
+          "index": 0,
+          "blob_bytes": 444996,
+          "blob_sha256": "c94411bcd3d72c0a45bc49e06262144af6bfe2980a8bc7ad88fa20100e0d56fd",
+          "commands": [
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                12,
+                197,
+                64,
+                64,
+                768,
+                1,
+                12608,
+                64,
+                1
+              ]
+            },
+            {
+              "type": 42,
+              "name": "DSP_OP_MATMUL_W8A16_BLOCK_FP16",
+              "params": [
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                192,
+                24,
+                197,
+                197,
+                197,
+                1,
+                12608,
+                64,
+                64,
+                113472,
+                768,
+                768,
+                576,
+                1,
+                1,
+                0,
+                0,
+                1,
+                226944,
+                1,
+                0
+              ]
+            },
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                9,
+                197,
+                64,
+                12608,
+                64,
+                1,
+                64,
+                576,
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "left_on_portable": [],
+      "inputs": [
+        {
+          "shape": [
+            197,
+            768
+          ],
+          "dtype": "torch.float32",
+          "bytes": 605184
+        }
+      ],
+      "outputs": [
+        {
+          "shape": [
+            197,
+            576
+          ],
+          "dtype": "torch.float32",
+          "bytes": 453888
+        }
+      ],
+      "role": "measurement",
+      "command_types": [
+        3,
+        42,
+        3
+      ]
+    },
+    {
+      "case": "w8_twin_m4_k4096_n128",
+      "m": 4,
+      "k": 4096,
+      "n": 128,
+      "seed": 7717,
+      "pte_bytes": 527172,
+      "pte_sha256": "f49249cb6c190948e1bc4d768a49e31c20893cf43bbdc9979fa4d3bf5087d463",
+      "delegates": [
+        {
+          "index": 0,
+          "blob_bytes": 526020,
+          "blob_sha256": "ae7248cc7a56fef5d9e68cffabee5ae03c1b80e4664c79c3712603d8eda3b6dd",
+          "commands": [
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                64,
+                4,
+                64,
+                64,
+                4096,
+                1,
+                256,
+                64,
+                1
+              ]
+            },
+            {
+              "type": 42,
+              "name": "DSP_OP_MATMUL_W8A16_BLOCK_FP16",
+              "params": [
+                0,
+                0,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1,
+                1024,
+                128,
+                4,
+                4,
+                4,
+                1,
+                256,
+                64,
+                64,
+                512,
+                4096,
+                4096,
+                128,
+                1,
+                1,
+                0,
+                0,
+                1,
+                1024,
+                1,
+                0
+              ]
+            },
+            {
+              "type": 3,
+              "name": "DSP_OP_RASTER_BLIT",
+              "params": [
+                1,
+                2,
+                1,
+                0,
+                0,
+                0,
+                2,
+                4,
+                64,
+                256,
+                64,
+                1,
+                64,
+                128,
+                1
+              ]
+            }
+          ]
+        }
+      ],
+      "left_on_portable": [],
+      "inputs": [
+        {
+          "shape": [
+            4,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "bytes": 65536
+        }
+      ],
+      "outputs": [
+        {
+          "shape": [
+            4,
+            128
+          ],
+          "dtype": "torch.float32",
+          "bytes": 2048
+        }
+      ],
+      "role": "control-weight",
+      "command_types": [
+        3,
+        42,
+        3
+      ]
+    },
+    {
+      "case": "w8_m1_k4096_n128",
+      "m": 1,
+      "k": 4096,
+      "n": 128,
+      "seed": 0,
+      "pte_bytes": 526468,
+      "pte_sha256": "5e5b479b5070125354b015e5490fe883de910027fe78a5af4b8a72b4616dd1bb",
+      "delegates": [
+        {
+          "index": 0,
+          "blob_bytes": 525316,
+          "blob_sha256": "e5dc112a3b57e85b1b30b737a442de691fe1e35e039e17454d65258d52a7b901",
+          "commands": [
+            {
+              "type": 45,
+              "name": "DSP_OP_MATMUL_W8A16_GEMV_I8",
+              "params": [
+                1,
+                4096,
+                128,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                0
+              ]
+            }
+          ]
+        }
+      ],
+      "left_on_portable": [],
+      "inputs": [
+        {
+          "shape": [
+            1,
+            4096
+          ],
+          "dtype": "torch.float32",
+          "bytes": 16384
+        }
+      ],
+      "outputs": [
+        {
+          "shape": [
+            1,
+            128
+          ],
+          "dtype": "torch.float32",
+          "bytes": 512
+        }
+      ],
+      "role": "control-m1",
+      "command_types": [
+        45
+      ]
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+{
+  "tree": "cef244b",
+  "rows": [
+    {
+      "case": "w8_m4_k4096_n128",
+      "role": "measurement",
+      "m": 4,
+      "k": 4096,
+      "n": 128,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "16fb4aaf97aa45f0",
+      "output_dtype": "torch.float32",
+      "output_bytes": 2048,
+      "fetched_bytes": 2048,
+      "verdict": {
+        "n": 512,
+        "max_abs": 0.014469146728515625,
+        "max_rel": 0.055915478919565435,
+        "fp16_steps_at_scale": 0.926025390625,
+        "wrong": 0,
+        "exact": 0,
+        "ref_absmax": 18.869539260864258,
+        "tolerance_step": 0.015625
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 150.959228515625,
+      "status": "PASS"
+    },
+    {
+      "case": "w8_m33_k4096_n128",
+      "role": "measurement",
+      "m": 33,
+      "k": 4096,
+      "n": 128,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "5da68e0b61cadddd",
+      "output_dtype": "torch.float32",
+      "output_bytes": 16896,
+      "fetched_bytes": 16896,
+      "verdict": {
+        "n": 4224,
+        "max_abs": 0.015672683715820312,
+        "max_rel": 0.43694144695368414,
+        "fp16_steps_at_scale": 1.0030517578125,
+        "wrong": 1,
+        "exact": 0,
+        "ref_absmax": 24.268356323242188,
+        "tolerance_step": 0.015625
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 194.14976501464844,
+      "status": "DIFFERS"
+    },
+    {
+      "case": "w8_m197_k768_n576",
+      "role": "measurement",
+      "m": 197,
+      "k": 768,
+      "n": 576,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "67d3545aca42d6a5",
+      "output_dtype": "torch.float32",
+      "output_bytes": 453888,
+      "fetched_bytes": 453888,
+      "verdict": {
+        "n": 113472,
+        "max_abs": 0.008075714111328125,
+        "max_rel": 400.36,
+        "fp16_steps_at_scale": 1.03369140625,
+        "wrong": 3,
+        "exact": 9,
+        "ref_absmax": 12.451776504516602,
+        "tolerance_step": 0.0078125
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 99.61428833007812,
+      "status": "DIFFERS"
+    },
+    {
+      "case": "w8_twin_m4_k4096_n128",
+      "role": "control-weight",
+      "m": 4,
+      "k": 4096,
+      "n": 128,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "f49249cb6c190948",
+      "output_dtype": "torch.float32",
+      "output_bytes": 2048,
+      "fetched_bytes": 2048,
+      "verdict": {
+        "n": 512,
+        "max_abs": 0.015127182006835938,
+        "max_rel": 0.1526683568228698,
+        "fp16_steps_at_scale": 0.9681396484375,
+        "wrong": 0,
+        "exact": 0,
+        "ref_absmax": 22.578622817993164,
+        "tolerance_step": 0.015625
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 180.62518310546875,
+      "status": "PASS"
+    },
+    {
+      "case": "w8_m1_k4096_n128",
+      "role": "control-m1",
+      "m": 1,
+      "k": 4096,
+      "n": 128,
+      "command_types": [
+        45
+      ],
+      "pte_sha256": "5e5b479b50701253",
+      "output_dtype": "torch.float32",
+      "output_bytes": 512,
+      "fetched_bytes": 512,
+      "verdict": {
+        "n": 128,
+        "max_abs": 0.15485095977783203,
+        "max_rel": 0.3636611065749057,
+        "fp16_steps_at_scale": 9.91046142578125,
+        "wrong": 105,
+        "exact": 0,
+        "ref_absmax": 17.5767822265625,
+        "tolerance_step": 0.015625
+      },
+      "detector_control_wrong": 3,
+      "detector_control_max_abs": 140.65232849121094,
+      "status": "DIFFERS"
+    },
+    {
+      "case": "w8_m40_k25216_n64",
+      "role": "measurement",
+      "m": 40,
+      "k": 25216,
+      "n": 64,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "0da77f3f55b99b20",
+      "output_dtype": "torch.float32",
+      "output_bytes": 10240,
+      "fetched_bytes": 10240,
+      "verdict": {
+        "n": 2560,
+        "max_abs": 0.03180694580078125,
+        "max_rel": 0.45050878815911194,
+        "fp16_steps_at_scale": 1.017822265625,
+        "wrong": 1,
+        "exact": 0,
+        "ref_absmax": 51.48268127441406,
+        "tolerance_step": 0.03125
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 411.85986328125,
+      "status": "DIFFERS"
+    }
+  ],
+  "weight_control": {
+    "identical_bytes": false,
+    "max_abs_between_them": 27.3125,
+    "fraction_of_elements_that_differ": 1.0
+  }
+}

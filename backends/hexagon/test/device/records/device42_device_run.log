@@ -1,0 +1,38 @@
+[lockrun:device] 槽 0 已获取（等待 0s，可用 9177MB）
+Welcome to VyOS
+CASE=w8_m4_k4096_n128 RUNNER_EXIT=0
+CASE=w8_m4_k4096_n128 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_m4_k4096_n128-0.bin OUTPUT_BYTES=2048 SHA256=d3bd57f0824e6c99a37b3d4ba033224b
+CASE=w8_m4_k4096_n128 enter d0: ops=3
+CASE=w8_m4_k4096_n128 exit d0: ok
+[hexagon] pool: new block 67584 bytes (#1)
+[hexagon] enter d0: ops=3 act=33792 scratch=67584 first=0 count=3
+[hexagon] exit d0: ok
+CASE=w8_twin_m4_k4096_n128 RUNNER_EXIT=0
+CASE=w8_twin_m4_k4096_n128 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_twin_m4_k4096_n128-0.bin OUTPUT_BYTES=2048 SHA256=fca4a9db33fa4903b3e5d085a50046b5
+CASE=w8_twin_m4_k4096_n128 enter d0: ops=3
+CASE=w8_twin_m4_k4096_n128 exit d0: ok
+[hexagon] pool: new block 67584 bytes (#1)
+[hexagon] enter d0: ops=3 act=33792 scratch=67584 first=0 count=3
+[hexagon] exit d0: ok
+CASE=w8_m33_k4096_n128 RUNNER_EXIT=0
+CASE=w8_m33_k4096_n128 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_m33_k4096_n128-0.bin OUTPUT_BYTES=16896 SHA256=4e9c7a331bd473ece77096569d5c79ad
+CASE=w8_m33_k4096_n128 enter d0: ops=3
+CASE=w8_m33_k4096_n128 exit d0: ok
+[hexagon] pool: new block 557568 bytes (#1)
+[hexagon] enter d0: ops=3 act=278784 scratch=557568 first=0 count=3
+[hexagon] exit d0: ok
+CASE=w8_m1_k4096_n128 RUNNER_EXIT=0
+CASE=w8_m1_k4096_n128 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_m1_k4096_n128-0.bin OUTPUT_BYTES=512 SHA256=1c1093c44cb37414ae773ffa9c6185a4
+CASE=w8_m1_k4096_n128 enter d0: ops=1
+CASE=w8_m1_k4096_n128 exit d0: ok
+[hexagon] pool: new block 8448 bytes (#1)
+[hexagon] enter d0: ops=1 act=0 scratch=8448 first=0 count=1
+[hexagon] exit d0: ok
+CASE=w8_m197_k768_n576 RUNNER_EXIT=0
+CASE=w8_m197_k768_n576 OUTPUT=/data/data/com.termux/files/home/csm/qwen3run/hxwin/dev42_a47/out_w8_m197_k768_n576-0.bin OUTPUT_BYTES=453888 SHA256=c94561e971322635c3342967cbd944ca
+CASE=w8_m197_k768_n576 enter d0: ops=3
+CASE=w8_m197_k768_n576 exit d0: ok
+[hexagon] pool: new block 1059072 bytes (#1)
+[hexagon] enter d0: ops=3 act=529536 scratch=1059072 first=0 count=3
+[hexagon] exit d0: ok
+[lockrun:device] 槽 0 释放，退出码 0
