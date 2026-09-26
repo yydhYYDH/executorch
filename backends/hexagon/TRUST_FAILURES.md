@@ -73,11 +73,14 @@ So `assert not HexagonOperatorSupport().is_node_supported({}, node)` is green in
 the tree where the gate works and green in the tree where the gate is gone.
 The suite builds the bare object 28 times and the parameterised one 9. The
 control is what keeps this honest: on the weightless families the bare object
-still accepts `relu`, `add`, `sum` and `silu` and still refuses `expm1` and
-`erf`, so the blindness is scoped rather than global.
+still accepts relu, add, sum and silu and still refuses expm1 and erf, and on
+native_group_norm the bare and correctly built objects agree at every geometry,
+so the blindness is scoped to two families rather than global.
 
-Pair every negative with a positive at the same geometry, as
-`test_refused_targets.py` does at lines 451 and 464.
+test_refused_targets.py::test_a_parameter_is_only_a_constant_with_the_partitioners_data_names
+is the shape to copy and already exists: a bare refusal at line 451, the
+correctly built acceptance of the same node at 452, and a pool at 464-466 where
+both objects agree because that gate reads no weight.
 
 ## A scan that reports zero and a broken scan report the same thing
 
