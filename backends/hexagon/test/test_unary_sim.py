@@ -32,40 +32,44 @@ small arguments leaves none of the value the function exists to compute, and its
 relative error there is measured at 1.0 -- no correct digits at all.
 """
 
-
+import os
+import pathlib
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
+# The checkout directory is itself named executorch, so putting its parent on the
+# path makes `import executorch` resolve to this tree. Without it the editable
+# install wins, and in this environment that points at a different checkout.
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+# The test directory is not a package, so the interpreter is importable by name.
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
-import hexagon_sim
-from blob_interpreter import Arena, read_blob
-from executorch.backends.hexagon.hexagon_backend import (
+import hexagon_sim  # noqa: E402
+from blob_interpreter import Arena, read_blob  # noqa: E402
+from executorch.backends.hexagon.hexagon_backend import (  # noqa: E402
     HexagonBackend,
     SUPPORTED_TARGETS,
 )
-from executorch.backends.hexagon.hexagon_ops import UNARY_OP_TYPES
-from executorch.backends.hexagon.partition.hexagon_partitioner import (
+from executorch.backends.hexagon.hexagon_ops import UNARY_OP_TYPES  # noqa: E402
+from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonOperatorSupport,
     HexagonPartitioner,
 )
-from executorch.exir import (
-    EdgeCompileConfig,
-    to_edge,
-    to_edge_transform_and_lower,
-)
-
-from executorch.exir.dialects._ops import ops as exir_ops
-from test_blob_on_sim import (
+from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower  # noqa: E402
+from test_blob_on_sim import (  # noqa: E402
     _fixture_header,
     _HT_P_OP_SHIM,
     _RUNNER,
     _SCHEMA,
     _SOURCES,
 )
-from torch.export import export
+
+from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
+from torch.export import export  # noqa: E402
 
 EXPM1 = exir_ops.edge.aten.expm1.default
 
