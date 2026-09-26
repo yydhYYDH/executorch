@@ -47,6 +47,14 @@ add_compile_options(${SKEL_ARCH_FLAGS})
 set(HEXAGON_SKEL_SOURCE_ID_GENERATOR "${CMAKE_CURRENT_SOURCE_DIR}/generate_skel_source_id.cmake")
 set(HEXAGON_SKEL_SOURCE_ID_HELPER "${CMAKE_CURRENT_SOURCE_DIR}/source_id.cmake")
 set(HEXAGON_SKEL_SOURCE_ID_PARENT_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/../CMakeLists.txt")
+# hexagon_skel_source_manifest reads this in the outer scope, and the full android
+# build never sets it there: its parent passes HEXAGON_SKEL_SOURCE_ID_HEADER, so that
+# build takes the else() branch below and never reaches the call. A standalone
+# `build.sh skel` has no such header and does reach it, so without this default the
+# configure stops with "Hexagon skel source manifest variables are incomplete".
+if(NOT SKEL_CMAKE)
+  set(SKEL_CMAKE "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt")
+endif()
 if(NOT HEXAGON_SKEL_SOURCE_ID_CONFIG)
   include("${HEXAGON_SKEL_SOURCE_ID_HELPER}")
   get_filename_component(_hexagon_source_tools_version "${HEXAGON_TOOLS_ROOT}" NAME)
