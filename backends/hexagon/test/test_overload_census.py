@@ -596,9 +596,21 @@ _ROWS = [
         [("aten.squeeze_copy.dims", "wired")],
     ),
     (
+        # A broadcast is a blit region that holds the source still on the axes
+        # that repeat, so a leading broadcast beside a plain run is two levels
+        # and the descriptor has three.
         "expand that is a real broadcast",
         lambda a: a.expand(2, 3),
         (_x(1, 3),),
+        [("aten.expand_copy.default", "wired")],
+    ),
+    (
+        # The other end of the same island: broadcast, plain, broadcast, plain
+        # is four levels of walk, and the shape the region cannot describe is
+        # the shape that stays portable.
+        "expand that needs a fourth region level",
+        lambda a: a.expand(2, 2, 4, 4),
+        (_x(1, 2, 1, 4),),
         [("aten.expand_copy.default", "refused")],
     ),
     (
