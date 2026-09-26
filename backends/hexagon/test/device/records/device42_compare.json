@@ -143,6 +143,35 @@
       "detector_control_wrong": 3,
       "detector_control_max_abs": 140.65232849121094,
       "status": "DIFFERS"
+    },
+    {
+      "case": "w8_m40_k25216_n64",
+      "role": "measurement",
+      "m": 40,
+      "k": 25216,
+      "n": 64,
+      "command_types": [
+        3,
+        42,
+        3
+      ],
+      "pte_sha256": "0da77f3f55b99b20",
+      "output_dtype": "torch.float32",
+      "output_bytes": 10240,
+      "fetched_bytes": 10240,
+      "verdict": {
+        "n": 2560,
+        "max_abs": 0.03180694580078125,
+        "max_rel": 0.45050878815911194,
+        "fp16_steps_at_scale": 1.017822265625,
+        "wrong": 1,
+        "exact": 0,
+        "ref_absmax": 51.48268127441406,
+        "tolerance_step": 0.03125
+      },
+      "detector_control_wrong": 1,
+      "detector_control_max_abs": 411.85986328125,
+      "status": "DIFFERS"
     }
   ],
   "weight_control": {
