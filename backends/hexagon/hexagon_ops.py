@@ -2256,12 +2256,15 @@ def select_condition_plane(
     output's axes: the walk then reduces to the output's flat index divided by
     the repeat, and the remainder never bites because the axes left over carry
     the whole extent. A staircase mask is that shape, with the repeat on the
-    context axis. A condition broadcast over a middle axis, such as (1,2,1,3)
-    against (1,2,4,3), is not: its index is not a function of index/innerSize
-    alone, and no plane describes it.
+    context axis. A condition broadcast over a middle axis as well, such as
+    (1,1,3,1) against (1,2,3,4), is not: its index is not a function of
+    index/innerSize alone, and no plane describes it.
 
     A one-element condition and a whole-output condition are the two walks that
-    name no plane, and (0, 0) is what the kernel reads as "none asked for".
+    name no plane, and (0, 0) is what the kernel reads as "none asked for". A
+    condition that is neither, and whose narrow axes are an empty suffix, is the
+    third refusal: the kernel would ask for a plane and find none, so answering
+    "no plane needed" here would be a descriptor it refuses with -2.
 
     A symbolic extent is refused rather than read off the example. The plane is
     a ratio of extents, and the ratio of two symbols is not a number the export
@@ -2277,20 +2280,39 @@ def select_condition_plane(
         c not in (1, o) for c, o in zip(padded, out_shape)
     ):
         return None
+    if _product(padded) in (1, _product(out_shape)):
+        # Two of the kernel's three walks are decided by the size alone -- a
+        # single element is broadcast, the output's own size is read along -- and
+        # neither consults the plane. Naming one here would put two numbers in a
+        # command that does not read them.
+        return NO_SELECT_PLANE
     inner = 1
     axis = rank
     while axis > 0 and padded[axis - 1] == 1:
         inner *= out_shape[axis - 1]
         axis -= 1
     if axis == rank:
-        return NO_SELECT_PLANE
+        # Neither of those two sizes, and narrow on no axis: the only walk that
+        # fits is the output's own index, which the kernel will not take at this
+        # size. No plane describes it, so there is nothing to name.
+        return None
     for c, o in zip(padded[:axis], out_shape[:axis]):
         if c != o:
             return None
+    # The axes left over are the ones that carry extent one, so this product is
+    # the condition's own element count -- which is what the kernel's guard asks
+    # a per-channel operand to name.
     channel = 1
     for extent in padded[:axis]:
         channel *= extent
-    return (channel, inner) if channel != 1 else NO_SELECT_PLANE
+    return (channel, inner)
+
+
+def _product(extents: Tuple[int, ...]) -> int:
+    total = 1
+    for extent in extents:
+        total *= extent
+    return total
 
 
 def where_is_emittable(node: torch.fx.Node) -> bool:
