@@ -243,10 +243,24 @@ governs one.
 
 The rows corpus is in this tree: it is the `_ROWS` and `_QUANTIZED_ROWS` tables of
 `test_overload_census.py` and `test_overload_census2.py`, driven through the same instrument.
-The models corpus is not — the nineteen geometries are hand-written and live in a scratch
-directory, and `Qwen3ForCausalLM` is built from a `transformers` config, so a reader has to
-rebuild it to re-derive §4. That is a real limitation of a census whose point is to be re-derived,
-and it is worth fixing before the next round rather than after: the geometries belong next to the
-other model fixtures, and the instrument and both drivers belong beside
-`test_partition_gates.py`, which already carries the instrument and the controls so that a
-reader does not have to rebuild those to know the census is sound.
+The nineteen hand-written models geometries are here too, as
+`test/model_census_corpus.py`, and `test/test_unwired_census_corpus.py` lowers all of them
+through the real partitioner, so §3's models half is rebuildable from this tree. The
+remaining half is `Qwen3ForCausalLM`, built from a `transformers` config at one and at 28
+layers: that needs a `transformers` install this environment does not have, so a reader has to
+rebuild those two graphs to re-derive the 28-layer part of §4, and §3's "21 graphs / 6545
+nodes" is a count over all twenty-one and has not been re-measured over the nineteen alone.
+
+The instrument and both drivers still live outside the tree, and §4 is still not a number a
+reader can produce without them. `test_partition_gates.py` already carries the instrument and
+the controls, so the piece worth moving next is the driver, not the corpus.
+
+One thing this corpus cannot be read as, because it is a property of
+`unwired_overload_census()` and not of these models: that census counts a target only when a
+*sibling overload* of the same schema has an emitter, so it reports `{}` over all nineteen
+geometries, and all 309 nodes it leaves off the emitter table, over 11 distinct targets, are
+whole-family absences (`aten::full`, `aten::full_like`, `aten::arange`, `aten::eq`,
+`aten::le`, `aten::logical_not`, `aten::any`,
+`aten::_native_batch_norm_legit_no_training`) rather than forgotten overloads. The
+unwired-target count that §4's rows half reports is a different number, read from the row
+tables.
