@@ -259,6 +259,13 @@ BOOL_BYTES = 1
 #: The element-wise select. The library's only ATen node for it.
 WHERE = exir_ops.edge.aten.where.self
 
+# The two order comparisons the DSP's own binary op types answer. The Scalar
+# overloads are not here: the measured route is two tensors, and a python
+# literal would reach the same binary command as an fp16 constant, which is a
+# second thing to have measured.
+GREATER_THAN = exir_ops.edge.aten.gt.Tensor
+LESS_THAN = exir_ops.edge.aten.lt.Tensor
+
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
 NATIVE_LAYER_NORM = exir_ops.edge.aten.native_layer_norm.default
@@ -543,8 +550,27 @@ def _patch_dynamic_numel(
     _patch_dynamic_product(ctx, op_index, tuple(_value_of(node).shape), param_index)
 
 
+def result_dtype_is_emittable(dtype: torch.dtype, target) -> bool:
+    """Whether a result of this width and this op is one the arena holds.
+
+    fp16 and fp32 both reach the same fp16 command -- the runtime narrows a fp32
+    operand and widens a fp32 result at the boundary -- and a torch.bool is a
+    third width, held by one command: SELECT's one-byte arm copies a byte at a
+    time, and a comparison is the only node here that produces one. The exemption
+    is keyed on the target rather than on the width, so a bool arriving anywhere
+    else is still refused.
+
+    Both gates read this one definition. The partitioner asks it before it
+    delegates and the emitters raise on the same answer, so a node the support
+    check admitted cannot fail the export for want of a width.
+    """
+    if dtype is torch.bool:
+        return target in COMPARISON_TARGETS
+    return dtype in (torch.float16, torch.float32)
+
+
 def _require_arena_dtype(node: torch.fx.Node, what: str) -> None:
-    """The two widths the arena holds, both of which reach the same fp16 command.
+    """The widths the arena holds, both of which reach the same fp16 command.
 
     Every kernel reads and writes two bytes per element, and the runtime narrows
     a fp32 operand and widens a fp32 result at the boundary, so a node the graph
@@ -552,7 +578,7 @@ def _require_arena_dtype(node: torch.fx.Node, what: str) -> None:
     the kernels reading those bits as half floats.
     """
     dtype = _value_of(node).dtype
-    if dtype not in (torch.float16, torch.float32):
+    if not result_dtype_is_emittable(dtype, node.target):
         raise RuntimeError(f"hexagon: {what} must be fp16 or fp32, got {dtype}")
 
 
@@ -2316,6 +2342,83 @@ def _emit_where(node: torch.fx.Node, ctx) -> TensorRef:
     for index, operand in enumerate((cond, lhs, rhs), start=1):
         _patch_dynamic_numel(ctx, op_index, operand, index)
     return ctx.record(node, out)
+
+
+def _emit_compare(op_name: str):
+    """A comparison as the DSP's own GREATER or LESS, then a one-byte select.
+
+    The compare arms of htp_ops_binary_elementwise write fp16 1.0 and 0.0, and
+    at bytes 2 it takes that arm whatever outputIsFloat says
+    (eltwise_ops.cc:1166-1173), so the first command leaves a flag at two bytes
+    and does not need an op type of its own. The second is SELECT at one byte,
+    whose one-byte arm copies a byte at a time (eltwise_ops.cc:2157-2168) and has
+    been in the library the whole time; the constants it copies between are what
+    make the result a torch.bool rather than two more flags.
+
+    Both halves matter and they are not the same half. GREATER and LESS are IEEE
+    -- a NaN compares false and -0.0 is not greater than 0.0 -- which is what a
+    subtract cannot be at any length; the select is what only packs.
+    """
+
+    def emit(node: torch.fx.Node, ctx) -> TensorRef:
+        lhs, rhs = node.args[0], node.args[1]
+        _require_arena_dtype(node, f"comparison {op_name}")
+        for operand in (lhs, rhs):
+            if isinstance(operand, torch.fx.Node):
+                _require_arena_dtype(operand, f"comparison {op_name} operand")
+
+        out_shape = tuple(_value_of(node).shape)
+        out_numel = _upper_product(out_shape, ctx)
+        flags = ctx.activation_for_shape(out_shape, torch.float16)
+        op_index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_BINARY_ELEMENTWISE,
+                inputs=[ctx.operand(lhs), ctx.operand(rhs)],
+                outputs=[flags],
+                params=[
+                    out_numel,
+                    _upper_product(_shape_of(lhs), ctx),
+                    _upper_product(_shape_of(rhs), ctx),
+                    BINARY_OP_TYPES[op_name],
+                    FP16_BYTES,
+                    FP16_BYTES,
+                    0,  # inputs are not 4-byte floats
+                    0,  # the compare arms write 1.0 and 0.0 at bytes 2 anyway
+                    *_broadcast_tail(lhs, rhs, out_shape, ctx),
+                ],
+            ),
+        )
+        _patch_dynamic_numel(ctx, op_index, node)
+        for index, operand in enumerate((lhs, rhs), start=1):
+            if isinstance(operand, torch.fx.Node):
+                _patch_dynamic_numel(ctx, op_index, operand, index)
+
+        out = ctx.result_for(node, out_numel, torch.bool)
+        select_index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_SELECT,
+                # The dispatcher's order: the condition first, then the value the
+                # test selects and the one it does not.
+                inputs=[flags, ctx.scalar(1, torch.bool), ctx.scalar(0, torch.bool)],
+                outputs=[out],
+                params=[
+                    out_numel,
+                    out_numel,  # one flag an element, so the command's own guard takes it whole
+                    1,  # each source is a single element
+                    1,
+                    BOOL_BYTES,  # the sources and the result are one byte wide
+                    FP16_BYTES,  # the flags the first command left are two
+                    0,  # the per-channel source mode, which this emitter never asks for
+                    0,
+                ],
+            ),
+        )
+        _patch_dynamic_numel(ctx, select_index, node)
+        return ctx.record(node, out)
+
+    return emit
 
 
 def update_cache_layout(node: torch.fx.Node):
@@ -7899,6 +8002,10 @@ EMITTERS = {
     # `cond ? a : b`. The only ATen node the library's select kernel serves, and
     # the only command here whose condition is one byte per element.
     WHERE: _emit_where,
+    # The two order comparisons, as the DSP's own binary op types plus the
+    # one-byte select that packs their 1.0 and 0.0 into a bool.
+    GREATER_THAN: _emit_compare("greater"),
+    LESS_THAN: _emit_compare("less"),
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
     exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
@@ -7952,6 +8059,10 @@ BINARY_TARGETS = frozenset(
         exir_ops.edge.aten.fmod.Tensor,
         MUL_SILU,
         ADD_RELU,
+        # The comparisons take the same descriptor, and the compare arm walks it
+        # with the same broadcast offsets, so they are gated by the same rank.
+        GREATER_THAN,
+        LESS_THAN,
     }
 )
 
@@ -7962,6 +8073,10 @@ MM_TARGETS = frozenset({exir_ops.edge.aten.mm.default})
 # The one target whose condition operand is legitimately one byte wide, which is
 # why operand_dtypes_are_readable has to know its name.
 WHERE_TARGETS = frozenset({WHERE})
+
+# The targets whose own result is a torch.bool, which is why the arena's width
+# rule is keyed on the target as well as on the dtype.
+COMPARISON_TARGETS = frozenset({GREATER_THAN, LESS_THAN})
 
 # bmm is the same tile geometry with a batch axis in front of both operands.
 BMM_TARGETS = frozenset({exir_ops.edge.aten.bmm.default})

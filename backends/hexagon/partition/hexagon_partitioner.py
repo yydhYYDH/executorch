@@ -90,6 +90,7 @@ from executorch.backends.hexagon.hexagon_ops import (
     REDUCTION_TARGETS,
     repeat_region,
     REPEAT_TARGETS,
+    result_dtype_is_emittable,
     sdpa_mask_fits_dsp_limits,
     sdpa_targets,
     select_region,
@@ -676,13 +677,14 @@ class HexagonOperatorSupport(OperatorSupportBase):
         if node.target not in SUPPORTED_TARGETS:
             _note_unwired_target(node)
             return False
-        dtype = _dtype_of(node)
-        if dtype not in (torch.float16, torch.float32):
-            # Both widths the arena holds are emittable: every kernel reads and
-            # writes two bytes per element, the runtime narrows a fp32 operand on
-            # the way in and widens a fp32 result on the way out, so one declared
-            # fp32 emits the same commands as its fp16 twin. Any other width
-            # would leave the kernels reading int64 bits as half floats.
+        # A comparison's result is a torch.bool and the one byte-wide result a
+        # command here writes: the DSP's own GREATER and LESS leave an fp16 1.0
+        # or 0.0, and the select that follows copies a byte at a time. Every
+        # other width would leave the kernels reading int64 bits as half floats.
+        # result_dtype_is_emittable is the emitters' own answer to the same
+        # question, so a node admitted here cannot fail the export for want of
+        # one -- which is the failure a relaxed gate alone produces.
+        if not result_dtype_is_emittable(_dtype_of(node), node.target):
             return False
         if not operand_dtypes_are_readable(node):
             # A bool operand is one byte per element where the kernels read two,
