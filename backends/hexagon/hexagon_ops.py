@@ -4337,23 +4337,46 @@ def _values_sink(node: torch.fx.Node) -> torch.fx.Node:
 def operand_dtypes_are_readable(node: torch.fx.Node) -> bool:
     """Whether every tensor operand is a width the arena holds.
 
-    A bool is one byte per element in the `.pte` and two in the arena's
-    arithmetic, so a kernel handed one reads the neighbouring slot's bytes as
-    the value: no error, just the wrong numbers. The case is reachable from an
-    ordinary `x + (a > b)`, whose comparison is portable for a dtype reason of
-    its own, so the consumer is refused here rather than left to read it.
+    Every kernel reads and writes two bytes an element, and the runtime narrows a
+    fp32 operand and widens a fp32 result at the boundary, so an operand the
+    graph declares fp32 is emitted exactly as its fp16 twin. Any other width
+    leaves the kernels reading those bits as half floats.
 
-    SELECT is the exception, and it is an exception about the *slot* rather than
-    about the value: an input's slot is the size the blob declares for it, so a
-    bool operand of a `where` is copied in at one byte per element and read back
-    at that width by the one kernel that asks for it. Every other target here
-    reads two bytes, so for those the rule stands unchanged.
+    This is a bool operand first and a width second, and the two are one rule: a
+    bool is one byte per element in the `.pte` and two in the arena's
+    arithmetic, so a kernel handed one reads the neighbouring slot's bytes as the
+    value -- no error, just the wrong numbers. The case is reachable from an
+    ordinary `x + (a > b)`, whose comparison is portable for a dtype reason of
+    its own, so the consumer is refused here rather than left to read it. The
+    width matters as much where the result does not say so: a comparison's
+    result is a torch.bool whatever it compares, so `result_dtype_is_emittable`
+    admits an `arange < lengths` over int64 and the emitter is left holding
+    eight bytes an element where the command declared two. That is the export
+    this gate exists to prevent -- `_require_arena_dtype` raising in the emitter
+    fails the whole `to_edge_transform_and_lower`, where a refusal here is one
+    node falling back to a portable kernel -- so it is the reason the check
+    belongs on this side of the boundary (see HexagonOperatorSupport).
+
+    What is left is the operand a command reads at a width of its own declaring,
+    which NON_ARENA_OPERAND_SLOTS names by argument position, and the target
+    that writes no command at all. SELECT is the first of those and is an
+    exception about the *slot* rather than about the value: an input's slot is
+    the size the blob declares for it, so a bool operand of a `where` is copied
+    in at one byte per element and read back at that width by the one kernel that
+    asks for it. Every other target here reads two bytes, so for those the rule
+    stands unchanged.
     """
-    if node.target in WHERE_TARGETS:
+    if node.target in NO_COMMAND_TARGETS:
         return True
-    for arg in node.args:
+    exempt = NON_ARENA_OPERAND_SLOTS.get(node.target, ())
+    for position, arg in enumerate(node.args):
+        if position in exempt:
+            continue
         value = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
-        if isinstance(value, torch.Tensor) and value.dtype is torch.bool:
+        if isinstance(value, torch.Tensor) and value.dtype not in (
+            torch.float16,
+            torch.float32,
+        ):
             return False
     return True
 
@@ -8732,6 +8755,28 @@ ELU_TARGETS = frozenset({ELU})
 # The one target whose condition operand is legitimately one byte wide, which is
 # why operand_dtypes_are_readable has to know its name.
 WHERE_TARGETS = frozenset({WHERE})
+
+# The tensor operands a command here reads at a width of its own declaring rather
+# than as arena data, by the argument position that carries it. Each is a width
+# the target's own gate already states: a row gather's indices are int32 or int64
+# and the slot is four bytes an element either way, the runtime narrowing a wider
+# one on the way in (shared_gather_spec, SHARED_GATHER_INDEX_BYTES); an
+# update_cache's position is read as an int scale by patch_scale and is never
+# walked an element at a time; and WHERE's condition is the one-byte input slot
+# the blob declares. The table and the index family are the whole list: every
+# other target in EMITTERS reads its operands as arena data, which is what
+# operand_dtypes_are_readable is there to say.
+NON_ARENA_OPERAND_SLOTS = {
+    EMBEDDING: (1,),
+    INDEX_SELECT: (2,),
+    UPDATE_CACHE: (2,),
+    WHERE: (0,),
+}
+
+# The targets whose emitter writes no command at all, so there is no width for
+# their operands to be read at. A dequantize marker is consumed by the quantized
+# matmul behind it and reads nothing of its own.
+NO_COMMAND_TARGETS = frozenset({DQ_PER_CHANNEL})
 
 # The targets whose own result is a torch.bool, which is why the arena's width
 # rule is keyed on the target as well as on the dtype.
