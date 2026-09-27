@@ -200,7 +200,7 @@ def test_each_refused_clause_stays_portable_while_a_control_delegates(
 
 
 def test_the_axis_table_cap_is_the_only_thing_the_width_clause_refuses():
-    assert BILINEAR_UPSAMPLE_MAX_ROW == 2048
+    assert BILINEAR_UPSAMPLE_MAX_ROW == 512
     at_cap, _ = _runs(
         _Bilinear(scale_factor=2.0), (1, 3, 4, BILINEAR_UPSAMPLE_MAX_ROW // 2)
     )
