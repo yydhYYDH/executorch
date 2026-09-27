@@ -476,12 +476,14 @@ _ROWS = [
         [("aten.elu.default", "wired")],
     ),
     (
-        "prelu decomposes, and both halves of it are wired",
+        "prelu decomposes, and every half of it is wired",
         _PReLU(),
         (_x(2, 4),),
         [
             ("aten.view_copy.default", "wired"),
-            ("aten.gt.Scalar", "unwired"),
+            # The comparison in the decomposition is the Scalar form, which
+            # reaches the same two commands as the tensor one.
+            ("aten.gt.Scalar", "wired"),
             ("aten.mul.Tensor", "wired"),
             ("aten.where.self", "wired"),
         ],
@@ -883,7 +885,7 @@ _ROWS = [
         "where over a computed condition",
         lambda a, b: torch.where(a > 0, a, b),
         (_x(8), _x(8)),
-        [("aten.gt.Scalar", "unwired"), ("aten.where.self", "wired")],
+        [("aten.gt.Scalar", "wired"), ("aten.where.self", "wired")],
     ),
     (
         "masked_fill is a where with a lifted constant",
@@ -896,7 +898,10 @@ _ROWS = [
         lambda a, b: a + (b > 0).to(torch.float16),
         (_x(8), _x(8)),
         [
-            ("aten.gt.Scalar", "unwired"),
+            # The comparison delegates now; the add still refuses, and the
+            # refusal is the row's subject: it is the bool operand, not the
+            # comparison, that the read-two-bytes rule is about.
+            ("aten.gt.Scalar", "wired"),
             ("dim_order_ops._to_dim_order_copy.default", "refused"),
             ("aten.add.Tensor", "wired"),
         ],
