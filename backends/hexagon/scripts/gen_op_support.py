@@ -62,6 +62,9 @@ W8A16_PREFILL = "DSP_OP_MATMUL_W8A16_BLOCK_FP16"
 # The row-wise arg-reduction command. It writes one int64 index per row and
 # takes a mode parameter for min versus max.
 ARG_REDUCTION = "DSP_OP_ARGMAX_FP16"
+# The bilinear upsample. One command, four taps per output element, fp32
+# accumulation with a single fp16 rounding at the store.
+BILINEAR_UPSAMPLE = "DSP_OP_UPSAMPLE_BILINEAR2D_FP16"
 # The row gather. One command reads a run of rows out of a fp16 table whose
 # bytes the export step rearranged into the 32x32 tiles the kernel walks.
 SHARED_GATHER = "DSP_OP_SHARED_GATHER"
@@ -1091,9 +1094,35 @@ SUPPORTED: List[OpSupport] = [
         "of passes. Left portable: a ratio that is not an exact integer multiple, "
         "including a shrinking one, because the runs of repeated source elements "
         "are then of unequal length and the phases stop being a constant stride "
-        "apart. `aten.upsample_bilinear2d.vec` and `aten.upsample_bicubic2d.vec` "
-        "have no region form at all: their taps carry weights that vary with the "
-        "output position, which is arithmetic rather than an index map.",
+        "apart. `aten.upsample_bicubic2d.vec` has no region form at all: its taps "
+        "carry weights that vary with the output position, which is arithmetic "
+        "rather than an index map. `aten.upsample_bilinear2d.vec` is arithmetic "
+        "too and has its own command instead.",
+    ),
+    OpSupport(
+        "aten.upsample_bilinear2d.vec",
+        BILINEAR_UPSAMPLE,
+        ARENA_FP16,
+        "A 4-D contiguous **fp16** input whose output extent is an exact integer "
+        "multiple of its input extent on both axes, with `align_corners=False`. "
+        "Four taps per output element, accumulated in fp32 as ATen does -- "
+        "`h0 * (w0 * a + w1 * b) + h1 * (w0 * c + w1 * d)` over the widened fp16 "
+        "loads, with one rounding to fp16 at the store -- and the source "
+        "coordinate computed as `scale * (dst + 0.5) - 0.5` over the *output* "
+        "index rather than as a block plus a phase, which differs in the last bit. "
+        "The command carries the five geometry ints and no weights: the kernel "
+        "derives the ratio, checks it is an exact integer multiple, and builds one "
+        "axis table per call. Left portable: `align_corners=True`, which is a "
+        "different function rather than a different spelling; a ratio that is not "
+        "an exact integer multiple, whose tap weights stop being periodic in the "
+        "output index; an output row wider than the 2048-entry axis table, a "
+        "32768-byte frame that is asserted in the kernel; and any "
+        "non-contiguous, non-fp16 or symbolic-extent operand. fp32 in particular is "
+        "refused rather than narrowed: the blob sizes the operand at the command's "
+        "own width, so it would record 120 bytes for a 240-byte tensor and the DSP "
+        "would read half of it as fp16. "
+        "`aten.upsample_bicubic2d.vec` is a separate op with sixteen taps and is "
+        "still portable.",
     ),
     OpSupport(
         "aten.unsqueeze_copy.default",

@@ -113,6 +113,10 @@ extern "C" int htp_ops_topkv2_k1_fp16(uint8_t *values, uint8_t *indices,
                                       int32_t rows);
 extern "C" int htp_ops_argmax_fp16(uint8_t *indices, const uint8_t *input,
                                    int32_t rowSize, int32_t rows, int32_t is_min);
+extern "C" int htp_ops_upsample_bilinear2d_fp16(uint8_t *dst, const uint8_t *src,
+                                           int32_t planes, int32_t in_h,
+                                           int32_t in_w, int32_t out_h,
+                                           int32_t out_w);
 /* The element-wise select. Its condition is the one operand this backend hands a
  * kernel that is not two bytes wide: condBytes is a parameter of its own, and the
  * kernel reads the condition at that width (eltwise_ops.cc:2116). */
@@ -177,6 +181,7 @@ enum {
   kVisionAttention = 43,
   kW8A16Gemv = 45,
   kArgmaxFp16 = 47,
+  kUpsampleBilinear2d = 46,
 };
 
 /* The three unary types that arrive at an entry point of their own, from
@@ -437,6 +442,16 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
                                   address(header, op.inputs[0]), params[0],
                                   params[1], params[2]);
     if (ret != 0) printf("%s argmax returned %d\n", g_tag, ret);
+    return;
+  }
+  if (op.type == kUpsampleBilinear2d) {
+    /* Five geometry ints and no weights: the kernel derives the ratio and builds
+     * its own axis tables, so the command carries the extents and nothing else. */
+    int ret = htp_ops_upsample_bilinear2d_fp16(address(header, op.outputs[0]),
+                                                address(header, op.inputs[0]),
+                                                params[0], params[1], params[2],
+                                                params[3], params[4]);
+    if (ret != 0) printf("%s upsample_bilinear2d returned %d\n", g_tag, ret);
     return;
   }
   if (op.type == kSharedGather) {

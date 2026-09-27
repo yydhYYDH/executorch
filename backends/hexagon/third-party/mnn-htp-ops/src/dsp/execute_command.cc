@@ -665,6 +665,13 @@ int htp_execute_command(MmapManager* mmap_manager, const DSPCOMMAND::Command* co
                                       intParams[0], intParams[1], intParams[2]);
             break;
         }
+        case DSP_OP_UPSAMPLE_BILINEAR2D_FP16: {
+            ret = htp_ops_upsample_bilinear2d_fp16(mapped_ptrs[inputs->size()],
+                                                   mapped_ptrs[0],
+                                                   intParams[0], intParams[1], intParams[2],
+                                                   intParams[3], intParams[4]);
+            break;
+        }
         case DSP_OP_SOFTMAX: {
             ret = htp_ops_softmax(mapped_ptrs[inputs->size()],
                                   mapped_ptrs[0],

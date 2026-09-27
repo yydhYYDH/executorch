@@ -83,6 +83,7 @@ SOFTMAX = 28
 REDUCTION = 29
 TOPKV2_K1_FP16 = 27
 ARGMAX_FP16 = 47
+UPSAMPLE_BILINEAR2D_FP16 = 46
 
 #: HtpOpsReductionOpType.
 REDUCTION_SUM = 1
@@ -1579,6 +1580,72 @@ def _run_arg_reduction(command: Command, params: List[int], arena: Arena) -> Non
     _store(arena, arena.address(command.outputs[0]), out.astype("<i8").tobytes())
 
 
+def _bilinear_axis(extent: int, out_extent: int):
+    """ATen's scale and source-coordinate lines, in fp32, one entry per output index.
+
+    The two lines are `scale * (dst + 0.5) - 0.5` with a zero clamp, over the
+    *output* index. Decomposing that into a block and a phase changes the last
+    bit, because the product stops being rounded on its own, so this evaluates
+    the same expression the kernel does rather than a tidier equivalent.
+    """
+    if extent <= 0 or out_extent <= 0 or out_extent % extent:
+        raise UnsupportedOp("blob: bilinear upsample is not an integer multiple")
+    scale = np.float32(1.0 / float(out_extent // extent))
+    low, high, weight = [], [], []
+    for dst in range(out_extent):
+        src = scale * (np.float32(dst) + np.float32(0.5)) - np.float32(0.5)
+        if src < np.float32(0.0):
+            src = np.float32(0.0)
+        i0 = int(np.floor(src))
+        i1 = i0 + 1 if i0 + 1 < extent else i0
+        low.append(i0)
+        high.append(i1)
+        weight.append(src - np.float32(i0))
+    return (
+        np.asarray(low, dtype=np.intp),
+        np.asarray(high, dtype=np.intp),
+        np.asarray(weight, dtype=np.float32),
+    )
+
+
+def _run_upsample_bilinear2d(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_upsample_bilinear2d_fp16: four taps per output element, in fp32.
+
+    The accumulation order is the one ATen uses, `h0 * (w0 * a + w1 * b) +
+    h1 * (w0 * c + w1 * d)`, and not the separable `top + h1 * (bot - top)`,
+    which agrees over the reals and not in floating point. The fp16 loads are
+    widened before the products and the single rounding to fp16 is at the store.
+    """
+    planes, in_h, in_w, out_h, out_w = params[:5]
+    if min(planes, in_h, in_w, out_h, out_w) <= 0:
+        raise UnsupportedOp("blob: bilinear upsample has a non-positive extent")
+    src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    if src.size < planes * in_h * in_w:
+        raise UnsupportedOp(f"blob: {src.size} values do not fill {planes} planes")
+    planes_view = src[: planes * in_h * in_w].reshape(planes, in_h, in_w)
+
+    y0, y1, hy = _bilinear_axis(in_h, out_h)
+    x0, x1, hx = _bilinear_axis(in_w, out_w)
+    w0 = (np.float32(1.0) - hx)[None, :]
+    h0 = (np.float32(1.0) - hy)[:, None]
+    wide = planes_view.astype(np.float32)
+
+    out = np.empty((planes, out_h, out_w), dtype=np.float32)
+    for plane in range(planes):
+        top = w0 * wide[plane][y0[:, None], x0[None, :]] + hx * wide[plane][
+            y0[:, None], x1[None, :]
+        ]
+        bot = w0 * wide[plane][y1[:, None], x0[None, :]] + hx * wide[plane][
+            y1[:, None], x1[None, :]
+        ]
+        out[plane] = h0 * top + hy[:, None] * bot
+    _store(
+        arena,
+        arena.address(command.outputs[0]),
+        out.astype(np.float16).reshape(-1).tobytes(),
+    )
+
+
 def _run_flash_attn(command: Command, params: List[int], arena: Arena) -> None:
     """Sync attention, over the cache the op was handed rather than one it keeps.
 
@@ -2210,6 +2277,7 @@ _EXECUTORS = {
     REDUCTION: _run_reduction,
     TOPKV2_K1_FP16: _run_topk,
     ARGMAX_FP16: _run_arg_reduction,
+    UPSAMPLE_BILINEAR2D_FP16: _run_upsample_bilinear2d,
     UNARY: _run_unary,
     BINARY_ELEMENTWISE: _run_binary,
     LAYER_NORM: _run_layer_norm,
