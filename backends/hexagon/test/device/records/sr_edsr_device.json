@@ -27,6 +27,12 @@
     "host_decoded": {"DSP_OP_RASTER_BLIT": 80, "DSP_OP_IM2COL_CONVOLUTION_FP16": 38, "DSP_OP_BINARY_ELEMENTWISE": 35, "DSP_OP_UNARY": 16, "DSP_OP_ZERO": 3},
     "total": 172,
     "per_delegate": {"executorch_call_delegate": 162, "executorch_call_delegate_1": 10},
+    "delegate_composition": {
+      "d0": {"nodes": 87, "ops": 162, "conv": 36, "relu": 16, "mul": 17, "add": 17, "view_copy": 1, "content": "all 16 residual blocks at the input resolution; no upsampling happens here"},
+      "d1": {"nodes": 6, "ops": 10, "conv": 2, "div": 1, "clone_dim_order": 2, "view_copy": 1, "content": "the x2 upsampling head, producing (1,3,128,128)"},
+      "residual_blocks": 16,
+      "residual_blocks_evidence": ["model.body is 16 x ResBlock followed by 1 x Conv2d", "d0 holds 16 relu and one ResBlock has exactly one"]
+    },
     "device_reported": {"d0_ops": 162, "d1_ops": 10},
     "agrees": true
   },
