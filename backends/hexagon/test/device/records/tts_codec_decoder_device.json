@@ -3,22 +3,43 @@
  "tier": "device",
  "tree": ".tmp/ttsdev/executorch @ d1e52d8 (hexagon-tts-device), branched from hexagon-integration-a47",
  "baseline": "5045487 (a47) + 13 commits, the same integration point the other device lines used",
- "not_run_here": ["hexagon-sim"],
+ "not_run_here": [
+  "hexagon-sim"
+ ],
  "model": {
   "source": "examples/models/voxtral_tts/model.py -> CodecDecoder (vocoder), VoxtralTTSConfig defaults",
   "premise_kept": "QUARTER WIDTH, not the full 4B-checkpoint vocoder. codec_dim 256 vs 1024, codec_hidden 1024 vs 4096, semantic_dim 64 vs 256, semantic_codebook 2048 vs 8192. The full config is 149,471,472 params and its export peaked at 2112 MB RSS, over the 1.5 GB stop line, so it was not run. The op set is unaffected: the census is identical at 1/8 width (unique 41, nodes 1222, delegated 820, delegates 40, same command totals).",
   "params": 15999216,
-  "input": [1, 37, 16],
-  "output": [1, 1, 30720],
+  "input": [
+   1,
+   37,
+   16
+  ],
+  "output": [
+   1,
+   1,
+   30720
+  ],
   "dtype": "int64 IN (4736 B = 592 x 8, itemsize read from the ExportedProgram, not assumed), float32 out (122880 B = 30720 x 4); the kernels and the arena are fp16"
  },
  "device": {
   "host": "oneplus13-reverse",
   "dir": "/data/data/com.termux/files/home/csm/execuTorch-ds/ttsdev",
-  "runner": {"bytes": 54292832, "md5": "3fdba2a1fe295e72f20283941c505602", "path": "devloop/executor_runner"},
-  "skel": {"bytes": 1500472, "md5": "9476b264825a23676e0578e323917ac7", "path": "devloop/skel/libhex-htp-skel-v79.so"},
+  "runner": {
+   "bytes": 54292832,
+   "md5": "3fdba2a1fe295e72f20283941c505602",
+   "path": "devloop/executor_runner"
+  },
+  "skel": {
+   "bytes": 1500472,
+   "md5": "9476b264825a23676e0578e323917ac7",
+   "path": "devloop/skel/libhex-htp-skel-v79.so"
+  },
   "env": "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64, ADSP_LIBRARY_PATH=devloop/skel",
-  "pte": {"bytes": 35124036, "md5": "ee1029bb1fbf520acb56b85a8b1bd118"}
+  "pte": {
+   "bytes": 35124036,
+   "md5": "ee1029bb1fbf520acb56b85a8b1bd118"
+  }
  },
  "command_stream": {
   "decoded_with": "enum DSPOpType parsed from backends/hexagon/third-party/mnn-htp-ops/include/htp_command.h:32",
@@ -34,13 +55,76 @@
    "DSP_OP_SELECT": 8,
    "DSP_OP_SOFTMAX": 4
   },
-  "type_numbers": {"3": "RASTER_BLIT", "4": "UNARY", "19": "BINARY_ELEMENTWISE", "26": "SELECT", "28": "SOFTMAX", "29": "REDUCTION", "38": "BATCH_MATMUL"},
+  "type_numbers": {
+   "3": "RASTER_BLIT",
+   "4": "UNARY",
+   "19": "BINARY_ELEMENTWISE",
+   "26": "SELECT",
+   "28": "SOFTMAX",
+   "29": "REDUCTION",
+   "38": "BATCH_MATMUL"
+  },
   "total": 516,
   "conv_commands": 0,
   "upsample_bilinear_commands": 0,
   "note": "ZERO conv commands of any kind and ZERO type-46 upsamples. The vocoder's convolutions are unfold+matmul and its transposed convolutions are matmul+Fold, so the whole structural upsampling of this family runs as BATCH_MATMUL, never as a convolution and never as an interpolation. This answers the open question for this family directly: the gap is NOT the upsample path.",
-  "census": {"unique_targets": 41, "in_table": 32, "off_table": 9, "nodes": 1222, "delegated": 820, "portable": 402, "delegates": 40},
-  "device_side": {"delegates_entered": 40, "delegates_ok": 40, "elapsed_s": 1}
+  "census": {
+   "unique_targets": 41,
+   "in_table": 32,
+   "off_table": 9,
+   "nodes": 1222,
+   "delegated": 820,
+   "portable": 402,
+   "delegates": 40
+  },
+  "device_side": {
+   "delegates_entered": 40,
+   "delegates_ok": 40,
+   "elapsed_s": 1
+  }
+ },
+ "second_length_T32": {
+  "input": [
+   1,
+   37,
+   32
+  ],
+  "output": [
+   1,
+   1,
+   61440
+  ],
+  "input_bytes": 9472,
+  "output_bytes": 245760,
+  "psnr_db": 67.00610632026381,
+  "max_abs": 0.0032874345779418945,
+  "rmse": 0.0007207436806649535,
+  "pearson_r": 0.9999989177984377,
+  "sign_agreement": 0.9996744791666666,
+  "nan": 0,
+  "inf": 0,
+  "delegates_entered": 40,
+  "delegates_ok": 40,
+  "elapsed_s": 3,
+  "commands": 524,
+  "controls": {
+   "perturbed_reference_psnr_db": 47.93,
+   "fp16_roundtrip_of_reference_psnr_db": 86.692,
+   "constant_mean_model_psnr_db": 13.014
+  }
+ },
+ "determinism": {
+  "runs": 3,
+  "sessions": 2,
+  "span_minutes": 3,
+  "sha256_all_three": "cb114b952847782239232dd57e802e1cc6c1b0de38f1ad4b88a4b00bc1483e59",
+  "note": "three runs of the T=16 input in two device sessions produced byte-identical output"
+ },
+ "known_good_control": {
+  "model": "devloop/cnnB.pte",
+  "bytes": 4096,
+  "md5": "64cae9e8e91b36b085ab3b15f937daf5",
+  "run_after_every_session": true
  },
  "numerics": {
   "psnr_db": 67.58962590531821,
