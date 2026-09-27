@@ -42,7 +42,7 @@ import torch
 
 # The checkout directory is itself named executorch, so its parent goes on the
 # path; without it the editable install wins and points at another checkout.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import execute, read_blob  # noqa: E402

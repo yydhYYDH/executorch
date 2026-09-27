@@ -38,7 +38,7 @@ import torch
 # The checkout directory is itself named executorch, so putting its parent on the
 # path makes "import executorch" resolve to this tree; the editable install in
 # this environment points at a different checkout with an older backend.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 import hexagon_sim  # noqa: E402

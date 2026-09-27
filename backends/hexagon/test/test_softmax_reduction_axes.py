@@ -28,7 +28,7 @@ import sys
 import pytest
 import torch
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import read_blob  # noqa: E402

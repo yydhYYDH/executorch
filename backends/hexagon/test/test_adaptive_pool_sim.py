@@ -15,7 +15,7 @@ import pytest
 import torch
 
 # Resolve this checkout rather than the editable install in the environment.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 import hexagon_sim  # noqa: E402

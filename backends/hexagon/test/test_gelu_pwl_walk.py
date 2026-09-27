@@ -52,7 +52,7 @@ import torch
 
 # The checkout directory is itself named executorch, so putting its parent on the
 # path makes `import executorch` resolve to this tree.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 import test_unary_pwl  # noqa: E402  the phone's own recorded bits

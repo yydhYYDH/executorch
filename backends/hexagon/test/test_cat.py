@@ -34,7 +34,7 @@ import torch
 # path makes "import executorch" resolve to this tree. Without it the
 # editable install wins, and in this environment that points at a different
 # checkout, which has an older backend in it.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 # The test directory is not a package, so the interpreter is importable by name.
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 

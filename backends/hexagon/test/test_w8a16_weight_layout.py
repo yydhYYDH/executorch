@@ -46,7 +46,7 @@ import pytest
 # The checkout directory is itself named executorch, so putting its parent on the
 # path makes `import executorch` resolve to this tree; the editable install in
 # this environment points at a different checkout.
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 
 from executorch.backends.hexagon.hexagon_ops import pack_w8a16_gemv_weight  # noqa: E402
 

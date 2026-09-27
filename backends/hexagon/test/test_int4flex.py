@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pytest
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 from executorch.backends.hexagon.hexagon_ops import (
     pack_q4a16_gemv_weight,
     pack_q4a16_prefill_weight,

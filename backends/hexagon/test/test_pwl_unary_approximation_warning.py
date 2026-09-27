@@ -47,7 +47,7 @@ import warnings
 import pytest
 import torch
 
-sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[4]))
+sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parents[3]))
 sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from executorch.backends.hexagon.hexagon_backend import HexagonBackend  # noqa: E402
