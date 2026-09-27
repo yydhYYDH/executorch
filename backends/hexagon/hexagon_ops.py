@@ -1283,8 +1283,15 @@ def cat_plan(node: torch.fx.Node):
         return None
     if not result.is_contiguous() or not all(value.is_contiguous() for value in values):
         return None
-    if result.dtype not in (torch.float16, torch.float32) or any(
-        value.dtype is not result.dtype for value in values
+    if result.dtype not in (torch.float16, torch.float32):
+        return None
+    # Both widths the arena holds reach the same two-byte region, as they do for
+    # every other command here: a fp32 slot is half the size its graph declares
+    # and the runtime narrows on the way in, so the operand the blit reads is two
+    # bytes per element either way.  A diffusion timestep embedding concatenates
+    # in fp32, and refusing it left the whole prologue on the portable kernels.
+    if any(
+        value.dtype not in (torch.float16, torch.float32) for value in values
     ):
         return None
 
