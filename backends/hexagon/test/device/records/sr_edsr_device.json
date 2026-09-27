@@ -76,6 +76,32 @@
     "before": {"resnet18": "52f903ab3eed089b0c0d9e6d35c82d2a2976a364dabda2404f42a945eaeeb33f", "s3": "ba5801bed343a101e6650a4dccfb71577b4b3a1cdbc26c8afa97f90e3d525d6c"},
     "after": {"resnet18": "52f903ab3eed089b0c0d9e6d35c82d2a2976a364dabda2404f42a945eaeeb33f", "s3": "ba5801bed343a101e6650a4dccfb71577b4b3a1cdbc26c8afa97f90e3d525d6c"},
     "identical": true,
+    "after_session_restart": {"resnet18": "52f903ab3eed089b0c0d9e6d35c82d2a2976a364dabda2404f42a945eaeeb33f", "s3": "ba5801bed343a101e6650a4dccfb71577b4b3a1cdbc26c8afa97f90e3d525d6c", "edsr": "2315a22cd2c626e69b38295d495870f7942b8a32751309d8dce435c84acbb66a"},
     "device_scan_for_9fabbf1a": "not found under execuTorch-ds; every *.bin was hashed"
+  },
+  "permute_convergence": {
+    "op": "aten.permute_copy.default",
+    "three_independent_lines": [
+      "this one: the only geometry-gated portable node, gate hexagon_ops.py:415",
+      "the upsample line: the only portable node in the edsr upsampling path; its two view_copy went into the delegate as RASTER_BLIT and the permute stayed outside",
+      ".tmp/wt/diffusion unmerged commit e522ac1, 'unroll the outermost axis of a permutation instead of refusing it'"
+    ],
+    "e522ac1_reaches_edsr": false,
+    "why": "the commit raises the ceiling from 3 advancing levels to 4 (after_ops.py:1053) and unrolls one level only when there are exactly 4 (after_ops.py:1055). The EDSR pixel_shuffle permute has 5.",
+    "measured": {
+      "method": "the gate function extracted verbatim from the commit, run on the EDSR shapes; the commit's own four claimed cases pass as controls first",
+      "controls_pass": 4,
+      "edsr_configurations_refused": 7,
+      "configurations": ["N=1 C=64 r=2 64x64", "N=1 C=64 r=2 32x32", "N=1 C=64 r=2 224x224", "N=1 C=64 r=3 64x64", "N=1 C=64 r=4 64x64", "N=1 C=16 r=2 64x64", "N=4 C=64 r=2 64x64"]
+    },
+    "what_would_reach_it": {
+      "unroll_1_level": "5 -> 4 levels, still over the limit",
+      "unroll_2_levels": "64 x 2 = 128 regions, 3 levels each, describable",
+      "cost_estimate_not_measured": "the moved tensor is 2,097,152 B; at 3 regions per command, 128 regions is about 43 commands against a delegate that currently carries 10"
+    },
+    "caveats": [
+      "e522ac1 is based on a different tree (hexagon_ops.py 6285 lines there, 8600+ on the land tree) and is not a drop-in; it needs a rebase",
+      "only the gate function was measured, not a full export with the commit applied"
+    ]
   }
 }
