@@ -71,8 +71,8 @@ CFG = EdgeCompileConfig(_check_ir_validity=False)
 #: The two gates this file separates, in this checkout's line numbering. Both are
 #: in `_verdict` and they are adjacent, so every refusal below is attributed to
 #: one of them rather than to "the update_cache gates".
-LAYOUT_GATE = 997
-APPEND_GATE = 1004
+LAYOUT_GATE = 1032
+APPEND_GATE = 1039
 
 BATCH, SEQ, HEADS, DIM = 1, 5, 2, 32
 
