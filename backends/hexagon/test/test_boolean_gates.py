@@ -29,6 +29,7 @@ from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa:
 from executorch.exir.dialects._ops import ops as exir_ops  # noqa: E402
 
 LOGICAL_NOT = exir_ops.edge.aten.logical_not.default
+LOGICAL_AND = exir_ops.edge.aten.logical_and.default
 ANY_DIM = exir_ops.edge.aten.any.dim
 ADD = exir_ops.edge.aten.add.Tensor
 
@@ -75,7 +76,10 @@ def test_the_supported_set_is_the_emitter_table_so_a_target_cannot_be_added_alon
     """
     assert hexagon_backend.SUPPORTED_TARGETS is hexagon_backend.EMITTERS
     assert part_mod.SUPPORTED_TARGETS is hexagon_backend.EMITTERS
-    assert LOGICAL_NOT not in hexagon_backend.SUPPORTED_TARGETS
+    # logical_not is wired now, so the example of a target that is not has moved
+    # to a neighbour in the same family that still is not; the assertion under
+    # test is the identity above, not the choice of example.
+    assert LOGICAL_AND not in hexagon_backend.SUPPORTED_TARGETS
     assert ANY_DIM not in hexagon_backend.SUPPORTED_TARGETS
 
     support = HexagonOperatorSupport()
@@ -120,9 +124,11 @@ def test_an_emitter_for_those_targets_would_need_the_arena_width_it_refuses():
     so admitting bool at the partitioner alone would convert a working export
     into a RuntimeError.
     """
-    node = _bool_chain()[0]
+    # The bool exemption is keyed on the target, and a comparison is on it, so
+    # the node that still has to be refused is a bool arriving at a float target.
+    bool_at_a_float_target = _add(torch.bool)
     with pytest.raises(RuntimeError, match="must be fp16 or fp32"):
-        hexagon_ops._require_arena_dtype(node, "logical_not")
+        hexagon_ops._require_arena_dtype(bool_at_a_float_target, "add")
 
     add = _add(torch.float16)
     hexagon_ops._require_arena_dtype(add, "add")
