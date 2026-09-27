@@ -331,9 +331,10 @@ SUPPORTED: List[OpSupport] = [
         "only packs. Broadcasting works through rank 8 on the same descriptor as "
         "the binary rows above. The result is a one-byte-per-element buffer, "
         "which is a bool the `where` row above reads as its condition. "
-        "The Scalar overloads are not here, and neither are eq, ne, ge and le: "
-        "htp_ops_binary_is_compare admits only the two op types, and the "
-        "subtraction the other four would need is not a comparison at any length.",
+        "The Scalar overloads are rows of their own below, and eq, ne, ge and le "
+        "are not here at any width: htp_ops_binary_is_compare admits only the two "
+        "op types, and the subtraction the other four would need is not a "
+        "comparison at any length.",
     ),
     OpSupport(
         "aten.lt.Tensor",
@@ -349,9 +350,59 @@ SUPPORTED: List[OpSupport] = [
         "only packs. Broadcasting works through rank 8 on the same descriptor as "
         "the binary rows above. The result is a one-byte-per-element buffer, "
         "which is a bool the `where` row above reads as its condition. "
-        "The Scalar overloads are not here, and neither are eq, ne, ge and le: "
-        "htp_ops_binary_is_compare admits only the two op types, and the "
-        "subtraction the other four would need is not a comparison at any length.",
+        "The Scalar overloads are rows of their own below, and eq, ne, ge and le "
+        "are not here at any width: htp_ops_binary_is_compare admits only the two "
+        "op types, and the subtraction the other four would need is not a "
+        "comparison at any length.",
+    ),
+    OpSupport(
+        "aten.gt.Scalar",
+        f"{BINARY} / {SELECT}",
+        "fp16 operands, one byte per result",
+        "The same two commands as the Tensor row, with the literal in place of the "
+        "right operand. A python literal reaches the binary command as a one-element "
+        "fp16 constant in the arena, and the command is handed the broadcast "
+        "descriptor with that constant's stride table zeroed, so the kernel reads "
+        "element zero at every index. It is not handed the kernel's own "
+        "in1Size == 1 arm, and the difference is not cosmetic: over the corner list "
+        "the two branches agree on fifteen of sixteen and disagree on the NaN, "
+        "where the arm answers 1.0 for `NaN > 0` and the descriptor answers "
+        "0.0 the way torch does. Both operand widths are the Tensor row's rule, the "
+        "literal has to be a real number, and an int literal is widened to fp16 "
+        "first, so an int64 above 2048 is not the number torch compared.",
+    ),
+    OpSupport(
+        "aten.lt.Scalar",
+        f"{BINARY} / {SELECT}",
+        "fp16 operands, one byte per result",
+        "The same two commands and the same descriptor as `aten.gt.Scalar`, "
+        "and the arm-vs-descriptor NaN difference is measured on the greater "
+        "direction only: the less arm agrees with the descriptor over the whole "
+        "corner list. Everything else is that row's, including that both operand "
+        "widths are the Tensor row's rule and the literal is widened to fp16 first.",
+    ),
+    OpSupport(
+        "aten.logical_not.default",
+        SELECT,
+        "one byte per condition, one byte per result",
+        "One command. The select's condition is the node's only operand, read one "
+        "byte at a time, and its two sources are the one-byte constants 1 and 0, so "
+        "the answer is a mask the `where` row above reads. The operand has to "
+        "be a torch.bool rather than anything else one byte wide: the kernel's test "
+        "is `!= 0`, and a float read at one byte an element is its "
+        "neighbour's low half rather than its own value. A comparison's two-byte "
+        "flags read this way are all zeros, which is why the comparison rows pack "
+        "before this reads.",
+    ),
+    OpSupport(
+        "aten.bitwise_not.default",
+        SELECT,
+        "one byte per condition, one byte per result",
+        "The row above under the other spelling, and the two are different ATen "
+        "nodes rather than one op with two names: `torch.logical_not` exports "
+        "as `aten.logical_not.default` and `~` on a bool exports as "
+        "`aten.bitwise_not.default`. Same command, same widths, same refusal, "
+        "and an island written with `~` splits in two without this row.",
     ),
     # --- the element-wise select (DSP_OP_SELECT) -------------------------
     OpSupport(
@@ -362,7 +413,11 @@ SUPPORTED: List[OpSupport] = [
         "at its own width and the kernel reads one byte at a time, so any other "
         "dtype here would be read at the wrong stride. The two values must be the "
         "output's element count or a single element, and both modes are reachable: "
-        "`masked_fill` reaches it with a one-element value. The kernel's per-channel "
+        "`masked_fill` reaches it with a one-element value. They must also be "
+        "the output's own dtype: the command declares one width for the output and "
+        "reads both values at it, so a value of another width is a misread -- each "
+        "element takes its neighbour for its high half -- and not a narrower flag. "
+        "The condition is the only operand here with a width of its own to declare. The kernel's per-channel "
         "VALUE mode needs a channel count keyed to a channel axis of the output, "
         "which this emitter does not compute, so a per-channel value stays portable. "
         "A condition is a different question and is answered: it is the whole "
@@ -1251,21 +1306,20 @@ NOT_SUPPORTED = [
         "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
     ),
     (
-        "aten.eq / ne / ge / le, and gt/lt against a Scalar",
-        "No target here is in EMITTERS, so SUPPORTED_TARGETS refuses each of them "
-        "at the first gate in the predicate. The DSP's own comparison is two op "
-        "types and not six: HtpOpsBinaryOpType carries GREATER(9) and LESS(10) "
-        "and htp_ops_binary_is_compare admits nothing else, so eq, ne, ge and le "
-        "have no kernel at any width, and the two above are reached only against a "
-        "tensor because that is the route measured. The subtraction the other four "
-        "would need is not a comparison at any length: a - b != 0 reads -0.0 as "
-        "set, inf - inf as a NaN, and a >= b written as not (b > a) fails De "
-        "Morgan on an unordered pair. The Scalar overloads fail for a host reason "
-        "instead -- a python literal reaches ctx.operand as an fp16 constant, "
-        "which is a second route nobody has measured. A bool *operand* is a "
-        "separate rule and the one operand_dtypes_are_readable states, about a "
-        "misread rather than an overrun, with SELECT the exception because it "
-        "declares the width it reads.",
+        "aten.eq / ne / ge / le, and a bool operand anywhere else",
+        "No comparison target here is in EMITTERS, so SUPPORTED_TARGETS refuses "
+        "each of them at the first gate in the predicate. The DSP's own comparison "
+        "is two op types and not six: HtpOpsBinaryOpType carries GREATER(9) and "
+        "LESS(10) and htp_ops_binary_is_compare admits nothing else, so eq, ne, ge "
+        "and le have no kernel at any width and neither spelling of them is a row. "
+        "The subtraction the other four would need is not a comparison at any "
+        "length: a - b != 0 reads -0.0 as set, inf - inf as a NaN, and a >= b "
+        "written as not (b > a) fails De Morgan on an unordered pair. A bool "
+        "*operand* is a separate rule and the one operand_dtypes_are_readable "
+        "states, about a misread rather than an overrun, with SELECT the exception "
+        "because it declares the width it reads: `add` with a mask still "
+        "refuses. A bool *result* is the other half and is deliberately admitted, "
+        "so the two rules cannot be read as one.",
     ),
     (
         "aten.sin / cos / expm1 defaults, and aten.erf.default",
