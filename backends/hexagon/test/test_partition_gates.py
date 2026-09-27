@@ -191,6 +191,12 @@ def _x(*shape):
     return torch.randn(*shape, dtype=F16)
 
 
+def _flags(*shape):
+    """A torch.bool tensor, seeded so a case that reads it twice reads the same."""
+    generator = torch.Generator().manual_seed(0xC0FFEE)
+    return torch.rand(*shape, generator=generator) < 0.5
+
+
 def _edge(module, inputs):
     program = HexagonPartitioner().transform_for_pre_decomposition(
         export(module, inputs)
@@ -233,8 +239,14 @@ CASES = [
     (
         715,
         "aten.where.self",
-        _M(lambda a: F.scaled_dot_product_attention(a, a, a)),
-        (_x(1, 2, 4, 8),),
+        # A condition narrower than the output over a middle axis. Its index is
+        # not a function of index/innerSize, so select_condition_plane returns
+        # None and this clause is what refuses it; the staircase form one axis
+        # along, which is the mask-add every attention block emits, is admitted
+        # and is what test_the_where_clause_turns_away_only_the_plane_it_cannot_name
+        # pins from the other side.
+        _M(lambda a, b, cond: torch.where(cond, a, b)),
+        (_x(1, 2, 3, 4), _x(1, 2, 3, 4), _flags(1, 2, 1, 4)),
     ),
     (
         724,
@@ -441,3 +453,34 @@ def test_a_refused_getitem_names_the_producer_it_is_standing_behind(instrumented
     assert not support.is_node_supported({}, getitem)
     assert _REFUSED[getitem] == 941
     assert _REFUSED[sort] == 687
+
+
+def test_the_where_clause_turns_away_only_the_plane_it_cannot_name(instrumented):
+    """The boundary line 715 draws, on four conditions one axis apart.
+
+    The clause used to be a claim about widths -- all three operands the
+    output's element count or a single element -- and the sdpa fully-masked-row
+    guard was its example. The guard's condition is one flag per query row, a
+    per-channel walk the kernel reaches through a plane, and
+    select_condition_plane derives that plane from the two shapes, so the node
+    delegates now. What the clause still refuses is a condition whose narrow
+    axis is not a suffix, because no plane describes it, and the same is true
+    of a non-bool condition.
+
+    So the neighbours are the measurement: three conditions of the same
+    element count that the same instrument accepts, against the one it does
+    not. Without them this test would pass on an instrument that refused every
+    where, which is the failure mode the table's other rows share.
+    """
+    where = _M(lambda a, b, cond: torch.where(cond, a, b))
+    a, b = _x(1, 2, 3, 4), _x(1, 2, 3, 4)
+    accepted = {
+        "whole_output": _flags(1, 2, 3, 4),
+        "one_element": _flags(1, 1, 1, 1),
+        "per_query_row": _flags(1, 2, 3, 1),
+    }
+    for label, cond in accepted.items():
+        assert _refusals(where, (a, b, cond)) == {}, label
+    assert _refusals(where, (a, b, _flags(1, 2, 1, 4))) == {
+        "aten.where.self": 715
+    }

@@ -92,7 +92,6 @@ consequences, and fixing them means fixing the other end of the same island.
 | 941 | `GETITEM_PRODUCER` | 160 | 2 | 162 | 0 | 160 | getitem 162 — every one behind a refused batch norm |
 | 950 | `ALIAS_BYTES_OR_SELECT` | 58 | 1 | 59 | 58 | 0 | expand_copy 59 |
 | 704 | `RESULT_DTYPE` | 52 | 3 | 55 | 2 | 50 | unsqueeze_copy 25, add 6, slice_copy 6, sub 5, index 4 |
-| 715 | `WHERE_EMITTABLE` | 21 | 0 | 21 | 0 | 21 | where 21, all inside the sdpa fully-masked-row guard |
 | 835 | `POOL_SPEC` | 2 | 2 | 4 | 2 | 0 | max_pool2d_with_indices 3, avg_pool2d 1 |
 | 797 | `TOPK_EMITTABLE` | 0 | 3 | 3 | – | – | topk 3 |
 | 859 | `GATHER_TABLE` | 1 | 2 | 3 | 1 | 0 | index.Tensor 2, embedding 1 |
@@ -110,6 +109,7 @@ consequences, and fixing them means fixing the other end of the same island.
 | 891 | `LOG_SOFTMAX_WITHIN_ARENA` | 0 | 1 | 1 | – | – | _log_softmax 1 |
 | 952 | `SLICE_REGION` | 0 | 1 | 1 | – | – | slice_copy 1 |
 | 991 | `CLONE_DIM_ORDER_CONTIGUOUS` | 0 | 1 | 1 | – | – | _clone_dim_order 1 |
+| 715 | `WHERE_EMITTABLE` | 0 | 0 | 0 | – | – | nothing in either corpus any more; what it still turns away, and what this row held before, is in §7 |
 | 681 | `NOT_CALL_FUNCTION` | 0 | 0 | 0 | – | – | not an op clause; see §6 |
 | 695 | `ARG_REDUCTION_GEOMETRY` | not in this census | – | – | – | – | added after the two corpora above were taken. It refuses an arg reduction whose result is not int64 or whose row geometry the command cannot express, and the row is here with no counts rather than with invented ones: measuring it needs the same 21-graph run, which is what §7 is for |
 | 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1004, 1012, 1019, 1031 | 33 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
@@ -212,10 +212,10 @@ can execute* rather than merely unexercised: **959** (a tensor `negative_slope` 
 be safe in practice and are also where the claim would be cheapest to get wrong, so they are called
 out rather than folded into the unsafe list.
 
-## 7. Two stale claims this census corrected
+## 7. Three stale claims this census corrected
 
-Both were found by measuring what the tree does today rather than by reading a document, and both
-are claims a future reader would otherwise believe. Neither is in this tree: `README.md`,
+All were found by measuring what the tree does today rather than by reading a document, and each is
+a claim a future reader would otherwise believe. The first two are not in this tree: `README.md`,
 `OP_SUPPORT.md` and `OP_GAPS.md` already say what the measurement says, and the two stale copies
 are the Hexagon skill's per-op notes and the `PORTABLE-CENSUS` workstream report, the latter taken
 on an older rev. Recorded here so the correction travels with the measurement.
@@ -240,6 +240,45 @@ on an older rev. Recorded here so the correction travels with the measurement.
   permuted inner width, and the inverse blit, which is what clause 881 is for. The emitter branches
   on `channel < SOFTMAX_VECTOR_WIDTH` itself, so the clause and the emitter agree and neither is
   the single line of defence — which is why 881 is listed as unsafe but not as a hole.
+- **"Clause 715 holds 21 `where` nodes, all inside the sdpa fully-masked-row guard."** Both halves
+  are wrong, and the row's own count was measured over a narrower corpus than §3 describes. The
+  clause was a statement about operand *widths* — all three operands the output's element count or
+  a single element — and its stated reason was that the per-channel form "needs a channel count this
+  emitter does not compute". `select_condition_plane` now derives that count from the two shapes, so
+  a condition narrower than the output over a suffix of its axes is admitted, and that condition is
+  what an attention block's mask-add is. **Re-measured at `97d4fcd` with the merge parent's
+  `where_is_emittable` and again with the merged one, over all twenty-one graphs of §3 and over the
+  nineteen hand-written geometries alone:** 50 nodes held and 0 head-on over twenty-one, 21 and 0 over
+  nineteen, and 0 over either with the merged predicate. The row's 21 is therefore the nineteen-
+  geometry count, and §3's corpus is twenty-one graphs, which is the discrepancy §9 already flagged
+  for the graph and node totals.
+  The attribution is the larger error. Of the 21, **one** is in an sdpa graph (`lm_sdpa_spelling`);
+  the other 20 are the per-layer mask selects of `transformer_encoder` (12), `audio_encoder` (2),
+  `vision_tower` (2) and `transformer_encoder_2layer` with and without the norm/silu fusions (2
+  each), and over twenty-one graphs the remaining 29 are Qwen3's, one per layer at 28 layers and one
+  at 1. Every one is the same shape — a condition of `(..., Q, 1)` against an output of
+  `(..., Q, K)`, with `aten.logical_not` as the producer and a plane of
+  `(B*H*Q, K)` — and the five distinct geometries measured were `(1,16,3,1)`, `(1,3,197,1)`,
+  `(1,4,32,1)`, `(1,4,4,1)` and `(1,2,64,1)`. So this is not one island called sdpa; it is the
+  mask-add every attention block emits, and a reader who believed the old sentence would have gone
+  looking for a guard when the width was the thing.
+  What the clause still refuses is a condition narrow on a **middle** axis, which no plane
+  describes, and a condition that is not a `torch.bool`. Both are constructible and
+  `test_a_clause_refuses_at_the_line_the_table_gives_it[715]` now uses the middle-axis one, with the
+  three accepted neighbours pinned beside it in
+  `test_the_where_clause_turns_away_only_the_plane_it_cannot_name`.
+  Numerics, and what they do and do not cover: over four output shapes × four condition patterns
+  (random, two fully-masked rows, all-true, all-false) in fp16, the host command model's answer for
+  the delegated leg is **bit-exact** against `torch.where` (`maxabs` 0.0, 0 of n differing, n from
+  32 to 16384), and the not-delegating leg is torch's own because the portable kernel *is*
+  `where`. Two legs that must be wrong were put through the same comparison and both were caught: a
+  plane named `(8, 2)` instead of `(8, 4)` gave `maxabs` 10001.9 over 16 of 32 elements, and
+  swapping the emitter's two value arms gave 10001.9 over 32 of 32. The fp32 case is **not**
+  measurable on this tier and the reason is not the merge: `blob_interpreter.execute` refuses an
+  fp32 select because the blob's slot is sized at two bytes per element, and it refuses exactly the
+  same way on a whole-output fp32 condition, which the merge parent's predicate already admitted.
+  Tier: `blob_interpreter.execute` is a numpy model of the command stream, not the vendored DSP C++;
+  nothing here was run on `hexagon-sim` and nothing was run on a phone.
 
 ## 8. What this file is not
 

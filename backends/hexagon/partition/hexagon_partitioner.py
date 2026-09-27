@@ -708,10 +708,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # that width, so any other node that carries one stays portable.
             return False
         if node.target in WHERE_TARGETS and not where_is_emittable(node):
-            # The condition has to be a bool and all three operands have to be
-            # the output's size or a single element: the command's own guard
-            # admits only those, and the per-channel form needs a channel count
-            # this emitter does not compute.
+            # A bool condition, and one whose narrow axes are a suffix of the
+            # output's, which is the mask-add shape every attention block
+            # produces and select_condition_plane turns into the plane the
+            # kernel walks. A condition narrow on a middle axis has no plane.
             return False
         if node.target is DQ_PER_CHANNEL:
             # The weight-only pattern's dequantize. It is delegated only when
