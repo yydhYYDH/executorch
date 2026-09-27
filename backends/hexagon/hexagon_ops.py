@@ -13,9 +13,11 @@ unchecked: getting one wrong produces wrong numbers rather than an error.
 """
 
 import operator
+import os
 import re
 import math
 import struct
+import warnings
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -271,6 +273,90 @@ UNARY_OP_TYPES: Dict[str, int] = {
     # the op (see the emitter).
     "mul_scalar": 17,
 }
+
+class HexagonApproximationWarning(UserWarning):
+    """A delegated op the DSP computes as an approximation of torch's function.
+
+    A dedicated category so it can be filtered, promoted or turned off by name:
+
+        -W error::executorch.backends.hexagon.hexagon_ops.HexagonApproximationWarning
+        -W ignore::executorch.backends.hexagon.hexagon_ops.HexagonApproximationWarning
+
+    and, to refuse the export instead of warning about it,
+    EXECUTORCH_HEXAGON_ERROR_ON_APPROX_UNARY=1 in the environment.
+    """
+
+
+#: The unary kinds htp_ops_unary_compute_fp16_chunk hands to
+#: htp_ops_unary_pwl_fp16_vec (unary_ops.cc:455-487), which answers with a table
+#: of fp16 chords rather than with the function: a companded index into a bank of
+#: slopes and biases, one fp16 multiply and one fp16 add, a fold through the odd
+#: or the shifted identity, and a saturation where the bank stops. Each value is
+#: the largest disagreement with the definition, over every finite fp16 inside the
+#: bank's range, measured on the host against a transcription of the vendored
+#: source rather than quoted out of a document.
+#:
+#: The tail of a buffer is a THIRD form, not a second one: the walk covers
+#: [0, numel & ~63) and the last numel % 64 elements go to
+#: htp_ops_unary_apply_fp16 (unary_ops.cc:489-491), which for these kinds is a
+#: scalar expression. So a tensor's length decides which of the two functions its
+#: last few elements get, and a buffer under 64 elements gets the scalar one
+#: throughout.
+#:
+#: silu is here for a second reason: its body is pwl.cc's learned8 bank rather
+#: than a chord table, and the host interpreter has not transcribed it, so a silu
+#: buffer long enough to take the walk cannot be modelled on the host at all
+#: (blob_interpreter's _PWL_UNTRANSCRIBED). The number below is what the
+#: vendored source says; no device run has recorded silu's answers.
+PWL_UNARY_MAX_ERROR: Dict[str, float] = {
+    "gelu": 6.164551e-03,
+    "sigmoid": 2.390534e-03,
+    "silu": 7.812500e-03,
+    "tanh": 6.296754e-03,
+}
+
+#: What the host interpreter can model of each of them, which is the other half
+#: of the warning: gelu, sigmoid and tanh are transcribed in
+#: backends/hexagon/test/blob_interpreter.py, so a comparison against the device
+#: can be made through it, and silu cannot.
+PWL_UNARY_HOST_MODEL: Dict[str, str] = {
+    "gelu": "transcribed in backends/hexagon/test/blob_interpreter.py",
+    "sigmoid": "transcribed in backends/hexagon/test/blob_interpreter.py",
+    "tanh": "transcribed in backends/hexagon/test/blob_interpreter.py",
+    "silu": "NOT modelled on the host above 64 elements (blob_interpreter._PWL_UNTRANSCRIBED)",
+}
+
+
+def _warn_pwl_unary(op_name: str) -> None:
+    """Say, at export, that this delegation is not the function torch exports.
+
+    The op is supported and the DSP does compute it, so this warns rather than
+    refuses: refusing would be a different backend. What it refuses to do is let
+    the support table imply the arithmetic. A graph that delegates a gelu runs
+    the chords, a host reference taken through torch does not, and the export
+    says nothing, so the two answers differ by up to the number above at the
+    scale of one activation -- on a stack of layers, a PSNR the caller cannot
+    account for from the log.
+
+    Once per kind per process, which is what the warnings registry already does
+    with a repeated call site: a graph with a hundred gelus prints one line.
+    """
+    if op_name not in PWL_UNARY_MAX_ERROR:
+        return
+    message = (
+        f"aten.{op_name}.default is delegated to DSP_OP_UNARY, which computes it "
+        f"as a table of fp16 chords (htp_ops_unary_pwl_fp16_vec, "
+        f"unary_ops.cc:259-330) and not as torch's {op_name}: the two differ by "
+        f"up to {PWL_UNARY_MAX_ERROR[op_name]:.3e} over every finite fp16 in the "
+        f"table's range. The last numel % 64 elements of the same buffer take a "
+        f"second, scalar form (unary_ops.cc:489-491), so the tensor's length "
+        f"decides which of the two its tail gets. On the host: "
+        f"{PWL_UNARY_HOST_MODEL[op_name]}. Measured values: "
+        f"backends/hexagon/test/test_unary_pwl.py."
+    )
+    if os.environ.get("EXECUTORCH_HEXAGON_ERROR_ON_APPROX_UNARY"):
+        raise RuntimeError(message)
+    warnings.warn(message, HexagonApproximationWarning, stacklevel=3)
 
 # HtpOpsBinaryOpType, declared in the DSP's eltwise_ops.cc. Same reasoning as
 # UNARY_OP_TYPES: the whole enum, but only some entries are reachable.
@@ -2146,6 +2232,7 @@ def _unary_command(
 def _unary(op_name: str):
     def emit(node: torch.fx.Node, ctx) -> TensorRef:
         src = node.args[0]
+        _warn_pwl_unary(op_name)
         _require_arena_dtype(node, f"unary {op_name} input")
         numel = _numel(node)
         out = ctx.result_for(node, numel)
