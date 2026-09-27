@@ -764,104 +764,26 @@ def _fast_logf(x):
     return out
 
 
-#: The companded16 sigmoid chords, from htp_ops_unary_pwl_fp16_vec. The
-#: slope and bias are the fp16 bit patterns the kernel's vlut16 hands back, not
-#: decimal coefficients: the table is a lookup, and reading the hex as a number
-#: would silently model a different function.
-_SIGMOID_SLOPE = np.array(
-    [0x33F5, 0x33B7, 0x3343, 0x32A4, 0x31EB, 0x3128, 0x3067, 0x2F62,
-     0x2D8C, 0x2B47, 0x28A3, 0x25CD, 0x21C8, 0x1C52, 0x1665, 0x10B7],
-    dtype=np.uint16,
-).view(np.float16)
-_SIGMOID_BIAS = np.array(
-    [0x3800, 0x3804, 0x3812, 0x3830, 0x385E, 0x389B, 0x38E4, 0x3933,
-     0x39A9, 0x3A42, 0x3AC0, 0x3B22, 0x3B7F, 0x3BC7, 0x3BE8, 0x3BF6],
-    dtype=np.uint16,
-).view(np.float16)
-
-
-def _pwl_index16(x: np.ndarray, scale: float) -> np.ndarray:
-    """htp_ops_pwl_index16: scale, clamp, offset by 16, then shift the bits.
-
-    The index is not a float. The kernel multiplies into fp16, clamps at 15.0
-    because a value just under 16 can round to exactly 16, adds 16.0 and then
-    shifts the fp16 bit pattern right by six; the low four bits of that are
-    what the vlut16 consumes.
-    """
-    scaled = (x * scale).astype(np.float16)
-    scaled = np.minimum(scaled, np.float16(15.0)).astype(np.float16)
-    scaled = (scaled + np.float16(16.0)).astype(np.float16)
-    return np.ascontiguousarray(scaled).view(np.uint16).astype(np.int64) >> 6
-
-
-def _sigmoid_pwl_vector(x: np.ndarray) -> np.ndarray:
-    """htp_ops_unary_pwl_fp16_vec for HTP_OPS_UNARY_SIGMOID, chord for chord.
-
-    abs_v selects the chord, the chord is an fp16 multiply accumulated into an
-    fp16 add, and the negative half is recovered as 1 - y rather than evaluated
-    a second time.
-
-    Past 8 in magnitude the kernel replaces the chord with the saturated limit,
-    and that clamp is the vector path's alone. eight_v is 0x4800, which is 8.0
-    (unary_ops.cc:266); range_is_eight is true for sigmoid alone (unary_ops.cc:
-    269-270); and the saturated predicate is "not 8.0 greater than |x|" selecting
-    between that limit and the chord (unary_ops.cc:327-329). The scalar path has
-    no such test: its sigmoid is three lines with no comparison in them
-    (unary_ops.cc:174-177), so it returns the true sigmoid at -9, which is
-    1.2341e-4, where the chords here return exactly 0. The two disagree because
-    the kernel contains two sigmoid implementations, not because either is
-    approximating the other.
-    """
-    negative = x < np.float16(0.0)
-    abs_v = np.where(negative, -x, x).astype(np.float16)
-    # Below 2 the chords are 0.25 wide; above it the exponent bit and the top
-    # two mantissa bits name the eight wider ones directly (pwl.h:58-71).
-    index_low = _pwl_index16(abs_v, np.float16(4.0))
-    index_wide = ((np.ascontiguousarray(abs_v).view(np.uint16).astype(np.int64) >> 8) & 7) + 8
-    index = np.where(abs_v >= np.float16(2.0), index_wide, index_low) & 15
-    slope = _SIGMOID_SLOPE[index]
-    bias = _SIGMOID_BIAS[index]
-    positive = (abs_v.astype(np.float32) * slope.astype(np.float32) + bias.astype(np.float32)).astype(
-        np.float16
-    )
-    result = np.where(negative, (np.float32(1.0) - positive.astype(np.float32)).astype(np.float16), positive)
-    saturated = np.abs(x.astype(np.float32)) >= np.float32(8.0)
-    limit = np.where(negative, np.float16(0.0), np.float16(1.0))
-    return np.where(saturated, limit, result).astype(np.float16)
-
-
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    """Sigmoid as the kernel computes it, which is two different functions.
-
-    htp_ops_unary_compute_fp16_chunk walks 64 fp16 at a time down to
-    vec_end = size & -64 and then finishes element by element through
-    htp_ops_unary_apply_fp16, where sigmoid is the exact 1/(1+expf(-x)) in fp32
-    (unary_ops.cc:174-177). So a tensor of 64 takes the chords and a tensor of
-    65 takes the chords for 64 elements and the exact form for one, and the two
-    disagree with each other by design. One tolerance across the boundary would
-    hide that, which is why the split is reproduced rather than smoothed.
-    """
-    values = np.asarray(x, dtype=np.float32)
-    vec_end = values.size & ~63
-    out = np.empty(values.shape, dtype=np.float16)
-    out[:vec_end] = _sigmoid_pwl_vector(values[:vec_end].astype(np.float16))
-    out[vec_end:] = (np.float32(1.0) / (np.float32(1.0) + np.exp(-values[vec_end:]))).astype(np.float16)
-    return out.astype(np.float32)
-
 
 #: The unary ops the kernel computes elementwise and exactly. log is here
 #: because the transcription above is the kernel's own arithmetic; the ones left
 #: out -- rsqrt, expm1, cos and sin -- have fast approximations this file has not
-#: transcribed, and a host model of them would be guessing. sigmoid is the one
-#: entry that is not exact, because above 64 elements the kernel stops computing
-#: it and evaluates chords instead.
+#: transcribed, and a host model of them would be guessing.
+#:
+#: gelu, sigmoid and tanh are exact here and only here. At or above the grain
+#: `_run_unary` hands them to `_pwl_body` instead, which is the kernel's other
+#: implementation of the same three functions rather than a second host model
+#: disagreeing with this one: the chords do not approximate the scalar form, the
+#: two live at different lengths inside one buffer, and at -9 the chords return
+#: exactly 0 where the scalar form returns 1.2341e-4 (unary_ops.cc:174-177,
+#: :313-316). The split is `_PWL_GRAIN`; `test_sigmoid_grain.py` pins it.
 _UNARY = {
     1: lambda x: np.where(x < 0, -x, x),  # abs
     2: lambda x: -x,  # neg
     3: lambda x: (  # gelu, the tanh form, which is the tail's form and not the body's
         0.5 * x * (1.0 + np.tanh(_f32(0.79788456) * (x + _f32(0.044715) * x * x * x)))
     ),
-    4: _sigmoid,  # sigmoid: chords above 64 elements, exact below
+    4: lambda x: np.float32(1.0) / (np.float32(1.0) + np.exp(-x)),  # sigmoid, the scalar form
     5: lambda x: np.exp(x),  # exp
     6: _fast_logf,  # log
     7: lambda x: np.where(x >= 8, x, np.where(x <= -8, 0.0, x / (1.0 + np.exp(-x)))),
@@ -921,6 +843,40 @@ _PWL_BIAS = {
 #: eight intervals at build time (pwl.cc:9-12), which is not transcribed here, so
 #: a buffer long enough to take the walk is refused instead of answered with the
 #: scalar form the kernel would not have used.
+#:
+#: This dict is also where a second bank for an op that already has one would have
+#: to be refused rather than added, and the reason is worth carrying. A merge once
+#: left two transcriptions of sigmoid's chords in this file -- this one, and a
+#: private copy under a name of its own -- which were not the same function: the
+#: private one carried the chord multiply in fp32, while htp_ops_pwl_eval's
+#: Q6_Vqf16_vmpy_VhfVhf rounds it to fp16 first (pwl.h:91). Over every finite fp16
+#: in [-8, 8) the two differ on 978 of 36866, by up to 4.8828125e-04. What made
+#: that survivable instead of a wrong answer shipping was the shape of the
+#: dispatch: _run_unary sent numel >= _PWL_GRAIN here and the sub-grain remainder
+#: to _UNARY, and on a sub-grain remainder the private copy's own vec_end was
+#: zero, so it was DEAD -- unreachable, and the interpreter's output was already
+#: the kernel's. A dead duplicate and a live second answer are different problems
+#: wearing the same diff, and only the dispatch tells them apart. So when a second
+#: bank turns up here, find out which one _run_unary reaches before assuming the
+#: numbers come out the same either way.
+#:
+#: The other half of that pair was removed by b43dbc0, and this dict is what caught
+#: it. It cannot catch the same mistake in a test file, and one was there:
+#: test_glu.py held a third transcription of sigmoid's chords under _SIGMOID_SLOPE
+#: and _SIGMOID_BIAS, identical bit for bit, and it was worse than the dead one
+#: because nothing about it was dead. Moving that copy by one ulp turned nothing red
+#: in any of the four files that talk about sigmoid, because the file holding it
+#: only ever compared its own table against its own scalar reference. Moving THIS
+#: table by one ulp turned exactly one test red, in test_sigmoid_grain.py, and left
+#: test_glu.py green. The tables agreed and the tree could not see it, which is the
+#: failure this dict was meant to prevent anywhere rather than only here.
+#:
+#: A dict in this file cannot reach into a sibling directory, so the tree-wide half
+#: lives where the tree is: test_pwl_bank_single_source.py reads every module under
+#: the test directory with ast and fails naming any that restates a bank above,
+#: including the case that is not a dict at all. It cannot see a copy outside that
+#: directory either, so a second transcription of one of these tables elsewhere in
+#: the tree is still only caught by whoever goes looking.
 _PWL_UNTRANSCRIBED = {7: "silu's learned8 bank"}
 
 
@@ -1166,13 +1122,19 @@ _COND_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32}
 
 
 def _run_select(command: Command, params: List[int], arena: Arena) -> None:
-    """htp_ops_select (eltwise_ops.cc:2380): `cond ? in1 : in2`, element by element.
+    """htp_ops_select (eltwise_ops.cc): `cond ? in1 : in2`, element by element.
 
-    The kernel picks its walk from three sizes: an operand of one element is
-    broadcast, the output's own size is read along, and anything else is the
-    per-channel mode this backend never emits. The condition is the one operand
-    whose width is a parameter rather than two bytes, which is what makes a
-    one-byte torch.bool readable.
+    All three operands take the same three walks, derived from their own size
+    against the output's: one element is broadcast, the output's own size is
+    read along, and anything else is the per-channel plane (index / innerSize)
+    % channelSize. The third is what a staircase mask's condition is, and the
+    same guard as the kernel's: a per-channel operand has to name the plane,
+    and channelSize has to be its own size. A descriptor the kernel would
+    refuse is refused here too, rather than answered with a walk the kernel
+    never takes.
+
+    The condition is the one operand whose width is a parameter rather than two
+    bytes, which is what makes a one-byte torch.bool readable.
 
     The operands are read out of the arena from their own addresses rather than
     out of the reference's own slice, because that is what the kernel does: it is
@@ -1182,17 +1144,28 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
     the encoding does not matter.
     """
     out_size, cond_size, in1_size, in2_size, bytes_, cond_bytes = params[:6]
+    channel, inner = (params[6], params[7]) if len(params) > 7 else (0, 0)
+    if out_size <= 0:
+        # The kernel returns before it walks anything.
+        return
     if bytes_ != FP16_BYTES or cond_bytes not in _COND_DTYPES:
         raise UnsupportedOp(
             f"blob: a select over {bytes_}-byte values with {cond_bytes}-byte "
             "conditions is not modelled"
         )
-    if in1_size not in (1, out_size) or in2_size not in (1, out_size):
-        # A value of any other size is the kernel's per-channel mode, which reads
-        # params[6] and params[7]; this emitter never produces one.
-        raise UnsupportedOp(
-            "blob: a select with a per-channel value operand is not modelled"
-        )
+
+    def walk(size: int, what: str) -> np.ndarray:
+        """The per-output-element index into an operand of this size."""
+        if size == 1:
+            return np.zeros(out_size, dtype=np.intp)
+        if size == out_size:
+            return np.arange(out_size, dtype=np.intp)
+        if channel <= 0 or inner <= 0 or size != channel:
+            raise UnsupportedOp(
+                f"blob: a select whose {what} is {size} elements needs a channel "
+                f"size of its own, and params name {channel} and {inner}"
+            )
+        return (np.arange(out_size, dtype=np.intp) // inner) % channel
 
     cond_ref = command.inputs[0]
     in1_ref, in2_ref = command.inputs[1], command.inputs[2]
@@ -1205,18 +1178,16 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
             raise UnsupportedOp("blob: a select reads an operand past the arena")
         return np.frombuffer(bytes(arena.bytes[at : at + count * width]), dtype=dtype)
 
-    cond_step = 0 if cond_size == 1 else 1
-    cond = read(cond_ref, _COND_DTYPES[cond_bytes], cond_step * (out_size - 1) + 1)
-    in1 = read(in1_ref, np.uint16, 1 if in1_size == 1 else out_size)
-    in2 = read(in2_ref, np.uint16, 1 if in2_size == 1 else out_size)
-
-    at = np.arange(out_size) * cond_step
-    on = np.zeros(out_size, dtype=np.intp) if in1_size == 1 else np.arange(out_size)
-    off = np.zeros(out_size, dtype=np.intp) if in2_size == 1 else np.arange(out_size)
+    cond_at = walk(cond_size, "condition")
+    in1_at = walk(in1_size, "true value")
+    in2_at = walk(in2_size, "false value")
+    cond = read(cond_ref, _COND_DTYPES[cond_bytes], int(cond_at.max()) + 1)
+    in1 = read(in1_ref, np.uint16, int(in1_at.max()) + 1)
+    in2 = read(in2_ref, np.uint16, int(in2_at.max()) + 1)
     _store(
         arena,
         arena.address(out_ref),
-        np.where(cond[at] != 0, in1[on], in2[off]).tobytes(),
+        np.where(cond[cond_at] != 0, in1[in1_at], in2[in2_at]).tobytes(),
     )
 
 

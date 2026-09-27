@@ -360,19 +360,24 @@ SUPPORTED: List[OpSupport] = [
         "fp16 values, one byte per condition",
         "The condition must be a torch.bool: it is the one operand the blob sizes "
         "at its own width and the kernel reads one byte at a time, so any other "
-        "dtype here would be read at the wrong stride. All three operands must be "
-        "the output's element count or a single element, and both modes are "
-        "reachable: `masked_fill` reaches it with a one-element value. The kernel's "
-        "per-channel value mode needs a channel count and an inner size this emitter "
-        "does not compute, so it stays portable. A condition arrives as a "
-        "delegate input, as a bool constant weight, or from the comparison row "
-        "above when the graph writes one inside the same island, and a broadcast "
-        "condition is refused by the extent rule above whichever of the three it "
-        "is. "
-        "The SDPA-through-CPU-flash guard is the shape that shows this up in a "
-        "census: eq -> logical_not -> any(-1) -> logical_not -> where, whose "
-        "condition is one flag per query row, so the where is refused on the extent "
-        "rule and the whole five-node island stays portable.",
+        "dtype here would be read at the wrong stride. The two values must be the "
+        "output's element count or a single element, and both modes are reachable: "
+        "`masked_fill` reaches it with a one-element value. The kernel's per-channel "
+        "VALUE mode needs a channel count keyed to a channel axis of the output, "
+        "which this emitter does not compute, so a per-channel value stays portable. "
+        "A condition is a different question and is answered: it is the whole "
+        "output, one element, or a suffix-broadcast whose plane "
+        "`select_condition_plane` derives from the two shapes for the kernel's "
+        "(index / innerSize) % channelSize walk. A condition narrow on a middle axis "
+        "has no plane and is refused. A condition arrives as a delegate input, as a "
+        "bool constant weight, or from the comparison row above when the graph writes "
+        "one inside the same island, and whichever of the three it is the broadcast "
+        "is admitted only where a plane describes it. "
+        "The mask-add is the shape that matters, and it is the same in every "
+        "attention block rather than a particular spelling: eq -> logical_not -> "
+        "any(-1) -> logical_not -> where, whose condition is one flag per query row "
+        "against a (..., Q, K) output. That is the staircase the plane names, so the "
+        "where delegates and the island does not stay portable.",
     ),
     # --- matmul family (DSP_OP_BATCH_MATMUL) -----------------------------
     OpSupport(
@@ -956,7 +961,14 @@ SUPPORTED: List[OpSupport] = [
         ARENA_FP16,
         "cache and value fp16 and contiguous, rank >= 3, value.shape[2:] == "
         "cache.shape[2:]. Emitted as two blits; the destination row is patched from "
-        "the position tensor scaled by one cached position's element count.",
+        "the position tensor scaled by one cached position's element count, so the "
+        "position also has to BOUND the write: it has to be a one-element int32 or "
+        "int64 tensor the program owns, and it has to satisfy `position * inner + "
+        "rows * run <= numel`. The shape check says nothing about where the write "
+        "lands, and a position the export does not own carries no value to bound it "
+        "with, so the ordinary decode -- one new token appended at the cache length "
+        "-- is refused rather than writing a whole cached position past the output "
+        "it was given.",
     ),
     # --- attention -------------------------------------------------------
     OpSupport(

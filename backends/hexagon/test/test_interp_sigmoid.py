@@ -4,210 +4,281 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The sigmoid the DSP computes, which is not the sigmoid.
+"""The two sigmoids the DSP has, and the rounding that tells them apart.
 
-Sigmoid is the one unary in this interpreter that the kernel does not evaluate
-exactly above 64 elements. htp_ops_unary_compute_fp16_chunk walks 64 fp16 at a
-time down to vec_end = size & -64 through htp_ops_unary_pwl_fp16_vec, which
-walks sixteen companded16 chords, and then finishes the remainder element by
-element through htp_ops_unary_apply_fp16, where sigmoid is the exact
-1/(1+expf(-x)) in fp32 (unary_ops.cc:174-177, :454-490).
+htp_ops_unary_compute_fp16_chunk is two implementations of gelu, sigmoid and
+tanh, and the length of the buffer decides which one answers an element. The
+first _PWL_GRAIN elements are walked by htp_ops_unary_pwl_fp16_vec, which
+evaluates a chord as a companded16 table lookup and an fp16 multiply into an fp16
+add; the remainder goes element by element through htp_ops_unary_apply_fp16,
+where sigmoid is the exact 1/(1+expf(-x)) in fp32 (unary_ops.cc:174-177,
+:489-491). They do not approximate one another, and at -9 the chords return
+exactly 0 where the scalar form returns 1.2341e-4. So the two are compared to
+each other here and never to np.sigmoid: a band measured against the ideal
+function certifies a comparison the DSP never makes.
 
-Every band below is measured against the kernel's OWN scalar path. A band
-measured against torch.sigmoid or np.sigmoid certifies a comparison the DSP
-never makes: the chords are wrong against the ideal function by design, and so
-is the difference between the two paths, so one tolerance spanning them hides
-the very thing the test is for.
+This file used to assert the opposite rounding, and the record is worth keeping
+because the test was worse than no test. Its
+test_chords_round_once_at_the_end_of_an_fp16_multiply_accumulate opened by
+saying the kernel evaluates a chord as "an fp16 multiply accumulated into an fp16
+add (pwl.h:90-93)" and that "a model that never rounded, or that carried fp32
+across the multiply, would pass it and be wrong". It then closed by asserting
+np.allclose(chords, fp32_path), where fp32_path was
+
+    (abs(x).astype(np.float32) * slope.astype(np.float32) + bias.astype(np.float32)).astype(np.float16)
+
+which is the fp32-across-the-multiply form its own comment had just named as the
+wrong one. It was not a tautology; it pinned the defect. Re-measured against
+_pwl_body, the form the phone's recorded tanh answers agree with, all three of
+its discriminating assertions fail: the allclose differs on 10 of 129 elements,
+its delta <= ulp/2 bound is exceeded at 2.861023e-04 against a 2.441406e-04
+allowance, and its delta <= 0.5 * 4.8828125e-4 ceiling is exceeded at the same
+value. A test that rejects the correct arithmetic is a lock on the wrong one, so
+the case is rebuilt below to demand the two roundings and to fail if the fp32
+product is ever substituted.
+
+What is here is the unit view of the two halves. The grain itself, end to end
+through execute() on a real blob, is test_sigmoid_grain.py's, because a boundary
+nobody exercises through the entry point is not a boundary.
 """
 
 import unittest
 
 import numpy as np
 
-from blob_interpreter import _SIGMOID_BIAS, _SIGMOID_SLOPE, _sigmoid, _sigmoid_pwl_vector
+from blob_interpreter import _PWL_BIAS, _PWL_SLOPE, _UNARY, _pwl_body
 
-#: What the kernel's own scalar path returns: 1/(1+expf(-x)) in fp32 rounded
-#: once to fp16. This is the reference a chord has to be judged against.
+#: vec_len is 128 bytes over fp16 (unary_ops.cc:334) and the walk covers
+#: [0, numel & ~63).
+_GRAIN = 64
+
+#: Where sigmoid's chords stop, and the only one of the three that is eight
+#: rather than four (unary_ops.cc:269-270).
+_RANGE = 8.0
+
+#: The ceiling test_unary_pwl.py records for sigmoid's own distance from the
+#: definition, 2.4e-3 measured, sitting just under a rounder number.
+_BAND = 2.5e-3
+
+_SLOPE = np.asarray(_PWL_SLOPE[4], np.uint16).view(np.float16)
+_BIAS = np.asarray(_PWL_BIAS[4], np.uint16).view(np.float16)
+
+
 def _scalar(x):
-    return (
-        np.float32(1.0) / (np.float32(1.0) + np.exp(-np.asarray(x, dtype=np.float32)))
-    ).astype(np.float16)
+    """htp_ops_unary_apply_fp16's SIGMOID: fp32, rounded once to fp16.
+
+    Kept independent of the module under test so the two halves cannot be
+    compared against a shared mistake.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    return (np.float32(1.0) / (np.float32(1.0) + np.exp(-x))).astype(np.float16)
 
 
 def _chord_index(abs_x):
-    """The chord each magnitude selects, re-derived here from pwl.h:58-71.
+    """htp_ops_pwl_companded_index16 (pwl.h:57-71), re-derived from the source.
 
-    Deliberately not imported from the module under test: the point of the
-    rounding test is to re-evaluate the chord in wider precision, and reusing
-    the implementation's own index would let a wrong index hide inside it.
+    Deliberately not imported: the rounding case below has to be able to tell a
+    wrong index from a wrong rounding, and reusing the implementation's own index
+    would let one hide inside the other.
     """
-    abs_x = np.asarray(abs_x, dtype=np.float16)
-    scaled = (abs_x * np.float16(4.0)).astype(np.float16)
-    scaled = np.minimum(scaled, np.float16(15.0)).astype(np.float16)
-    shifted = np.ascontiguousarray(
-        (scaled + np.float16(16.0)).astype(np.float16)
-    ).view(np.uint16).astype(np.int64) >> 6
-    wide = ((np.ascontiguousarray(abs_x).view(np.uint16).astype(np.int64) >> 8) & 7) + 8
-    return np.where(abs_x >= np.float16(2.0), wide, shifted) & 15
+    abs_x = np.ascontiguousarray(np.asarray(abs_x, np.float16))
+    scaled = np.minimum((abs_x * np.float16(4.0)).astype(np.float16), np.float16(15.0))
+    low = (scaled + np.float16(16.0)).astype(np.float16).view(np.uint16).astype(np.int64) >> 6
+    wide = ((abs_x.view(np.uint16).astype(np.int64) >> 8) & 7) + 8
+    return np.where(abs_x >= np.float16(2.0), wide, low) & 15
 
 
-#: The model this file replaces: sigmoid as an ideal function, applied to every
-#: element regardless of how many there are.
-def _old_model(x):
-    return (np.float32(1.0) / (np.float32(1.0) + np.exp(-np.asarray(x, dtype=np.float32)))).astype(
-        np.float16
-    )
+def _chord_fp16_product(x):
+    """The kernel's chord: fp16 multiply, then fp16 add (pwl.h:90-93)."""
+    x = np.ascontiguousarray(np.asarray(x, np.float16))
+    negative = x < np.float16(0.0)
+    abs_v = np.where(negative, (-x).astype(np.float16), x)
+    index = _chord_index(abs_v)
+    positive = (abs_v * _SLOPE[index]).astype(np.float16) + _BIAS[index]
+    folded = (np.float16(1.0) - positive).astype(np.float16)
+    limit = np.where(negative, np.float16(0.0), np.float16(1.0))
+    return np.where(
+        abs_v < np.float16(_RANGE), np.where(negative, folded, positive), limit
+    ).astype(np.float16)
 
 
-class SigmoidPathSplitTest(unittest.TestCase):
-    def test_below_sixty_four_elements_the_kernel_takes_the_scalar_path(self):
-        for numel in (1, 33, 63):
-            with self.subTest(numel=numel):
-                x = np.linspace(-8, 8, numel).astype(np.float16)
-                got = _sigmoid(x.astype(np.float32)).astype(np.float16)
-                np.testing.assert_array_equal(got, _scalar(x))
-
-    def test_at_sixty_four_elements_every_element_takes_the_chords(self):
-        x = np.linspace(-8, 8, 64).astype(np.float16)
-        got = _sigmoid(x.astype(np.float32)).astype(np.float16)
-        np.testing.assert_array_equal(got, _sigmoid_pwl_vector(x))
-
-    def test_sixty_five_elements_split_sixty_four_and_one(self):
-        x = np.linspace(-8, 8, 65).astype(np.float16)
-        got = _sigmoid(x.astype(np.float32)).astype(np.float16)
-        np.testing.assert_array_equal(got[:64], _sigmoid_pwl_vector(x[:64]))
-        np.testing.assert_array_equal(got[64:], _scalar(x[64:]))
-
-    def test_a_multiple_of_sixty_four_leaves_no_scalar_tail(self):
-        # vec_end = size & -64 (unary_ops.cc:335), so a length that is already a
-        # multiple of the vector width is walked to the end and nothing reaches
-        # the scalar loop. A model that assumed a half-and-half split here would
-        # be wrong on all 128.
-        x = np.linspace(-8, 8, 128).astype(np.float16)
-        got = _sigmoid(x.astype(np.float32)).astype(np.float16)
-        np.testing.assert_array_equal(got, _sigmoid_pwl_vector(x))
-        self.assertEqual((128 & ~63), 128)
-
-    def test_one_hundred_and_thirty_split_one_hundred_twenty_eight_and_two(self):
-        x = np.linspace(-8, 8, 130).astype(np.float16)
-        got = _sigmoid(x.astype(np.float32)).astype(np.float16)
-        np.testing.assert_array_equal(got[:128], _sigmoid_pwl_vector(x[:128]))
-        np.testing.assert_array_equal(got[128:], _scalar(x[128:]))
+def _chord_fp32_product(x):
+    """The form the kernel is not: the same multiply carried in fp32."""
+    x = np.ascontiguousarray(np.asarray(x, np.float16))
+    negative = x < np.float16(0.0)
+    abs_v = np.where(negative, (-x).astype(np.float16), x)
+    index = _chord_index(abs_v)
+    positive = (
+        abs_v.astype(np.float32) * _SLOPE[index].astype(np.float32)
+        + _BIAS[index].astype(np.float32)
+    ).astype(np.float16)
+    folded = (np.float32(1.0) - positive.astype(np.float32)).astype(np.float16)
+    limit = np.where(negative, np.float16(0.0), np.float16(1.0))
+    return np.where(
+        abs_v < np.float16(_RANGE), np.where(negative, folded, positive), limit
+    ).astype(np.float16)
 
 
-class SigmoidChordTest(unittest.TestCase):
+def _ideal(x):
+    """The model this file replaced: sigmoid as a function of the value alone."""
+    return _scalar(x)
+
+
+class ChordArithmeticTest(unittest.TestCase):
+    def test_a_chord_is_an_fp16_multiply_into_an_fp16_add(self):
+        """The kernel's two roundings, and the fp32 form refused by name.
+
+        Q6_Vqf16_vmpy_VhfVhf returns an fp16 product (pwl.h:91), so the bias is
+        added to a value that has already been rounded. The two forms are not
+        equal and this says so on both sides: the chords match the fp16 product
+        everywhere, and differ from the fp32 product somewhere.
+        """
+        x = np.linspace(-7.5, 7.5, 129).astype(np.float16)
+        chords = _pwl_body(x, 4)
+        np.testing.assert_array_equal(chords, _chord_fp16_product(x))
+
+        fp32_form = _chord_fp32_product(x)
+        differing = int((chords.view(np.uint16) != fp32_form.view(np.uint16)).sum())
+        self.assertGreater(
+            differing, 0,
+            "the fp32 product agrees with the fp16 product on this sample, so "
+            "this case cannot tell the two roundings apart",
+        )
+        distance = np.abs(chords.astype(np.float64) - fp32_form.astype(np.float64)).max()
+        self.assertGreater(distance, 0.0)
+
+    def test_the_two_roundings_separate_at_minus_three(self):
+        """One named input, so the failure says which form is installed."""
+        x = np.array([-3.0], dtype=np.float16)
+        np.testing.assert_array_equal(
+            _pwl_body(x, 4), np.array([0.0478515625], dtype=np.float16)
+        )
+        np.testing.assert_array_equal(
+            _chord_fp32_product(x), np.array([0.04736328125], dtype=np.float16)
+        )
+
+    def test_the_deviation_from_float64_is_two_roundings_and_not_one(self):
+        """Bounded by the kernel's arithmetic rather than by a loose tolerance.
+
+        Evaluated in float64 the same slope and bias, the chords must differ
+        somewhere: both forms round at least once, and the fp16 product rounds
+        twice. What separates them is that the fp16 form's inner rounding is
+        visible -- it cannot be inside the half-ulp the final rounding alone
+        would allow, which is what the old version of this case measured and
+        measured wrongly, against the fp32 form.
+        """
+        x = np.linspace(-7.5, 7.5, 129).astype(np.float16)
+        index = _chord_index(np.abs(x))
+        wide = (
+            np.abs(x).astype(np.float64) * _SLOPE[index].astype(np.float64)
+            + _BIAS[index].astype(np.float64)
+        )
+        delta = np.abs(_pwl_body(x, 4).astype(np.float64) - wide)
+        self.assertGreater(int((delta > 0).sum()), 0, "the chords never rounded")
+        # The fp32 product rounds once, so its deviation is inside half an ulp of
+        # the value it rounds. The kernel's does not, and the margin is recorded
+        # so a refitted table cannot quietly move it back inside.
+        rounded = wide.astype(np.float16).astype(np.float64)
+        half_ulp = np.abs(
+            np.nextafter(rounded, np.float16(np.inf)).astype(np.float64) - rounded
+        ) / 2.0
+        self.assertGreater(
+            float((delta > half_ulp + 1e-12).sum()),
+            0,
+            "every chord is inside a single rounding, so the inner fp16 "
+            "multiply is not happening",
+        )
+
+
+class TwoImplementationsTest(unittest.TestCase):
     def test_minus_nine_saturates_to_zero_where_the_scalar_path_does_not(self):
-        # The sharpest disagreement between the two DSP paths. The chords clamp
-        # at 8 in magnitude, so the vector path returns exactly 0; the kernel's
-        # scalar path returns the true sigmoid.
         x = np.array([-9.0], dtype=np.float16)
-        self.assertEqual(float(_sigmoid_pwl_vector(x)[0]), 0.0)
+        self.assertEqual(float(_pwl_body(x, 4)[0]), 0.0)
         self.assertAlmostEqual(float(_scalar(x)[0]), 1.2341e-4, places=7)
         self.assertNotEqual(float(_scalar(x)[0]), 0.0)
 
     def test_eight_saturates_to_one_where_the_scalar_path_returns_just_under(self):
         x = np.array([8.0], dtype=np.float16)
-        self.assertEqual(float(_sigmoid_pwl_vector(x)[0]), 1.0)
+        self.assertEqual(float(_pwl_body(x, 4)[0]), 1.0)
         self.assertLess(float(_scalar(x)[0]), 1.0)
 
-    def test_chords_and_the_scalar_path_disagree_across_the_domain(self):
-        x = np.linspace(-7.9, 7.9, 256).astype(np.float16)
-        chords = _sigmoid_pwl_vector(x).astype(np.float32)
-        scalar = _scalar(x).astype(np.float32)
-        self.assertGreater(int((chords != scalar).sum()), 0)
-        self.assertLessEqual(float(np.abs(chords - scalar).max()), 2.5e-3)
+    def test_the_saturation_is_the_vector_paths_alone(self):
+        """_UNARY[4] has no comparison in it, which is the kernel's own shape.
 
-    def test_chords_round_once_at_the_end_of_an_fp16_multiply_accumulate(self):
-        # The kernel evaluates a chord as an fp16 multiply accumulated into an
-        # fp16 add (pwl.h:90-93), so every chord output has been rounded to
-        # fp16 exactly once. Evaluating the same slope and bias in float64 and
-        # demanding agreement would therefore have to FAIL; a model that never
-        # rounded, or that carried fp32 across the multiply, would pass it and
-        # be wrong.
-        x = np.linspace(-7.5, 7.5, 129).astype(np.float16)
-        chords = _sigmoid_pwl_vector(x)
-        index = _chord_index(np.abs(x))
-        # The same arithmetic in float64, including the sign rule, so the only
-        # thing that can differ is the single fp16 rounding.
-        positive = (
-            np.abs(x).astype(np.float64) * _SIGMOID_SLOPE[index].astype(np.float64)
-            + _SIGMOID_BIAS[index].astype(np.float64)
+        htp_ops_unary_apply_fp16's sigmoid is three lines and returns the true
+        sigmoid at any magnitude (unary_ops.cc:174-177); the clamp at 8 belongs
+        to the chord walk (unary_ops.cc:327-329). Reading a saturated value out
+        of _UNARY[4] would be a host model inventing a guard the kernel has not
+        got in that path.
+        """
+        for value in (-9.0, 9.0):
+            x = np.array([value], dtype=np.float16)
+            self.assertEqual(float(_pwl_body(x, 4)[0]), 0.0 if value < 0 else 1.0)
+            self.assertNotEqual(float(_UNARY[4](np.float32(x))[0]), 0.0 if value < 0 else 1.0)
+
+    def test_the_chords_stay_inside_the_recorded_band(self):
+        """Distance from the definition, against the ceiling the device set."""
+        x = np.linspace(-_RANGE, _RANGE, 4096).astype(np.float16)
+        chords = _pwl_body(x, 4).astype(np.float64)
+        want = 1.0 / (1.0 + np.exp(-x.astype(np.float64)))
+        worst = float(np.abs(chords - want).max())
+        self.assertLessEqual(
+            worst, _BAND, f"sigmoid's chords are off by {worst:.3e}, past {_BAND:.3e}"
         )
-        wide = np.where(x < 0, 1.0 - positive, positive)
-        chords64 = chords.astype(np.float64)
-        rounded = int((chords64 != wide).sum())
-        self.assertGreater(rounded, 0)
-        # The deviation is a single rounding, so it is bounded by half an ulp
-        # of the value the kernel rounds -- the positive branch, which for a
-        # negative input sits just under 1.0 where an fp16 ulp is 4.9e-4.
-        # Nothing is rounded at the small final value, which is why 1 - y can
-        # look like a large relative error while being exactly one rounding of
-        # y; the measured worst ratio is 0.4833.
-        rounded_pos = positive.astype(np.float16)
-        ulp = np.abs(
-            np.nextafter(rounded_pos, np.float16(np.inf)).astype(np.float64)
-            - rounded_pos.astype(np.float64)
+        self.assertGreater(worst, _BAND / 64, "the chords are exact, which they are not")
+
+    def test_the_scalar_entry_is_the_kernel_s_scalar_form(self):
+        """_UNARY[4] on its own, against a reference written from the C++."""
+        x = np.linspace(-40.0, 40.0, 1024).astype(np.float32)
+        np.testing.assert_array_equal(
+            np.asarray(_UNARY[4](x), np.float16).view(np.uint16),
+            _scalar(x).view(np.uint16),
         )
-        # A model that carried fp32 across the rounding, or skipped it, would
-        # land outside that bound; a model that rounds twice would as well.
-        delta = np.abs(chords64 - wide)
-        self.assertTrue(np.all(delta <= ulp / 2.0 + 1e-12))
-        # The deviation disappears when the identical arithmetic is evaluated in
-        # fp16, which is what makes this a rounding artefact and not a drift.
-        fp16_path = (
-            (np.abs(x).astype(np.float32) * _SIGMOID_SLOPE[index].astype(np.float32)
-             + _SIGMOID_BIAS[index].astype(np.float32))
-            .astype(np.float16)
-            .astype(np.float64)
-        )
-        fp16_wide = np.where(x < 0, 1.0 - fp16_path, fp16_path)
-        self.assertTrue(np.allclose(chords64, fp16_wide, rtol=0.0, atol=1e-12))
-        self.assertLessEqual(float(delta.max()), 0.5 * 4.8828125e-4)
+
+    def test_the_split_is_the_grain_and_nothing_else(self):
+        """vec_end = numel & ~63, stated as arithmetic rather than end to end.
+
+        The end-to-end version, which is the one that would catch a dispatch
+        change, is test_sigmoid_grain.py's.
+        """
+        for numel in (1, 33, 63, 64, 65, 127, 128, 129, 256):
+            self.assertEqual(numel & ~(_GRAIN - 1), numel - numel % _GRAIN)
 
 
-class OldModelWasWrongTest(unittest.TestCase):
-    """The red that motivated the change, kept as a test.
+class IdealModelWasWrongTest(unittest.TestCase):
+    """The red that motivated the transcription, kept as a test.
 
-    Each case below is a statement the previous model could not satisfy. They
-    are not tolerances loosened to make a suite green; they are the specific
-    comparisons that were certifying an ideal function the DSP never computes.
+    Each case is a statement the previous model could not satisfy. They are not
+    tolerances loosened to make a suite green; they are the comparisons that
+    were certifying an ideal function the DSP never computes.
     """
 
-    def test_the_old_model_could_not_reach_zero_at_minus_nine(self):
-        x = np.array([-9.0] * 64, dtype=np.float16)
-        self.assertEqual(float(_old_model(x)[0]), float(_scalar(x)[0]))
-        self.assertNotEqual(
-            float(_sigmoid_pwl_vector(x)[0]), float(_old_model(x)[0])
-        )
+    def test_the_ideal_model_could_not_reach_zero_at_minus_nine(self):
+        x = np.array([-9.0] * _GRAIN, dtype=np.float16)
+        self.assertEqual(float(_ideal(x)[0]), float(_scalar(x)[0]))
+        self.assertNotEqual(float(_pwl_body(x, 4)[0]), float(_ideal(x)[0]))
 
-    def test_the_old_model_agreed_with_the_scalar_path_on_chord_elements(self):
-        # The old model was exact, so it agreed with the scalar path on every
-        # element -- including the ones the kernel computes with chords, where
-        # it should have disagreed and did not. That is the whole failure: a
-        # suite that only ever compared a short tensor, where the kernel does
-        # take the scalar path, stayed green and certified the wrong function.
+    def test_the_ideal_model_agreed_with_the_scalar_path_on_chord_elements(self):
+        """The failure in one sentence: a short-tensor-only suite stays green."""
         rng = np.random.default_rng(7)
-        x = rng.uniform(-8, 8, 128).astype(np.float16)
-        old = _old_model(x).astype(np.float32)
+        x = rng.uniform(-_RANGE, _RANGE, 128).astype(np.float16)
+        ideal = _ideal(x).astype(np.float32)
         scalar = _scalar(x).astype(np.float32)
-        chords = _sigmoid_pwl_vector(x).astype(np.float32)
-        # The old model matches the scalar path everywhere.
-        self.assertEqual(int((old != scalar).sum()), 0)
-        # And so it misses the elements the kernel actually computes as a chord:
-        # 91 of these 128 chords miss the scalar path, max 2.2e-3.
-        self.assertEqual(int((chords != scalar).sum()), 91)
-        self.assertGreater(float(np.abs(chords - old).max()), 1e-3)
+        chords = _pwl_body(x, 4).astype(np.float32)
+        self.assertEqual(int((ideal != scalar).sum()), 0)
+        self.assertGreater(int((chords != scalar).sum()), 0)
+        self.assertGreater(float(np.abs(chords - ideal).max()), 1e-3)
 
-    def test_the_old_model_had_no_chord_error_at_all(self):
+    def test_the_ideal_model_had_no_chord_error_at_all(self):
         rng = np.random.default_rng(11)
-        x = rng.uniform(-8, 8, 4096).astype(np.float16)
-        old_error = np.abs(
-            _old_model(x).astype(np.float32) - _scalar(x).astype(np.float32)
+        x = rng.uniform(-_RANGE, _RANGE, 4096).astype(np.float16)
+        ideal_error = np.abs(
+            _ideal(x).astype(np.float32) - _scalar(x).astype(np.float32)
         ).max()
         chord_error = np.abs(
-            _sigmoid_pwl_vector(x).astype(np.float32) - _scalar(x).astype(np.float32)
+            _pwl_body(x, 4).astype(np.float32) - _scalar(x).astype(np.float32)
         ).max()
-        self.assertLess(float(old_error), 1e-7)
+        self.assertLess(float(ideal_error), 1e-7)
         self.assertGreater(float(chord_error), 1e-3)
 
 

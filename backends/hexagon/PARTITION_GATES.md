@@ -92,7 +92,6 @@ consequences, and fixing them means fixing the other end of the same island.
 | 941 | `GETITEM_PRODUCER` | 160 | 2 | 162 | 0 | 160 | getitem 162 — every one behind a refused batch norm |
 | 950 | `ALIAS_BYTES_OR_SELECT` | 58 | 1 | 59 | 58 | 0 | expand_copy 59 |
 | 704 | `RESULT_DTYPE` | 52 | 3 | 55 | 2 | 50 | unsqueeze_copy 25, add 6, slice_copy 6, sub 5, index 4 |
-| 715 | `WHERE_EMITTABLE` | 21 | 0 | 21 | 0 | 21 | where 21, all inside the sdpa fully-masked-row guard |
 | 835 | `POOL_SPEC` | 2 | 2 | 4 | 2 | 0 | max_pool2d_with_indices 3, avg_pool2d 1 |
 | 797 | `TOPK_EMITTABLE` | 0 | 3 | 3 | – | – | topk 3 |
 | 859 | `GATHER_TABLE` | 1 | 2 | 3 | 1 | 0 | index.Tensor 2, embedding 1 |
@@ -110,11 +109,12 @@ consequences, and fixing them means fixing the other end of the same island.
 | 891 | `LOG_SOFTMAX_WITHIN_ARENA` | 0 | 1 | 1 | – | – | _log_softmax 1 |
 | 952 | `SLICE_REGION` | 0 | 1 | 1 | – | – | slice_copy 1 |
 | 991 | `CLONE_DIM_ORDER_CONTIGUOUS` | 0 | 1 | 1 | – | – | _clone_dim_order 1 |
+| 715 | `WHERE_EMITTABLE` | 0 | 0 | 0 | – | – | nothing in either corpus any more; what it still turns away, and what this row held before, is in §7 |
 | 681 | `NOT_CALL_FUNCTION` | 0 | 0 | 0 | – | – | not an op clause; see §6 |
 | 695 | `ARG_REDUCTION_GEOMETRY` | not in this census | – | – | – | – | added after the two corpora above were taken. It refuses an arg reduction whose result is not int64 or whose row geometry the command cannot express, and the row is here with no counts rather than with invented ones: measuring it needs the same 21-graph run, which is what §7 is for |
-| 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1005, 1012, 1024 | 32 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
+| 722, 724, 738, 740, 749, 766, 786, 807, 817, 826, 850, 865, 867, 869, 871, 879, 881, 899, 905, 919, 954, 956, 959, 965, 967, 970, 972, 980, 997, 1004, 1012, 1019, 1031 | 33 clauses | 0 | 0 | 0 | – | – | nothing in either corpus; see §6 for which of them can be reached at all |
 
-The other 32 rows, in `_verdict`'s own order, with what each clause is and whether it is safe to
+The other 33 rows, in `_verdict`'s own order, with what each clause is and whether it is safe to
 remove:
 
 | line | clause | what it is | verdict |
@@ -148,9 +148,10 @@ remove:
 | 972 | `REFLECT_PAD_REGIONS` | a contiguous source, a positive pad narrower than the axis it reflects | unsafe; a pad at least as wide as the axis wraps around |
 | 980 | `CONSTANT_PAD_REGION` | the region's three levels reach a pad on the last two axes, and the memset writes zero and nothing else | unsafe; a third-axis pad, a negative pad, a symbolic extent or a nonzero value |
 | 997 | `UPDATE_CACHE_LAYOUT` | the cache-advance lowering's operands and geometry | unexercised: **the corpus builds no KV cache at all** (`use_cache=False` throughout), and a cached decode is the common LLM deployment shape |
-| 1005 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 687 instead, measured |
-| 1012 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
-| 1024 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
+| 1004 | `UPDATE_CACHE_APPEND_FITS` | a one-element int32/int64 position the program OWNS, and `position * inner + rows * run <= numel` | **unsafe without it, measured**: 997 admits a cache advance by shape alone, and the emitter writes the value's rows at `position * inner`, so a decode step appending at the cache length — the ordinary one — places the write a whole cached position past the end of the output. Read off the emitted command stream through `blob_interpreter`'s numpy model, which is host tier and a model of the region walk rather than of the kernels. A position the export does not own is refused whatever its value, because it carries none to bound the write with; a program-owned position that fits is accepted, and that is the positive control |
+| 1012 | `CUMSUM_EMITTABLE` | a contiguous fp16 operand with a 64-aligned static last extent, so the mask the two commands read exists | unsafe, and only reachable by a caller that invokes the custom op: `CUMSUM` is `et_hexagon.cumsum.default`, while `torch.cumsum` exports as `aten.cumsum.default` and is refused at 687 instead, measured |
+| 1019 | `ARGUMENT_NOT_A_NODE` | after the literal check, anything left is not a node | unsafe, but again against a crash: removing it makes `arg.op` raise on a `torch.Size` or a dtype |
+| 1031 | `GET_ATTR_NOT_FP16` | a constant operand at the width the arena holds, except where the emitter converts it | unsafe, and paired with `_require_arena_dtype` — see §1 |
 
 ## 5. Both ends of the largest island, named separately
 
@@ -180,8 +181,8 @@ strided result reads the wrong elements, and nothing downstream would notice.
 
 ## 6. No clause here is safe to remove as written, and the three that are closest
 
-Stated plainly because the brief asked for it and the answer is not the expected one. Of the 56
-clauses, 52 are the inventory, and **none of the 52 is safe to remove**: every one either stands
+Stated plainly because the brief asked for it and the answer is not the expected one. Of the 59
+clauses, 53 are the inventory, and **none of the 53 is safe to remove**: every one either stands
 between a geometry a program can produce and a kernel that would compute something else, or stands
 between that geometry and a crash. Three are worth separating out, because the failure they prevent
 is loud rather than silent, which changes their priority and nothing else:
@@ -191,20 +192,30 @@ is loud rather than silent, which changes their priority and nothing else:
   nodes, so its count is zero by construction rather than by measurement. Its two `return False`
   neighbours are the two entry gates, so removing this one moves every non-op node into the target
   table check.
-- **766** and **1012** convert a clean fallback into an `AttributeError` if removed. They are the
+- **766** and **1019** convert a clean fallback into an `AttributeError` if removed. They are the
   two clauses where the cost of keeping is zero and the cost of removing is a stack trace.
+
+One clause is a third thing again, and it is the only one whose removal is a **memory-safety
+defect** rather than a wrong answer or a crash. **1004 `UPDATE_CACHE_APPEND_FITS`** is not in
+either census and never was: 997 admits a cache advance by shape alone, and the emitter places the
+value's rows at `position * inner` with nothing above it, so a decode step appending at the cache
+length writes past the end of the output. Measured, not derived — `test_cache_append_bound.py` runs
+the emitted command stream through `blob_interpreter`'s numpy model and gets
+`RegionOutOfBounds`, and the same file's mutation test relaxes the clause and watches the node come
+back. It is also the one clause where the shape rule above is not enough: the position is a run-time
+tensor, so a cache advance the export does not own a position for is refused whatever the geometry.
 
 Four clauses are *unexercised and, as far as this measurement goes, unreachable by a program torch
 can execute* rather than merely unexercised: **959** (a tensor `negative_slope` does not export),
-**970** (the only violating slope is one `F.prelu` rejects), **1005** (the target is a custom op) and
+**970** (the only violating slope is one `F.prelu` rejects), **1012** (the target is a custom op) and
 **965** (a permuted source measures as accepted). Those four are where a removal is most likely to
 be safe in practice and are also where the claim would be cheapest to get wrong, so they are called
 out rather than folded into the unsafe list.
 
-## 7. Two stale claims this census corrected
+## 7. Three stale claims this census corrected
 
-Both were found by measuring what the tree does today rather than by reading a document, and both
-are claims a future reader would otherwise believe. Neither is in this tree: `README.md`,
+All were found by measuring what the tree does today rather than by reading a document, and each is
+a claim a future reader would otherwise believe. The first two are not in this tree: `README.md`,
 `OP_SUPPORT.md` and `OP_GAPS.md` already say what the measurement says, and the two stale copies
 are the Hexagon skill's per-op notes and the `PORTABLE-CENSUS` workstream report, the latter taken
 on an older rev. Recorded here so the correction travels with the measurement.
@@ -229,6 +240,45 @@ on an older rev. Recorded here so the correction travels with the measurement.
   permuted inner width, and the inverse blit, which is what clause 881 is for. The emitter branches
   on `channel < SOFTMAX_VECTOR_WIDTH` itself, so the clause and the emitter agree and neither is
   the single line of defence — which is why 881 is listed as unsafe but not as a hole.
+- **"Clause 715 holds 21 `where` nodes, all inside the sdpa fully-masked-row guard."** Both halves
+  are wrong, and the row's own count was measured over a narrower corpus than §3 describes. The
+  clause was a statement about operand *widths* — all three operands the output's element count or
+  a single element — and its stated reason was that the per-channel form "needs a channel count this
+  emitter does not compute". `select_condition_plane` now derives that count from the two shapes, so
+  a condition narrower than the output over a suffix of its axes is admitted, and that condition is
+  what an attention block's mask-add is. **Re-measured at `97d4fcd` with the merge parent's
+  `where_is_emittable` and again with the merged one, over all twenty-one graphs of §3 and over the
+  nineteen hand-written geometries alone:** 50 nodes held and 0 head-on over twenty-one, 21 and 0 over
+  nineteen, and 0 over either with the merged predicate. The row's 21 is therefore the nineteen-
+  geometry count, and §3's corpus is twenty-one graphs, which is the discrepancy §9 already flagged
+  for the graph and node totals.
+  The attribution is the larger error. Of the 21, **one** is in an sdpa graph (`lm_sdpa_spelling`);
+  the other 20 are the per-layer mask selects of `transformer_encoder` (12), `audio_encoder` (2),
+  `vision_tower` (2) and `transformer_encoder_2layer` with and without the norm/silu fusions (2
+  each), and over twenty-one graphs the remaining 29 are Qwen3's, one per layer at 28 layers and one
+  at 1. Every one is the same shape — a condition of `(..., Q, 1)` against an output of
+  `(..., Q, K)`, with `aten.logical_not` as the producer and a plane of
+  `(B*H*Q, K)` — and the five distinct geometries measured were `(1,16,3,1)`, `(1,3,197,1)`,
+  `(1,4,32,1)`, `(1,4,4,1)` and `(1,2,64,1)`. So this is not one island called sdpa; it is the
+  mask-add every attention block emits, and a reader who believed the old sentence would have gone
+  looking for a guard when the width was the thing.
+  What the clause still refuses is a condition narrow on a **middle** axis, which no plane
+  describes, and a condition that is not a `torch.bool`. Both are constructible and
+  `test_a_clause_refuses_at_the_line_the_table_gives_it[715]` now uses the middle-axis one, with the
+  three accepted neighbours pinned beside it in
+  `test_the_where_clause_turns_away_only_the_plane_it_cannot_name`.
+  Numerics, and what they do and do not cover: over four output shapes × four condition patterns
+  (random, two fully-masked rows, all-true, all-false) in fp16, the host command model's answer for
+  the delegated leg is **bit-exact** against `torch.where` (`maxabs` 0.0, 0 of n differing, n from
+  32 to 16384), and the not-delegating leg is torch's own because the portable kernel *is*
+  `where`. Two legs that must be wrong were put through the same comparison and both were caught: a
+  plane named `(8, 2)` instead of `(8, 4)` gave `maxabs` 10001.9 over 16 of 32 elements, and
+  swapping the emitter's two value arms gave 10001.9 over 32 of 32. The fp32 case is **not**
+  measurable on this tier and the reason is not the merge: `blob_interpreter.execute` refuses an
+  fp32 select because the blob's slot is sized at two bytes per element, and it refuses exactly the
+  same way on a whole-output fp32 condition, which the merge parent's predicate already admitted.
+  Tier: `blob_interpreter.execute` is a numpy model of the command stream, not the vendored DSP C++;
+  nothing here was run on `hexagon-sim` and nothing was run on a phone.
 
 ## 8. What this file is not
 
@@ -243,10 +293,24 @@ governs one.
 
 The rows corpus is in this tree: it is the `_ROWS` and `_QUANTIZED_ROWS` tables of
 `test_overload_census.py` and `test_overload_census2.py`, driven through the same instrument.
-The models corpus is not — the nineteen geometries are hand-written and live in a scratch
-directory, and `Qwen3ForCausalLM` is built from a `transformers` config, so a reader has to
-rebuild it to re-derive §4. That is a real limitation of a census whose point is to be re-derived,
-and it is worth fixing before the next round rather than after: the geometries belong next to the
-other model fixtures, and the instrument and both drivers belong beside
-`test_partition_gates.py`, which already carries the instrument and the controls so that a
-reader does not have to rebuild those to know the census is sound.
+The nineteen hand-written models geometries are here too, as
+`test/model_census_corpus.py`, and `test/test_unwired_census_corpus.py` lowers all of them
+through the real partitioner, so §3's models half is rebuildable from this tree. The
+remaining half is `Qwen3ForCausalLM`, built from a `transformers` config at one and at 28
+layers: that needs a `transformers` install this environment does not have, so a reader has to
+rebuild those two graphs to re-derive the 28-layer part of §4, and §3's "21 graphs / 6545
+nodes" is a count over all twenty-one and has not been re-measured over the nineteen alone.
+
+The instrument and both drivers still live outside the tree, and §4 is still not a number a
+reader can produce without them. `test_partition_gates.py` already carries the instrument and
+the controls, so the piece worth moving next is the driver, not the corpus.
+
+One thing this corpus cannot be read as, because it is a property of
+`unwired_overload_census()` and not of these models: that census counts a target only when a
+*sibling overload* of the same schema has an emitter, so it reports `{}` over all nineteen
+geometries, and all 309 nodes it leaves off the emitter table, over 11 distinct targets, are
+whole-family absences (`aten::full`, `aten::full_like`, `aten::arange`, `aten::eq`,
+`aten::le`, `aten::logical_not`, `aten::any`,
+`aten::_native_batch_norm_legit_no_training`) rather than forgotten overloads. The
+unwired-target count that §4's rows half reports is a different number, read from the row
+tables.

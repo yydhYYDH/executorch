@@ -708,10 +708,10 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # that width, so any other node that carries one stays portable.
             return False
         if node.target in WHERE_TARGETS and not where_is_emittable(node):
-            # The condition has to be a bool and all three operands have to be
-            # the output's size or a single element: the command's own guard
-            # admits only those, and the per-channel form needs a channel count
-            # this emitter does not compute.
+            # A bool condition, and one whose narrow axes are a suffix of the
+            # output's, which is the mask-add shape every attention block
+            # produces and select_condition_plane turns into the plane the
+            # kernel walks. A condition narrow on a middle axis has no plane.
             return False
         if node.target is DQ_PER_CHANNEL:
             # The weight-only pattern's dequantize. It is delegated only when
@@ -995,6 +995,13 @@ class HexagonOperatorSupport(OperatorSupportBase):
             return False
         if node.target is UPDATE_CACHE and update_cache_layout(node) is None:
             return False
+        if node.target is UPDATE_CACHE and not _update_cache_append_fits(
+            node, self.program
+        ):
+            # A shape says nothing about where the write lands, so the position
+            # is what has to bound it, and one the host cannot read bounds
+            # nothing: the emitter would place the rows past the output.
+            return False
         if node.target is CUMSUM and not cumsum_is_emittable(
             node.args[0] if node.args else None,
             node.args[1] if len(node.args) > 1 else None,
@@ -1023,6 +1030,45 @@ class HexagonOperatorSupport(OperatorSupportBase):
             ):
                 return False
         return True
+
+
+def _update_cache_append_fits(node: torch.fx.Node, program) -> bool:
+    """Whether the position leaves room for every row the value carries.
+
+    `update_cache_layout` can only read shapes, and the cache's shape says
+    nothing about the position: the emitter copies the cache out and then writes
+    the value's `rows * run` elements at `position * inner`, so a decoder that
+    has consumed N tokens and asks to write token N -- the ordinary decode step
+    -- puts them a whole `inner` past the end of the output it was given. The
+    bound is `position * inner + rows * run <= numel`, in the emitter's own flat
+    terms and so on rows as well as on the position, and it is the position's
+    VALUE that carries it.
+
+    So a position the host can read has to satisfy the bound, and one it cannot
+    is refused whatever the geometry: a tensor the program does not own carries
+    no value here, and nothing downstream can bound it either. That is the whole
+    clause -- an advance whose position the program owns and that fits still
+    delegates, and the positive control beside it in the tests is that case.
+
+    True when the layout is the clause's business rather than this one's: a node
+    `update_cache_layout` already turned away never reaches here.
+    """
+    layout = update_cache_layout(node)
+    if layout is None:
+        return True
+    cache, _, position, run, inner, rows = layout
+    numel = cache.meta["val"].numel()
+    if not isinstance(numel, int) or not isinstance(inner, int):
+        return False
+    # A fake carries no value, and the data-dependent one raises rather than
+    # answering, so only a materialized tensor is a position this can bound.
+    held = owned_weight(program, position) if program is not None else None
+    if type(held) is not torch.Tensor or held.dtype not in (torch.int32, torch.int64):
+        return False
+    if held.numel() != 1:
+        return False
+    start = int(held.reshape(-1)[0].item())
+    return start >= 0 and start * inner + rows * run <= numel
 
 
 def _data_placeholders(exported_program: ExportedProgram) -> Set[str]:
