@@ -66,6 +66,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
     log_softmax_shifts_within_the_arena,
+    logical_not_is_emittable,
+    LOGICAL_NOT,
     LOG_SOFTMAX_TARGETS,
     MAX_DIM,
     MIN_DIM,
@@ -706,6 +708,12 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # A bool operand is one byte per element where the kernels read two,
             # which is a wrong answer rather than an error. Only SELECT declares
             # that width, so any other node that carries one stays portable.
+            return False
+        if node.target is LOGICAL_NOT and not logical_not_is_emittable(node):
+            # The negation is a select whose condition is its only operand, and
+            # that operand is read one byte at a time. A slot declared anything
+            # but a torch.bool would be read at the wrong stride, so it keeps a
+            # portable kernel instead of a flag the kernel's test cannot make.
             return False
         if node.target in WHERE_TARGETS and not where_is_emittable(node):
             # A bool condition, and one whose narrow axes are a suffix of the
