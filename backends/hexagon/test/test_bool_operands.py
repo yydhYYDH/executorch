@@ -344,9 +344,25 @@ def test_a_staircase_condition_reaches_the_kernel_with_its_plane():
                 and node.target is exir_ops.edge.aten.where.self
                 and node.args[0].meta["val"].numel() < node.meta["val"].numel()
             ):
+                # This blob is not this node's command. A select is also how a
+                # mask negation and a comparison are written, and the delegate that
+                # holds the staircase also holds the negation producing its
+                # condition, so every SELECT in this blob counts two commands for
+                # two nodes. Match the one this node emitted: its first four
+                # parameters are the output, the condition and the two values,
+                # read off the node's own shapes.
+                signature = [
+                    node.meta["val"].numel(),
+                    node.args[0].meta["val"].numel(),
+                    node.args[1].meta["val"].numel(),
+                    node.args[2].meta["val"].numel(),
+                ]
                 header, commands = read_blob(bytes(sub._processed_bytes))
                 selects.extend(
-                    (node, command) for command in commands if command.type == _DSP_OP_SELECT
+                    (node, command)
+                    for command in commands
+                    if command.type == _DSP_OP_SELECT
+                    and list(command.params[:4]) == signature
                 )
     assert len(selects) == 1, f"expected the staircase's one SELECT, got {selects}"
     node, command = selects[0]

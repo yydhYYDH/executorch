@@ -83,8 +83,14 @@ def test_the_supported_set_is_the_emitter_table_so_a_target_cannot_be_added_alon
     assert ANY_DIM not in hexagon_backend.SUPPORTED_TARGETS
 
     support = HexagonOperatorSupport()
-    for node in _bool_chain():
-        assert not support.is_node_supported(None, node)
+    first, reduced, second = _bool_chain()
+    # The two negations are wired, so they are admitted. any.dim is not in the
+    # table, and it is refused there rather than anywhere later -- which is the
+    # point of the identity above: nothing downstream ever saw the node.
+    assert support.is_node_supported(None, first)
+    assert reduced.target not in hexagon_backend.SUPPORTED_TARGETS
+    assert not support.is_node_supported(None, reduced)
+    assert support.is_node_supported(None, second)
 
 
 def test_the_width_gate_reads_the_result_so_a_boolean_node_is_refused_in_both_tables(
@@ -114,8 +120,15 @@ def test_the_width_gate_reads_the_result_so_a_boolean_node_is_refused_in_both_ta
     # here so a future unbinding fails loudly instead of patching half the path.
     assert part_mod.SUPPORTED_TARGETS is hexagon_backend.SUPPORTED_TARGETS
 
-    for node in _bool_chain():
-        assert not support.is_node_supported(None, node)
+    first, reduced, second = _bool_chain()
+    # The negations are wired, so putting a target in the table is not what decides
+    # them. The reduce is the node this is about: with any.dim now in the table it
+    # is still refused, and the refusal is the width gate rather than the table,
+    # which is the whole claim.
+    assert reduced.target in part_mod.SUPPORTED_TARGETS
+    assert support.is_node_supported(None, first)
+    assert not support.is_node_supported(None, reduced)
+    assert support.is_node_supported(None, second)
 
 
 def test_an_emitter_for_those_targets_would_need_the_arena_width_it_refuses():
