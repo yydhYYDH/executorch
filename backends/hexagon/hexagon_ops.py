@@ -6198,11 +6198,14 @@ class BilinearUpsampleSpec(NamedTuple):
 
 #: The widest output row the command accepts, which is the axis table the
 #: kernel materialises per call. The two tables are 8 bytes an entry, so this is
-#: a 32768-byte stack frame -- 0.39% of the 8354560-byte VTCM the skel reserves.
-#: The number is not a modelling limit: a vocoder's first up-block is 8x on a row
-#: a few hundred wide and a super-resolution head's is 2x on a couple of
-#: thousand, and both are below it.
-BILINEAR_UPSAMPLE_MAX_ROW = 2048
+#: an 8192-byte stack frame, and the DSP RPC thread's stack is what bounds it: at
+#: 2048 the frame is 32768 bytes, it overflows, and the command group comes back
+#: 0x8000040d rather than a value. Keep this equal to HTP_OPS_BILINEAR_AXIS_MAX in
+#: upsample_ops.cc; if the two drift, a row the host delegates is refused on the
+#: DSP. The number is not a modelling limit: a vocoder's first up-block is 8x on a
+#: row a few hundred wide and a super-resolution head's is 2x on a couple of
+#: hundred, and both are below it.
+BILINEAR_UPSAMPLE_MAX_ROW = 512
 
 
 def _bilinear_ratio_agrees(in_extent: int, out_extent: int) -> bool:

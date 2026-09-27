@@ -31,12 +31,14 @@
 extern "C" {
 
 /* The widest output row the two axis tables cover, and so the size of the
- * stack frame: 2 axes * 2048 entries * 8 bytes = 32768 bytes, which is 0.39%
- * of the 8354560-byte VTCM the skel reserves. A vocoder row is a few hundred
- * samples wide and a super-resolution row a couple of thousand, so the bound
- * is above every geometry either family produces and the alternative -- a
- * table per call with no bound -- is the one that can overrun. */
-#define HTP_OPS_BILINEAR_AXIS_MAX 2048
+ * stack frame: 2 axes * 512 entries * 8 bytes = 8192 bytes. The bound is set by
+ * the DSP RPC thread's stack, not by VTCM: a 32768-byte frame overflows it and
+ * the command group comes back 0x8000040d, which is the same signature the skel
+ * records for an -O0 branch chain at 14 KB. A vocoder row is a few hundred
+ * samples wide and a super-resolution row a couple of hundred, so 512 is above
+ * every geometry either family produces; hexagon_ops.py refuses anything wider,
+ * and the two bounds are meant to move together. */
+#define HTP_OPS_BILINEAR_AXIS_MAX 512
 
 /* One output index: the source position below the tap and the weight above it.
  * low is the floor of the source coordinate and w the fraction, with the
@@ -51,8 +53,8 @@ struct htp_bilinear_axis {
  * is asserted rather than described: a layout change that widened the entry
  * would otherwise silently double the VTCM the kernel asks for. */
 static_assert(sizeof(struct htp_bilinear_axis) == 8, "the axis entry must stay 8 bytes");
-static_assert(sizeof(struct htp_bilinear_axis) * 2 * HTP_OPS_BILINEAR_AXIS_MAX == 32768,
-              "the two axis tables must stay 32768 bytes");
+static_assert(sizeof(struct htp_bilinear_axis) * 2 * HTP_OPS_BILINEAR_AXIS_MAX == 8192,
+              "the two axis tables must stay 8192 bytes");
 
 static inline float htp_bilinear_source(float scale, int32_t dst) {
   float src = scale * ((float)dst + 0.5f) - 0.5f;
