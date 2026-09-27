@@ -138,14 +138,14 @@ def _lowered(module, args):
 
 
 def _commands(program):
-    """Every delegate's command types, in order."""
+    """Every delegate's commands, in order."""
     out = []
     for node in program.graph_module.graph.nodes:
         if node.target is not torch.ops.higher_order.executorch_call_delegate:
             continue
         module = program.graph_module.get_submodule(node.args[0].target)
         _, commands = read_blob(bytes(module._processed_bytes))
-        out.append([command.type for command in commands])
+        out.append(commands)
     return out
 
 
@@ -161,7 +161,7 @@ def test_the_whole_cross_attention_is_one_delegate():
     model, x, context = _case_inputs()
     program = _lowered(model, (x, context))
 
-    assert _commands(program) == [COMMANDS]
+    assert [command.type for command in _commands(program)[0]] == COMMANDS
 
 
 def test_the_only_node_left_outside_the_delegate_is_a_getitem():
@@ -183,21 +183,27 @@ def test_the_only_node_left_outside_the_delegate_is_a_getitem():
     assert portable == ["getitem"], portable
 
 
-def test_the_same_split_at_a_batch_of_two_is_still_refused():
-    """Two rows of batch make the batch group a loop, and the refusal stays.
+def test_a_batch_of_two_is_the_split_unrolled_into_two_regions():
+    """Two rows of batch make the batch group a loop, and the loop is unrolled.
 
-    This is the control for the two tests above: the acceptance is about an extent
-    of one, so the identical permutation with a batch of two keeps its fourth loop
-    and keeps its refusal -- no delegate at all, and the move runs on the CPU. A
-    graph-level check, because a predicate that said no to everything would pass
-    the unit test next door and fail here.
+    This is the control for the two tests above, and it is a graph-level check
+    because a predicate that said no to everything would pass the unit test next
+    door and fail here. The batch of one stays a single region, so the acceptance
+    is still a rule about extents rather than a blanket one; the batch of four is
+    past the three regions a command carries, so it is the only one of these that
+    takes more than one command, and it has to cover the same four elements.
     """
 
     class Two(torch.nn.Module):
         def forward(self, x):
             return x.permute(0, 2, 1, 3)
 
-    x = torch.randn(2, 16, 8, 40, dtype=torch.float16)
-    program = _lowered(Two().eval(), (x,))
-
-    assert _commands(program) == [], "a batch of two delegated the head split"
+    for batch, regions in ((1, [1]), (2, [2]), (3, [3]), (4, [3, 1]), (5, [3, 2])):
+        x = torch.randn(batch, 16, 8, 40, dtype=torch.float16)
+        commands = _commands(_lowered(Two().eval(), (x,)))
+        assert len(commands) == 1, f"batch {batch} cut the delegate"
+        assert [c.type for c in commands[0]] == [DSP_OP_RASTER_BLIT] * len(regions)
+        assert [c.params[0] for c in commands[0]] == regions, (
+            f"batch {batch} should be {regions} regions"
+        )
+        assert sum(regions) == batch, f"batch {batch} regions do not cover it"
