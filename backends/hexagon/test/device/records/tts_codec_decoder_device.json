@@ -1,0 +1,76 @@
+{
+ "what": "TTS (Voxtral-4B-TTS CodecDecoder, the vocoder) on a Snapdragon device DSP.",
+ "tier": "device",
+ "tree": ".tmp/ttsdev/executorch @ d1e52d8 (hexagon-tts-device), branched from hexagon-integration-a47",
+ "baseline": "5045487 (a47) + 13 commits, the same integration point the other device lines used",
+ "not_run_here": ["hexagon-sim"],
+ "model": {
+  "source": "examples/models/voxtral_tts/model.py -> CodecDecoder (vocoder), VoxtralTTSConfig defaults",
+  "premise_kept": "QUARTER WIDTH, not the full 4B-checkpoint vocoder. codec_dim 256 vs 1024, codec_hidden 1024 vs 4096, semantic_dim 64 vs 256, semantic_codebook 2048 vs 8192. The full config is 149,471,472 params and its export peaked at 2112 MB RSS, over the 1.5 GB stop line, so it was not run. The op set is unaffected: the census is identical at 1/8 width (unique 41, nodes 1222, delegated 820, delegates 40, same command totals).",
+  "params": 15999216,
+  "input": [1, 37, 16],
+  "output": [1, 1, 30720],
+  "dtype": "int64 IN (4736 B = 592 x 8, itemsize read from the ExportedProgram, not assumed), float32 out (122880 B = 30720 x 4); the kernels and the arena are fp16"
+ },
+ "device": {
+  "host": "oneplus13-reverse",
+  "dir": "/data/data/com.termux/files/home/csm/execuTorch-ds/ttsdev",
+  "runner": {"bytes": 54292832, "md5": "3fdba2a1fe295e72f20283941c505602", "path": "devloop/executor_runner"},
+  "skel": {"bytes": 1500472, "md5": "9476b264825a23676e0578e323917ac7", "path": "devloop/skel/libhex-htp-skel-v79.so"},
+  "env": "LD_LIBRARY_PATH=/system/lib64:/vendor/lib64, ADSP_LIBRARY_PATH=devloop/skel",
+  "pte": {"bytes": 35124036, "md5": "ee1029bb1fbf520acb56b85a8b1bd118"}
+ },
+ "command_stream": {
+  "decoded_with": "enum DSPOpType parsed from backends/hexagon/third-party/mnn-htp-ops/include/htp_command.h:32",
+  "enum_names": 50,
+  "python_mirror_used": false,
+  "names_cross_checked_against_enum": true,
+  "host_decoded": {
+   "DSP_OP_BINARY_ELEMENTWISE": 150,
+   "DSP_OP_RASTER_BLIT": 134,
+   "DSP_OP_UNARY": 98,
+   "DSP_OP_BATCH_MATMUL": 77,
+   "DSP_OP_REDUCTION": 45,
+   "DSP_OP_SELECT": 8,
+   "DSP_OP_SOFTMAX": 4
+  },
+  "type_numbers": {"3": "RASTER_BLIT", "4": "UNARY", "19": "BINARY_ELEMENTWISE", "26": "SELECT", "28": "SOFTMAX", "29": "REDUCTION", "38": "BATCH_MATMUL"},
+  "total": 516,
+  "conv_commands": 0,
+  "upsample_bilinear_commands": 0,
+  "note": "ZERO conv commands of any kind and ZERO type-46 upsamples. The vocoder's convolutions are unfold+matmul and its transposed convolutions are matmul+Fold, so the whole structural upsampling of this family runs as BATCH_MATMUL, never as a convolution and never as an interpolation. This answers the open question for this family directly: the gap is NOT the upsample path.",
+  "census": {"unique_targets": 41, "in_table": 32, "off_table": 9, "nodes": 1222, "delegated": 820, "portable": 402, "delegates": 40},
+  "device_side": {"delegates_entered": 40, "delegates_ok": 40, "elapsed_s": 1}
+ },
+ "numerics": {
+  "psnr_db": 67.58962590531821,
+  "max_abs": 0.003962874412536621,
+  "rmse": 0.0006919244848131795,
+  "pearson_r": 0.9999989389331045,
+  "sign_agreement": 0.9995442708333333,
+  "exact_frac": 0.0,
+  "ref_absmax": 1.657829999923706,
+  "got_absmax": 1.6591796875,
+  "got_absmax_is_exactly_fp16_representable": true,
+  "nan": 0,
+  "inf": 0,
+  "controls": {
+   "perturbed_reference_psnr_db": 44.86233923985551,
+   "fp16_roundtrip_of_reference_psnr_db": 87.22753443411735,
+   "constant_mean_model_psnr_db": 13.52532772768095,
+   "second_input_psnr_db_between_the_two_device_runs": 15.009792152072345,
+   "second_input_byte_identical": false
+  }
+ },
+ "where_the_gap_is": {
+  "semantic_blocker": "aten.embedding.default, 1 node, IN the table and refused: the codebook weight is a COMPUTED buffer (embedding_sum / cluster_usage.clamp) rather than a parameter, so the gather cannot read a constant at export.",
+  "rest": "401 further portable nodes, all refused by the predicate and none accepted-but-stranded: the sliding-window ALiBi mask construction (where/gt/lt/logical_not/bitwise_or/eq/arange on tiny int64 and bool tensors) and the int64 index arithmetic of the unfold+matmul convolutions (unsqueeze_copy/add/sub/pow/constant_pad_nd/index/slice_copy).",
+  "accepted_but_not_delegated": 0
+ },
+ "boundaries": {
+  "reduced_width": "the 4B-checkpoint vocoder was not run; its export peaks at 2112 MB, over the budget",
+  "untested_accumulators": "skill 38 measured the accumulator of IM2COL (fp32), DEPTHWISE (fp16) and POOL (fp16). This graph contains NONE of those commands and zero CONV1X1_DIRECT_FP16, so the brief's question about the unmeasured CONV1X1 accumulator does not arise here. What it DOES use -- BATCH_MATMUL, REDUCTION, SOFTMAX -- has no device-verified accumulator reading at all, so the 67.59 dB cannot be attributed to any specific accumulator.",
+  "one_width_and_one_length": "one model width (1/4) and one sequence length (T=16) on the device",
+  "not_a_full_tts_pipeline": "this is the vocoder only. The 4B Mistral LLM and the flow-matching head that produce the codes were not run."
+ }
+}
