@@ -38,7 +38,9 @@ so a partitioner that refused everything would fail this file rather than pass
 it, and a width gate that stopped working would go red on the command.
 """
 
+import inspect
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -175,14 +177,26 @@ class _PositionArithmetic(torch.nn.Module):
         )
 
 
-#: The two lines that decide these nodes, re-derived from the tree. 686 and 678
-#: when this branch was written, 695 and 680 after the arg-reduction merge put a
-#: clause above each, and 704 and 687 after the comparison merge replaced the
-#: width gate with the shared predicate. That is three re-derivations in one
-#: merge series, which is the argument for deriving these two at import time by
-#: reading _verdict's own text rather than writing them down.
-WIDTH_GATE = 704
-UNWIRED_GATE = 687
+#: The two lines that decide these nodes, read out of _verdict's own text
+#: rather than written down: 686/678 here, 695/680 after the arg-reduction
+#: merge, 704/687 after the comparison merge replaced the width gate, and a
+#: fourth pair after the bool and upsample predicates landed. Four
+#: re-derivations in one merge series is why this reads the text.
+def _clause_line(containing):
+    start = hexagon_partitioner.HexagonOperatorSupport._verdict.__code__.co_firstlineno
+    lines = textwrap.dedent(
+        inspect.getsource(hexagon_partitioner.HexagonOperatorSupport._verdict)
+    ).splitlines()
+    for offset, line in enumerate(lines):
+        if line.strip() != 'return False':
+            continue
+        if containing in ' '.join(lines[max(0, offset - 4) : offset]):
+            return start + offset
+    raise AssertionError(containing)
+
+
+WIDTH_GATE = _clause_line('result_dtype_is_emittable')
+UNWIRED_GATE = _clause_line('not in SUPPORTED_TARGETS')
 
 
 def test_every_supported_row_node_in_the_position_prologue_is_refused_at_one_line():

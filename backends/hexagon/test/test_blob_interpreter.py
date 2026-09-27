@@ -740,15 +740,37 @@ def _permute_copy(shape, dims):
     return node
 
 
-def test_a_permutation_needing_a_fourth_run_is_refused():
-    """Four groups is one more loop than a region has, so it has to be refused.
+def _regions_reproduce(regions, shape, dims):
+    """Whether the regions write the permutation, checked against torch."""
+    src = torch.arange(1, 1 + int(torch.tensor(shape).prod()), dtype=torch.float32)
+    src = src.reshape(shape)
+    want = src.permute(*dims).contiguous()
+    out = torch.zeros(tuple(want.shape), dtype=torch.float32)
+    flat_src, flat_out = src.reshape(-1), out.reshape(-1)
+    for r in regions:
+        _, so, do, sx, sy, sz, ssx, ssy, ssz, dsx, dsy, dsz = r
+        for i in range(sx):
+            for j in range(sy):
+                for k in range(sz):
+                    flat_out[do + i * dsx + j * dsy + k * dsz] = flat_src[
+                        so + i * ssx + j * ssy + k * ssz
+                    ]
+    return bool(torch.equal(out, want))
+
+
+def test_a_permutation_needing_a_fourth_run_costs_a_second_region():
+    """Four groups is one more loop than a region has, so it costs a second one.
 
     Swapping the two outer axes *and* the two inner ones pairs every axis with a
     different one, so every group is a single axis and no single region describes
-    it. The emitter would write the wrong elements rather than fail, which is why
-    the refusal lives in the predicate the support check reads.
+    it. That used to be a refusal, on the grounds that the emitter would write the
+    wrong elements rather than fail. Unrolling the outermost run once says it in
+    two regions instead, and what the refusal was protecting is now asserted
+    directly: the regions have to reproduce the permutation, not merely exist.
     """
-    assert hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 3, 2))) is None
+    paired = hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 3, 2)))
+    assert len(paired) == 2
+    assert _regions_reproduce(paired, (2, 3, 5, 7), (1, 0, 3, 2))
     assert (
         hexagon_ops.permute_region(_permute_copy((2, 3, 5, 7), (1, 0, 2, 3)))
         is not None
@@ -779,9 +801,11 @@ def test_a_head_split_on_a_batch_of_one_is_three_loops():
         _, got, expected = _run_permute(shape, (0, 2, 1, 3))
         assert np.array_equal(got, expected), f"differs from torch at {shape}"
 
-    assert (
-        hexagon_ops.permute_region(_permute_copy((2, 16, 8, 40), (0, 2, 1, 3))) is None
-    )
+    two = hexagon_ops.permute_region(_permute_copy((2, 16, 8, 40), (0, 2, 1, 3)))
+    assert len(two) == 2, two
+    assert _regions_reproduce(two, (2, 16, 8, 40), (0, 2, 1, 3))
+    one = hexagon_ops.permute_region(_permute_copy((1, 16, 8, 40), (0, 2, 1, 3)))
+    assert len(one) == 1, one
 
 
 #: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed
