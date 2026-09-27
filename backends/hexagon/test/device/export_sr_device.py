@@ -25,7 +25,15 @@ import sys
 
 import torch
 
-LAND = "/home/yydh/executorch/.tmp/agents/land/executorch"
+# The tree under test is the one this script lives in, found by walking up to
+# the marker rather than by naming a worktree: a driver that only runs from the
+# branch it was written on cannot answer whether the integrated tree still works.
+LAND = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+)
+assert os.path.isdir(LAND + "/backends/hexagon"), LAND
 FAMDEPS = "/home/yydh/executorch/.tmp/scratch/famdeps"
 sys.path.insert(0, LAND + "/src")
 sys.path.insert(0, LAND + "/backends/hexagon/test")
@@ -47,9 +55,10 @@ from executorch.backends.hexagon.partition.hexagon_partitioner import (
 from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower
 from torch.export import export
 
-# The tree under test must be the tree that is imported. Load-bearing.
-assert ".tmp/agents/land/executorch" in _P.__file__, _P.__file__
-assert ".tmp/agents/land/executorch" in hexagon_ops.__file__, hexagon_ops.__file__
+# The tree under test must be the tree that is imported. Load-bearing, and
+# checked by identity of the tree rather than by the name of one worktree.
+assert _P.__file__.startswith(LAND), (_P.__file__, LAND)
+assert hexagon_ops.__file__.startswith(LAND), (hexagon_ops.__file__, LAND)
 
 CFG = EdgeCompileConfig(_check_ir_validity=False)
 DELEGATE = torch.ops.higher_order.executorch_call_delegate
