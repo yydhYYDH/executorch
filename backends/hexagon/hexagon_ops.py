@@ -413,6 +413,11 @@ def _permute_region_from_shapes(source_shape, result_shape, dims):
             levels.append((run, source_strides[last], destinations[last]))
     if len(levels) > 3:
         return None
+    return _three_region(levels)
+
+
+def _three_region(levels):
+    """One region's three loops, padded to three and innermost-run-first."""
     while len(levels) < 3:
         levels.append((1, 0, 0))
     for index, level in enumerate(levels):
@@ -424,6 +429,71 @@ def _permute_region_from_shapes(source_shape, result_shape, dims):
     src = [level[1] for level in levels]
     dst = [level[2] for level in levels]
     return [0, 0, 0] + size + src + dst
+
+
+def _permute_regions_from_shapes(source_shape, result_shape, dims):
+    """The blit regions for a concrete axis permutation, or None.
+
+    A region is three nested loops, so a permutation is ONE region when its axes
+    split into at most three advancing groups. A FOURTH advancing group is the
+    outermost one unrolled: the batch of a [batch, tokens, heads, dim] to
+    [batch, heads, tokens, dim] head split is exactly that, and it is the split
+    every attention in a diffusers export spells. Each element of it becomes a
+    region of the three groups that are left, offset by its own strides, because
+    a region carries a base offset per side and the batch loop is the one thing
+    two regions share. The regions do not overlap, so this partitions the work
+    rather than walking the same bytes twice.
+
+    Five advancing groups is a refusal: dropping the outermost still leaves four,
+    and no single region describes four. So is a permutation that reverses the
+    axes inside a group -- what that would emit reads the wrong elements rather
+    than failing.
+
+    The three-level answer is byte-for-byte the one _permute_region_from_shapes
+    gives; only the four-group case is new, and only the permute emitter asks
+    here, so the fused transpose pair keeps its own single-region spelling.
+    """
+    single = _permute_region_from_shapes(source_shape, result_shape, dims)
+    if single is not None:
+        return [single]
+    if not isinstance(dims, (list, tuple)):
+        return None
+    rank = len(source_shape)
+    if rank < 2 or len(dims) != rank or sorted(dims) != list(range(rank)):
+        return None
+    if len(result_shape) != rank:
+        return None
+    source_strides = _row_major_strides(source_shape)
+    result_strides = _row_major_strides(result_shape)
+    positions = [0] * rank
+    for position, axis in enumerate(dims):
+        positions[axis] = position
+    destinations = [result_strides[position] for position in positions]
+
+    groups = []
+    first = 0
+    for axis in range(1, rank):
+        if positions[axis] != positions[first] + (axis - first):
+            groups.append((first, axis - 1))
+            first = axis
+    groups.append((first, rank - 1))
+
+    levels = []
+    for start, last in groups:
+        run = 1
+        for axis in range(start, last + 1):
+            run *= int(source_shape[axis])
+        if run > 1:
+            levels.append((run, source_strides[last], destinations[last]))
+    if len(levels) != 4:
+        return None
+
+    outermost = levels[0]
+    return [
+        [0, element * outermost[1], element * outermost[2]]
+        + _three_region(list(levels[1:]))[3:]
+        for element in range(outermost[0])
+    ]
 
 
 def log_softmax_shifts_within_the_arena(node: torch.fx.Node) -> bool:
@@ -1340,7 +1410,7 @@ def permute_region(node: torch.fx.Node):
     if source_value.numel() != result_value.numel():
         return None
 
-    return _permute_region_from_shapes(
+    return _permute_regions_from_shapes(
         source_value.shape, result_value.shape, dims
     )
 
@@ -1479,7 +1549,13 @@ def _fold_constant_transpose(node: torch.fx.Node, ctx):
 
 
 def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
-    """A transpose is a strided read and a strided write, which is one region."""
+    """A transpose is a strided read and a strided write, which is one region.
+
+    A permutation whose outermost axis had to be unrolled is one region per element
+    of that axis, and a command carries BLIT_BLOCKS_PER_COMMAND regions, so a wider
+    batch takes more than one command against the same output. The regions do not
+    overlap, so this partitions the work rather than walking the same bytes twice.
+    """
     # A folded transpose is stored in the weights section and reached through
     # the folded table, which only a consumer reads. A node the caller reads
     # from a delegate output has no consumer, and an output slot is a region of
@@ -1491,15 +1567,22 @@ def _emit_permute_copy(node: torch.fx.Node, ctx) -> TensorRef:
         if folded is not None:
             return folded
     out = ctx.result_for(node, _numel(node))
-    ctx.emit(
-        node,
-        Op(
-            type=DSP_OP_RASTER_BLIT,
-            inputs=[ctx.operand(node.args[0])],
-            outputs=[out],
-            params=[1, FP16_BYTES, 1] + permute_region(node),
-        ),
-    )
+    regions = permute_region(node)
+    if regions is None:
+        raise RuntimeError(f"hexagon: {node.target} needs a fifth level")
+    source = ctx.operand(node.args[0])
+    for start in range(0, len(regions), BLIT_BLOCKS_PER_COMMAND):
+        block = regions[start : start + BLIT_BLOCKS_PER_COMMAND]
+        ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_RASTER_BLIT,
+                inputs=[source],
+                outputs=[out],
+                params=[len(block), FP16_BYTES, 1]
+                + [value for region in block for value in region],
+            ),
+        )
     return ctx.record(node, out)
 
 
