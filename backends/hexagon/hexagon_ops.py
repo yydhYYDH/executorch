@@ -274,6 +274,7 @@ UNARY_OP_TYPES: Dict[str, int] = {
     "mul_scalar": 17,
 }
 
+
 class HexagonApproximationWarning(UserWarning):
     """A delegated op the DSP computes as an approximation of torch's function.
 
