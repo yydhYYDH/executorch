@@ -54,10 +54,12 @@ from executorch.exir import EdgeCompileConfig, to_edge_transform_and_lower  # no
 from torch.export import export  # noqa: E402
 
 #: The clause as it stands, and the clause as it was: the same check with fp32 taken
-#: out of the accepted set, which is the whole of the change.
+#: out of the accepted set, which is the whole of the change. The first conjunct is
+#: the admitted set, the second the homogeneity the blit header's single element
+#: size needs -- a mixed cat has to be refused by one of them, not both.
 _CLAUSE = (
-    "    if any(\n"
-    "        value.dtype not in (torch.float16, torch.float32) for value in values\n"
+    "    if result.dtype not in (torch.float16, torch.float32) or any(\n"
+    "        value.dtype is not result.dtype for value in values\n"
     "    ):\n"
     "        return None"
 )
