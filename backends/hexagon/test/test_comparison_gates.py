@@ -34,6 +34,8 @@ holds -- is no longer reachable, because the emitter knows the width. The raise
 stays as a backstop for a bool that reaches an emitter by any other route.
 """
 
+import inspect
+
 import pytest
 import torch
 
@@ -436,3 +438,232 @@ def test_the_comparison_merge_performed_the_experiment_this_test_described():
     assert _delegate_count(program) == 1
     names = {str(command.type) for command in _commands(program)}
     assert not any(name in names for name in ("eq", "ne", "ge", "le"))
+
+
+#: The clause the operand gate refuses an int64 operand on, spelled out so that a
+#: reformat of the predicate makes this file fail loudly instead of quietly
+#: turning the mutation below into a no-op that still passes.
+_OPERAND_WIDTH_CLAUSE = """value.dtype not in (
+            torch.float16,
+            torch.float32,
+        )"""
+_MUTATED_OPERAND_WIDTH_CLAUSE = """value.dtype not in (
+            torch.float16,
+            torch.float32,
+            torch.int64,
+        )"""
+
+
+class _Int64Comparison(torch.nn.Module):
+    """The shape an ASR front end produces: an int64 arange against int64 lengths.
+
+    Its result is a torch.bool, which is the width `result_dtype_is_emittable`
+    admits on purpose for a wired comparison, so the result gate passes and the
+    operand is the only thing left to refuse it.
+    """
+
+    def forward(self, lengths):
+        steps = torch.arange(0, 8, dtype=torch.int64)
+        return (steps[: lengths.shape[-1]] < lengths).to(torch.float16)
+
+
+class _Fp16Comparison(torch.nn.Module):
+    """The same geometry at the two widths the arena holds."""
+
+    def forward(self, lengths):
+        steps = torch.arange(0, 8, dtype=torch.float16)
+        return (steps[: lengths.shape[-1]] < lengths).to(torch.float16)
+
+
+class _ArgReduction(torch.nn.Module):
+    def forward(self, x):
+        return torch.argmax(x, dim=-1)
+
+
+def _call_function(target, result_dtype, operand_dtypes, numel=(4,)):
+    """A call_function node carrying recorded values and nothing else."""
+    graph = torch.fx.Graph()
+    args = []
+    for index, dtype in enumerate(operand_dtypes):
+        placeholder = graph.placeholder("in%d" % index)
+        placeholder.meta["val"] = torch.zeros(numel).to(dtype)
+        args.append(placeholder)
+    node = graph.call_function(target, tuple(args))
+    node.meta["val"] = torch.zeros(numel).to(result_dtype)
+    return node
+
+
+def _verdict(node):
+    """One node's support verdict, on a support object built as the partitioner does."""
+    program = to_edge(
+        export(_Fp16Comparison(), (torch.zeros(4, dtype=torch.float16),)),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    return HexagonOperatorSupport(_data_placeholders(program)).is_node_supported(
+        program.graph_module, node
+    )
+
+
+def _delegated_targets(program):
+    names = set()
+    for node in program.graph_module.graph.nodes:
+        if node.target is not torch.ops.higher_order.executorch_call_delegate:
+            continue
+        lowered = program.graph_module.get_submodule(node.args[0].target)
+        for inner in lowered.original_module.graph_module.graph.nodes:
+            if inner.op != "call_function":
+                continue
+            text = str(inner.target)
+            names.add(
+                text[len("<EdgeOpOverload: ") :].split(">:")[0]
+                if text.startswith("<EdgeOpOverload: ")
+                else text
+            )
+    return names
+
+
+def test_the_operand_gate_refuses_an_int64_operand_a_wired_comparison_carries():
+    """The defect: the two gates disagree on exactly this shape.
+
+    A bool result passes the result gate whatever it compared, so the operand is
+    the only thing that can refuse this node -- and until the operand rule read
+    widths and not only bools, nothing did. The emitter caught it instead, and
+    `_require_arena_dtype` raising there is not a fallback: it takes the whole
+    `to_edge_transform_and_lower` down, so an ASR model whose mask is
+    `arange < lengths` could not be exported at all.
+    """
+    node = _call_function(
+        _EDGE.lt.Tensor, torch.bool, (torch.int64, torch.int64)
+    )
+    assert _dtype_of(node) is torch.bool
+    assert partition.result_dtype_is_emittable(_dtype_of(node), node.target) is True
+    assert ops.operand_dtypes_are_readable(node) is False
+    assert _verdict(node) is False
+
+
+def test_the_width_clause_and_not_another_one_is_what_refuses_that_node():
+    """The assertion above is load-bearing only if this clause is the reason.
+
+    Relaxing it in the predicate's own source and re-executing it puts the int64
+    node back on the DSP, while the fp16 twin is taken either way. A test naming
+    a clause can be satisfied by whichever clause happens to fire, so the node
+    this one claims to refuse has to flip when the clause is dropped -- and the
+    control has to stay put, or the relaxed predicate is refusing everything
+    instead of everything-but-int64.
+    """
+    source = inspect.getsource(ops.operand_dtypes_are_readable)
+    assert _OPERAND_WIDTH_CLAUSE in source, "the clause this file mutates is gone"
+    namespace = dict(vars(ops))
+    exec(compile(source.replace(
+        _OPERAND_WIDTH_CLAUSE, _MUTATED_OPERAND_WIDTH_CLAUSE
+    ), "<mutated operand gate>", "exec"), namespace)
+    relaxed = namespace["operand_dtypes_are_readable"]
+
+    int64 = _call_function(_EDGE.lt.Tensor, torch.bool, (torch.int64, torch.int64))
+    fp16 = _call_function(_EDGE.lt.Tensor, torch.bool, (torch.float16, torch.float16))
+    assert relaxed(int64) is True, "the clause under test is not what refuses it"
+    assert relaxed(fp16) is True
+    assert ops.operand_dtypes_are_readable(int64) is False
+    assert ops.operand_dtypes_are_readable(fp16) is True
+
+
+def test_the_fp16_twin_of_that_geometry_still_delegates_the_comparison():
+    """The positive control, and a refusal assertion is vacuous without one.
+
+    A support object that refused everything would satisfy the two tests above, so
+    the same geometry at fp16 has to still reach a delegate with the comparison
+    inside it -- named, not counted, so an empty delegate cannot satisfy it.
+    """
+    program = _lower(
+        _Fp16Comparison(), (torch.tensor([2, 5, 1, 3], dtype=torch.float16),)
+    )
+    assert _delegate_count(program) == 1
+    assert _delegated_targets(program) == {
+        "aten.lt.Tensor",
+        "aten.slice_copy.Tensor",
+    }
+
+
+def test_the_int64_comparison_lowers_and_the_refusal_is_named():
+    """The end state, measured on the refusal rather than on a missing delegate.
+
+    "No delegate" is also what a graph of nothing but refusals gives, so the
+    assertion is the count the census reports for the comparison itself.
+    """
+    partition.reset_refused_overload_census()
+    program = _lower(
+        _Int64Comparison(), (torch.tensor([2, 5, 1, 3], dtype=torch.int64),)
+    )
+    assert _delegate_count(program) == 0
+    assert partition.refused_overload_census().get("aten.lt.Tensor") == 1
+
+
+def test_an_arg_reduction_still_delegates_its_int64_result():
+    """The negative control, on the case the special case in _verdict exists for.
+
+    An arg reduction's result is int64 by design and its command writes that width
+    directly, which is why it has to run before the shared width check. The
+    operand gate is a different question: it reads the operand, which is the fp16
+    data. Widening it to widths must not reach the index result, or every valid
+    index in the model is refused.
+    """
+    program = _lower(_ArgReduction(), (torch.randn(2, 8, dtype=torch.float16),))
+    assert _delegate_count(program) == 1
+    assert _delegated_targets(program) == {"aten.argmax.default"}
+    fp16 = _call_function(_EDGE.argmax.default, torch.int64, (torch.float16,))
+    assert _dtype_of(fp16) is torch.int64
+    assert ops.operand_dtypes_are_readable(fp16) is True
+    assert _verdict(fp16) is True
+
+
+def test_an_arg_reduction_over_an_int64_source_stops_delegating():
+    """The one behaviour the widening changes, stated rather than left implied.
+
+    The kernel reads its source as half floats, so an int64 arg reduction
+    delegated today answered something other than the index torch computed. It is
+    now portable. The fp16 case above is the control that stays on the DSP.
+    """
+    int64 = _call_function(_EDGE.argmax.default, torch.int64, (torch.int64,))
+    assert ops.operand_dtypes_are_readable(int64) is False
+    assert _verdict(int64) is False
+
+
+def test_the_exemptions_are_operands_a_command_declares_its_own_width_for():
+    """A gate that refused every operand would pass every test above.
+
+    Each exemption is a width the kernel reads at a width of its own, keyed by
+    argument position: a where's one-byte condition slot, a gather's four-byte
+    index slot. The gather's indices are int32 *and* int64, because the slot is
+    declared four bytes an element either way and the runtime narrows a wider one
+    into it -- so exempting the position rather than the width is the whole
+    reason int64 keeps delegating there.
+    """
+    assert ops.NON_ARENA_OPERAND_SLOTS[ops.WHERE] == (0,)
+    assert ops.NON_ARENA_OPERAND_SLOTS[ops.EMBEDDING] == (1,)
+    assert ops.NON_ARENA_OPERAND_SLOTS[ops.INDEX_SELECT] == (2,)
+    assert ops.NON_ARENA_OPERAND_SLOTS[ops.UPDATE_CACHE] == (2,)
+
+    where = _call_function(
+        ops.WHERE, torch.float16, (torch.bool, torch.float16, torch.float16)
+    )
+    assert ops.operand_dtypes_are_readable(where) is True
+    for indices in (torch.int32, torch.int64):
+        assert ops.operand_dtypes_are_readable(
+            _call_function(ops.EMBEDDING, torch.float16, (torch.float16, indices))
+        ) is True
+    # The index slot is what is exempted, so an int64 *table* is still refused.
+    assert ops.operand_dtypes_are_readable(
+        _call_function(ops.EMBEDDING, torch.float16, (torch.int64, torch.int64))
+    ) is False
+
+
+def test_the_emitter_still_raises_for_an_int64_operand_that_reaches_it():
+    """The backstop is not dead code, which is why the fix belongs on the other side.
+
+    `_require_arena_dtype` is what caught this defect, and it is kept: a node
+    that arrives by a route the support check does not cover still raises rather
+    than emits a command that reads eight bytes an element as two.
+    """
+    node = _call_function(_EDGE.lt.Tensor, torch.bool, (torch.int64, torch.int64))
+    with pytest.raises(RuntimeError, match="must be fp16 or fp32"):
+        ops._require_arena_dtype(node.args[0], "comparison less operand")
