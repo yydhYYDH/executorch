@@ -144,6 +144,13 @@ extern AEEResult htp_ops_lstm(uint8_t* y, uint8_t* yh, uint8_t* yc, const uint8_
                               uint8_t* scratch, const int32* sizes, int32 packedWeightBytes);
 extern AEEResult htp_ops_im2col_convolution_fp16(uint8_t* output, uint8_t* input, uint8_t* weight, uint8_t* bias,
                                                  const HmxIm2ColConvParam* params);
+  extern AEEResult htp_ops_upsample_bilinear2d_fp16(uint8_t* dst,
+                                                    const uint8_t* src,
+                                                    int32_t planes,
+                                                    int32_t in_h,
+                                                    int32_t in_w,
+                                                    int32_t out_h,
+                                                    int32_t out_w);
 
 using TensorVector = flatbuffers::Vector<flatbuffers::Offset<DSPCOMMAND::Tensor>>;
 
