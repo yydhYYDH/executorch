@@ -283,7 +283,12 @@ GREATER_THAN_SCALAR = exir_ops.edge.aten.gt.Scalar
 LESS_THAN_SCALAR = exir_ops.edge.aten.lt.Scalar
 
 #: The negation of a mask, which is a one-byte select and not a new command.
+#: Two spellings reach it and they are different ATen nodes: torch.logical_not
+#: names one and `~` on a bool names `bitwise_not`. Only the second one is what
+#: `~` exports to, so a graph that writes `~` in a mask chain would otherwise
+#: split the island it is meant to close.
 LOGICAL_NOT = exir_ops.edge.aten.logical_not.default
+BITWISE_NOT = exir_ops.edge.aten.bitwise_not.default
 
 
 LAYER_NORM = exir_ops.edge.aten.layer_norm.default
@@ -2736,8 +2741,27 @@ def _product(extents: Tuple[int, ...]) -> int:
     return total
 
 
-def logical_not_is_emittable(node: torch.fx.Node) -> bool:
-    """Whether this `logical_not` is the shape _emit_logical_not can walk.
+def comparison_operands_are_readable(node: torch.fx.Node) -> bool:
+    """Whether every operand of a comparison is a width the arena holds.
+
+    A comparison's result is a bool and its operands are floats the binary
+    command reads two bytes at a time, so the two width rules answer different
+    questions and both are needed: `result_dtype_is_emittable` admits the one
+    byte a command here writes, and this refuses an operand the kernels could
+    not read. An fp64 or int comparison is refused here rather than admitted and
+    then raised at by `_require_arena_dtype`, which is a failed export where a
+    portable kernel would have done.
+    """
+    for arg in node.args:
+        if not isinstance(arg, torch.fx.Node):
+            continue
+        if _value_of(arg).dtype not in (torch.float16, torch.float32):
+            return False
+    return True
+
+
+def mask_negation_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this `logical_not` or `bitwise_not` is the shape _emit_mask_negation can walk.
 
     The command is a select whose condition is the node's only operand and
     whose two sources are constants, so the condition's size is the output's by
@@ -2775,7 +2799,10 @@ def where_is_emittable(node: torch.fx.Node) -> bool:
 
     The condition's dtype is checked as well as its width, because a
     torch.bool *is* one byte and any other one-byte tensor is not a flag the
-    kernel's `!= 0` test would read the way torch would.
+    kernel's `!= 0` test would read the way torch would. The two values are
+    checked for the same reason and not for a different one: they are the only
+    operands here with no width of their own to declare, so a width that differs
+    from the result's has nowhere to be written down and is a misread instead.
     """
     result = _value_of(node)
     if result.dtype not in (torch.float16, torch.float32):
@@ -2794,6 +2821,15 @@ def where_is_emittable(node: torch.fx.Node) -> bool:
             return False
         value = _value_of(operand)
         if value.numel() not in (out_numel, 1):
+            return False
+        # The condition is declared at its own width and the two values are not:
+        # the command carries one `bytes` for the output and reads every value
+        # at it, so a value whose slot is a different width than the result's is
+        # not a narrower flag but a misread -- each element takes its neighbour
+        # for its high half, and nothing downstream sees an error. The width is
+        # what is compared, not the family: an fp32 value under an fp16 result
+        # is as wrong as a bool.
+        if value.dtype != result.dtype:
             return False
     return True
 
@@ -2927,7 +2963,7 @@ def _emit_compare(op_name: str):
     return emit
 
 
-def _emit_logical_not(node: torch.fx.Node, ctx) -> TensorRef:
+def _emit_mask_negation(node: torch.fx.Node, ctx) -> TensorRef:
     """`!mask` as the select that is already in the blob, between two bytes.
 
     torch's logical_not is "nonzero becomes False" and the kernel's condition
@@ -8730,8 +8766,9 @@ EMITTERS = {
     GREATER_THAN_SCALAR: _emit_compare("greater"),
     LESS_THAN_SCALAR: _emit_compare("less"),
     # `!mask`, which the select already in the blob answers between two
-    # one-byte constants.
-    LOGICAL_NOT: _emit_logical_not,
+    # one-byte constants, under either spelling.
+    LOGICAL_NOT: _emit_mask_negation,
+    BITWISE_NOT: _emit_mask_negation,
     exir_ops.edge.aten.alias_copy.default: _emit_alias,
     exir_ops.edge.aten.unsqueeze_copy.default: _emit_alias,
     exir_ops.edge.aten.squeeze_copy.dims: _emit_alias,
@@ -8808,9 +8845,14 @@ ELU_TARGETS = frozenset({ELU})
 # why operand_dtypes_are_readable has to know its name.
 WHERE_TARGETS = frozenset({WHERE})
 
-# `logical_not` reads its only operand the way a `where` reads its condition,
-# one byte at a time, so it joins that exemption rather than earning a second.
-ONE_BYTE_CONDITION_TARGETS = frozenset({WHERE, LOGICAL_NOT})
+# `logical_not` and `bitwise_not` read their only operand the way a `where`
+# reads its condition, one byte at a time, so they join that exemption rather
+# than earning a second.
+ONE_BYTE_CONDITION_TARGETS = frozenset({WHERE, LOGICAL_NOT, BITWISE_NOT})
+
+# The two spellings of a mask's negation, which are one command and one
+# predicate between them.
+MASK_NEGATION_TARGETS = frozenset({LOGICAL_NOT, BITWISE_NOT})
 
 # The targets whose own result is a torch.bool, which is why the arena's width
 # rule is keyed on the target as well as on the dtype.
@@ -8822,7 +8864,7 @@ COMPARISON_TARGETS = frozenset(
 # comparisons: the negation writes one through the same one-byte select arm.
 # Derived rather than restated so that the two cannot drift apart, and both the
 # partitioner and the emitters read this one.
-BOOL_RESULT_TARGETS = COMPARISON_TARGETS | {LOGICAL_NOT}
+BOOL_RESULT_TARGETS = COMPARISON_TARGETS | MASK_NEGATION_TARGETS
 
 # bmm is the same tile geometry with a batch axis in front of both operands.
 BMM_TARGETS = frozenset({exir_ops.edge.aten.bmm.default})

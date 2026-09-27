@@ -99,11 +99,12 @@ def _node(result_dtype, operand_dtypes, numel=(4, 8)):
 def test_supported_targets_is_the_emitter_table_and_not_a_second_one():
     """One object, so the wiring question is asked once and answered once."""
     assert partition.SUPPORTED_TARGETS is ops.EMITTERS
-    # 90 when this branch was written, 96 now: the arg-reduction merge added the
-    # two reductions to the same table and the comparison merge added four more.
-    # The count is a census rather than a constant of the design, so it is
+    # 90 when this branch was written, 96 after the comparison merge, 99 now:
+    # the arg-reduction merge added two reductions, the comparison merge four
+    # comparison targets, and the Scalar-comparison and logical_not rows three
+    # more. The count is a census rather than a constant of the design, so it is
     # re-derived rather than loosened.
-    assert len(partition.SUPPORTED_TARGETS) == len(ops.EMITTERS) == 96
+    assert len(partition.SUPPORTED_TARGETS) == len(ops.EMITTERS) == 99
     for name, target in COMPARISON_TARGETS.items():
         # Two of the six are wired since this file was written, so the absence is
         # the narrower claim now, and the narrower one is the useful one: eq, ne,

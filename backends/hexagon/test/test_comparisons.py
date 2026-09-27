@@ -29,7 +29,9 @@ from executorch.backends.hexagon.hexagon_ops import (
     COMPARISON_TARGETS,
     EMITTERS,
     LESS_THAN,
+    LESS_THAN_SCALAR,
     GREATER_THAN,
+    GREATER_THAN_SCALAR,
     operand_dtypes_are_readable,
     result_dtype_is_emittable,
 )
@@ -92,6 +94,24 @@ def _blob_of(op, a, b):
     return blob, commands
 
 
+class _Op(torch.nn.Module):
+    """A module whose forward is the callable it was handed."""
+
+    def __init__(self, op):
+        super().__init__()
+        self.op = op
+
+    def forward(self, *args):
+        return self.op(*args)
+
+
+def _blob_of_scalar(fn, x):
+    """The same, for a comparison whose second operand is a literal."""
+    lowered = _delegate(_program(_Op(fn), (x,)))
+    blob = bytes(lowered._processed_bytes)
+    return blob, read_blob(blob)[1]
+
+
 def _corners():
     a = torch.tensor([_A], dtype=torch.float16)
     b = torch.tensor([_B], dtype=torch.float16)
@@ -118,10 +138,12 @@ def test_the_table_row_is_the_supported_target_row_too():
     two and every test below would still pass.
     """
     assert SUPPORTED_TARGETS is EMITTERS
-    for target in (GREATER_THAN, LESS_THAN):
+    for target in (GREATER_THAN, LESS_THAN, GREATER_THAN_SCALAR, LESS_THAN_SCALAR):
         assert target in EMITTERS
         assert target in SUPPORTED_TARGETS
-    assert COMPARISON_TARGETS == frozenset({GREATER_THAN, LESS_THAN})
+    assert COMPARISON_TARGETS == frozenset(
+        {GREATER_THAN, LESS_THAN, GREATER_THAN_SCALAR, LESS_THAN_SCALAR}
+    )
 
 
 def test_the_four_comparisons_left_out_are_absent_and_the_two_kept_are_present():
@@ -386,36 +408,91 @@ def test_a_bool_on_a_target_that_is_not_a_comparison_still_raises():
     assert "must be fp16 or fp32, got torch.bool" in str(caught.exception)
 
 
-def test_a_comparison_against_a_scalar_stays_portable():
-    """The overload boundary, with the tensor form as its own control.
+def test_a_comparison_against_a_scalar_delegates_as_the_same_two_commands():
+    """The Scalar form, with the Tensor form as its own control.
 
-    F.prelu decomposes to view_copy + gt + mul + where, and that gt is the Scalar
-    form, so widening to the Scalar overloads would be what moves the prelu
-    decomposition rather than a separate convenience. The control is the same
-    operands one line apart: a > b delegates, a > 0.5 does not.
+    It was portable, and the reason it was left there was a measurement nobody
+    had made rather than a route that failed: a python literal reaches
+    `ctx.operand` as a one-element fp16 constant, which is the same binary
+    command with the second operand's count at one. The control is the same
+    operands one spelling apart, and both are asserted on the command stream
+    rather than on a delegate count, so a delegate carrying a different pair of
+    commands fails.
     """
     a = torch.randn(2, 8, dtype=torch.float16)
     b = torch.randn(2, 8, dtype=torch.float16)
     tensor_form = _program(_Compare(torch.gt), (a, b))
+    assert [c.type for c in _blob_of(torch.gt, a, b)[1]] == [_BINARY, _SELECT]
     assert _delegate(tensor_form) is not None
 
     class Scalar(torch.nn.Module):
         def forward(self, x):
             return x > 0.5
 
+    _, commands = _blob_of_scalar(lambda x: x > 0.5, a)
+    assert [c.type for c in commands] == [_BINARY, _SELECT], commands
+    compare = commands[0]
+    assert compare.params[3] == 9, "the op type is GREATER(9)"
+    assert compare.params[2] == 1, "the literal is one element"
+    assert compare.params[1] == 16, "the tensor operand is the whole output"
     scalar_form = _program(Scalar(), (a,))
-    calls = [
-        node
-        for node in scalar_form.graph_module.graph.nodes
-        if node.target is torch.ops.higher_order.executorch_call_delegate
-    ]
-    assert calls == [], "the Scalar overload is not in EMITTERS, so nothing delegates"
+    assert _delegate(scalar_form) is not None
     outer = {
         str(node.target)
         for node in scalar_form.graph_module.graph.nodes
         if node.op == "call_function"
     }
-    assert any("gt" in target for target in outer), outer
+    assert not any("gt" in target for target in outer), outer
+
+    class LessScalar(torch.nn.Module):
+        def forward(self, x):
+            return x < 0.5
+
+    _, less = _blob_of_scalar(lambda x: x < 0.5, a)
+    assert [c.type for c in less] == [_BINARY, _SELECT]
+    assert less[0].params[3] == 10, "LESS(10) rather than GREATER(9)"
+
+
+def test_a_comparison_against_an_operand_the_arena_does_not_hold_falls_back():
+    """The operand half of the width rule, which the Scalar form needs too.
+
+    A comparison's result is a bool that the select writes at one byte and its
+    operands are floats the binary command reads two at a time, so the two gates
+    are crossed. This one used to be missing on the operand side, and admitting
+    an fp64 comparison without it raised inside the emitter -- a failed export
+    where a portable kernel would have done. The control is the fp16 form at the
+    same geometry, which must still delegate.
+    """
+    fp16 = torch.randn(2, 8, dtype=torch.float16)
+    assert [c.type for c in _blob_of_scalar(lambda x: x > 3, fp16)[1]] == [
+        _BINARY,
+        _SELECT,
+    ]
+    for dtype in (torch.float64, torch.int32, torch.int64):
+        wide = torch.ones(2, 8, dtype=dtype)
+        program = _program(_Op(lambda x: x > 3), (wide,))
+        calls = [
+            node
+            for node in program.graph_module.graph.nodes
+            if node.target is torch.ops.higher_order.executorch_call_delegate
+        ]
+        assert calls == [], f"a {dtype} comparison must fall back, not delegate"
+        outer = {
+            str(node.target)
+            for node in program.graph_module.graph.nodes
+            if node.op == "call_function"
+        }
+        assert any("gt" in target for target in outer), (dtype, outer)
+
+    # The Tensor overload refuses on the same rule, which is what makes this a
+    # property of the comparison rather than of the spelling.
+    wide = torch.ones(2, 8, dtype=torch.float64)
+    tensor_form = _program(_Compare(torch.gt), (wide, wide))
+    assert [
+        node
+        for node in tensor_form.graph_module.graph.nodes
+        if node.target is torch.ops.higher_order.executorch_call_delegate
+    ] == []
 
 
 def test_a_rank_nine_operand_stays_portable_rather_than_failing_the_export():

@@ -46,6 +46,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     constant_pad_region,
     reflect_pad_regions,
     conv_spec,
+    comparison_operands_are_readable,
+    COMPARISON_TARGETS,
     CONV_TARGETS,
     CUMSUM,
     cumsum_is_emittable,
@@ -66,8 +68,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     layer_norm_is_emittable,
     layer_norm_normalizes_the_trailing_dims,
     log_softmax_shifts_within_the_arena,
-    logical_not_is_emittable,
-    LOGICAL_NOT,
+    mask_negation_is_emittable,
+    MASK_NEGATION_TARGETS,
     LOG_SOFTMAX_TARGETS,
     MAX_DIM,
     MIN_DIM,
@@ -709,7 +711,18 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # which is a wrong answer rather than an error. Only SELECT declares
             # that width, so any other node that carries one stays portable.
             return False
-        if node.target is LOGICAL_NOT and not logical_not_is_emittable(node):
+        if node.target in COMPARISON_TARGETS and not comparison_operands_are_readable(
+            node
+        ):
+            # The width gate above reads the result, which for a comparison is a
+            # bool the select writes at one byte; this reads the operands, which
+            # the binary command reads two at a time. An fp64 or int operand is
+            # refused here because admitting it raises inside the emitter, and a
+            # raise while emitting fails the export rather than falling back.
+            return False
+        if node.target in MASK_NEGATION_TARGETS and not mask_negation_is_emittable(
+            node
+        ):
             # The negation is a select whose condition is its only operand, and
             # that operand is read one byte at a time. A slot declared anything
             # but a torch.bool would be read at the wrong stride, so it keeps a
