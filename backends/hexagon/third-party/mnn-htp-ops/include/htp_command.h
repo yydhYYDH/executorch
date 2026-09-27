@@ -77,6 +77,9 @@ enum DSPOpType {
   DSP_OP_VISION_ATTENTION_FP16                = 43,
   DSP_OP_VISION_FLASH_ATTENTION_FP16          = 44,
   DSP_OP_MATMUL_W8A16_GEMV_I8                 = 45,
+  // Bilinear upsample of an NCHW fp16 plane set. The output extents carry
+  // the ratio; the kernel refuses anything that is not an exact integer multiple.
+  DSP_OP_UPSAMPLE_BILINEAR2D_FP16               = 46,
   // Row-wise argmax/argmin over fp16 input. The third parameter selects min
   // versus max; the output is one int64 index per row.
   DSP_OP_ARGMAX_FP16                          = 47,
@@ -91,4 +94,5 @@ enum DSPOpType {
 static_assert(DSP_OP_MATMUL_Q4A16_GEMV_I8 == 41, "DSP_OP_MATMUL_Q4A16_GEMV_I8 must stay 41");
 static_assert(DSP_OP_MATMUL_W8A16_GEMV_I8 == 45, "DSP_OP_MATMUL_W8A16_GEMV_I8 must stay 45");
 static_assert(DSP_OP_ARGMAX_FP16 == 47, "DSP_OP_ARGMAX_FP16 must stay 47");
+static_assert(DSP_OP_UPSAMPLE_BILINEAR2D_FP16 == 46, "DSP_OP_UPSAMPLE_BILINEAR2D_FP16 must stay 46");
 #endif

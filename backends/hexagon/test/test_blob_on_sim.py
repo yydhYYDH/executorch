@@ -150,6 +150,10 @@ _SOURCES = [
     # cases establish is that the first output really is a maximum per row and
     # that the two extents in the command are the ones the layout has.
     "topk_ops.cc",
+    # The bilinear upsample. Its own translation unit, and the only command the
+    # stream carries for an op whose result is arithmetic rather than an index
+    # map, so there is no other source that could have answered these.
+    "upsample_ops.cc",
     # Tensor-tensor power is composed from the existing binary elementwise
     # kernel; no additional DSP source is needed for these integer cases.
     # The kernels above call htp_probe_stage, which the device build defines in

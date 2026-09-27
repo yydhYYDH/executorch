@@ -139,6 +139,7 @@ set(_skel_cxx
     ${_dsp}/eltwise_ops.cc
     ${_dsp}/lstm_ops.cc
     ${_dsp}/topk_ops.cc
+    ${_dsp}/upsample_ops.cc
     ${_dsp}/softmax_ops.cc
     ${_dsp}/loop_ops.cc
     ${_dsp}/rope_ops.cc

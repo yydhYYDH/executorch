@@ -119,6 +119,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     update_cache_layout,
     upsample_regions,
     UPSAMPLE_TARGETS,
+    upsample_bilinear2d_is_emittable,
+    UPSAMPLE_BILINEAR_TARGETS,
     vision_attention_is_emittable,
     VISION_ATTENTION_TARGETS,
     where_is_emittable,
@@ -814,6 +816,18 @@ class HexagonOperatorSupport(OperatorSupportBase):
             # hard-code -- reads a source index this blit cannot describe, so the
             # node stays on a portable kernel rather than reaching a blit that
             # reads the wrong elements.
+            return False
+        if (
+            node.target in UPSAMPLE_BILINEAR_TARGETS
+            and not upsample_bilinear2d_is_emittable(node)
+        ):
+            # Bilinear is arithmetic, not an index map, so unlike the nearest
+            # form it has no region decomposition to fall back on: the command
+            # has to compute the four taps. The gate is where the boundary is,
+            # and it refuses the three things the kernel cannot do -- align_corners
+            # (a different function, not a different spelling), a non-integer
+            # ratio (the scale it derives from the extents would not be the one
+            # ATen used), and an output row wider than the axis table it builds.
             return False
         if node.target in SPLIT_TARGETS and not split_is_emittable(node):
             # A split is one blit per piece, and each piece's offset and extent

@@ -20,8 +20,14 @@ That is why the cases here compare **bytes** rather than tolerances: nothing on
 this path computes, so there is no rounding to excuse.
 
 The boundary is an exact integer multiple, and the tests below pin it from both
-sides -- a fractional ratio, a shrinking ratio and `upsample_bilinear2d` all
-have to stay on the portable kernels.
+sides -- a fractional ratio and a shrinking ratio have to stay on the portable
+kernels, and `align_corners=True` has to as well.
+
+`upsample_bilinear2d` used to be named in that list. It is not portable any more:
+it has a sampling kernel of its own (`DSP_OP_UPSAMPLE_BILINEAR2D_FP16`, 46,
+`upsample_ops.cc`) and a different boundary, which `test_upsample_bilinear.py`
+pins case by case. The two sampling ops are separate rows, not one row with two
+spellings.
 """
 
 
@@ -320,7 +326,6 @@ def test_a_region_that_is_wrong_produces_a_wrong_answer():
         (_Nearest(1.5), (1, 8, 8, 8)),
         (_Nearest(2.5), (1, 8, 4, 4)),
         (_Nearest(0.5), (1, 8, 8, 8)),
-        (_Bilinear(2.0, False), (1, 8, 8, 8)),
         (_Bilinear(2.0, True), (1, 8, 8, 8)),
         (_Nearest(2.0), (1, 8, 8, 8)),
     ],
@@ -330,10 +335,20 @@ def test_only_an_integer_multiple_has_a_region_set(module, shape):
 
     A fractional ratio repeats source elements in runs of unequal length, so the
     phases are no longer `s` of them; a shrinking ratio reads several sources per
-    destination cell. Both are refused. `upsample_bilinear2d` is refused for a
-    different reason -- its taps depend on the output's parity -- and the last
-    case is the control: an integer multiple must still reach the delegate, or
-    these refusals would be indistinguishable from an op that never delegates.
+    destination cell. Both are refused. `align_corners=True` is refused as well,
+    and for a different reason than the ratio -- it is a different function, not a
+    different spelling. The last case is the control: an integer multiple must
+    still reach the delegate, or these refusals would be indistinguishable from
+    an op that never delegates.
+
+    A `(_Bilinear(2.0, False), ...)` case used to be in this list. It asserted
+    that bilinear stayed portable, which was the gap this file's docstring
+    described, and it stopped being true when `aten.upsample_bilinear2d.vec` got
+    a command of its own (`DSP_OP_UPSAMPLE_BILINEAR2D_FP16`, 46). It now
+    delegates, which is the point of that work, so it lives in
+    `test_upsample_bilinear.py` now. **Every entry in this list is a claim that
+    the op stays on the portable kernels**, so an entry here is a gap, not a
+    test of a supported form.
     """
     x = _exact(shape, 16)
     delegates = len(_delegates(_lower(module, (x,))))

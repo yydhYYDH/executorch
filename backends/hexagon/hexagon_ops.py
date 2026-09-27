@@ -57,6 +57,10 @@ DSP_OP_ZERO = 24
 # The one kernel that answers two outputs: htp_ops_topkv2_k1_fp16 writes a
 # maximum and its position per row (topk_ops.cc:48).
 DSP_OP_TOPKV2_K1_FP16 = 27
+# Bilinear upsample of an NCHW fp16 plane set. The command carries the two
+# output extents rather than a factor: the kernel derives the ratio, checks it is
+# an exact integer multiple, and refuses anything else (upsample_ops.cc).
+DSP_OP_UPSAMPLE_BILINEAR2D_FP16 = 46
 # Row-wise argmax/argmin. The command carries a mode in its third parameter:
 # zero selects max and one selects min. Its output is one int64 per row, which
 # is the width ATen declares for an index result; an int32 slot cannot be
@@ -149,6 +153,39 @@ DSP_OP_VISION_ATTENTION_FP16 = 43
 # so a bool operand reaches the arena as one byte per element and this command is
 # the only one that asks for it that way.
 DSP_OP_SELECT = 26
+
+# The rest of `enum DSPOpType`, so the Python mirror is the whole table and not
+# the part of it that happened to be needed. These are the members no emitter in
+# this backend produces -- reserved slots, the packed and alternate forms, the two
+# sentinels -- and they were missing here, which made
+# `{v: k for k, v in vars(hexagon_ops).items() if k.startswith("DSP_OP_")}`
+# report 'unmapped' for a command type that had just run on the device. A name
+# that reads as 'this kernel does not exist' is worse than no name, so the whole
+# enum is here and `test/test_dsp_op_enum.py` fails if this block and the header
+# ever disagree.
+DSP_OP_RESERVED_0 = 0
+DSP_OP_BINARY_BLIT = 5
+DSP_OP_LOOP_BLIT = 6
+DSP_OP_TENSOR_CONVERT = 7
+DSP_OP_LAYER_NORM_PACKED = 9
+DSP_OP_WEIGHT_REORDER = 10
+DSP_OP_WEIGHT_REORDER_INT4 = 11
+DSP_OP_SCALE = 13
+DSP_OP_ROPE_FUSE_LAYERNORM = 15
+DSP_OP_GET_INFO = 20
+DSP_OP_RESERVED_21 = 21
+DSP_OP_CAST = 25
+DSP_OP_RELU6 = 30
+DSP_OP_MASKED_REDUCTION = 31
+DSP_OP_TMAC_A16W1 = 32
+DSP_OP_FLASH_ATTENTION_BLOCK = 33
+DSP_OP_MATMUL_Q4A16_BLOCK_FP16 = 34
+DSP_OP_POST_ATTN_REDUCE_FUSE = 35
+DSP_OP_LSTM = 36
+DSP_OP_CONV1X1_DIRECT_W8A16_SYM_PER_CHANNEL = 40
+DSP_OP_VISION_FLASH_ATTENTION_FP16 = 44
+DSP_OP_COMMAND_GROUP = 99
+DSP_OP_MAX = 100
 
 # HtpOpsReductionType, from the DSP's eltwise_ops.cc.
 REDUCTION_SUM = 1
@@ -5844,8 +5881,145 @@ def _emit_upsample(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+class BilinearUpsampleSpec(NamedTuple):
+    """The geometry one bilinear upsample command walks."""
+
+    planes: int
+    in_h: int
+    in_w: int
+    out_h: int
+    out_w: int
 
 
+#: The widest output row the command accepts, which is the axis table the
+#: kernel materialises per call. The two tables are 8 bytes an entry, so this is
+#: a 32768-byte stack frame -- 0.39% of the 8354560-byte VTCM the skel reserves.
+#: The number is not a modelling limit: a vocoder's first up-block is 8x on a row
+#: a few hundred wide and a super-resolution head's is 2x on a couple of
+#: thousand, and both are below it.
+BILINEAR_UPSAMPLE_MAX_ROW = 2048
+
+
+def _bilinear_ratio_agrees(in_extent: int, out_extent: int) -> bool:
+    """Whether the two spellings of the scale give the same fp32.
+
+    ATen derives the scale from a scale_factor as (float)(1.0 / factor) and
+    from a size as (float)in / out. The kernel only has the extents, so it
+    derives (float)(1.0 / (double)(out / in)). For an integer ratio those are
+    the same correctly-rounded float, and this is where that is checked for the
+    geometry at hand rather than assumed: a ratio where they part company is a
+    refusal, not a kernel that would be right for one spelling only.
+    """
+    import numpy as np
+
+    from_factor = np.float32(1.0 / float(out_extent // in_extent))
+    from_size = np.float32(in_extent) / np.float32(out_extent)
+    return from_factor.tobytes() == from_size.tobytes()
+
+
+def upsample_bilinear2d_spec(node: torch.fx.Node) -> Optional[BilinearUpsampleSpec]:
+    """The geometry for a bilinear upsample this command answers, or None.
+
+    **The supported form is an exact integer multiple per axis.** That is
+    narrower than the arithmetic needs and narrower than the two model families
+    that need this op: it is where the scale the kernel derives from the extents
+    is provably the scale ATen would have used, and it is what every upsampling
+    stage of HiFi-GAN (8, 8, 2, 2) and Vocos (8, 5, 2, 2) is. A fractional ratio
+    is a refusal rather than a gap: the tap weights stop being periodic in the
+    output index, so the per-axis table would have to become the whole output
+    row, and that is the VTCM number in the report.
+
+    `align_corners` is refused outright. The two settings are not the same
+    function, and only the default is the half-pixel one that
+    `area_pixel_compute_source_index` writes as scale * (dst + 0.5) - 0.5.
+    """
+    if node.target not in UPSAMPLE_BILINEAR_TARGETS:
+        return None
+    if len(node.args) < 3:
+        return None
+    source = node.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return None
+    source_value = source.meta.get("val")
+    result_value = node.meta.get("val")
+    if not isinstance(source_value, torch.Tensor) or not isinstance(
+        result_value, torch.Tensor
+    ):
+        return None
+    # fp16 and nothing else. The kernel reads and writes two bytes, so an fp32
+    # input would be handed to it as fp16, and the blob -- which sizes the
+    # operand at the command's own width -- would record 120 bytes for a 240-byte
+    # tensor without anything objecting on the way out. arg_reduction_spec
+    # refuses fp32 for the same reason.
+    if source_value.dtype is not torch.float16:
+        return None
+    if source_value.dim() != 4 or result_value.dim() != 4:
+        return None
+    if not source_value.is_contiguous() or not result_value.is_contiguous():
+        return None
+    if source_value.dtype is not result_value.dtype:
+        return None
+    batch, channels, in_h, in_w = source_value.shape
+    out_batch, out_channels, out_h, out_w = result_value.shape
+    if (batch, channels) != (out_batch, out_channels):
+        return None
+    if not all(
+        isinstance(extent, int) and extent > 0
+        for extent in (batch, channels, in_h, in_w, out_h, out_w)
+    ):
+        return None
+    if out_h % in_h or out_w % in_w:
+        return None
+    if out_h // in_h < 1 or out_w // in_w < 1:
+        return None
+    if out_h > BILINEAR_UPSAMPLE_MAX_ROW or out_w > BILINEAR_UPSAMPLE_MAX_ROW:
+        return None
+    if node.args[2] is not False:
+        return None
+    if not _bilinear_ratio_agrees(in_h, out_h) or not _bilinear_ratio_agrees(
+        in_w, out_w
+    ):
+        return None
+    return BilinearUpsampleSpec(
+        planes=batch * channels, in_h=in_h, in_w=in_w, out_h=out_h, out_w=out_w
+    )
+
+
+def upsample_bilinear2d_is_emittable(node: torch.fx.Node) -> bool:
+    return upsample_bilinear2d_spec(node) is not None
+
+
+def _emit_upsample_bilinear2d(node: torch.fx.Node, ctx) -> TensorRef:
+    """One command, four taps, and the output the graph asked for.
+
+    Unlike the nearest form there is no region set: the result is arithmetic on
+    four source elements, so the command is the sampling kernel itself and there
+    is nothing to compose it out of.
+    """
+    spec = upsample_bilinear2d_spec(node)
+    if spec is None:
+        raise RuntimeError(
+            f"hexagon: {node.target} is outside the bilinear upsample boundary"
+        )
+    _require_arena_dtype(node, "upsample_bilinear2d")
+    source = ctx.operand(node.args[0])
+    out = ctx.result_for(node, spec.planes * spec.out_h * spec.out_w)
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UPSAMPLE_BILINEAR2D_FP16,
+            inputs=[source],
+            outputs=[out],
+            params=[
+                spec.planes,
+                spec.in_h,
+                spec.in_w,
+                spec.out_h,
+                spec.out_w,
+            ],
+        ),
+    )
+    return ctx.record(node, out)
 
 
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
@@ -8674,6 +8848,7 @@ EMITTERS = {
     SPLIT_COPY: _emit_split,
     exir_ops.edge.aten.cat.default: _emit_cat,
     exir_ops.edge.aten.upsample_nearest2d.vec: _emit_upsample,
+    exir_ops.edge.aten.upsample_bilinear2d.vec: _emit_upsample_bilinear2d,
     exir_ops.edge.aten.permute_copy.default: _emit_permute_copy,
     # A repeat and a flip are region walks over the operand's own bytes, and
     # the forms that are views of it emit nothing: see repeat_region and
@@ -8765,6 +8940,12 @@ CAT_TARGETS = frozenset({exir_ops.edge.aten.cat.default})
 # Reaches _emit_upsample. Only the integer-multiple nearest form has a region
 # set; upsample_regions says what the others are missing.
 UPSAMPLE_TARGETS = frozenset({exir_ops.edge.aten.upsample_nearest2d.vec})
+
+# Reaches _emit_upsample_bilinear2d. One target and one gate: the .vec spelling
+# is the whole of the bilinear surface EXIR reaches, and align_corners is an
+# argument of it rather than a second target, so it is the gate not the set that
+# has to say which of the two settings is emittable.
+UPSAMPLE_BILINEAR_TARGETS = frozenset({exir_ops.edge.aten.upsample_bilinear2d.vec})
 
 PERMUTE_TARGETS = frozenset({exir_ops.edge.aten.permute_copy.default})
 
