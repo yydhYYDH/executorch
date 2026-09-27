@@ -99,21 +99,28 @@ def test_the_comparison_and_its_conversion_stay_outside_the_delegate():
             for node in program.graph_module.graph.nodes
             if node.op == "call_function"
         }
-        assert any("gt" in target for target in outer), outer
+        # The conversion is the part that has to stay out. A bool result is held in
+        # the arena as one byte per element, and reading that at fp16's stride would
+        # pair up neighbouring elements rather than widening each one, so the bool to
+        # fp16 cast is a host kernel and the outer graph is what it lands in.
         assert any("dim_order_copy" in target for target in outer), outer
+        assert not any("gt" in target for target in outer), outer
+        # The two delegate calls and the conversion, and nothing else outer.
+        assert len(outer) == 3, outer
         calls = _delegates(program)
         assert (
-            len(calls) == 1
-        ), f"the element-wise op did not reach the delegate: {calls}"
-        lowered = program.graph_module.get_submodule(calls[0].args[0].target)
-        blob = bytes(lowered._processed_bytes)
-        _, commands = read_blob(blob)
-        converted = (y > 0.0).to(torch.float16)
-        got = np.frombuffer(
-            execute(blob, [x.numpy(), converted.numpy()])[0], dtype=np.float16
-        )
-        expected = x + converted
-        assert got.tobytes() == expected.numpy().reshape(-1).tobytes()
+            len(calls) == 2
+        ), f"the comparison and the element-wise op want one delegate each: {calls}"
+        # The comparison delegates now, and it brings a select, because that is how a
+        # comparison is written. It sits in its own delegate ahead of the add, so the
+        # outer conversion still separates them.
+        shapes = []
+        for call in calls:
+            lowered = program.graph_module.get_submodule(call.args[0].target)
+            _, commands = read_blob(bytes(lowered._processed_bytes))
+            shapes.append([command.type for command in commands])
+        assert _DSP_OP_SELECT in shapes[0], shapes
+        assert _DSP_OP_SELECT not in shapes[1], shapes
 
 
 def _node_with_operand(dtype, size=(4, 8)):
