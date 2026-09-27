@@ -102,7 +102,10 @@ def test_the_width_gate_reads_the_result_so_a_boolean_node_is_refused_in_both_ta
     assert support.is_node_supported(None, _add(torch.float16))
     assert not support.is_node_supported(None, _add(torch.bool))
 
-    for target in (LOGICAL_NOT, ANY_DIM):
+    # any.dim only: a negation of a bool is a bool, which the arena holds, so it
+    # is admitted on purpose and putting it here would assert the opposite of
+    # what wiring it means.
+    for target in (ANY_DIM,):
         monkeypatch.setitem(hexagon_backend.EMITTERS, target, lambda ctx, node, i: None)
         monkeypatch.setitem(
             part_mod.SUPPORTED_TARGETS, target, lambda ctx, node, i: None

@@ -4593,6 +4593,12 @@ def operand_dtypes_are_readable(node: torch.fx.Node) -> bool:
     """
     if node.target in NO_COMMAND_TARGETS:
         return True
+    # A select and the two negations read their one operand at the width the blob
+    # declares for it, which is one byte for a bool. They are that exception by
+    # slot rather than by value, so they are admitted before the general walk
+    # below, which is about operands a command reads at two bytes.
+    if node.target in ONE_BYTE_CONDITION_TARGETS:
+        return True
     exempt = NON_ARENA_OPERAND_SLOTS.get(node.target, ())
     for position, arg in enumerate(node.args):
         if position in exempt:
