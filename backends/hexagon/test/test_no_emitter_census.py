@@ -30,7 +30,10 @@ EXIR graph. `torch.var` lowers to `aten.var.correction`, and the `.pte`
 carries `aten::var.correction_out`; the functional-to-out-variant rewrite
 happens inside `to_executorch()`, not in the graph the partitioner saw. Every
 one of the twenty families resolves to a registered portable kernel, so none of
-them is a functional gap -- they cost speed, not correctness.
+them is a functional gap -- they cost speed, not correctness. `aten::sort` is
+the one family that reaches no command *and* has no registered spelling to
+fall back on, which is why it is not a row; the test at the end of this file
+holds those two halves separately.
 
 *What the op would cost* is answered by lowering the composition it could be
 made of and counting the commands that come out, because "no kernel exists"
@@ -64,12 +67,14 @@ sys.path.insert(0, os.fspath(pathlib.Path(__file__).resolve().parent))
 
 from blob_interpreter import execute, read_blob  # noqa: E402
 from executorch.backends.hexagon import hexagon_ops  # noqa: E402
+import executorch.backends.hexagon.partition.hexagon_partitioner as _PARTITIONER_MODULE  # noqa: E402
 from executorch.backends.hexagon.partition.hexagon_partitioner import (  # noqa: E402
     HexagonPartitioner,
 )
 from executorch.backends.hexagon.serialization import blob as _blob  # noqa: E402
 from executorch.exir import (  # noqa: E402
     EdgeCompileConfig,
+    to_edge,
     to_edge_transform_and_lower,
 )
 from executorch.exir._serialize import _deserialize_pte_binary  # noqa: E402
@@ -411,3 +416,155 @@ def test_the_vendored_enums_have_no_erf_elu_or_product_reduction():
     assert "ERF" not in unary_types and "ELU" not in unary_types
     assert reduction_types == {"SUM", "MAXIMUM", "MEAN", "MINIMUM"}
     assert len(reduction_types) == REDUCTION_SUBTYPES, "a fifth would be a product walk"
+
+
+#: The portable operator registry: the set of names
+#: `operator_registry.cpp:265`'s `strcmp` will match. Every entry is an
+#: out-variant spelling with a `kernel_name` beside it. The yaml omits the
+#: namespace `codegen/gen.py:735` puts in front of it.
+_FUNCTIONS_YAML = (
+    pathlib.Path(__file__).resolve().parents[3] / "kernels" / "portable" / "functions.yaml"
+)
+
+
+def _assert_measuring_this_checkout():
+    """The precondition, as an assertion rather than a printed path.
+
+    The editable install puts a finder on `sys.meta_path`, which is consulted
+    before `sys.path`, and it points at a different checkout. Measured here it
+    loses anyway -- every module in this file resolves under this tree -- but
+    that is an ordering accident, not a guarantee, and a print is a line
+    nobody has to read. A negative attribute control cannot stand in for it:
+    `hasattr(hexagon_ops, "DSP_OP_MATMUL_Q4A16_FP16") is False` holds on a tree
+    262 commits behind this one and is True on this one, because int4 prefill
+    has since been wired up.
+    """
+    root = os.fspath(pathlib.Path(__file__).resolve().parents[3])
+    for module in (hexagon_ops, _PARTITIONER_MODULE, _blob):
+        where = os.fspath(pathlib.Path(module.__file__))
+        assert where.startswith(root + os.sep), f"measuring {where}, not {root}"
+
+
+def _portable_spellings():
+    return {
+        "aten::" + line.split("op: ", 1)[1].strip()
+        for line in _FUNCTIONS_YAML.read_text().splitlines()
+        if line.startswith("- op: ")
+    }
+
+
+def _portable_operators(tmp_path, forward, args):
+    """The operator names a delegate-free pte carries, through the plain path."""
+    program = to_edge(
+        export(_M(forward), tuple(args)), compile_config=_CONFIG
+    ).to_executorch()
+    path = tmp_path / "portable.pte"
+    program.save(os.fspath(path))
+    pte = _deserialize_pte_binary(path.read_bytes())
+    return [
+        operator.name + ("." + operator.overload if operator.overload else "")
+        for plan in pte.program.execution_plan
+        for operator in plan.operators
+    ]
+
+
+def _sorted(a):
+    """The two results as a plain tuple.
+
+    `_M` hands the forward's return value to the exporter unchanged, and
+    `torch.sort` returns a `torch.return_types.sort`, which the emitter
+    cannot serialize -- see the test below. `aten.sort.default` is
+    two-output, so an output spec that names it has to be unpacked before
+    the pipeline will write a `.pte` at all.
+    """
+    ordered = torch.sort(a)
+    return ordered.values, ordered.indices
+
+
+def test_sort_is_the_one_family_here_with_no_portable_spelling_to_fall_back_on(
+    tmp_path,
+):
+    """Why `aten::sort` cannot be a row above, measured on both halves.
+
+    Reaching no DSP command is the same here as for every family in `_ROWS`,
+    and the `.pte` the pipeline writes names `aten::sort.values` -- the
+    functional-to-out-variant rewrite again, read from the real file. What no
+    other family has is that the name is absent from the portable registry, so
+    the exact `strcmp` finds no kernel and the program is `OperatorMissing` at
+    run time. That makes this a functional gap in the portable layer rather
+    than a speed gap in this backend, and it is why it belongs to none of
+    `OP_GAPS.md`'s four buckets.
+
+    The two halves are asserted separately because either alone is a different
+    claim, and the registry read is paired with the names the rows above
+    already depend on, so a reader that returned nothing could not pass.
+    """
+    _assert_measuring_this_checkout()
+    args = (torch.randn(1, 64, dtype=F16),)
+
+    count, names = _named(_sorted, args)
+    assert count == 0, f"sort now reaches {count} DSP commands: {names}"
+
+    operators = _host_operators(tmp_path, _sorted, args)
+    assert "aten::sort.values" in operators, operators
+
+    spellings = _portable_spellings()
+    assert len(spellings) > 150, f"the registry read returned {len(spellings)} names"
+    for required in (
+        "aten::topk.values",
+        "aten::relu.out",
+        "aten::var.correction_out",
+    ):
+        assert required in spellings, f"{required} is not registered"
+    assert not [s for s in spellings if s.startswith("aten::sort")], (
+        "aten::sort now has a portable spelling, so the row above can carry it "
+        "and the bucket it belongs to changes with this file"
+    )
+
+
+def test_the_unpacked_spelling_is_what_cannot_be_written_and_that_is_not_about_kernels(
+    tmp_path,
+):
+    """The export-time failure, and the control that rules out a kernel cause.
+
+    Handing `torch.sort`'s return value straight to the exporter makes the
+    output spec a `torch.return_types.sort`, and the emitter asks torch to
+    serialize that treespec; torch raises, because the `torch.return_types.*`
+    pytree node types carry no `serialized_type_name`. This is upstream of
+    every kernel question: `topk` has the same two outputs and the same
+    namedtuple, and `torch::executor::topk_values` is registered, so a
+    kernel cannot be what the two share. The tree already records both as
+    expected failures in `backends/arm/test/models/test_torch_functions.py`.
+
+    Unpacking sidesteps the treespec, and the two controls below are both
+    measured through the plain path, where the `.pte` carries the operator the
+    runtime will look up: `topk` writes one and is registered, and `sort`
+    writes one and is not.
+    """
+    _assert_measuring_this_checkout()
+    args = (torch.randn(1, 64, dtype=F16),)
+
+    for label, namedtuple_op in (
+        ("sort", torch.sort),
+        ("topk", lambda a: torch.topk(a, 2)),
+    ):
+        try:
+            _lowered(namedtuple_op, args).to_executorch()
+        except NotImplementedError as e:
+            assert "No registered serialization name" in str(e), e
+        else:
+            raise AssertionError(
+                f"{label} now serializes its namedtuple, so the unpacked spelling "
+                "is no longer the first thing that stops this row"
+            )
+
+    def _topk(a):
+        picked = torch.topk(a, 2)
+        return picked.values, picked.indices
+
+    # both are written once unpacked, and the two spellings differ in exactly
+    # the way the registry does: one is registered and the other is not
+    topk = _portable_operators(tmp_path, _topk, args)
+    assert "aten::topk.values" in topk, topk
+    assert "aten::topk.values" in _portable_spellings()
+    assert "aten::sort.values" in _portable_operators(tmp_path, _sorted, args)

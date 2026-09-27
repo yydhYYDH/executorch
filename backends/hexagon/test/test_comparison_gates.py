@@ -6,21 +6,32 @@
 
 """Which gate a comparison stops at, and what each of the three costs.
 
-Four comparisons reach this backend's tables with nothing on the other side:
-`aten.eq.Tensor`, `aten.ne.Tensor`, `aten.ge.Tensor` and `aten.le.Tensor` name a
-DSP op type the vendored enum does not have, and `aten.gt.Tensor` and
-`aten.lt.Tensor` name one it does have and never reach. This file measures
-where each of them is refused, and what the three gates in the way would do if
-the table were edited underneath them.
+Four comparisons stop here with nothing on the other side: `aten.eq.Tensor`,
+`aten.ne.Tensor`, `aten.ge.Tensor` and `aten.le.Tensor` name a DSP op type the
+vendored enum does not have, so they have no row in `EMITTERS` at all.
+`aten.gt.Tensor` and `aten.lt.Tensor` name one it does have -- the DSP's own
+`HTP_OPS_BINARY_GREATER`(9) and `HTP_OPS_BINARY_LESS`(10) -- and the comparison
+merge wired them, so of the six, two delegate and four stay portable. This file
+measures where each of the four is refused, owns the count that says two of six
+delegate, and records what the three gates did when the table was edited
+underneath them.
 
 The three are one fact and two clauses, not three facts. `SUPPORTED_TARGETS` is
 the `EMITTERS` dict itself, so a target absent from one is absent from the other
-and admitting one admits both. The width gate reads the result's dtype and not
-its operands', and `operand_dtypes_are_readable` -- the clause below it -- reads
-the operands and not the result, which is why a node can fail either and pass
-the other. `_require_arena_dtype` raises rather than falling back, so a table
-edit that lets a bool result past the partitioner turns an export that worked
-into an export that raises.
+and admitting one admits both. The width gate reads the result's dtype and
+not its operands', and `operand_dtypes_are_readable` -- the clause below it
+-- reads the operands and not the result, which is why a node can fail either
+and pass the other.
+
+The third gate no longer raises behind a relaxed one. `_require_arena_dtype`
+and the width gate read one shared predicate, `result_dtype_is_emittable`, so a
+comparison's bool result is admitted by both and a bool arriving anywhere else
+is refused by both. That is what turned this file's own experiment into the
+tree: `test_the_comparison_merge_performed_the_experiment_this_test_described`
+used to walk refuse-then-accept against a probe emitter, and its third step --
+relax the gate, and the emitter reports that a bool is not a width the arena
+holds -- is no longer reachable, because the emitter knows the width. The raise
+stays as a backstop for a bool that reaches an emitter by any other route.
 """
 
 import pytest

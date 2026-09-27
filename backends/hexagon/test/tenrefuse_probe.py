@@ -1,10 +1,14 @@
-"""Read the actual refusal reason for the ten nodes on supported rows.
+"""Read the actual refusal reason for the nodes on supported rows.
 
 The 28-layer Qwen3 census counted `aten.add` 3, `aten.sub` 2, `aten.cat` 2,
-`aten.index` 2 and `aten.cumsum` 1 as portable. A bucket count records no
-reasons, so this asks the partitioner itself: every `is_node_supported` call is
-wrapped in a line tracer, and the line the verdict frame returns from is the
+`aten.index` 2 and `aten.cumsum` 1 as portable -- ten. A bucket count records
+no reasons, so this asks the partitioner itself: every `is_node_supported` call
+is wrapped in a line tracer, and the line the verdict frame returns from is the
 clause that refused the node. Nothing here re-implements a gate.
+
+Re-measured at `bbe19c9` the count is nine: `aten.cat` is 1, not 2, so the older
+bucket is one high. `hexagon-fp32cat` is an ancestor and did widen `cat_plan`,
+but the width clause these nodes are refused on is unchanged across it.
 """
 
 from __future__ import annotations
