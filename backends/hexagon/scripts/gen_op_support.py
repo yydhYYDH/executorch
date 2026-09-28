@@ -944,8 +944,11 @@ SUPPORTED: List[OpSupport] = [
         BLIT,
         ARENA_FP16,
         "A permutation of all axes whose axes split into at most three ordered "
-        "consecutive groups; reversing axes inside a group is refused. A constant "
-        "2-D [1, 0] weight transpose is folded at export instead.",
+        "consecutive groups, which is one blit region; a fourth advancing group is "
+        "the outermost one unrolled into one region per element of it, which is "
+        "what the batch of a head split is. Five or more is refused, as is "
+        "reversing axes inside a group. A constant 2-D [1, 0] weight transpose is "
+        "folded at export instead.",
     ),
     OpSupport(
         "aten.select_copy.int",
@@ -1416,10 +1419,11 @@ NOT_SUPPORTED = [
         "portable; see the supported row for the forms that do.",
     ),
     (
-        "aten.permute_copy.default reversing axes inside a group, or needing more "
-        "than three groups",
-        "No single blit region describes it; the emitter refuses rather than "
-        "reading the wrong elements.",
+        "aten.permute_copy.default reversing axes inside a group, or needing "
+        "more than four advancing groups",
+        "A region is three nested loops, so a fourth advancing group is the "
+        "outermost one unrolled and a fifth is one loop past that; the emitter "
+        "refuses rather than reading the wrong elements.",
     ),
     (
         "aten.slice_copy.Tensor with step != 1",
