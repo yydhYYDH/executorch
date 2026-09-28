@@ -202,6 +202,12 @@ def _load_cortex_m() -> list[TestFlow]:
     return [CORTEX_M_TEST_FLOW]
 
 
+def _load_hexagon() -> list[TestFlow]:
+    from executorch.backends.test.suite.flows.hexagon import HEXAGON_TEST_FLOW
+
+    return [HEXAGON_TEST_FLOW]
+
+
 def all_flows() -> dict[str, TestFlow]:
     from executorch.backends.test.suite.flows.portable import PORTABLE_TEST_FLOW
 
@@ -216,6 +222,11 @@ def all_flows() -> dict[str, TestFlow]:
         + _register_flow(_load_arm, "ARM")
         + _register_flow(_load_cortex_m, "Cortex-M")
         + _register_flow(_load_nxp, "NXP")
+        # Hexagon lowers and serializes on the collecting host, so this one is not
+        # gated the way QNN and Cortex-M are: a guard that found the SDK missing
+        # would return an empty list and `pytest -m flow_hexagon` would collect
+        # nothing and still report success.
+        + _register_flow(_load_hexagon, "Hexagon")
     )
 
     try:
