@@ -278,6 +278,12 @@ def _halfwords(values):
 def measured():
     cases, reorders = _matmul_cases(), _reorder_cases()
     try:
+        hexagon_sim._check()
+    except hexagon_sim.Unavailable as error:
+        # A machine with no SDK has nothing to say here and skips.
+        pytest.skip(str(error))
+
+    try:
         return hexagon_sim.run(
             _RUNNER,
             _SOURCES,
@@ -286,7 +292,11 @@ def measured():
             },
         )
     except hexagon_sim.Unavailable as error:
-        pytest.skip(str(error))
+        # The SDK and the simulator are both present, so a later Unavailable
+        # is the simulator refusing to run the binary it just built. That is a
+        # failure, not a missing toolchain: a skip here would turn a vendored
+        # kernel that stopped loading into a green DSP tier.
+        pytest.fail(f"the SDK is present but the runner did not run: {error}")
 
 
 @pytest.fixture(scope="module")

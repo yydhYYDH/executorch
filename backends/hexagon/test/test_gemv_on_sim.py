@@ -202,6 +202,12 @@ def measured():
     weights, packed = _operands()
     sources = [source for source in blob_sim._SOURCES if isinstance(source, str)]
     try:
+        hexagon_sim._check()
+    except hexagon_sim.Unavailable as error:
+        # A machine with no SDK has nothing to say here and skips.
+        pytest.skip(str(error))
+
+    try:
         hexagon_sim.run(
             _RUNNER,
             sources,
@@ -214,7 +220,11 @@ def measured():
         # A machine with no simulator skips; a runner that does not compile is a
         # `BuildFailed`, which is deliberately not an `Unavailable`, so it fails
         # here instead of being read as a missing toolchain.
-        pytest.skip(str(error))
+        # The SDK and the simulator are both present, so a later Unavailable
+        # is the simulator refusing to run the binary it just built. That is a
+        # failure, not a missing toolchain: a skip here would turn a vendored
+        # kernel that stopped loading into a green DSP tier.
+        pytest.fail(f"the SDK is present but the runner did not run: {error}")
     rows, read_path = _parse(hexagon_sim.LAST_STDOUT)
     assert read_path is not None, "the runner never printed the read path"
     return weights, rows, read_path

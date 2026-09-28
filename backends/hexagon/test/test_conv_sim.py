@@ -108,6 +108,12 @@ _WEIGHT_PADDING_VALUE = 1.0
 @pytest.fixture(scope="module")
 def simulated():
     try:
+        hexagon_sim._check()
+    except hexagon_sim.Unavailable as error:
+        # A machine with no SDK has nothing to say here and skips.
+        pytest.skip(str(error))
+
+    try:
         return hexagon_sim.run(_RUNNER, _SOURCES, headers=_HEADERS)
     except hexagon_sim.BuildFailed as error:
         # A runner that does not compile is a failure, because every assertion
@@ -116,7 +122,11 @@ def simulated():
         pytest.fail(str(error), pytrace=False)
     except hexagon_sim.Unavailable as error:
         # A machine without the SDK has nothing to say here and skips.
-        pytest.skip(str(error))
+        # The SDK and the simulator are both present, so a later Unavailable
+        # is the simulator refusing to run the binary it just built. That is a
+        # failure, not a missing toolchain: a skip here would turn a vendored
+        # kernel that stopped loading into a green DSP tier.
+        pytest.fail(f"the SDK is present but the runner did not run: {error}")
 
 
 def _bits(values):

@@ -69,6 +69,11 @@ def cases():
 def test_minimum_overloads_run_on_hexagon_sim_and_match_fp64_reference(cases):
     try:
         hexagon_sim._check()
+    except hexagon_sim.Unavailable as error:
+        # A machine with no SDK has nothing to say here and skips.
+        pytest.skip(str(error))
+
+    try:
         answers = hexagon_sim.run(
             _RUNNER,
             _SOURCES,
@@ -76,7 +81,11 @@ def test_minimum_overloads_run_on_hexagon_sim_and_match_fp64_reference(cases):
             includes_more=[str(_SCHEMAS)],
         )
     except hexagon_sim.Unavailable as error:
-        pytest.skip(str(error))
+        # The SDK and the simulator are both present, so a later Unavailable
+        # is the simulator refusing to run the binary it just built. That is a
+        # failure, not a missing toolchain: a skip here would turn a vendored
+        # kernel that stopped loading into a green DSP tier.
+        pytest.fail(f"the SDK is present but the runner did not run: {error}")
 
     assert not [line for line in hexagon_sim.LAST_STDOUT.splitlines() if "TAG" not in line and "hexagon" in line.lower() and "error" in line.lower()]
     for case in cases:
