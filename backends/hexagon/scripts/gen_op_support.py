@@ -1283,10 +1283,11 @@ NOT_SUPPORTED = [
         "need a multiply the emitter does not produce.",
     ),
     (
-        "aten.layer_norm / native_layer_norm with a non-trailing normalized shape "
-        "or a run-time eps",
-        "The kernel describes the norm as one inner span repeated; a run-time eps is "
-        "not a number the command can carry.",
+        "aten.layer_norm / native_layer_norm with a non-trailing or symbolic "
+        "normalized shape, or a run-time eps",
+        "The kernel describes the norm as one inner span repeated; neither a "
+        "run-time eps nor a shape the graph left symbolic is a number the command "
+        "can carry.",
     ),
     (
         "aten.mean.dim with non-adjacent reduced dims",

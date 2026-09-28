@@ -7840,13 +7840,19 @@ def layer_norm_normalizes_the_trailing_dims(node: torch.fx.Node) -> bool:
 
     The command describes the norm as one inner span repeated outer times, which
     only matches a normalized shape covering the trailing dims; any other shape
-    would read a span the kernel was never told about.
+    would read a span the kernel was never told about. A shape the graph left
+    symbolic is the same answer: `normalized_shape` is `SymInt[]`, so a model that
+    builds it from the input's own shape, with that axis marked dynamic, hands this a
+    `sym_size` node, and reading one as a number raises instead of answering --
+    taking the whole lowering down rather than leaving the node portable.
     """
     shape = list(_value_of(node).shape)
     normalized = list(node.args[1])
     if len(normalized) > len(shape):
         return False
-    return [int(size) for size in normalized] == shape[len(shape) - len(normalized) :]
+    if not all(isinstance(size, int) for size in normalized):
+        return False
+    return normalized == shape[len(shape) - len(normalized) :]
 
 
 def _emit_layer_norm(node: torch.fx.Node, ctx) -> TensorRef:
