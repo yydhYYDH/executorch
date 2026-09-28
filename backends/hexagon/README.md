@@ -915,15 +915,19 @@ compared against -- a separate script that re-creates the module draws different
 weights after `torch.manual_seed(0)`, which cost this work two rounds of a
 "wrong" device answer that was a wrong reference:
 
-- a three-delegate convolution graph (`conv3x3`, a depthwise `conv3x3`, `relu`,
-  `maxpool`, `conv1x1`) runs all three rounds and lands within one fp16 ULP of
-  torch -- 4.88e-4 against a reference peaking at 0.57. Only part of that graph
-  reached the DSP: the partitioner left the depthwise `conv3x3` and the
-  `maxpool` outside the delegates, so what the three command streams contain is
-  two im2col convolutions and both rectifiers -- four of the graph's six nodes.
-  The whole-graph agreement
-  therefore rests on those ops running on silicon with the other two on the
-  portable kernels, which is a different claim from "this graph ran on the DSP";
+- a three-delegate convolution graph runs all three of its rounds and its whole
+  output lands within one fp16 ULP of torch -- 4.88e-4 against a reference
+  peaking at 0.57. **What it credits the DSP with is narrower than its name
+  suggests, and that gap is worth stating.** The graph is `conv3x3`, `relu`,
+  depthwise `conv3x3`, `maxpool`, `relu`, `conv1x1`, and two of its six nodes
+  fall back to the portable kernels: the depthwise convolution and the `maxpool`.
+  The four that reach the DSP are the two im2col convolutions and both `relu`s, so
+  `d0` is ZERO, RASTER_BLIT, IM2COL_CONVOLUTION_FP16, RASTER_BLIT, UNARY; `d1` is
+  one UNARY; `d2` is ZERO, RASTER_BLIT, IM2COL_CONVOLUTION_FP16, RASTER_BLIT.
+  There is no pool command and no depthwise walk in any of them. A graph whose
+  whole output agrees with torch is one claim and an op having run on the DSP is
+  another, and this list is about the second. Neither the depthwise nor the
+  pooling paragraph below gains a device run from this graph;
 - `embedding` gather, `add`, `amax(dim=1)` and `sum(dim=1)` in one delegate
   (`ops=3`): the `amax` is bit-for-bit torch's answer, the `sum` is one ULP out at
   1.56e-2 against a reference of 16.9. The gather is run on the phone at both
