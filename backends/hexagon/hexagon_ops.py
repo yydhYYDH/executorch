@@ -3255,7 +3255,16 @@ def update_cache_layout(node: torch.fx.Node):
     # every overrun. This one is the part that is a fact about the shapes: a value
     # wider than the whole cache fits at no position at all, so refusing it here
     # costs nothing and closes the degenerate graph. The runtime bound is
-    # pos * inner + rows * run <= numel.
+    # pos * inner + rows * run <= numel, and it is closable in the runtime without a
+    # new parameter, which is worth writing down before someone goes looking for one.
+    # The cache-write blit is the only op in this backend emitted with patch (5, 2),
+    # and the blob already carries what the clamp needs: rows and run are in its
+    # params, inner rides along as patch_scale, and the cache is one of its three
+    # inputs, so the runtime can read numel from the input it is rewriting. That
+    # makes it the same shape of fix as narrow_indices_to_int32 -- a per-input
+    # descriptor built while the ops are walked, consulted in the same rewrite loop.
+    # It is not here because the file does not compile outside a CMake build, and a
+    # change to that loop is on the path of every op rather than only this one.
     if rows * run > cache_val.numel():
         return None
     return cache, value, position, run, inner, rows
