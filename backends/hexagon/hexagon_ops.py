@@ -3263,8 +3263,15 @@ def update_cache_layout(node: torch.fx.Node):
     # inputs, so the runtime can read numel from the input it is rewriting. That
     # makes it the same shape of fix as narrow_indices_to_int32 -- a per-input
     # descriptor built while the ops are walked, consulted in the same rewrite loop.
-    # It is not here because the file does not compile outside a CMake build, and a
-    # change to that loop is on the path of every op rather than only this one.
+    # It should refuse rather than clamp: a position past the end is a model asking
+    # to write outside its cache, which is what narrow_indices_to_int32 already
+    # refuses a row for, and a clamp would write the last valid row and return
+    # success, which answers a different question than the one that was asked.
+    # What is left is verification, not mechanism. The runtime does build --
+    # `make hexagon_backend` in cmake-out-android-arm64-v8a compiles it -- but a
+    # graph that reaches this node has to be built by hand, because match_kv_cache
+    # keys off an op that raises on export and FuseKvCachePass has no caller, so
+    # there is no suite that would notice if the check were wrong.
     if rows * run > cache_val.numel():
         return None
     return cache, value, position, run, inner, rows
