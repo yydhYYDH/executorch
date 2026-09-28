@@ -52,6 +52,7 @@ from executorch.backends.hexagon.conv_patch_embed import DecomposePatchEmbed
 from executorch.backends.hexagon.decompose_conv3d import DecomposeFrameConv3d
 from executorch.backends.hexagon.fold_batch_norm import FoldBatchNormIntoConv
 from executorch.backends.hexagon.fold_transposes import FoldConstantTransposes
+from executorch.backends.hexagon.pool_count import RewriteCeilPoolCountToValid
 from executorch.backends.hexagon.prelu import PreservePRelu
 from executorch.backends.hexagon.reflect_pad import PreserveReflectPad
 from executorch.backends.hexagon.row_guard import FuseMaskedRowGuard
@@ -89,6 +90,7 @@ def default_fusion_passes() -> List[ExportedProgramPassBase]:
     return [
         PreservePRelu(),
         PreserveReflectPad(),
+        RewriteCeilPoolCountToValid(),
         FoldConstantTransposes(),
         DecomposeFrameConv3d(),
         DecomposePatchEmbed(),
