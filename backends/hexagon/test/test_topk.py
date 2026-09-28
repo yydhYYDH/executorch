@@ -28,6 +28,7 @@ from blob_interpreter import Arena, execute, read_blob
 from executorch.backends.hexagon import hexagon_ops
 from executorch.backends.hexagon.hexagon_ops import (
     TopkSpec,
+    topk_is_emittable,
     topk_spec,
 )
 from executorch.backends.hexagon.partition.hexagon_partitioner import (
@@ -56,6 +57,22 @@ class _Topk(torch.nn.Module):
 
     def forward(self, x):
         return torch.topk(x, self.k, **self.kwargs).values
+
+
+class _Both(torch.nn.Module):
+    """A topk whose positions the graph goes on to read."""
+
+    def forward(self, x):
+        values, indices = torch.topk(x, 1)
+        return values + indices.to(F16)
+
+
+class _Both(torch.nn.Module):
+    """A topk whose positions the graph goes on to read."""
+
+    def forward(self, x):
+        values, indices = torch.topk(x, 1)
+        return values + indices.to(F16)
 
 
 class _Wrapper(torch.nn.Module):
@@ -159,13 +176,15 @@ def test_the_position_the_kernel_writes_is_not_the_one_torch_writes():
 
     torch's CPU kernel breaks a tie wherever its partial sort leaves it: 1 for a
     row whose first two elements are equal, 2 for a row of four equal values, and
-    for 200 rows of quantized values it is the first occurrence on some and the
-    last on others and neither on 175 of them. This kernel returns the first
+    for 200 rows of quantized values it is neither the first nor the last
+    occurrence on 175 of them and the last on 13 more, so it is not the first
+    occurrence on 188 in all. This kernel returns the first
     occurrence of the maximum, every time. Handing a graph that position would put
     a number torch never produced into a tensor the model reads, so the rule keeps
     it out; this test is the evidence the rule rests on, and the position is read
     out of the blob's own scratch slot rather than out of a transcription of the
-    kernel.
+    kernel. The three counts and the identity between them are in
+    `test_reason_one_refuses_the_node_and_reason_two_is_a_repairable_hazard`.
     """
     x = torch.tensor([[1.0, 1.0, 0.5, -2.0, 1.0, 0.5, 0.0]], dtype=F16)
     raw, _commands = _lowered(_Topk(), x)
@@ -413,3 +432,307 @@ def test_topk_is_the_only_operator_this_file_put_on_the_dsp():
     """A guard on the command type, so a rename cannot silently change the test."""
     assert hexagon_ops.DSP_OP_TOPKV2_K1_FP16 == _TOPK
     assert blob_interpreter.TOPKV2_K1_FP16 == _TOPK
+
+
+# --- The two stated reasons, resolved one at a time -----------------------------
+#
+# OP_GAPS section 3 gives the refusal two reasons: the position the kernel writes
+# is not the one torch writes, and the node declares int64 where the kernel
+# writes one int32 a row. They are separable, they were both asserted rather than
+# measured, and they turn out to have different answers -- one is what refuses
+# the node, the other is a repair the library already has a command for.
+#
+# The tests below are the measurements. Each brings a control, because a scan
+# that finds nothing and a scan that is broken return the same thing.
+
+
+def test_reason_one_refuses_the_node_and_reason_two_is_a_repairable_hazard():
+    """Which of the two reasons refuses the node, established separately.
+
+    Reason one -- the position -- is real, and it is what the gate refuses on.
+    The controls are what make it a measurement rather than an assertion: the
+    tied input has to be tied (200 of 200 rows, so the ceiling is not what caps
+    the count), torch's answer has to be a genuine maximum at the index it names
+    (a wrong index pointing at a non-maximum would make every count below
+    meaningless), and the categories have to sum to the row count, because a
+    decomposition with no arithmetic on it is a list rather than a census.
+
+    Reason two -- the width -- is real as a fact and is NOT what refuses the
+    node. The gate's body, read with the docstring stripped, names no dtype at
+    all, so there is no width clause for the reason to be load-bearing on; what
+    refuses the node is the reader rule. The width is a hazard the library can
+    repair, and the repair is one region, measured in the next test.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    # -- reason one, measured ------------------------------------------------
+    torch.manual_seed(0)
+    x = torch.randint(0, 4, (200, 33)).to(F16)
+    flat = x.reshape(-1, 33)
+    first = flat.argmax(-1)
+    last = (flat.shape[-1] - 1) - flat.flip(-1).argmax(-1)
+    theirs = torch.topk(x, 1).indices.reshape(-1)
+
+    # CONTROL: torch's index must hold a maximum, or the counts below are about
+    # something other than tie-breaking.
+    assert torch.equal(
+        flat.gather(-1, theirs.reshape(-1, 1)).reshape(-1), flat.max(-1).values
+    )
+    # CONTROL: only a tied row can carry a different answer at all, so the count
+    # of tied rows is the ceiling the number below has to respect.
+    tied = ((flat == flat.max(-1, keepdim=True).values).sum(-1) > 1).sum()
+    assert int(tied) == 200, f"only {int(tied)} of 200 rows are tied"
+
+    is_first = theirs == first
+    is_last_only = (theirs == last) & ~is_first
+    neither = (theirs != first) & (theirs != last)
+    # CONTROL: the three categories partition the rows.
+    assert int(is_first.sum()) + int(is_last_only.sum()) + int(neither.sum()) == 200
+    # CONTROL: a difference is impossible on an untied row, so this count is a
+    # property of ties and not of the harness.
+    distinct = torch.randn(400, 64).to(F16)
+    assert (
+        int(
+            (
+                torch.topk(distinct, 1).indices.reshape(-1)
+                != distinct.argmax(-1).reshape(-1)
+            ).sum()
+        )
+        == 0
+    )
+
+    # The figure that refuses the node: how often the kernel's first occurrence
+    # is not the position torch returns. 188, not the 175 four files quote --
+    # 175 counts the rows that are neither first nor last, which leaves out the
+    # 13 rows where torch lands on the last occurrence, and those are just as
+    # wrong. Both numbers are kept, and the difference between them is 13.
+    assert int((theirs != first).sum()) == 188
+    assert int(neither.sum()) == 175
+    assert int(is_last_only.sum()) == 13
+
+    # CONTROL on the method: the endpoints are recomputed with an explicit
+    # per-row loop, so a vectorised census that agreed with itself because of a
+    # wrong axis or a flip of the wrong thing would disagree here instead. The
+    # loop is the slow obvious answer and it is what the two figures rest on.
+    loop_first, loop_last = [], []
+    for row in x.reshape(-1, 33).tolist():
+        row_max = max(row)
+        loop_first.append(row.index(row_max))
+        loop_last.append(len(row) - 1 - row[::-1].index(row_max))
+    assert loop_first == list(map(int, first))
+    assert loop_last == list(map(int, last))
+    assert (
+        sum(1 for t, f, l in zip(map(int, theirs), loop_first, loop_last) if t != f)
+        == 188
+    )
+
+    # The kernel's own answer, read out of the blob's scratch slot rather than
+    # out of a transcription of the kernel.
+    raw, _commands = _lowered(_Topk(), x)
+    assert list(map(int, _scratch_indices(raw, x))) == list(map(int, first))
+
+    # -- reason two, read rather than measured -------------------------------
+    # The node does declare int64, so the prose is right about the fact ...
+    both = torch.randn(2, 8, dtype=F16)
+    program = to_edge(
+        export(_Both(), (both,)),
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    ).exported_program()
+    topk = next(
+        node
+        for node in program.graph_module.graph.nodes
+        if node.target is exir_ops.edge.aten.topk.default
+    )
+    assert [out.dtype for out in topk.meta["val"]] == [F16, torch.int64]
+
+    # ... and the gate that refuses it names no width. Read from the parsed
+    # source with the docstring stripped, so the prose cannot satisfy this.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(topk_is_emittable)))
+    body = ast.unparse(ast.Module(body=tree.body[0].body[1:], type_ignores=[]))
+    for word in ("int64", "int32", "INT32_BYTES", "dtype", "ScalarType"):
+        assert word not in body, f"the gate now names {word}; reason two became real"
+    # What is left is the reader rule, and that is what refuses the node.
+    assert "topk_getitem" in body and "topk_spec" in body
+
+
+def test_the_int64_position_width_is_one_raster_blit_region():
+    """Reason two is repairable with a command the library already emits.
+
+    The kernel writes one int32 per row and the slot is declared int64, so the
+    upper half of every position would be left as the arena held it. A RASTER_BLIT
+    region carries a stride per side at every level, which makes the widening a
+    single region: the rows on the innermost level, ss2 of 4 for the int32 pitch
+    and ds2 of 8 for the int64 one.
+
+    The control is the int32-to-int32 copy at matching strides, and it is what
+    separates "the widening is impossible" from "this probe wrote somewhere
+    else". An earlier spelling set both the destination ref's offset and the
+    region's dst_offset, which writes at 128 while the assertion reads at 64 --
+    a row of zeros that looks exactly like a refutation. The region's offset is
+    RELATIVE to the ref.
+    """
+    from executorch.backends.hexagon.serialization import blob as B
+    from blob_interpreter import Arena, Command, _run_raster_blit
+
+    activation = int(B.TensorSpace.ACTIVATION)
+    rows = 4
+    src = np.array([0, 7, 3, 11], dtype=np.int32)
+    dst = 64
+
+    def blit(src_stride, dst_stride, dst_bytes):
+        arena = Arena.__new__(Arena)
+        arena.name = "topk width probe"
+        arena.base = {int(space): 0 for space in B.TensorSpace}
+        arena.bytes = bytearray(1024)
+        arena.bytes[0 : rows * 4] = src.tobytes()
+        command = Command(
+            type=blob_interpreter.RASTER_BLIT,
+            inputs=[B.TensorRef(space=activation, offset=0, size=rows * 4)],
+            outputs=[B.TensorRef(space=activation, offset=dst, size=rows * dst_bytes)],
+            params=[1, 1, 1, 0, 0, 0, 1, 1, rows, 0, 0, src_stride, 0, 0, dst_stride],
+            patch_param=-1,
+            patch_input=-1,
+            patch_scale=0,
+            in_place=0,
+        )
+        _run_raster_blit(command, command.params, arena)
+        return arena
+
+    widened = blit(4, 8, 8)
+    assert list(
+        map(
+            int,
+            np.frombuffer(bytes(widened.bytes[dst : dst + rows * 8]), dtype=np.int64),
+        )
+    ) == src.tolist()
+    # CONTROL: the same region at matching strides is a plain copy, and it has to
+    # come out exact or the assertion above proves nothing.
+    plain = blit(4, 4, 4)
+    assert list(
+        map(
+            int,
+            np.frombuffer(bytes(plain.bytes[dst : dst + rows * 4]), dtype=np.int32),
+        )
+    ) == src.tolist()
+    # CONTROL: the region writes no byte past its own destination.
+    assert set(bytes(widened.bytes[dst + rows * 8 : dst + rows * 8 + 16])) == {0}
+
+
+def test_reason_one_is_the_topk_reason_and_not_the_argmax_one():
+    """Why the position refusal is topk's and not the arg reductions'.
+
+    A strict first-occurrence walk is what an arg reduction wants, and torch CPU's
+    argmax is exactly that: argmax and max(x, -1).indices agree with a strict walk
+    on every one of these tied rows, while topk does not. So the position the
+    kernel writes is a correct answer for a reduction and the wrong answer for a
+    partial sort, which is why the figure cannot be carried from one op to the
+    other and why the two are refused for different reasons.
+
+    The control is one input through all four, so a difference in the count is a
+    property of the operation rather than of the data.
+    """
+    torch.manual_seed(0)
+    x = torch.randint(0, 4, (200, 33)).to(F16)
+    flat = x.reshape(-1, 33)
+    first = flat.argmax(-1)
+
+    def differs(indices):
+        return int((indices.reshape(-1) != first).sum())
+
+    assert differs(flat.argmax(-1)) == 0
+    assert differs(flat.max(-1).indices) == 0
+    assert differs(flat.max(-1, keepdim=True).indices) == 0
+    assert differs(torch.topk(x, 1).indices) == 188
+    # A row of equal values, where every answer is a maximum and only one is the
+    # first occurrence: argmax takes it and topk does not.
+    equal = torch.full((3, 4), 2.0, dtype=F16)
+    assert equal.max(-1).indices.reshape(-1).tolist() == [0, 0, 0]
+    assert torch.topk(equal, 1).indices.reshape(-1).tolist() == [2, 2, 2]
+    # And the kernel's answer agrees with the reductions, which is the whole
+    # reason the two families came apart.
+    raw, _commands = _lowered(_Topk(), equal)
+    assert list(map(int, _scratch_indices(raw, equal))) == [0, 0, 0]
+
+
+def test_the_int64_narrowing_is_the_gathers_input_and_not_this_output():
+    """What hexagon-int64idx (b204d36) covers, and why it does not reach topk.
+
+    The question this answers is whether that commit unblocks topk's positions.
+    It does not, and the reason is a direction rather than an omission: the
+    narrowing converts a caller's int64 tensor into an int32 INPUT slot, while
+    topk's positions are an OUTPUT the kernel writes. The commit's diff mentions
+    topk nowhere.
+
+    Two controls, because "the commit does not mention topk" would also be true
+    of a commit that did not exist. The first is the mechanism itself: the
+    runtime's narrowing table is sized by the input count, so an output index has
+    no entry to narrow into. The second is the positive control -- the gather
+    really does take an int64 index through that path today, so the three
+    measured numbers are the working case and not an absence of testing.
+    """
+    import pathlib
+    import re
+
+    from executorch.backends.hexagon.partition.hexagon_partitioner import (
+        HexagonPartitioner as _Partitioner,
+    )
+    from executorch.exir import to_edge_transform_and_lower as _lower
+    from torch.export import export as _export
+
+    runtime = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "runtime"
+        / "hexagon_backend.cpp"
+    ).read_text()
+
+    # The table is indexed by method INPUT, which is the whole reason.
+    assert "delegate->gather_indices.assign(header->n_inputs" in runtime
+    assert re.search(r"gather_indices\.assign\(header->n_outputs", runtime) is None
+    # And the narrowing clause is reached from the copy-in loop over inputs.
+    assert "narrow_indices_to_int32(" in runtime
+    assert "ScalarType::Long" in runtime
+
+    # POSITIVE CONTROL: the gather takes an int64 index through that path now,
+    # so the assertion above is about a direction and not about a missing commit.
+    class Embedding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(64, 32)
+
+        def forward(self, tokens):
+            return self.emb(tokens)
+
+    def gather_commands(dtype):
+        torch.manual_seed(0)
+        model = Embedding().eval()
+        tokens = torch.from_numpy(np.array([3, 63, 0, 17, 5], dtype=dtype))
+        program = _lower(
+            _export(model, (tokens,)),
+            partitioner=[_Partitioner()],
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+        ).exported_program()
+        calls = _delegates(program)
+        assert len(calls) == 1, f"the gather did not delegate for {np.dtype(dtype).name}"
+        lowered = program.graph_module.get_submodule(calls[0].args[0].target)
+        _header, commands = read_blob(bytes(lowered._processed_bytes))
+        return commands[0]
+
+    for dtype, width in ((np.int32, 4), (np.int64, 8)):
+        command = gather_commands(dtype)
+        assert command.type == hexagon_ops.DSP_OP_SHARED_GATHER
+        # The slot is the kernel's own width whatever the caller handed over,
+        # and the command says which the caller handed over.
+        assert command.params[7] == width
+        indices = command.inputs[0]
+        assert indices.space is blob_interpreter.B.TensorSpace.INPUT
+        assert indices.size == 5 * 4, "the slot is not the kernel's int32 width"
+
+    # And the graph that reads topk's positions still reaches no command at all,
+    # with or without the narrowing in the tree.
+    program = _program(_Both(), torch.randn(2, 8, dtype=F16))
+    assert [
+        _TOPK in [command.type for command in stream]
+        for stream in _commands_of(program)
+    ] == [False]

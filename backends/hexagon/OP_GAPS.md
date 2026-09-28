@@ -323,11 +323,26 @@ one byte, not a kernel.
   hexagon-sim. The positions are refused, and the reason is measured rather than
   assumed: this kernel writes the **first** occurrence of the row maximum while
   torch's own kernel writes whichever index its partial sort stops on, which
-  over 200 rows of quantized values is neither the first nor the last occurrence
-  175 times. Handing the graph a position torch never produced is the one thing
-  a refusal is unambiguously for, so `topk_is_emittable` keeps the whole node on
-  the portable kernels whenever anything reads it. (The width would refuse it
-  anyway: the node declares int64 and the kernel writes one int32 a row.)
+  over 200 rows of quantized values is something other than the first occurrence
+  on **188** of them -- 175 that are neither the first nor the last, and the 13
+  that are the last, which are wrong by exactly as much. Four entries carried the
+  175, which is the narrower of the two figures, and a reader subtracting nothing
+  from it would understate the case by those 13 rows. Handing the graph a position
+  torch never produced is the one thing a refusal is unambiguously for, so
+  `topk_is_emittable` keeps the whole node on the portable kernels whenever
+  anything reads it. `test_topk.py` pins the three numbers together with the
+  identity that ties them, because a decomposition with no arithmetic on it is a
+  list rather than a census.
+  That figure is this entry's reason and **not** the arg reductions' (§3's
+  `argmax`/`argmin`, and `max.dim`'s positions with them). Measured on the same
+  200 rows, `torch.argmax`, `torch.max(x, -1).indices` and
+  `torch.max(x, -1, keepdim=True).indices` agree with a strict first-occurrence
+  walk on **200 of 200**, against 188 for `topk`. A strict DSP walk agrees with
+  torch by construction for the reductions and disagrees for the partial sort,
+  so the one number cannot be carried between the two families.
+  The second reason this entry used to give in parentheses -- *"the width would
+  refuse it anyway: the node declares int64 and the kernel writes one int32 a
+  row"* -- is a true fact about the two widths and **not a reason at all**.
 - **`aten.argmax.default` and `aten.argmin.default`**: **done**, and the
   point of the entry is that §3's objection to `topk`'s indices does *not* carry
   over to it. That objection was two independent claims: the kernel writes a
