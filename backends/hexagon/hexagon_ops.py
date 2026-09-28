@@ -3221,6 +3221,11 @@ def update_cache_layout(node: torch.fx.Node):
 
     Shared by the support predicate and the emitter, so a node the predicate
     accepts cannot reach an emitter that does not know what to do with it.
+
+    The shape half of the write bound lives here because it is decidable here. The
+    position half cannot be, which is why this clause is worth reading before
+    concluding the node is safe: the emitter blits from position * inner and no
+    amount of shape checking moves that.
     """
     if node.target is not UPDATE_CACHE:
         return None
@@ -3242,6 +3247,16 @@ def update_cache_layout(node: torch.fx.Node):
     inner = cache_val.numel() // cache_val.shape[-3]
     rows = value_val.numel() // run
     if inner % run:
+        return None
+    # The write covers rows * run elements starting at position * inner, into an
+    # arena of numel = shape[-3] * inner. Whether that lands inside is decided by
+    # position, which is a runtime tensor, so no predicate here can close the
+    # general bound -- a static check either refuses every decode step or accepts
+    # every overrun. This one is the part that is a fact about the shapes: a value
+    # wider than the whole cache fits at no position at all, so refusing it here
+    # costs nothing and closes the degenerate graph. The runtime bound is
+    # pos * inner + rows * run <= numel.
+    if rows * run > cache_val.numel():
         return None
     return cache, value, position, run, inner, rows
 
