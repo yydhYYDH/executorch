@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Paraformer 语音识别</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <header>
+      <h1>Paraformer 语音识别</h1>
+      <span id="health" class="health" title="后端连接状态">检测中…</span>
+    </header>
+
+    <section class="panel">
+      <h2>麦克风录音（流式）</h2>
+      <button id="record" class="record">开始录音</button>
+      <span id="timer" class="timer">00:00</span>
+      <p class="hint">点击开始，边说边出字；再次点击结束。</p>
+    </section>
+
+    <section class="panel">
+      <h2>上传音频</h2>
+      <label class="drop" id="drop">
+        <input type="file" id="file" accept="audio/*,.wav,.pcm" hidden />
+        <span>点击选择音频文件，或拖拽到这里</span>
+      </label>
+      <p class="hint">支持浏览器可解码的格式，会统一转成 16 kHz 单声道 PCM 后识别。</p>
+    </section>
+
+    <section class="panel">
+      <h2>识别结果</h2>
+      <div id="status" class="status"></div>
+      <textarea id="result" rows="6" readonly placeholder="识别文字会显示在这里"></textarea>
+      <div class="footer">
+        <button id="copy" class="ghost" disabled>复制</button>
+        <span id="speed" class="speed"></span>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

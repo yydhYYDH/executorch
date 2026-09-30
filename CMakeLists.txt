@@ -1773,6 +1773,75 @@ if(EXECUTORCH_BUILD_EXECUTOR_RUNNER)
   endif()
 endif()
 
+if(EXECUTORCH_BUILD_PARAFORMER_RUNNER)
+  set(_paraformer_fbank_dir
+      ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/third_party/kaldi-native-fbank)
+  add_library(paraformer_fbank STATIC
+    ${_paraformer_fbank_dir}/csrc/feature-fbank.cc
+    ${_paraformer_fbank_dir}/csrc/feature-functions.cc
+    ${_paraformer_fbank_dir}/csrc/feature-window.cc
+    ${_paraformer_fbank_dir}/csrc/fftsg.c
+    ${_paraformer_fbank_dir}/csrc/mel-computations.cc
+    ${_paraformer_fbank_dir}/csrc/online-feature.cc
+    ${_paraformer_fbank_dir}/csrc/rfft.cc
+  )
+  target_include_directories(paraformer_fbank PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/third_party)
+  add_executable(paraformer_runner
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/paraformer_runner.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/audio_frontend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad/fsmn_vad_frontend.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad/fsmn_vad_decoder.cpp
+  )
+  target_include_directories(paraformer_runner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad
+    ${CMAKE_CURRENT_SOURCE_DIR}/third-party/json/single_include)
+  target_link_libraries(
+    paraformer_runner
+    PRIVATE executorch extension_runner_util gflags executorch_backends
+            portable_ops_lib extension_module extension_data_loader
+            extension_tensor extension_flat_tensor paraformer_fbank
+  )
+  target_compile_options(paraformer_runner PUBLIC ${_common_compile_options})
+  target_link_options(paraformer_runner PRIVATE -Wl,--allow-multiple-definition)
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_link_options_gc_sections(paraformer_runner)
+  endif()
+endif()
+
+if(EXECUTORCH_BUILD_FSMN_VAD_RUNNER)
+  set(_fsmn_vad_fbank_dir
+      ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/third_party/kaldi-native-fbank)
+  add_library(fsmn_vad_fbank STATIC
+    ${_fsmn_vad_fbank_dir}/csrc/feature-fbank.cc
+    ${_fsmn_vad_fbank_dir}/csrc/feature-functions.cc
+    ${_fsmn_vad_fbank_dir}/csrc/feature-window.cc
+    ${_fsmn_vad_fbank_dir}/csrc/fftsg.c
+    ${_fsmn_vad_fbank_dir}/csrc/mel-computations.cc
+    ${_fsmn_vad_fbank_dir}/csrc/online-feature.cc
+    ${_fsmn_vad_fbank_dir}/csrc/rfft.cc
+  )
+  target_include_directories(fsmn_vad_fbank PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/paraformer/third_party)
+  add_executable(fsmn_vad_runner
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad/fsmn_vad_runner.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad/fsmn_vad_frontend.cpp
+  )
+  target_include_directories(fsmn_vad_runner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/examples/fsmn_vad)
+  target_link_libraries(
+    fsmn_vad_runner
+    PRIVATE executorch extension_runner_util gflags executorch_backends
+            portable_ops_lib extension_module extension_data_loader
+            extension_tensor extension_flat_tensor fsmn_vad_fbank
+  )
+  target_compile_options(fsmn_vad_runner PUBLIC ${_common_compile_options})
+  target_link_options(fsmn_vad_runner PRIVATE -Wl,--allow-multiple-definition)
+  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_link_options_gc_sections(fsmn_vad_runner)
+  endif()
+endif()
+
 if(EXECUTORCH_BUILD_ANDROID_JNI)
   add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extension/android)
 endif()

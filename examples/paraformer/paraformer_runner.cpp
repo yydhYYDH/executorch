@@ -1,0 +1,1554 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+// Multi-stage ASR runner: loads a .pte stage, prints its graph signature, and
+// drives it from input .bin files.  One binary serves both the offline chain
+// (each stage executed once) and the streaming chain (stage 0 repeated over
+// chunks, its state threaded into the later stages).
+//
+// Stage I/O comes from the graph signature, so a stage is described by its .pte
+// and its input .bin files rather than by a hard-coded layout.
+
+#include <gflags/gflags.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <cerrno>
+#include <cstdlib>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <nlohmann/json.hpp>
+
+#include "audio_frontend.h"
+#include "fsmn_vad_decoder.h"
+#include "fsmn_vad_frontend.h"
+
+#include <executorch/extension/module/module.h>
+#include <executorch/extension/tensor/tensor_ptr_maker.h>
+#include <executorch/runtime/core/evalue.h>
+#include <executorch/runtime/core/exec_aten/util/scalar_type_util.h>
+#include <executorch/runtime/executor/method_meta.h>
+#include <executorch/runtime/platform/log.h>
+
+using executorch::aten::ScalarType;
+using executorch::extension::from_blob;
+using executorch::extension::Module;
+using executorch::runtime::Error;
+using executorch::runtime::EValue;
+using executorch::runtime::MethodMeta;
+
+namespace {
+
+DEFINE_string(model_path, "", "Path to a .pte stage.");
+DEFINE_string(inputs, "", "Comma-separated input .bin files, bound positionally.");
+DEFINE_string(output_file, "", "Prefix for output .bin files.");
+DEFINE_bool(sig, false, "Print the graph signature and exit.");
+DEFINE_int32(num_executions, 1, "Number of times to execute the stage.");
+DEFINE_bool(serve, false, "Execute tab-separated model, input, output requests on stdin.");
+DEFINE_bool(serve_audio, false, "Transcribe audio paths from stdin in one process.");
+DEFINE_int32(tcp_port, 0, "Listen on 127.0.0.1 at this TCP port; 0 disables TCP mode.");
+DEFINE_string(tcp_tmp_dir, ".", "Directory for temporary uploaded audio in TCP mode.");
+DEFINE_string(audio, "", "16 kHz mono 16-bit WAV or raw PCM input.");
+DEFINE_string(cmvn, "", "Float32 CMVN asset for direct audio input.");
+DEFINE_string(tokens, "", "JSON token list for direct audio input.");
+DEFINE_string(predictor, "", "Predictor .pte for direct audio input.");
+DEFINE_string(decoder_first, "", "First decoder .pte for direct audio input.");
+DEFINE_string(decoder_next, "", "Subsequent decoder .pte for direct audio input.");
+DEFINE_string(vad_model, "", "Optional FSMN-VAD encoder .pte; enables VAD endpointing.");
+DEFINE_string(cmvn_vad, "", "Float32 CMVN asset for the VAD (2 x 400 values).");
+DEFINE_int32(vad_chunk, 20, "VAD encoder frames per invocation.");
+DEFINE_int32(
+    vad_delay_chunks,
+    0,
+    "Delay the Paraformer stream behind VAD by this many 600 ms chunks. 0 keeps "
+    "text aligned to the segment start; larger values trade that for boundary "
+    "alignment on the end side.");
+DEFINE_string(
+    vad_mode,
+    "continuous",
+    "continuous: never reset Paraformer and split tokens into segments by chunk "
+    "time. reset: flush accumulated text at each VAD endpoint and reset.");
+
+const char* dtype_name(ScalarType t) {
+  switch (t) {
+    case ScalarType::Float:
+      return "fp32";
+    case ScalarType::Half:
+      return "fp16";
+    case ScalarType::BFloat16:
+      return "bf16";
+    case ScalarType::Int:
+      return "int32";
+    case ScalarType::Long:
+      return "int64";
+    case ScalarType::Byte:
+      return "uint8";
+    case ScalarType::Char:
+      return "int8";
+    case ScalarType::Bool:
+      return "bool";
+    default:
+      return "other";
+  }
+}
+
+size_t elem_size(ScalarType t) {
+  switch (t) {
+    case ScalarType::Float:
+    case ScalarType::Int:
+      return 4;
+    case ScalarType::Half:
+    case ScalarType::BFloat16:
+      return 2;
+    case ScalarType::Long:
+      return 8;
+    default:
+      return 1;
+  }
+}
+
+std::string shape_str(const executorch::runtime::TensorInfo& ti) {
+  std::string s = "[";
+  auto sizes = ti.sizes();
+  for (size_t i = 0; i < sizes.size(); i++) {
+    if (i) {
+      s += ",";
+    }
+    s += std::to_string(sizes[i]);
+  }
+  return s + "]";
+}
+
+bool read_file(const std::string& path, std::vector<uint8_t>& out) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    ET_LOG(Error, "cannot open %s", path.c_str());
+    return false;
+  }
+  fseek(f, 0, SEEK_END);
+  long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  out.resize(n > 0 ? n : 0);
+  size_t got = out.empty() ? 0 : fread(out.data(), 1, out.size(), f);
+  fclose(f);
+  return got == out.size();
+}
+
+void split_csv(const std::string& s, std::vector<std::string>& out) {
+  size_t start = 0;
+  while (start <= s.size()) {
+    size_t c = s.find(',', start);
+    std::string tok = s.substr(start, c == std::string::npos ? c : c - start);
+    if (!tok.empty()) {
+      out.push_back(tok);
+    }
+    if (c == std::string::npos) {
+      break;
+    }
+    start = c + 1;
+  }
+}
+
+int execute_stage(
+    Module& module,
+    const MethodMeta& meta,
+    const std::string& inputs,
+    const std::string& output_file,
+    int num_executions) {
+  std::vector<std::string> input_paths;
+  split_csv(inputs, input_paths);
+  if (input_paths.size() != meta.num_inputs()) {
+    ET_LOG(
+        Error,
+        "graph wants %zu inputs, got %zu bin files",
+        meta.num_inputs(),
+        input_paths.size());
+    return 6;
+  }
+
+  std::vector<EValue> evals;
+  std::vector<std::vector<uint8_t>> backing(input_paths.size());
+  for (size_t i = 0; i < input_paths.size(); i++) {
+    if (!read_file(input_paths[i], backing[i])) {
+      return 7;
+    }
+    auto ti = meta.input_tensor_meta(i);
+    ScalarType dt = ti.ok() ? ti.get().scalar_type() : ScalarType::Float;
+    size_t esz = elem_size(dt);
+    if (esz && backing[i].size() % esz != 0) {
+      ET_LOG(
+          Error,
+          "input %zu size %zu is not a multiple of %zu",
+          i,
+          backing[i].size(),
+          esz);
+      return 8;
+    }
+    std::vector<executorch::aten::SizesType> isizes;
+    if (ti.ok()) {
+      auto s = ti.get().sizes();
+      for (size_t d = 0; d < s.size(); d++) {
+        isizes.push_back(s[d]);
+      }
+    }
+    if (isizes.empty() && !ti.ok()) {
+      isizes.push_back(static_cast<executorch::aten::SizesType>(backing[i].size() / esz));
+    }
+    evals.emplace_back(from_blob(backing[i].data(), isizes, dt));
+    std::printf(
+        "BOUND %zu %s %s %zu bytes\n",
+        i,
+        input_paths[i].c_str(),
+        shape_str(ti.get()).c_str(),
+        backing[i].size());
+  }
+  std::fflush(stdout);
+
+  for (int it = 0; it < num_executions; it++) {
+    auto outs = module.execute("forward", evals);
+    if (!outs.ok()) {
+      std::printf("EXECUTE_FAILED 0x%08x\n", static_cast<uint32_t>(outs.error()));
+      std::fflush(stdout);
+      return 9;
+    }
+    const auto& vals = outs.get();
+    std::printf("EXEC %d outputs %zu\n", it, vals.size());
+    for (size_t i = 0; i < vals.size(); i++) {
+      if (!vals[i].isTensor()) {
+        continue;
+      }
+      const auto& t = vals[i].toTensor();
+      std::string path = output_file + "-" + std::to_string(i) + ".bin";
+      FILE* f = fopen(path.c_str(), "wb");
+      if (!f) {
+        ET_LOG(Error, "cannot write %s", path.c_str());
+        return 10;
+      }
+      fwrite(t.data_ptr(), 1, t.numel() * elem_size(t.scalar_type()), f);
+      fclose(f);
+      std::printf(
+          "OUT %d %s numel %zu %s\n",
+          it,
+          path.c_str(),
+          t.numel(),
+          dtype_name(t.scalar_type()));
+    }
+    std::fflush(stdout);
+  }
+
+  return 0;
+}
+
+uint16_t half_bits(float value) {
+  return executorch::aten::Half(value).x;
+}
+
+float half_value(uint16_t bits) {
+  return static_cast<float>(executorch::aten::Half(
+      bits, executorch::aten::Half::from_bits()));
+}
+
+uint16_t read_half(const std::vector<uint8_t>& data, size_t index) {
+  uint16_t value;
+  std::memcpy(&value, data.data() + index * sizeof(value), sizeof(value));
+  return value;
+}
+
+float read_float(const std::vector<uint8_t>& data, size_t index) {
+  float value;
+  std::memcpy(&value, data.data() + index * sizeof(value), sizeof(value));
+  return value;
+}
+
+struct StageTiming {
+  double load_seconds = 0;
+  double run_seconds = 0;
+  size_t calls = 0;
+};
+
+bool run_half_stage(
+    std::unordered_map<std::string, std::unique_ptr<Module>>& modules,
+    const std::string& path,
+    std::vector<uint16_t>& input,
+    std::vector<std::vector<uint8_t>>& output,
+    const int64_t* position = nullptr,
+    StageTiming* timing = nullptr) {
+  auto stage_start = std::chrono::steady_clock::now();
+  auto& module = modules[path];
+  if (!module) {
+    module = std::make_unique<Module>(path, Module::LoadMode::Mmap);
+    const Error load_error = module->load();
+    if (load_error != Error::Ok) {
+      std::fprintf(stderr, "cannot load %s: %u\n", path.c_str(),
+                   static_cast<unsigned>(load_error));
+      module.reset();
+      return false;
+    }
+    const Error forward_error = module->load_forward();
+    if (forward_error != Error::Ok) {
+      std::fprintf(stderr, "cannot load forward in %s: %u\n", path.c_str(),
+                   static_cast<unsigned>(forward_error));
+      module.reset();
+      return false;
+    }
+  }
+  const auto loaded_at = std::chrono::steady_clock::now();
+  if (timing) {
+    timing->load_seconds += std::chrono::duration<double>(loaded_at - stage_start).count();
+  }
+  auto meta = module->method_meta("forward");
+  if (!meta.ok() || (meta.get().num_inputs() != 1 && meta.get().num_inputs() != 2)) {
+    std::fprintf(stderr, "unsupported tensor inputs in %s\n", path.c_str());
+    return false;
+  }
+  auto info = meta.get().input_tensor_meta(0);
+  if (!info.ok() || info.get().scalar_type() != ScalarType::Half) {
+    std::fprintf(stderr, "expected fp16 input in %s\n", path.c_str());
+    return false;
+  }
+  std::vector<executorch::aten::SizesType> sizes;
+  size_t expected = 1;
+  for (auto dim : info.get().sizes()) {
+    sizes.push_back(dim);
+    expected *= dim;
+  }
+  constexpr size_t encoder_values = 3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560;
+  if (position && meta.get().num_inputs() == 1 &&
+      input.size() == encoder_values + 4 && expected == encoder_values + 10 * 560 + 65) {
+    const int nvalid = static_cast<int>(half_value(input[1]));
+    const int ncache = static_cast<int>(half_value(input[2]));
+    input.resize(expected);
+    const float increment = std::log(10000.0f) / 279.0f;
+    for (size_t row = 0; row < 10; ++row) {
+      const float pos = static_cast<float>(*position + row + 1);
+      for (size_t col = 0; col < 280; ++col) {
+        const float phase = pos * std::exp(static_cast<float>(col) * -increment);
+        input[encoder_values + row * 560 + col] = half_bits(std::sin(phase));
+        input[encoder_values + row * 560 + 280 + col] = half_bits(std::cos(phase));
+      }
+    }
+    for (int i = 0; i < 65; ++i) {
+      const bool valid = i < 50 ? i >= 50 - ncache : i < 55 || i < 55 + nvalid;
+      input[encoder_values + 10 * 560 + i] = half_bits(valid ? 1.0f : 0.0f);
+    }
+  }
+  if (position && meta.get().num_inputs() == 1 && expected + 4 == input.size()) {
+    if (*position > 2048) {
+      std::fprintf(stderr, "%s stores position in fp16; use the packed-position PTE\n",
+                   path.c_str());
+      return false;
+    }
+    input.resize(expected);
+  }
+  if (expected != input.size()) {
+    std::fprintf(stderr, "%s wants %zu values, got %zu\n", path.c_str(), expected, input.size());
+    return false;
+  }
+  std::vector<EValue> args;
+  args.emplace_back(from_blob(input.data(), sizes, ScalarType::Half));
+  int64_t position_value = position ? *position : 0;
+  if (meta.get().num_inputs() == 2) {
+    auto position_info = meta.get().input_tensor_meta(1);
+    if (!position || !position_info.ok() ||
+        position_info.get().scalar_type() != ScalarType::Long ||
+        position_info.get().sizes().size() != 1 ||
+        position_info.get().sizes()[0] != 1) {
+      std::fprintf(stderr, "expected one int64 position in %s\n", path.c_str());
+      return false;
+    }
+    args.emplace_back(from_blob(&position_value, {1}, ScalarType::Long));
+  }
+  auto result = module->execute("forward", args);
+  if (!result.ok()) {
+    std::fprintf(stderr, "execution failed in %s: %u\n", path.c_str(),
+                 static_cast<unsigned>(result.error()));
+    return false;
+  }
+  output.clear();
+  for (const auto& value : result.get()) {
+    if (!value.isTensor()) {
+      std::fprintf(stderr, "non-tensor output from %s\n", path.c_str());
+      return false;
+    }
+    const auto& tensor = value.toTensor();
+    const size_t bytes = tensor.numel() * elem_size(tensor.scalar_type());
+    output.emplace_back(bytes);
+    std::memcpy(output.back().data(), tensor.data_ptr(), bytes);
+  }
+  if (timing) {
+    timing->run_seconds += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - loaded_at).count();
+    ++timing->calls;
+  }
+  return true;
+}
+
+uint16_t le16(const uint8_t* bytes) {
+  return static_cast<uint16_t>(bytes[0] | (bytes[1] << 8));
+}
+
+uint32_t le32(const uint8_t* bytes) {
+  return static_cast<uint32_t>(bytes[0]) |
+      (static_cast<uint32_t>(bytes[1]) << 8) |
+      (static_cast<uint32_t>(bytes[2]) << 16) |
+      (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+class AudioReader {
+ public:
+  explicit AudioReader(const std::string& path) : file_(std::fopen(path.c_str(), "rb")) {
+    if (!file_) {
+      return;
+    }
+    if (path.size() >= 4 && path.substr(path.size() - 4) == ".pcm") {
+      std::fseek(file_, 0, SEEK_END);
+      remaining_ = std::ftell(file_);
+      std::rewind(file_);
+      valid_ = remaining_ % 2 == 0;
+      total_bytes_ = remaining_;
+      return;
+    }
+    uint8_t header[12];
+    if (std::fread(header, 1, sizeof(header), file_) != sizeof(header) ||
+        std::memcmp(header, "RIFF", 4) || std::memcmp(header + 8, "WAVE", 4)) {
+      return;
+    }
+    bool format_ok = false;
+    uint8_t chunk[8];
+    while (std::fread(chunk, 1, sizeof(chunk), file_) == sizeof(chunk)) {
+      const uint32_t size = le32(chunk + 4);
+      if (!std::memcmp(chunk, "fmt ", 4)) {
+        uint8_t format[16];
+        if (size < sizeof(format) ||
+            std::fread(format, 1, sizeof(format), file_) != sizeof(format)) {
+          return;
+        }
+        format_ok = le16(format) == 1 && le16(format + 2) == 1 &&
+            le32(format + 4) == 16000 && le16(format + 14) == 16;
+        std::fseek(file_, size - sizeof(format) + (size & 1), SEEK_CUR);
+      } else if (!std::memcmp(chunk, "data", 4)) {
+        remaining_ = size;
+        valid_ = format_ok && remaining_ % 2 == 0;
+        total_bytes_ = remaining_;
+        return;
+      } else {
+        std::fseek(file_, size + (size & 1), SEEK_CUR);
+      }
+    }
+  }
+
+  ~AudioReader() {
+    if (file_) {
+      std::fclose(file_);
+    }
+  }
+
+  bool valid() const { return valid_; }
+  double duration_seconds() const { return total_bytes_ / 32000.0; }
+
+  bool next(std::vector<float>& samples, bool& final) {
+    if (!remaining_) {
+      return false;
+    }
+    const size_t count = std::min<size_t>(9600, remaining_ / 2);
+    std::array<int16_t, 9600> pcm;
+    if (std::fread(pcm.data(), sizeof(int16_t), count, file_) != count) {
+      return false;
+    }
+    remaining_ -= count * 2;
+    samples.resize(count);
+    for (size_t i = 0; i < count; ++i) {
+      samples[i] = pcm[i] / 32768.0f;
+    }
+    final = remaining_ == 0;
+    return true;
+  }
+
+ private:
+  FILE* file_ = nullptr;
+  size_t remaining_ = 0;
+  size_t total_bytes_ = 0;
+  bool valid_ = false;
+};
+
+int transcribe_audio(
+    const std::string& audio_path,
+    std::unordered_map<std::string, std::unique_ptr<Module>>& modules,
+    std::string* result_text = nullptr,
+    uint32_t* result_elapsed_ms = nullptr,
+    uint32_t* result_audio_ms = nullptr) {
+  const auto start_time = std::chrono::steady_clock::now();
+  if (FLAGS_model_path.empty() || FLAGS_predictor.empty() ||
+      FLAGS_decoder_first.empty() || FLAGS_decoder_next.empty() ||
+      FLAGS_cmvn.empty() || FLAGS_tokens.empty()) {
+    ET_LOG(Error, "audio mode requires all four PTEs, CMVN, and tokens");
+    return 2;
+  }
+  AudioReader audio(audio_path);
+  if (!audio.valid() || audio.duration_seconds() == 0) {
+    ET_LOG(Error, "audio must be nonempty 16 kHz mono 16-bit WAV or raw PCM");
+    return 3;
+  }
+  std::vector<uint8_t> cmvn_bytes;
+  if (!read_file(FLAGS_cmvn, cmvn_bytes) || cmvn_bytes.size() != 1120 * sizeof(float)) {
+    ET_LOG(Error, "CMVN must contain 1120 float32 values");
+    return 4;
+  }
+  std::vector<float> cmvn(1120);
+  std::memcpy(cmvn.data(), cmvn_bytes.data(), cmvn_bytes.size());
+  std::ifstream token_file(FLAGS_tokens);
+  if (!token_file) {
+    ET_LOG(Error, "cannot open %s", FLAGS_tokens.c_str());
+    return 5;
+  }
+  const auto tokens = nlohmann::json::parse(token_file).get<std::vector<std::string>>();
+  paraformer::AudioFrontend frontend(cmvn);
+  std::vector<uint8_t> enc_state(2 * 50 * 4 * 50 * 128 * 2);
+  std::vector<uint8_t> overlap(5 * 560 * 2);
+  std::vector<uint8_t> fsmn(16 * 512 * 26 * 2);
+  std::vector<uint8_t> opt(32 * 5120 * 2);
+  std::array<float, 513> predictor_state{};
+  bool decoder_started = false;
+  StageTiming encoder_timing;
+  StageTiming predictor_timing;
+  StageTiming decoder_first_timing;
+  StageTiming decoder_next_timing;
+  size_t chunk_index = 0;
+  std::string text;
+  std::vector<float> samples;
+  bool final = false;
+  while (audio.next(samples, final)) {
+    auto features = frontend.Accept(samples.data(), samples.size(), final);
+    if (features.empty()) {
+      continue;
+    }
+    if (features.size() > 10) {
+      ET_LOG(Error, "audio chunk exceeds current encoder PTE contract");
+      return 6;
+    }
+    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    const int64_t position = static_cast<int64_t>(chunk_index * 10);
+    if (position >= (int64_t{1} << 40)) {
+      ET_LOG(Error, "audio position exceeds packed encoder range");
+      return 6;
+    }
+    enc_input[0] = half_bits(static_cast<float>(std::min<int64_t>(position, 2048)));
+    enc_input[1] = half_bits(static_cast<float>(features.size()));
+    enc_input[2] = half_bits(static_cast<float>(std::min<size_t>(chunk_index * 10, 40)));
+    for (size_t row = 0; row < features.size(); ++row) {
+      for (size_t col = 0; col < 560; ++col) {
+        enc_input[3 + row * 560 + col] = half_bits(features[row][col]);
+      }
+    }
+    std::memcpy(enc_input.data() + 3 + 10 * 560, enc_state.data(), enc_state.size());
+    std::memcpy(enc_input.data() + 3 + 10 * 560 + enc_state.size() / 2,
+                overlap.data(), overlap.size());
+    for (size_t digit = 0; digit < 4; ++digit) {
+      enc_input[enc_input.size() - 4 + digit] =
+          half_bits(static_cast<float>((position >> (digit * 10)) & 1023));
+    }
+    std::vector<std::vector<uint8_t>> enc;
+    if (!run_half_stage(modules, FLAGS_model_path, enc_input, enc, &position, &encoder_timing) || enc.size() != 3 ||
+        enc[0].size() != 15 * 512 * 2 || enc[1].size() != enc_state.size() ||
+        enc[2].size() != overlap.size()) {
+      return 7;
+    }
+    enc_state = std::move(enc[1]);
+    overlap = std::move(enc[2]);
+    for (size_t i = 0; i < enc[0].size() / 2; ++i) {
+      if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
+        ET_LOG(Error, "encoder chunk %zu produced non-finite values", chunk_index);
+        return 8;
+      }
+    }
+    std::vector<uint16_t> pred_input(8195);
+    std::memcpy(pred_input.data(), enc[0].data(), enc[0].size());
+    pred_input[7680] = half_bits(predictor_state[0]);
+    for (size_t i = 0; i < 512; ++i) {
+      pred_input[7681 + i] = half_bits(predictor_state[i + 1]);
+    }
+    pred_input[8194] = half_bits(final ? 1.0f : 0.0f);
+    std::vector<std::vector<uint8_t>> pred;
+    if (!run_half_stage(modules, FLAGS_predictor, pred_input, pred, nullptr, &predictor_timing)) {
+      return 9;
+    }
+    if (pred.size() != 4 || pred[0].size() < 16 * 512 * sizeof(float) ||
+        pred[1].size() % 2 || pred[2].size() < sizeof(float) ||
+        pred[3].size() < 512 * sizeof(float)) {
+      std::fprintf(stderr, "predictor output sizes:");
+      for (const auto& value : pred) {
+        std::fprintf(stderr, " %zu", value.size());
+      }
+      std::fprintf(stderr, "\n");
+      return 9;
+    }
+    size_t nvalid = 0;
+    for (size_t i = 0; i + 1 < pred[1].size(); i += 2) {
+      nvalid += read_half(pred[1], i / 2) != 0;
+    }
+    if (nvalid > 16) {
+      ET_LOG(Error, "predictor chunk %zu exceeds 16 decoder slots", chunk_index);
+      return 10;
+    }
+    predictor_state[0] = read_float(pred[2], 0);
+    for (size_t i = 0; i < 512; ++i) {
+      predictor_state[i + 1] = read_float(pred[3], i);
+    }
+    if (nvalid) {
+      std::vector<uint16_t> dec_input(15 * 512 + 16 * 512 + 16 * 512 * 26 + 32 * 5120 + 1);
+      std::memcpy(dec_input.data(), enc[0].data(), enc[0].size());
+      for (size_t i = 0; i < nvalid * 512; ++i) {
+        dec_input[7680 + i] = half_bits(read_float(pred[0], i));
+      }
+      std::memcpy(dec_input.data() + 7680 + 16 * 512, fsmn.data(), fsmn.size());
+      std::memcpy(dec_input.data() + 7680 + 16 * 512 + fsmn.size() / 2,
+                  opt.data(), opt.size());
+      dec_input.back() = half_bits(static_cast<float>(nvalid));
+      std::vector<std::vector<uint8_t>> dec;
+      const std::string& decoder = decoder_started ? FLAGS_decoder_next : FLAGS_decoder_first;
+      StageTiming& decoder_timing = decoder_started ? decoder_next_timing : decoder_first_timing;
+      if (!run_half_stage(modules, decoder, dec_input, dec, nullptr, &decoder_timing) || dec.size() != 49 ||
+          dec[0].size() != 16 * 8404 * 2) {
+        return 11;
+      }
+      decoder_started = true;
+      for (size_t row = 0; row < nvalid; ++row) {
+        size_t best = 0;
+        float score = -INFINITY;
+        for (size_t col = 0; col < 8404; ++col) {
+          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          if (value > score) {
+            score = value;
+            best = col;
+          }
+        }
+        if (best >= tokens.size()) {
+          ET_LOG(Error, "decoder produced out-of-range token %zu", best);
+          return 12;
+        }
+        if (best != 0 && best != 1 && best != 2) {
+          text += tokens[best] == "<space>" ? " " : tokens[best];
+        }
+      }
+      fsmn.clear();
+      opt.clear();
+      for (size_t i = 1; i < 17; ++i) {
+        fsmn.insert(fsmn.end(), dec[i].begin(), dec[i].end());
+      }
+      for (size_t i = 17; i < 49; ++i) {
+        opt.insert(opt.end(), dec[i].begin(), dec[i].end());
+      }
+      if (fsmn.size() != 16 * 512 * 26 * 2 || opt.size() != 32 * 5120 * 2) {
+        ET_LOG(Error, "decoder cache size mismatch");
+        return 13;
+      }
+    }
+    std::printf("chunk %zu: %zu tokens\n", chunk_index, nvalid);
+    std::fflush(stdout);
+    ++chunk_index;
+  }
+  std::printf("TEXT %s\n", text.c_str());
+  if (result_text) {
+    *result_text = text;
+  }
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start_time).count();
+  if (result_elapsed_ms) {
+    *result_elapsed_ms = static_cast<uint32_t>(seconds * 1000.0 + 0.5);
+  }
+  if (result_audio_ms) {
+    *result_audio_ms = static_cast<uint32_t>(audio.duration_seconds() * 1000.0 + 0.5);
+  }
+  std::printf("TIMING audio=%.3fs elapsed=%.3fs rtf=%.3f\n",
+              audio.duration_seconds(), seconds, seconds / audio.duration_seconds());
+  std::printf("TIMING_STAGE encoder=%zu/%.3f/%.3f predictor=%zu/%.3f/%.3f decoder_first=%zu/%.3f/%.3f decoder_next=%zu/%.3f/%.3f (calls/load_s/run_s)\n",
+              encoder_timing.calls, encoder_timing.load_seconds, encoder_timing.run_seconds,
+              predictor_timing.calls, predictor_timing.load_seconds, predictor_timing.run_seconds,
+              decoder_first_timing.calls, decoder_first_timing.load_seconds, decoder_first_timing.run_seconds,
+              decoder_next_timing.calls, decoder_next_timing.load_seconds, decoder_next_timing.run_seconds);
+  return 0;
+}
+
+constexpr int kVadFeat = 400;
+constexpr int kVadProj = 128;
+constexpr int kVadCacheFrames = 19;
+constexpr int kVadClasses = 248;
+
+bool run_vad_encoder(
+    Module& module,
+    std::vector<float>& caches,
+    const std::vector<std::array<float, kVadFeat>>& frames,
+    size_t valid,
+    std::vector<float>& psil_out) {
+  const int T = FLAGS_vad_chunk;
+  std::vector<std::array<float, kVadFeat>> chunk(frames.begin(), frames.begin() + valid);
+  while (chunk.size() < static_cast<size_t>(T)) {
+    chunk.push_back(chunk.back());
+  }
+  std::vector<float> input(static_cast<size_t>(T) * kVadFeat);
+  for (int row = 0; row < T; ++row) {
+    for (int col = 0; col < kVadFeat; ++col) {
+      input[row * kVadFeat + col] = chunk[row][col];
+    }
+  }
+  std::vector<executorch::aten::SizesType> x_shape = {1, T, kVadFeat};
+  std::vector<executorch::aten::SizesType> c_shape = {1, kVadProj, kVadCacheFrames, 1};
+  std::vector<executorch::extension::TensorPtr> held;
+  std::vector<EValue> args;
+  held.push_back(from_blob(input.data(), x_shape, ScalarType::Float));
+  args.emplace_back(*held.back());
+  for (int layer = 0; layer < 4; ++layer) {
+    held.push_back(from_blob(
+        caches.data() + static_cast<size_t>(layer) * kVadProj * kVadCacheFrames,
+        c_shape,
+        ScalarType::Float));
+    args.emplace_back(*held.back());
+  }
+  auto result = module.execute("forward", args);
+  if (!result.ok()) {
+    std::fprintf(stderr, "VAD encoder failed: %u\n",
+                 static_cast<unsigned>(result.error()));
+    return false;
+  }
+  int probs_index = -1;
+  std::vector<int> cache_indices;
+  std::vector<std::vector<float>> outputs;
+  size_t out_index = 0;
+  for (const auto& value : result.get()) {
+    if (!value.isTensor()) {
+      return false;
+    }
+    const auto& tensor = value.toTensor();
+    const size_t numel = tensor.numel();
+    const auto* data = static_cast<const float*>(tensor.data_ptr());
+    if (numel == static_cast<size_t>(T) * kVadClasses) {
+      probs_index = static_cast<int>(out_index);
+    } else if (numel == static_cast<size_t>(kVadProj) * kVadCacheFrames) {
+      cache_indices.push_back(static_cast<int>(out_index));
+    }
+    outputs.emplace_back(data, data + numel);
+    ++out_index;
+  }
+  if (probs_index < 0 || cache_indices.size() != 4) {
+    return false;
+  }
+  for (size_t layer = 0; layer < 4; ++layer) {
+    std::memcpy(
+        caches.data() + layer * kVadProj * kVadCacheFrames,
+        outputs[cache_indices[layer]].data(),
+        kVadProj * kVadCacheFrames * sizeof(float));
+  }
+  psil_out.resize(valid);
+  for (size_t row = 0; row < valid; ++row) {
+    psil_out[row] = outputs[probs_index][row * kVadClasses];
+  }
+  return true;
+}
+
+// B-a: run the streaming Paraformer continuously and let VAD endpoints close an
+// utterance. The accumulated text is flushed as the segment's transcript and the
+// Paraformer state is reset at the boundary.
+int transcribe_audio_vad(
+    const std::string& audio_path,
+    std::unordered_map<std::string, std::unique_ptr<Module>>& modules) {
+  const auto start_time = std::chrono::steady_clock::now();
+  if (FLAGS_model_path.empty() || FLAGS_predictor.empty() ||
+      FLAGS_decoder_first.empty() || FLAGS_decoder_next.empty() ||
+      FLAGS_cmvn.empty() || FLAGS_tokens.empty() || FLAGS_vad_model.empty() ||
+      FLAGS_cmvn_vad.empty()) {
+    ET_LOG(Error, "VAD mode requires the four PTEs, CMVN, tokens, VAD PTE and VAD CMVN");
+    return 2;
+  }
+  AudioReader audio(audio_path);
+  if (!audio.valid() || audio.duration_seconds() == 0) {
+    ET_LOG(Error, "audio must be nonempty 16 kHz mono 16-bit WAV or raw PCM");
+    return 3;
+  }
+  std::vector<uint8_t> cmvn_bytes;
+  if (!read_file(FLAGS_cmvn, cmvn_bytes) || cmvn_bytes.size() != 1120 * sizeof(float)) {
+    ET_LOG(Error, "CMVN must contain 1120 float32 values");
+    return 4;
+  }
+  std::vector<float> cmvn(1120);
+  std::memcpy(cmvn.data(), cmvn_bytes.data(), cmvn_bytes.size());
+  std::vector<uint8_t> vad_cmvn_bytes;
+  if (!read_file(FLAGS_cmvn_vad, vad_cmvn_bytes) ||
+      vad_cmvn_bytes.size() != 800 * sizeof(float)) {
+    ET_LOG(Error, "VAD CMVN must contain 800 float32 values");
+    return 4;
+  }
+  std::vector<float> vad_cmvn(800);
+  std::memcpy(vad_cmvn.data(), vad_cmvn_bytes.data(), vad_cmvn_bytes.size());
+  std::ifstream token_file(FLAGS_tokens);
+  if (!token_file) {
+    ET_LOG(Error, "cannot open %s", FLAGS_tokens.c_str());
+    return 5;
+  }
+  const auto tokens = nlohmann::json::parse(token_file).get<std::vector<std::string>>();
+
+  Module vad_module(FLAGS_vad_model, Module::LoadMode::Mmap);
+  if (vad_module.load() != Error::Ok || vad_module.load_forward() != Error::Ok) {
+    ET_LOG(Error, "cannot load %s", FLAGS_vad_model.c_str());
+    return 5;
+  }
+
+  paraformer::AudioFrontend frontend(cmvn);
+  fsmn_vad::VadFrontend vad_frontend(vad_cmvn);
+  fsmn_vad::VadDecoder vad_decoder;
+
+  std::vector<uint8_t> enc_state(2 * 50 * 4 * 50 * 128 * 2);
+  std::vector<uint8_t> overlap(5 * 560 * 2);
+  std::vector<uint8_t> fsmn(16 * 512 * 26 * 2);
+  std::vector<uint8_t> opt(32 * 5120 * 2);
+  std::array<float, 513> predictor_state{};
+  bool decoder_started = false;
+  size_t chunk_index = 0;
+
+  std::vector<float> vad_caches(4 * kVadProj * kVadCacheFrames, 0);
+  std::vector<std::array<float, kVadFeat>> vad_pending;
+  std::deque<std::pair<int64_t, std::vector<std::array<float, 560>>>> pf_queue;
+  struct PfChunk {
+    int64_t center_ms;
+    std::string text;
+  };
+  std::vector<PfChunk> pf_chunks;
+  std::vector<float> all_samples;
+  int64_t vad_frames = 0;
+  int64_t audio_chunks = 0;
+
+  const bool b_reset = FLAGS_vad_mode == "reset";
+  std::string cur_text;
+  std::vector<fsmn_vad::VadSegment> segments;
+  std::vector<std::string> segment_texts;
+
+  auto reset_paraformer = [&]() {
+    std::fill(enc_state.begin(), enc_state.end(), 0);
+    std::fill(overlap.begin(), overlap.end(), 0);
+    std::fill(fsmn.begin(), fsmn.end(), 0);
+    std::fill(opt.begin(), opt.end(), 0);
+    predictor_state.fill(0.0f);
+    decoder_started = false;
+    chunk_index = 0;
+  };
+
+  auto decibel_at = [&](int64_t frame) {
+    const int64_t begin = frame * 160;
+    const int64_t end = std::min<int64_t>(begin + 400, all_samples.size());
+    double acc = 0.0;
+    for (int64_t j = begin; j < end; ++j) {
+      acc += static_cast<double>(all_samples[j]) * all_samples[j];
+    }
+    return static_cast<float>(10.0 * std::log10(acc + 1e-6));
+  };
+
+  auto process_paraformer_chunk =
+      [&](const std::vector<std::array<float, 560>>& features,
+          bool final,
+          std::string* out) -> int {
+    out->clear();
+    if (features.empty()) {
+      return 0;
+    }
+    if (features.size() > 10) {
+      ET_LOG(Error, "audio chunk exceeds current encoder PTE contract");
+      return 6;
+    }
+    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    const int64_t position = static_cast<int64_t>(chunk_index * 10);
+    if (position >= (int64_t{1} << 40)) {
+      ET_LOG(Error, "audio position exceeds packed encoder range");
+      return 6;
+    }
+    enc_input[0] = half_bits(static_cast<float>(std::min<int64_t>(position, 2048)));
+    enc_input[1] = half_bits(static_cast<float>(features.size()));
+    enc_input[2] = half_bits(static_cast<float>(std::min<size_t>(chunk_index * 10, 40)));
+    for (size_t row = 0; row < features.size(); ++row) {
+      for (size_t col = 0; col < 560; ++col) {
+        enc_input[3 + row * 560 + col] = half_bits(features[row][col]);
+      }
+    }
+    std::memcpy(enc_input.data() + 3 + 10 * 560, enc_state.data(), enc_state.size());
+    std::memcpy(enc_input.data() + 3 + 10 * 560 + enc_state.size() / 2,
+                overlap.data(), overlap.size());
+    for (size_t digit = 0; digit < 4; ++digit) {
+      enc_input[enc_input.size() - 4 + digit] =
+          half_bits(static_cast<float>((position >> (digit * 10)) & 1023));
+    }
+    std::vector<std::vector<uint8_t>> enc;
+    if (!run_half_stage(modules, FLAGS_model_path, enc_input, enc, &position, nullptr) ||
+        enc.size() != 3 || enc[0].size() != 15 * 512 * 2 ||
+        enc[1].size() != enc_state.size() || enc[2].size() != overlap.size()) {
+      return 7;
+    }
+    enc_state = std::move(enc[1]);
+    overlap = std::move(enc[2]);
+    for (size_t i = 0; i < enc[0].size() / 2; ++i) {
+      if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
+        ET_LOG(Error, "encoder chunk %zu produced non-finite values", chunk_index);
+        return 8;
+      }
+    }
+    std::vector<uint16_t> pred_input(8195);
+    std::memcpy(pred_input.data(), enc[0].data(), enc[0].size());
+    pred_input[7680] = half_bits(predictor_state[0]);
+    for (size_t i = 0; i < 512; ++i) {
+      pred_input[7681 + i] = half_bits(predictor_state[i + 1]);
+    }
+    pred_input[8194] = half_bits(final ? 1.0f : 0.0f);
+    std::vector<std::vector<uint8_t>> pred;
+    if (!run_half_stage(modules, FLAGS_predictor, pred_input, pred, nullptr, nullptr)) {
+      return 9;
+    }
+    if (pred.size() != 4 || pred[0].size() < 16 * 512 * sizeof(float) ||
+        pred[1].size() % 2 || pred[2].size() < sizeof(float) ||
+        pred[3].size() < 512 * sizeof(float)) {
+      return 9;
+    }
+    size_t nvalid = 0;
+    for (size_t i = 0; i + 1 < pred[1].size(); i += 2) {
+      nvalid += read_half(pred[1], i / 2) != 0;
+    }
+    if (nvalid > 16) {
+      ET_LOG(Error, "predictor chunk %zu exceeds 16 decoder slots", chunk_index);
+      return 10;
+    }
+    predictor_state[0] = read_float(pred[2], 0);
+    for (size_t i = 0; i < 512; ++i) {
+      predictor_state[i + 1] = read_float(pred[3], i);
+    }
+    if (nvalid) {
+      std::vector<uint16_t> dec_input(15 * 512 + 16 * 512 + 16 * 512 * 26 + 32 * 5120 + 1);
+      std::memcpy(dec_input.data(), enc[0].data(), enc[0].size());
+      for (size_t i = 0; i < nvalid * 512; ++i) {
+        dec_input[7680 + i] = half_bits(read_float(pred[0], i));
+      }
+      std::memcpy(dec_input.data() + 7680 + 16 * 512, fsmn.data(), fsmn.size());
+      std::memcpy(dec_input.data() + 7680 + 16 * 512 + fsmn.size() / 2,
+                  opt.data(), opt.size());
+      dec_input.back() = half_bits(static_cast<float>(nvalid));
+      std::vector<std::vector<uint8_t>> dec;
+      const std::string& decoder = decoder_started ? FLAGS_decoder_next : FLAGS_decoder_first;
+      if (!run_half_stage(modules, decoder, dec_input, dec, nullptr, nullptr) ||
+          dec.size() != 49 || dec[0].size() != 16 * 8404 * 2) {
+        return 11;
+      }
+      decoder_started = true;
+      for (size_t row = 0; row < nvalid; ++row) {
+        size_t best = 0;
+        float score = -INFINITY;
+        for (size_t col = 0; col < 8404; ++col) {
+          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          if (value > score) {
+            score = value;
+            best = col;
+          }
+        }
+        if (best >= tokens.size()) {
+          ET_LOG(Error, "decoder produced out-of-range token %zu", best);
+          return 12;
+        }
+        if (best != 0 && best != 1 && best != 2) {
+          *out += tokens[best] == "<space>" ? " " : tokens[best];
+        }
+      }
+      fsmn.clear();
+      opt.clear();
+      for (size_t i = 1; i < 17; ++i) {
+        fsmn.insert(fsmn.end(), dec[i].begin(), dec[i].end());
+      }
+      for (size_t i = 17; i < 49; ++i) {
+        opt.insert(opt.end(), dec[i].begin(), dec[i].end());
+      }
+      if (fsmn.size() != 16 * 512 * 26 * 2 || opt.size() != 32 * 5120 * 2) {
+        ET_LOG(Error, "decoder cache size mismatch");
+        return 13;
+      }
+    }
+    ++chunk_index;
+    return 0;
+  };
+
+  auto consume_chunk = [&](const std::vector<std::array<float, 560>>& feats,
+                           bool is_final,
+                           int64_t center) -> int {
+    std::string chunk_text;
+    const int status = process_paraformer_chunk(feats, is_final, &chunk_text);
+    if (status != 0) {
+      return status;
+    }
+    if (b_reset) {
+      cur_text += chunk_text;
+    } else {
+      pf_chunks.push_back({center, chunk_text});
+    }
+    return 0;
+  };
+
+  std::vector<float> samples;
+  bool final = false;
+  int rc = 0;
+  while (audio.next(samples, final)) {
+    all_samples.insert(all_samples.end(), samples.begin(), samples.end());
+
+    auto vad_features = vad_frontend.Accept(samples.data(), samples.size(), final);
+    vad_pending.insert(vad_pending.end(), vad_features.begin(), vad_features.end());
+    while (vad_pending.size() >= static_cast<size_t>(FLAGS_vad_chunk) ||
+           (final && !vad_pending.empty())) {
+      const size_t valid = std::min<size_t>(FLAGS_vad_chunk, vad_pending.size());
+      std::vector<float> psil;
+      if (!run_vad_encoder(vad_module, vad_caches, vad_pending, valid, psil)) {
+        return 7;
+      }
+      vad_pending.erase(vad_pending.begin(), vad_pending.begin() + valid);
+      std::vector<float> decibel(valid);
+      for (size_t j = 0; j < valid; ++j) {
+        decibel[j] = decibel_at(vad_frames + j);
+      }
+      const bool is_last = final && vad_pending.empty();
+      auto got = vad_decoder.Accept(decibel.data(), psil.data(), valid, is_last);
+      for (const auto& seg : got) {
+        segments.push_back(seg);
+        if (b_reset) {
+          segment_texts.push_back(cur_text);
+          cur_text.clear();
+          reset_paraformer();
+        }
+      }
+      vad_frames += valid;
+    }
+
+    pf_queue.push_back(
+        {audio_chunks * 600 + 300,
+         frontend.Accept(samples.data(), samples.size(), final)});
+    ++audio_chunks;
+    while (static_cast<int>(pf_queue.size()) > FLAGS_vad_delay_chunks) {
+      if ((rc = consume_chunk(
+               pf_queue.front().second, false, pf_queue.front().first)) != 0) {
+        return rc;
+      }
+      pf_queue.pop_front();
+    }
+  }
+  while (!pf_queue.empty()) {
+    const bool last = pf_queue.size() == 1;
+    if ((rc = consume_chunk(
+             pf_queue.front().second, last, pf_queue.front().first)) != 0) {
+      return rc;
+    }
+    pf_queue.pop_front();
+  }
+
+  if (!b_reset) {
+    segment_texts.assign(segments.size(), std::string());
+    if (segments.empty()) {
+      for (const PfChunk& chunk : pf_chunks) {
+        cur_text += chunk.text;
+      }
+    } else {
+      // Every chunk goes to the segment nearest its center, so no token is
+      // dropped at a boundary; only silence chunks fall in a gap and are empty.
+      for (const PfChunk& chunk : pf_chunks) {
+        size_t best = 0;
+        int64_t best_distance = std::numeric_limits<int64_t>::max();
+        for (size_t i = 0; i < segments.size(); ++i) {
+          const int64_t s = segments[i].start_ms;
+          const int64_t e = segments[i].end_ms;
+          const int64_t distance = chunk.center_ms < s
+              ? s - chunk.center_ms
+              : (chunk.center_ms >= e ? chunk.center_ms - e : 0);
+          if (distance < best_distance) {
+            best_distance = distance;
+            best = i;
+          }
+        }
+        segment_texts[best] += chunk.text;
+      }
+    }
+  }
+
+  if (!segments.empty()) {
+    for (size_t i = 0; i < segments.size(); ++i) {
+      std::printf(
+          "SEG %lld %lld %s\n",
+          (long long)segments[i].start_ms,
+          (long long)segments[i].end_ms,
+          segment_texts[i].c_str());
+    }
+  }
+  if (!cur_text.empty()) {
+    std::printf("TAIL %s\n", cur_text.c_str());
+  }
+  const double seconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start_time).count();
+  std::printf("SEGMENTS %zu\n", segments.size());
+  std::printf("TIMING audio=%.3fs elapsed=%.3fs rtf=%.3f\n",
+              audio.duration_seconds(), seconds, seconds / audio.duration_seconds());
+  return 0;
+}
+
+// Stateful counterpart used by the TCP protocol. The file path mode above is
+// intentionally kept unchanged; this session consumes raw PCM incrementally.
+class StreamingSession {
+ public:
+  explicit StreamingSession(
+      std::unordered_map<std::string, std::unique_ptr<Module>>& modules)
+      : modules_(modules) {
+    std::vector<uint8_t> cmvn_bytes;
+    if (!read_file(FLAGS_cmvn, cmvn_bytes) || cmvn_bytes.size() != 1120 * sizeof(float)) {
+      return;
+    }
+    std::vector<float> cmvn(1120);
+    std::memcpy(cmvn.data(), cmvn_bytes.data(), cmvn_bytes.size());
+    std::ifstream token_file(FLAGS_tokens);
+    if (!token_file) {
+      return;
+    }
+    tokens_ = nlohmann::json::parse(token_file).get<std::vector<std::string>>();
+    frontend_ = std::make_unique<paraformer::AudioFrontend>(cmvn);
+    valid_ = true;
+  }
+
+  bool valid() const { return valid_; }
+  const std::string& text() const { return text_; }
+  size_t audio_bytes() const { return audio_bytes_; }
+  size_t chunks() const { return chunk_index_; }
+
+  int feed(const uint8_t* pcm_bytes, size_t byte_count, bool final) {
+    if (!valid_ || finalized_ || (byte_count & 1)) {
+      return 2;
+    }
+    std::vector<float> samples(byte_count / 2);
+    for (size_t i = 0; i < samples.size(); ++i) {
+      int16_t sample;
+      std::memcpy(&sample, pcm_bytes + i * 2, sizeof(sample));
+      samples[i] = sample / 32768.0f;
+    }
+    audio_bytes_ += byte_count;
+    if (final) {
+      finalized_ = true;
+    }
+    // Keep the fbank bounded like AudioReader and batch the encoder's ten
+    // frames per invocation. Large TCP payloads must not be handed to the
+    // online fbank in one call: its bounded feature queue is not a request
+    // buffer.
+    for (size_t offset = 0; offset < samples.size() || (final && offset == samples.size());) {
+      const size_t count = std::min<size_t>(9600, samples.size() - offset);
+      const bool sub_final = final && offset + count == samples.size();
+      auto features = frontend_->Accept(samples.data() + offset, count, sub_final);
+      pending_features_.insert(pending_features_.end(), features.begin(), features.end());
+      while (pending_features_.size() >= 10) {
+        std::vector<std::array<float, 560>> batch(pending_features_.begin(), pending_features_.begin() + 10);
+        pending_features_.erase(pending_features_.begin(), pending_features_.begin() + 10);
+        if (process_features(batch, false) != 0) {
+          return 3;
+        }
+      }
+      if (sub_final) {
+        if (!pending_features_.empty()) {
+          std::vector<std::array<float, 560>> batch(pending_features_.begin(), pending_features_.end());
+          pending_features_.clear();
+          if (process_features(batch, true) != 0) {
+            return 3;
+          }
+        }
+        break;
+      }
+      offset += count;
+    }
+    return 0;
+  }
+
+ private:
+  int process_features(const std::vector<std::array<float, 560>>& features, bool final) {
+    if (features.empty() || features.size() > 10) {
+      return 1;
+    }
+    if (chunk_index_ * 10 >= (size_t{1} << 40)) {
+      return 1;
+    }
+    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    const int64_t position = static_cast<int64_t>(chunk_index_ * 10);
+    enc_input[0] = half_bits(static_cast<float>(std::min<int64_t>(position, 2048)));
+    enc_input[1] = half_bits(static_cast<float>(features.size()));
+    enc_input[2] = half_bits(static_cast<float>(std::min<size_t>(chunk_index_ * 10, 40)));
+    for (size_t row = 0; row < features.size(); ++row) {
+      for (size_t col = 0; col < 560; ++col) {
+        enc_input[3 + row * 560 + col] = half_bits(features[row][col]);
+      }
+    }
+    std::memcpy(enc_input.data() + 3 + 10 * 560, enc_state_.data(), enc_state_.size());
+    std::memcpy(enc_input.data() + 3 + 10 * 560 + enc_state_.size() / 2,
+                overlap_.data(), overlap_.size());
+    for (size_t digit = 0; digit < 4; ++digit) {
+      enc_input[enc_input.size() - 4 + digit] =
+          half_bits(static_cast<float>((position >> (digit * 10)) & 1023));
+    }
+    std::vector<std::vector<uint8_t>> enc;
+    if (!run_half_stage(modules_, FLAGS_model_path, enc_input, enc, &position, &encoder_timing_) ||
+        enc.size() != 3 || enc[0].size() != 15 * 512 * 2 ||
+        enc[1].size() != enc_state_.size() || enc[2].size() != overlap_.size()) {
+      return 2;
+    }
+    enc_state_ = std::move(enc[1]);
+    overlap_ = std::move(enc[2]);
+    std::vector<uint16_t> pred_input(8195);
+    std::memcpy(pred_input.data(), enc[0].data(), enc[0].size());
+    pred_input[7680] = half_bits(predictor_state_[0]);
+    for (size_t i = 0; i < 512; ++i) {
+      pred_input[7681 + i] = half_bits(predictor_state_[i + 1]);
+    }
+    pred_input[8194] = half_bits(final ? 1.0f : 0.0f);
+    std::vector<std::vector<uint8_t>> pred;
+    if (!run_half_stage(modules_, FLAGS_predictor, pred_input, pred, nullptr, &predictor_timing_) ||
+        pred.size() != 4 || pred[0].size() < 16 * 512 * sizeof(float) || pred[1].size() % 2 ||
+        pred[2].size() < sizeof(float) || pred[3].size() < 512 * sizeof(float)) {
+      return 3;
+    }
+    size_t nvalid = 0;
+    for (size_t i = 0; i + 1 < pred[1].size(); i += 2) {
+      nvalid += read_half(pred[1], i / 2) != 0;
+    }
+    if (nvalid > 16) {
+      return 4;
+    }
+    predictor_state_[0] = read_float(pred[2], 0);
+    for (size_t i = 0; i < 512; ++i) {
+      predictor_state_[i + 1] = read_float(pred[3], i);
+    }
+    if (nvalid) {
+      std::vector<uint16_t> dec_input(15 * 512 + 16 * 512 + 16 * 512 * 26 + 32 * 5120 + 1);
+      std::memcpy(dec_input.data(), enc[0].data(), enc[0].size());
+      for (size_t i = 0; i < nvalid * 512; ++i) {
+        dec_input[7680 + i] = half_bits(read_float(pred[0], i));
+      }
+      std::memcpy(dec_input.data() + 7680 + 16 * 512, fsmn_.data(), fsmn_.size());
+      std::memcpy(dec_input.data() + 7680 + 16 * 512 + fsmn_.size() / 2,
+                  opt_.data(), opt_.size());
+      dec_input.back() = half_bits(static_cast<float>(nvalid));
+      std::vector<std::vector<uint8_t>> dec;
+      const std::string& decoder = decoder_started_ ? FLAGS_decoder_next : FLAGS_decoder_first;
+      StageTiming& timing = decoder_started_ ? decoder_next_timing_ : decoder_first_timing_;
+      if (!run_half_stage(modules_, decoder, dec_input, dec, nullptr, &timing) ||
+          dec.size() != 49 || dec[0].size() != 16 * 8404 * 2) {
+        return 5;
+      }
+      decoder_started_ = true;
+      for (size_t row = 0; row < nvalid; ++row) {
+        size_t best = 0;
+        float score = -INFINITY;
+        for (size_t col = 0; col < 8404; ++col) {
+          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          if (value > score) {
+            score = value;
+            best = col;
+          }
+        }
+        if (best >= tokens_.size()) {
+          return 6;
+        }
+        if (best != 0 && best != 1 && best != 2) {
+          text_ += tokens_[best] == "<space>" ? " " : tokens_[best];
+        }
+      }
+      fsmn_.clear();
+      opt_.clear();
+      for (size_t i = 1; i < 17; ++i) {
+        fsmn_.insert(fsmn_.end(), dec[i].begin(), dec[i].end());
+      }
+      for (size_t i = 17; i < 49; ++i) {
+        opt_.insert(opt_.end(), dec[i].begin(), dec[i].end());
+      }
+    }
+    ++chunk_index_;
+    return 0;
+  }
+
+  std::unordered_map<std::string, std::unique_ptr<Module>>& modules_;
+  bool valid_ = false;
+  bool finalized_ = false;
+  bool decoder_started_ = false;
+  size_t audio_bytes_ = 0;
+  size_t chunk_index_ = 0;
+  std::unique_ptr<paraformer::AudioFrontend> frontend_;
+  std::vector<std::string> tokens_;
+  std::vector<std::array<float, 560>> pending_features_;
+  std::vector<uint8_t> enc_state_ = std::vector<uint8_t>(2 * 50 * 4 * 50 * 128 * 2);
+  std::vector<uint8_t> overlap_ = std::vector<uint8_t>(5 * 560 * 2);
+  std::vector<uint8_t> fsmn_ = std::vector<uint8_t>(16 * 512 * 26 * 2);
+  std::vector<uint8_t> opt_ = std::vector<uint8_t>(32 * 5120 * 2);
+  std::array<float, 513> predictor_state_{};
+  std::string text_;
+  StageTiming encoder_timing_, predictor_timing_, decoder_first_timing_, decoder_next_timing_;
+};
+
+bool recv_all(int fd, void* data, size_t size) {
+  auto* bytes = static_cast<uint8_t*>(data);
+  while (size) {
+    const ssize_t got = recv(fd, bytes, size, 0);
+    if (got <= 0) {
+      return false;
+    }
+    bytes += got;
+    size -= static_cast<size_t>(got);
+  }
+  return true;
+}
+
+bool send_all(int fd, const void* data, size_t size) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  while (size) {
+    const ssize_t sent = send(fd, bytes, size, MSG_NOSIGNAL);
+    if (sent <= 0) {
+      return false;
+    }
+    bytes += sent;
+    size -= static_cast<size_t>(sent);
+  }
+  return true;
+}
+
+int make_tcp_listener(int port) {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  int reuse = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0 ||
+      listen(fd, 1) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+bool send_frame(int fd, uint8_t type, const void* data, uint32_t length) {
+  return send_all(fd, &type, sizeof(type)) && send_all(fd, &length, sizeof(length)) &&
+      (!length || send_all(fd, data, length));
+}
+
+int serve_tcp_audio(int port,
+                    std::unordered_map<std::string, std::unique_ptr<Module>>& modules) {
+  if (port < 1 || port > 65535) {
+    ET_LOG(Error, "--tcp_port must be between 1 and 65535");
+    return 2;
+  }
+  const int listener = make_tcp_listener(port);
+  if (listener < 0) {
+    ET_LOG(Error, "cannot listen on 127.0.0.1:%d: %s", port, std::strerror(errno));
+    return 3;
+  }
+  std::printf("READY tcp=127.0.0.1:%d\n", port);
+  std::fflush(stdout);
+  constexpr uint32_t kMaxAudioBytes = 64u * 1024u * 1024u;
+  while (true) {
+    const int client = accept(listener, nullptr, nullptr);
+    if (client < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;
+    }
+    uint8_t frame_type = 0;
+    uint32_t frame_length = 0;
+    std::unique_ptr<StreamingSession> session;
+    std::chrono::steady_clock::time_point started;
+    bool ended = false;
+    while (!ended && recv_all(client, &frame_type, sizeof(frame_type)) &&
+           recv_all(client, &frame_length, sizeof(frame_length))) {
+      if (frame_length > kMaxAudioBytes || (frame_type != 1 && frame_type != 2 && frame_type != 3)) {
+        const uint32_t status = 4;
+        send_frame(client, 0x7f, &status, sizeof(status));
+        break;
+      }
+      std::vector<uint8_t> payload(frame_length);
+      if (frame_length && !recv_all(client, payload.data(), payload.size())) {
+        break;
+      }
+      if (frame_type == 1) {
+        if (session) {
+          const uint32_t status = 5;
+          send_frame(client, 0x7f, &status, sizeof(status));
+          break;
+        }
+        session = std::make_unique<StreamingSession>(modules);
+        started = std::chrono::steady_clock::now();
+        const uint32_t status = session->valid() ? 0 : 6;
+        send_frame(client, 0x80, &status, sizeof(status));
+      } else if (frame_type == 2) {
+        if (!session || payload.empty() || session->audio_bytes() + payload.size() > kMaxAudioBytes ||
+            session->feed(payload.data(), payload.size(), false) != 0) {
+          const uint32_t status = 7;
+          send_frame(client, 0x7f, &status, sizeof(status));
+          break;
+        }
+        const uint32_t text_length = static_cast<uint32_t>(session->text().size());
+        send_frame(client, 0x81, session->text().data(), text_length);
+      } else {
+        if (!session || session->feed(nullptr, 0, true) != 0 || session->audio_bytes() == 0) {
+          const uint32_t status = 8;
+          send_frame(client, 0x7f, &status, sizeof(status));
+          break;
+        }
+        const uint32_t elapsed_ms = static_cast<uint32_t>(
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() * 1000.0 + 0.5);
+        const uint32_t status = 0;
+        const uint32_t audio_ms = static_cast<uint32_t>(session->audio_bytes() / 32);
+        const uint32_t text_length = static_cast<uint32_t>(session->text().size());
+        std::vector<uint8_t> result(16 + text_length);
+        std::memcpy(result.data(), &status, sizeof(uint32_t));
+        std::memcpy(result.data() + 4, &elapsed_ms, sizeof(uint32_t));
+        std::memcpy(result.data() + 8, &audio_ms, sizeof(uint32_t));
+        std::memcpy(result.data() + 12, &text_length, sizeof(uint32_t));
+        std::memcpy(result.data() + 16, session->text().data(), text_length);
+        send_frame(client, 0x82, result.data(), static_cast<uint32_t>(result.size()));
+        ended = true;
+      }
+    }
+    close(client);
+  }
+  close(listener);
+  return 0;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+  if (FLAGS_tcp_port != 0) {
+    std::unordered_map<std::string, std::unique_ptr<Module>> modules;
+    return serve_tcp_audio(FLAGS_tcp_port, modules);
+  }
+
+  if (!FLAGS_audio.empty()) {
+    std::unordered_map<std::string, std::unique_ptr<Module>> modules;
+    if (!FLAGS_vad_model.empty()) {
+      return transcribe_audio_vad(FLAGS_audio, modules);
+    }
+    return transcribe_audio(FLAGS_audio, modules);
+  }
+
+  if (FLAGS_serve_audio) {
+    std::unordered_map<std::string, std::unique_ptr<Module>> modules;
+    std::string audio_path;
+    std::puts("READY");
+    std::fflush(stdout);
+    while (std::getline(std::cin, audio_path)) {
+      if (audio_path == "QUIT") {
+        break;
+      }
+      const int status = transcribe_audio(audio_path, modules);
+      std::printf("DONE %d\n", status);
+      std::fflush(stdout);
+    }
+    return 0;
+  }
+
+  if (FLAGS_serve) {
+    std::unordered_map<std::string, std::unique_ptr<Module>> modules;
+    std::string line;
+    std::puts("READY");
+    std::fflush(stdout);
+    while (std::getline(std::cin, line)) {
+      if (line == "QUIT") {
+        break;
+      }
+      const size_t first = line.find('\t');
+      const size_t second = first == std::string::npos ? first : line.find('\t', first + 1);
+      int status = 2;
+      if (second != std::string::npos) {
+        const std::string path = line.substr(0, first);
+        const std::string inputs = line.substr(first + 1, second - first - 1);
+        const std::string output = line.substr(second + 1);
+        auto& module = modules[path];
+        if (!module) {
+          module = std::make_unique<Module>(path, Module::LoadMode::Mmap);
+          if (module->load() != Error::Ok || module->load_forward() != Error::Ok) {
+            module.reset();
+            status = 3;
+          }
+        }
+        if (module) {
+          auto meta = module->method_meta("forward");
+          status = meta.ok() ? execute_stage(*module, meta.get(), inputs, output, 1) : 5;
+        }
+      }
+      std::printf("DONE %d\n", status);
+      std::fflush(stdout);
+    }
+    return 0;
+  }
+
+  if (FLAGS_model_path.empty()) {
+    ET_LOG(Error, "--model_path is required");
+    return 2;
+  }
+  auto module = std::make_unique<Module>(FLAGS_model_path, Module::LoadMode::Mmap);
+  if (module->load() != Error::Ok) {
+    ET_LOG(Error, "failed to load %s", FLAGS_model_path.c_str());
+    return 3;
+  }
+  if (module->load_forward() != Error::Ok) {
+    ET_LOG(Error, "failed to load forward of %s", FLAGS_model_path.c_str());
+    return 4;
+  }
+  auto mmeta = module->method_meta("forward");
+  if (!mmeta.ok()) {
+    ET_LOG(Error, "no forward method in %s", FLAGS_model_path.c_str());
+    return 5;
+  }
+  const MethodMeta& meta = mmeta.get();
+  std::printf("MODEL %s\n", FLAGS_model_path.c_str());
+  std::printf("INPUTS %zu\n", meta.num_inputs());
+  for (size_t i = 0; i < meta.num_inputs(); i++) {
+    auto ti = meta.input_tensor_meta(i);
+    if (!ti.ok()) {
+      std::printf("  in %zu non-tensor\n", i);
+      continue;
+    }
+    std::printf("  in %zu %s %s %s\n", i, shape_str(ti.get()).c_str(),
+                dtype_name(ti.get().scalar_type()),
+                std::string(ti.get().name()).c_str());
+  }
+  std::printf("OUTPUTS %zu\n", meta.num_outputs());
+  for (size_t i = 0; i < meta.num_outputs(); i++) {
+    auto ti = meta.output_tensor_meta(i);
+    if (!ti.ok()) {
+      std::printf("  out %zu non-tensor\n", i);
+      continue;
+    }
+    std::printf("  out %zu %s %s %s\n", i, shape_str(ti.get()).c_str(),
+                dtype_name(ti.get().scalar_type()),
+                std::string(ti.get().name()).c_str());
+  }
+  std::fflush(stdout);
+  return FLAGS_sig ? 0 : execute_stage(*module, meta, FLAGS_inputs, FLAGS_output_file,
+                                       FLAGS_num_executions);
+}
