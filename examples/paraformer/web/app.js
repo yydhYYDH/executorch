@@ -147,6 +147,18 @@ function openEvents() {
     resultEl.value = segmentText;
     setStatus("识别中…");
   });
+  eventSource.addEventListener("diarization", (event) => {
+    const data = JSON.parse(event.data);
+    const segments = data.segments || [];
+    segmentText = segments
+      .map((seg) => {
+        const who = seg.speaker >= 0 ? `说话人${seg.speaker} ` : "";
+        return `[${(seg.start_ms / 1000).toFixed(2)}-${(seg.end_ms / 1000).toFixed(2)}s] ${who}${seg.text}`;
+      })
+      .join("\n");
+    sawSegments = true;
+    resultEl.value = segmentText;
+  });
   eventSource.addEventListener("done", (event) => {
     const data = JSON.parse(event.data);
     resultEl.value = sawSegments ? segmentText : (data.text || "");

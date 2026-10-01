@@ -773,21 +773,28 @@ int transcribe_audio(
         enc[2].size() != overlap.size()) {
       return 7;
     }
-    enc_state = std::move(enc[1]);
-    overlap = std::move(enc[2]);
     for (size_t i = 0; i < enc[0].size() / 2; ++i) {
       if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
-        // A saturating chunk on loud far-field audio is tolerated by the
-        // streaming session; the file paths used to abort on it, which stops a
-        // whole meeting over one chunk. Warn and carry on, as the session does.
+        // The fused encoder overflows fp16 on a few chunks of far-field audio.
+        // Its caches are fed back, so a non-finite chunk poisons every later
+        // one; clear the streaming state so the next chunk starts clean and the
+        // run recovers instead of turning into noise for the rest of the file.
         std::fprintf(
             stderr,
-            "encoder chunk %zu produced non-finite values; continuing\n",
+            "encoder chunk %zu produced non-finite values; resetting state\n",
             chunk_index);
         std::fflush(stderr);
-        break;
+        std::fill(enc_state.begin(), enc_state.end(), 0);
+        std::fill(overlap.begin(), overlap.end(), 0);
+        std::fill(fsmn.begin(), fsmn.end(), 0);
+        std::fill(opt.begin(), opt.end(), 0);
+        predictor_state.fill(0.0f);
+        decoder_started = false;
+        return 0;
       }
     }
+    enc_state = std::move(enc[1]);
+    overlap = std::move(enc[2]);
     std::vector<uint16_t> pred_input(8195);
     std::memcpy(pred_input.data(), enc[0].data(), enc[0].size());
     pred_input[7680] = half_bits(predictor_state[0]);
@@ -1144,21 +1151,28 @@ int transcribe_audio_vad(
         enc[1].size() != enc_state.size() || enc[2].size() != overlap.size()) {
       return 7;
     }
-    enc_state = std::move(enc[1]);
-    overlap = std::move(enc[2]);
     for (size_t i = 0; i < enc[0].size() / 2; ++i) {
       if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
-        // A saturating chunk on loud far-field audio is tolerated by the
-        // streaming session; the file paths used to abort on it, which stops a
-        // whole meeting over one chunk. Warn and carry on, as the session does.
+        // The fused encoder overflows fp16 on a few chunks of far-field audio.
+        // Its caches are fed back, so a non-finite chunk poisons every later
+        // one; clear the streaming state so the next chunk starts clean and the
+        // run recovers instead of turning into noise for the rest of the file.
         std::fprintf(
             stderr,
-            "encoder chunk %zu produced non-finite values; continuing\n",
+            "encoder chunk %zu produced non-finite values; resetting state\n",
             chunk_index);
         std::fflush(stderr);
-        break;
+        std::fill(enc_state.begin(), enc_state.end(), 0);
+        std::fill(overlap.begin(), overlap.end(), 0);
+        std::fill(fsmn.begin(), fsmn.end(), 0);
+        std::fill(opt.begin(), opt.end(), 0);
+        predictor_state.fill(0.0f);
+        decoder_started = false;
+        return 0;
       }
     }
+    enc_state = std::move(enc[1]);
+    overlap = std::move(enc[2]);
     std::vector<uint16_t> pred_input(8195);
     std::memcpy(pred_input.data(), enc[0].data(), enc[0].size());
     pred_input[7680] = half_bits(predictor_state[0]);
@@ -1490,6 +1504,20 @@ class StreamingSession {
     return out;
   }
 
+  // Second pass: relabel every segment offline with agglomerative clustering on
+  // the same embeddings the online pass used. The live frames already carried a
+  // provisional speaker; this is the corrected list, sent once at the end.
+  std::vector<DiarSegment> finalize() {
+    if (!seg_embs_.empty()) {
+      const auto labels =
+          cluster_offline(seg_embs_, static_cast<float>(FLAGS_spk_threshold));
+      for (size_t k = 0; k < seg_emb_index_.size(); ++k) {
+        all_segments_[seg_emb_index_[k]].speaker = labels[k];
+      }
+    }
+    return all_segments_;
+  }
+
   int feed(const uint8_t* pcm_bytes, size_t byte_count, bool final) {
     if (!valid_ || finalized_ || (byte_count & 1)) {
       return 2;
@@ -1576,6 +1604,19 @@ class StreamingSession {
         enc.size() != 3 || enc[0].size() != 15 * 512 * 2 ||
         enc[1].size() != enc_state_.size() || enc[2].size() != overlap_.size()) {
       return 2;
+    }
+    for (size_t i = 0; i < enc[0].size() / 2; ++i) {
+      if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
+        std::fprintf(stderr, "session encoder chunk %zu non-finite; resetting state\n", chunk_index_);
+        std::fill(enc_state_.begin(), enc_state_.end(), 0);
+        std::fill(overlap_.begin(), overlap_.end(), 0);
+        std::fill(fsmn_.begin(), fsmn_.end(), 0);
+        std::fill(opt_.begin(), opt_.end(), 0);
+        predictor_state_.fill(0.0f);
+        decoder_started_ = false;
+        ++chunk_index_;
+        return 0;
+      }
     }
     enc_state_ = std::move(enc[1]);
     overlap_ = std::move(enc[2]);
@@ -1695,6 +1736,7 @@ class StreamingSession {
             ++pf_flush_;
           }
           int speaker = -1;
+          std::vector<float> seg_emb;
           if (spk_module_ != nullptr &&
               (seg.end_ms - seg.start_ms) >= FLAGS_spk_min_ms) {
             const int64_t a = seg.start_ms * 16;
@@ -1720,12 +1762,19 @@ class StreamingSession {
                   }
                   normalize_vector(centroid);
                 } else {
-                  normalize_vector(emb);
                   speaker = static_cast<int>(spk_centroids_.size());
-                  spk_centroids_.push_back(std::move(emb));
+                  std::vector<float> seed = emb;
+                  normalize_vector(seed);
+                  spk_centroids_.push_back(std::move(seed));
                 }
+                seg_emb = emb;
               }
             }
+          }
+          all_segments_.push_back({seg, seg_text, speaker});
+          if (!seg_emb.empty()) {
+            seg_embs_.push_back(std::move(seg_emb));
+            seg_emb_index_.push_back(all_segments_.size() - 1);
           }
           segments_out_.push_back({seg, seg_text, speaker});
         }
@@ -1753,6 +1802,9 @@ class StreamingSession {
   std::vector<PfChunk> pf_chunks_;
   size_t pf_flush_ = 0;
   std::vector<DiarSegment> segments_out_;
+  std::vector<DiarSegment> all_segments_;
+  std::vector<std::vector<float>> seg_embs_;
+  std::vector<size_t> seg_emb_index_;
   std::unique_ptr<Module> spk_module_;
   int spk_T_ = 300;
   std::vector<std::vector<float>> spk_centroids_;
@@ -1921,6 +1973,28 @@ int serve_tcp_audio(int port,
           std::memcpy(payload.data() + 12, &length, sizeof(length));
           std::memcpy(payload.data() + 16, segment.text.data(), length);
           send_frame(client, 0x83, payload.data(), static_cast<uint32_t>(payload.size()));
+        }
+        {
+          // 0x84: the whole segment list, relabelled by the offline clustering
+          // pass, so the client can replace the provisional online speakers.
+          const auto final_segments = session->finalize();
+          std::vector<uint8_t> payload(4);
+          const uint32_t count = static_cast<uint32_t>(final_segments.size());
+          std::memcpy(payload.data(), &count, sizeof(count));
+          for (const auto& segment : final_segments) {
+            const uint32_t start = static_cast<uint32_t>(segment.span.start_ms);
+            const uint32_t end = static_cast<uint32_t>(segment.span.end_ms);
+            const int32_t speaker = static_cast<int32_t>(segment.speaker);
+            const uint32_t length = static_cast<uint32_t>(segment.text.size());
+            const size_t base = payload.size();
+            payload.resize(base + 16 + length);
+            std::memcpy(payload.data() + base, &start, sizeof(start));
+            std::memcpy(payload.data() + base + 4, &end, sizeof(end));
+            std::memcpy(payload.data() + base + 8, &speaker, sizeof(speaker));
+            std::memcpy(payload.data() + base + 12, &length, sizeof(length));
+            std::memcpy(payload.data() + base + 16, segment.text.data(), length);
+          }
+          send_frame(client, 0x84, payload.data(), static_cast<uint32_t>(payload.size()));
         }
         send_frame(client, 0x82, result.data(), static_cast<uint32_t>(result.size()));
         ended = true;

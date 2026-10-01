@@ -11,6 +11,7 @@ framed as one type byte, a little-endian uint32 payload length and the payload:
     runner -> client   0x80 start status (uint32)
                        0x81 cumulative UTF-8 partial text
                        0x83 segment: start_ms, end_ms, speaker, text_length, text
+                       0x84 diarization: count, then count x segment records (final)
                        0x82 final: status, elapsed_ms, audio_ms, text_length, text
                        0x7f error status (uint32)
 
@@ -33,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MAX_AUDIO_BYTES = 256 * 1024 * 1024
 PCM_CHUNK_BYTES = 4096
 START, PCM, END = 0x01, 0x02, 0x03
-START_OK, PARTIAL, SEGMENT, FINAL, ERROR = 0x80, 0x81, 0x83, 0x82, 0x7F
+START_OK, PARTIAL, SEGMENT, DIAR, FINAL, ERROR = 0x80, 0x81, 0x83, 0x84, 0x82, 0x7F
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -106,6 +107,18 @@ def _parse_segment(payload):
     return {"start_ms": start_ms, "end_ms": end_ms, "speaker": speaker, "text": text}
 
 
+def _parse_diar(payload):
+    count = struct.unpack("<I", payload[:4])[0]
+    offset = 4
+    segments = []
+    for _ in range(count):
+        start_ms, end_ms, speaker, text_length = struct.unpack("<IIiI", payload[offset:offset + 16])
+        text = payload[offset + 16:offset + 16 + text_length].decode("utf-8", "replace")
+        segments.append({"start_ms": start_ms, "end_ms": end_ms, "speaker": speaker, "text": text})
+        offset += 16 + text_length
+    return {"segments": segments}
+
+
 class Session:
     def __init__(self, runner):
         self.sock = socket.create_connection((runner.host, runner.port), runner.timeout)
@@ -134,6 +147,8 @@ class Session:
                     self.events.put(("partial", {"text": payload.decode("utf-8", "replace")}))
                 elif frame_type == SEGMENT:
                     self.events.put(("segment", _parse_segment(payload)))
+                elif frame_type == DIAR:
+                    self.events.put(("diarization", _parse_diar(payload)))
                 elif frame_type == FINAL:
                     self.events.put(("done", _parse_final(payload)))
                     return
