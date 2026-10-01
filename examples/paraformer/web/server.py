@@ -10,7 +10,7 @@ framed as one type byte, a little-endian uint32 payload length and the payload:
                        0x03 END (empty)
     runner -> client   0x80 start status (uint32)
                        0x81 cumulative UTF-8 partial text
-                       0x83 segment: start_ms, end_ms, text_length, text
+                       0x83 segment: start_ms, end_ms, speaker, text_length, text
                        0x82 final: status, elapsed_ms, audio_ms, text_length, text
                        0x7f error status (uint32)
 
@@ -101,9 +101,9 @@ def _parse_final(payload):
 
 
 def _parse_segment(payload):
-    start_ms, end_ms, text_length = struct.unpack("<III", payload[:12])
-    text = payload[12:12 + text_length].decode("utf-8", "replace")
-    return {"start_ms": start_ms, "end_ms": end_ms, "text": text}
+    start_ms, end_ms, speaker, text_length = struct.unpack("<IIiI", payload[:16])
+    text = payload[16:16 + text_length].decode("utf-8", "replace")
+    return {"start_ms": start_ms, "end_ms": end_ms, "speaker": speaker, "text": text}
 
 
 class Session:

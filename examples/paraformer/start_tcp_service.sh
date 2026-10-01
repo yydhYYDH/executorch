@@ -28,6 +28,13 @@ if [ -f "$VAD_MODEL" ] && [ -f "$VAD_CMVN" ]; then
   VAD_FLAGS="--vad_model $VAD_MODEL --cmvn_vad $VAD_CMVN"
 fi
 
+# CAM++ speaker tagging is enabled when its CPU PTE is present.
+SPK_MODEL=${SPK_MODEL:-"$BASE_DIR/camppluscpu/campplus_cpu.pte"}
+SPK_FLAGS=""
+if [ -f "$SPK_MODEL" ]; then
+  SPK_FLAGS="--spk_model $SPK_MODEL"
+fi
+
 # Stop only this service instance. Other HTP users, such as llama-bench, are
 # intentionally left untouched.
 for pid in $(ps -A -o pid= -o args= | awk -v runner="$RUNNER_NAME" -v port="$PORT" \
@@ -50,6 +57,7 @@ nohup "$RUNNER" \
   --decoder_first "$BASE_DIR/decoder16_first.pte" \
   --decoder_next "$BASE_DIR/decoder16_next.pte" \
   $VAD_FLAGS \
+  $SPK_FLAGS \
   >> "$LOG" 2>&1 </dev/null &
 
-echo "started pid=$! port=$PORT log=$LOG vad=${VAD_FLAGS:-off}"
+echo "started pid=$! port=$PORT log=$LOG vad=${VAD_FLAGS:-off} spk=${SPK_FLAGS:-off}"

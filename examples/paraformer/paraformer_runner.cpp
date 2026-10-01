@@ -78,6 +78,9 @@ DEFINE_string(decoder_first, "", "First decoder .pte for direct audio input.");
 DEFINE_string(decoder_next, "", "Subsequent decoder .pte for direct audio input.");
 DEFINE_string(vad_model, "", "Optional FSMN-VAD encoder .pte; enables VAD endpointing.");
 DEFINE_string(cmvn_vad, "", "Float32 CMVN asset for the VAD (2 x 400 values).");
+DEFINE_string(spk_model, "", "Optional CAM++ speaker .pte; tags each segment with a speaker.");
+DEFINE_double(spk_threshold, 0.35, "Cosine threshold for merging speaker embeddings.");
+DEFINE_int32(spk_min_ms, 1500, "Segments shorter than this get no own speaker decision.");
 DEFINE_int32(vad_chunk, 20, "VAD encoder frames per invocation.");
 DEFINE_int32(
     vad_delay_chunks,
@@ -527,6 +530,160 @@ class AudioReader {
   bool valid_ = false;
 };
 
+// CAM++ embedding for one span of audio: 80-mel fbank frames with their time
+// mean removed, padded or cropped to the PTE's fixed length, through the
+// network. This is FunASR's extract_feature followed by the CAM++ forward.
+std::vector<float> campplus_embedding(
+    Module& spk_module,
+    const float* samples,
+    size_t count,
+    int T) {
+  knf::FbankOptions opts;
+  opts.frame_opts.samp_freq = 16000;
+  opts.frame_opts.frame_length_ms = 25;
+  opts.frame_opts.frame_shift_ms = 10;
+  opts.frame_opts.window_type = "hamming";
+  opts.frame_opts.dither = 0;
+  // A whole segment is handed to the fbank in one call, so the bounded queue
+  // has to hold every frame we will read (the T we keep, plus edge frames).
+  opts.frame_opts.max_feature_vectors = T + 8;
+  opts.mel_opts.num_bins = 80;
+  opts.energy_floor = 0;
+  knf::OnlineFbank fbank(opts);
+  // Only the first T frames are kept, so there is nothing to gain from more
+  // than the samples that produce them.
+  const size_t usable = std::min<size_t>(count, static_cast<size_t>(T) * 160 + 400);
+  std::vector<float> scaled(usable);
+  for (size_t i = 0; i < usable; ++i) {
+    scaled[i] = samples[i] * 32768.0f;
+  }
+  fbank.AcceptWaveform(16000, scaled.data(), static_cast<int32_t>(usable));
+  fbank.InputFinished();
+  const int32_t ready = fbank.NumFramesReady();
+  if (ready <= 0) {
+    return {};
+  }
+  const int rows = std::min<int32_t>(ready, T);
+  if (std::getenv("SPK_DEBUG") != nullptr) {
+    std::fprintf(stderr, "campplus: usable=%zu ready=%d rows=%d T=%d max=%d\n",
+                 usable, ready, rows, T, opts.frame_opts.max_feature_vectors);
+  }
+  std::vector<std::array<float, 80>> frames(rows);
+  std::array<double, 80> mean{};
+  try {
+    for (int i = 0; i < rows; ++i) {
+      std::copy_n(fbank.GetFrame(i), 80, frames[i].begin());
+      for (int c = 0; c < 80; ++c) {
+        mean[c] += frames[i][c];
+      }
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "campplus fbank read failed: %s\n", e.what());
+    return {};
+  }
+  for (int c = 0; c < 80; ++c) {
+    mean[c] /= rows;
+  }
+  std::vector<float> input(static_cast<size_t>(T) * 80);
+  for (int r = 0; r < T; ++r) {
+    const auto& f = frames[std::min(r, rows - 1)];
+    for (int c = 0; c < 80; ++c) {
+      input[r * 80 + c] = static_cast<float>(f[c] - mean[c]);
+    }
+  }
+  std::vector<executorch::aten::SizesType> shape = {1, T, 80};
+  auto tensor = from_blob(input.data(), shape, ScalarType::Float);
+  std::vector<EValue> args;
+  args.emplace_back(*tensor);
+  auto result = spk_module.execute("forward", args);
+  if (!result.ok()) {
+    return {};
+  }
+  for (const auto& value : result.get()) {
+    if (value.isTensor()) {
+      const auto& t = value.toTensor();
+      const auto* data = static_cast<const float*>(t.data_ptr());
+      return std::vector<float>(data, data + t.numel());
+    }
+  }
+  return {};
+}
+
+void normalize_vector(std::vector<float>& v) {
+  double norm = 0;
+  for (float x : v) {
+    norm += static_cast<double>(x) * x;
+  }
+  norm = std::sqrt(norm) + 1e-9;
+  for (float& x : v) {
+    x = static_cast<float>(x / norm);
+  }
+}
+
+float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
+  double dot = 0, na = 0, nb = 0;
+  for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb) + 1e-9));
+}
+
+// Offline agglomerative clustering with average linkage and a cosine
+// threshold, the operating point measured on AISHELL-4.
+std::vector<int> cluster_offline(
+    const std::vector<std::vector<float>>& embs,
+    float threshold) {
+  const size_t n = embs.size();
+  std::vector<int> labels(n, 0);
+  if (n == 0) {
+    return labels;
+  }
+  std::vector<std::vector<float>> sim(n, std::vector<float>(n, 0.0f));
+  for (size_t i = 0; i < n; ++i) {
+    for (size_t j = i + 1; j < n; ++j) {
+      sim[i][j] = sim[j][i] = cosine_similarity(embs[i], embs[j]);
+    }
+  }
+  std::vector<std::vector<int>> clusters(n);
+  for (size_t i = 0; i < n; ++i) {
+    clusters[i] = {static_cast<int>(i)};
+  }
+  while (clusters.size() > 1) {
+    float best = -2.0f;
+    int bi = -1, bj = -1;
+    for (size_t i = 0; i < clusters.size(); ++i) {
+      for (size_t j = i + 1; j < clusters.size(); ++j) {
+        double sum = 0;
+        for (int a : clusters[i]) {
+          for (int b : clusters[j]) {
+            sum += sim[a][b];
+          }
+        }
+        const float s = static_cast<float>(
+            sum / (clusters[i].size() * clusters[j].size()));
+        if (s > best) {
+          best = s;
+          bi = static_cast<int>(i);
+          bj = static_cast<int>(j);
+        }
+      }
+    }
+    if (best < threshold) {
+      break;
+    }
+    clusters[bi].insert(clusters[bi].end(), clusters[bj].begin(), clusters[bj].end());
+    clusters.erase(clusters.begin() + bj);
+  }
+  for (size_t k = 0; k < clusters.size(); ++k) {
+    for (int i : clusters[k]) {
+      labels[i] = static_cast<int>(k);
+    }
+  }
+  return labels;
+}
+
 // Fixed part of the encoder input before the appended position encoding and
 // mask: three scalars, ten feature rows, the encoder state, and the overlap.
 constexpr size_t kEncoderBaseValues =
@@ -620,8 +777,15 @@ int transcribe_audio(
     overlap = std::move(enc[2]);
     for (size_t i = 0; i < enc[0].size() / 2; ++i) {
       if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
-        ET_LOG(Error, "encoder chunk %zu produced non-finite values", chunk_index);
-        return 8;
+        // A saturating chunk on loud far-field audio is tolerated by the
+        // streaming session; the file paths used to abort on it, which stops a
+        // whole meeting over one chunk. Warn and carry on, as the session does.
+        std::fprintf(
+            stderr,
+            "encoder chunk %zu produced non-finite values; continuing\n",
+            chunk_index);
+        std::fflush(stderr);
+        break;
       }
     }
     std::vector<uint16_t> pred_input(8195);
@@ -742,6 +906,12 @@ constexpr int kVadClasses = 248;
 struct PfChunk {
   int64_t center_ms;
   std::string text;
+};
+
+struct DiarSegment {
+  fsmn_vad::VadSegment span;
+  std::string text;
+  int speaker = -1;
 };
 
 float decibel_at(const std::vector<float>& samples, int64_t frame) {
@@ -872,6 +1042,23 @@ int transcribe_audio_vad(
     return 5;
   }
 
+  std::unique_ptr<Module> spk_module;
+  int spk_T = 300;
+  if (!FLAGS_spk_model.empty()) {
+    spk_module = std::make_unique<Module>(FLAGS_spk_model, Module::LoadMode::Mmap);
+    if (spk_module->load() != Error::Ok || spk_module->load_forward() != Error::Ok) {
+      ET_LOG(Error, "cannot load %s", FLAGS_spk_model.c_str());
+      return 5;
+    }
+    auto smeta = spk_module->method_meta("forward");
+    if (smeta.ok() && smeta.get().num_inputs() >= 1) {
+      auto ti = smeta.get().input_tensor_meta(0);
+      if (ti.ok() && ti.get().sizes().size() == 3) {
+        spk_T = ti.get().sizes()[1];
+      }
+    }
+  }
+
   paraformer::AudioFrontend frontend(cmvn);
   fsmn_vad::VadFrontend vad_frontend(vad_cmvn);
   fsmn_vad::VadDecoder vad_decoder;
@@ -888,15 +1075,22 @@ int transcribe_audio_vad(
   std::vector<std::array<float, kVadFeat>> vad_pending;
   std::deque<std::pair<int64_t, std::vector<std::array<float, 560>>>> pf_queue;
   std::vector<PfChunk> pf_chunks;
-  std::vector<float> all_samples;
+  // Only a bounded tail of the waveform is kept: enough for the decibel of the
+  // frames in flight and for the longest segment's speaker embedding. Holding
+  // the whole meeting would cost 150 MB over 39 minutes for nothing.
+  std::vector<float> sample_buf;
+  int64_t sample_base = 0;
   int64_t vad_frames = 0;
   int64_t audio_chunks = 0;
 
   const bool b_reset = FLAGS_vad_mode == "reset";
   const bool b_realtime = !b_reset && FLAGS_vad_realtime;
+  const bool b_diarize = spk_module != nullptr && !b_reset;
   std::string cur_text;
   std::vector<fsmn_vad::VadSegment> segments;
   std::vector<std::string> segment_texts;
+  std::vector<std::vector<float>> diar_embs;
+  std::vector<size_t> diar_index;
   size_t pf_flush = 0;
 
   auto reset_paraformer = [&]() {
@@ -954,8 +1148,15 @@ int transcribe_audio_vad(
     overlap = std::move(enc[2]);
     for (size_t i = 0; i < enc[0].size() / 2; ++i) {
       if ((read_half(enc[0], i) & 0x7c00) == 0x7c00) {
-        ET_LOG(Error, "encoder chunk %zu produced non-finite values", chunk_index);
-        return 8;
+        // A saturating chunk on loud far-field audio is tolerated by the
+        // streaming session; the file paths used to abort on it, which stops a
+        // whole meeting over one chunk. Warn and carry on, as the session does.
+        std::fprintf(
+            stderr,
+            "encoder chunk %zu produced non-finite values; continuing\n",
+            chunk_index);
+        std::fflush(stderr);
+        break;
       }
     }
     std::vector<uint16_t> pred_input(8195);
@@ -1056,11 +1257,21 @@ int transcribe_audio_vad(
     return 0;
   };
 
+  auto decibel_frame = [&](int64_t frame) {
+    const int64_t begin = frame * 160 - sample_base;
+    const int64_t end =
+        std::min<int64_t>(begin + 400, static_cast<int64_t>(sample_buf.size()));
+    double acc = 0.0;
+    for (int64_t j = std::max<int64_t>(begin, int64_t{0}); j < end; ++j) {
+      acc += static_cast<double>(sample_buf[j]) * sample_buf[j];
+    }
+    return static_cast<float>(10.0 * std::log10(acc + 1e-6));
+  };
   std::vector<float> samples;
   bool final = false;
   int rc = 0;
   while (audio.next(samples, final)) {
-    all_samples.insert(all_samples.end(), samples.begin(), samples.end());
+    sample_buf.insert(sample_buf.end(), samples.begin(), samples.end());
 
     auto vad_features = vad_frontend.Accept(samples.data(), samples.size(), final);
     vad_pending.insert(vad_pending.end(), vad_features.begin(), vad_features.end());
@@ -1074,7 +1285,7 @@ int transcribe_audio_vad(
       vad_pending.erase(vad_pending.begin(), vad_pending.begin() + valid);
       std::vector<float> decibel(valid);
       for (size_t j = 0; j < valid; ++j) {
-        decibel[j] = decibel_at(all_samples, vad_frames + j);
+        decibel[j] = decibel_frame(vad_frames + j);
       }
       const bool is_last = final && vad_pending.empty();
       auto got = vad_decoder.Accept(decibel.data(), psil.data(), valid, is_last);
@@ -1092,15 +1303,42 @@ int transcribe_audio_vad(
             ++pf_flush;
           }
           segment_texts.push_back(seg_text);
-          std::printf(
-              "SEG %lld %lld %s\n",
-              (long long)seg.start_ms,
-              (long long)seg.end_ms,
-              seg_text.c_str());
-          std::fflush(stdout);
+          if (!b_diarize) {
+            std::printf(
+                "SEG %lld %lld %s\n",
+                (long long)seg.start_ms,
+                (long long)seg.end_ms,
+                seg_text.c_str());
+            std::fflush(stdout);
+          }
+        }
+        if (b_diarize && (seg.end_ms - seg.start_ms) >= FLAGS_spk_min_ms) {
+          int64_t a = seg.start_ms * 16 - sample_base;
+          int64_t b = std::min<int64_t>(
+              seg.end_ms * 16 - sample_base, static_cast<int64_t>(sample_buf.size()));
+          a = std::max<int64_t>(a, int64_t{0});
+          if (b > a) {
+            auto emb = campplus_embedding(
+                *spk_module, sample_buf.data() + a, b - a, spk_T);
+            if (!emb.empty()) {
+              diar_embs.push_back(std::move(emb));
+              diar_index.push_back(segments.size() - 1);
+              if (std::getenv("SPK_DEBUG") != nullptr) {
+                std::fprintf(stderr, "EMB %zu\n", diar_index.size());
+                std::fflush(stderr);
+              }
+            }
+          }
         }
       }
       vad_frames += valid;
+    }
+
+    const int64_t keep = 80 * 16000;
+    if (static_cast<int64_t>(sample_buf.size()) > keep) {
+      const int64_t drop = static_cast<int64_t>(sample_buf.size()) - keep;
+      sample_buf.erase(sample_buf.begin(), sample_buf.begin() + drop);
+      sample_base += drop;
     }
 
     pf_queue.push_back(
@@ -1156,13 +1394,25 @@ int transcribe_audio_vad(
     }
   }
 
-  if (!b_realtime && !segments.empty()) {
+  std::vector<int> spk_labels(segments.size(), -1);
+  if (b_diarize && !diar_embs.empty()) {
+    const auto labels =
+        cluster_offline(diar_embs, static_cast<float>(FLAGS_spk_threshold));
+    for (size_t k = 0; k < diar_index.size(); ++k) {
+      spk_labels[diar_index[k]] = labels[k];
+    }
+  }
+
+  if (b_diarize || !b_realtime) {
     for (size_t i = 0; i < segments.size(); ++i) {
       std::printf(
-          "SEG %lld %lld %s\n",
+          "SEG %lld %lld",
           (long long)segments[i].start_ms,
-          (long long)segments[i].end_ms,
-          segment_texts[i].c_str());
+          (long long)segments[i].end_ms);
+      if (spk_labels[i] >= 0) {
+        std::printf(" SPK%d", spk_labels[i]);
+      }
+      std::printf(" %s\n", segment_texts[i].c_str());
     }
   }
   if (!cur_text.empty()) {
@@ -1211,6 +1461,19 @@ class StreamingSession {
       vad_caches_.assign(4 * kVadProj * kVadCacheFrames, 0);
       vad_enabled_ = true;
     }
+    if (!FLAGS_spk_model.empty()) {
+      spk_module_ = std::make_unique<Module>(FLAGS_spk_model, Module::LoadMode::Mmap);
+      if (spk_module_->load() != Error::Ok || spk_module_->load_forward() != Error::Ok) {
+        return;
+      }
+      auto smeta = spk_module_->method_meta("forward");
+      if (smeta.ok() && smeta.get().num_inputs() >= 1) {
+        auto ti = smeta.get().input_tensor_meta(0);
+        if (ti.ok() && ti.get().sizes().size() == 3) {
+          spk_T_ = ti.get().sizes()[1];
+        }
+      }
+    }
     valid_ = true;
   }
 
@@ -1221,8 +1484,8 @@ class StreamingSession {
 
   // Completed VAD segments (start/end ms and the text assigned to them), in
   // order. Drained by the TCP loop after each feed.
-  std::vector<std::pair<fsmn_vad::VadSegment, std::string>> take_segments() {
-    std::vector<std::pair<fsmn_vad::VadSegment, std::string>> out;
+  std::vector<DiarSegment> take_segments() {
+    std::vector<DiarSegment> out;
     out.swap(segments_out_);
     return out;
   }
@@ -1431,7 +1694,40 @@ class StreamingSession {
             seg_text += pf_chunks_[pf_flush_].text;
             ++pf_flush_;
           }
-          segments_out_.emplace_back(seg, seg_text);
+          int speaker = -1;
+          if (spk_module_ != nullptr &&
+              (seg.end_ms - seg.start_ms) >= FLAGS_spk_min_ms) {
+            const int64_t a = seg.start_ms * 16;
+            const int64_t b = std::min<int64_t>(seg.end_ms * 16, all_samples_.size());
+            if (a >= 0 && b > a) {
+              auto emb = campplus_embedding(
+                  *spk_module_, all_samples_.data() + a, b - a, spk_T_);
+              if (!emb.empty()) {
+                float best = -2.0f;
+                int bi = -1;
+                for (size_t c = 0; c < spk_centroids_.size(); ++c) {
+                  const float s = cosine_similarity(emb, spk_centroids_[c]);
+                  if (s > best) {
+                    best = s;
+                    bi = static_cast<int>(c);
+                  }
+                }
+                if (bi >= 0 && best >= static_cast<float>(FLAGS_spk_threshold)) {
+                  speaker = bi;
+                  auto& centroid = spk_centroids_[bi];
+                  for (size_t d = 0; d < centroid.size() && d < emb.size(); ++d) {
+                    centroid[d] = 0.7f * centroid[d] + 0.3f * emb[d];
+                  }
+                  normalize_vector(centroid);
+                } else {
+                  normalize_vector(emb);
+                  speaker = static_cast<int>(spk_centroids_.size());
+                  spk_centroids_.push_back(std::move(emb));
+                }
+              }
+            }
+          }
+          segments_out_.push_back({seg, seg_text, speaker});
         }
         vad_frames_ += valid;
       }
@@ -1456,7 +1752,10 @@ class StreamingSession {
   std::vector<float> all_samples_;
   std::vector<PfChunk> pf_chunks_;
   size_t pf_flush_ = 0;
-  std::vector<std::pair<fsmn_vad::VadSegment, std::string>> segments_out_;
+  std::vector<DiarSegment> segments_out_;
+  std::unique_ptr<Module> spk_module_;
+  int spk_T_ = 300;
+  std::vector<std::vector<float>> spk_centroids_;
   bool decoder_started_ = false;
   size_t audio_bytes_ = 0;
   size_t chunk_index_ = 0;
@@ -1581,14 +1880,16 @@ int serve_tcp_audio(int port,
         const uint32_t text_length = static_cast<uint32_t>(session->text().size());
         send_frame(client, 0x81, session->text().data(), text_length);
         for (const auto& segment : session->take_segments()) {
-          const uint32_t start = static_cast<uint32_t>(segment.first.start_ms);
-          const uint32_t end = static_cast<uint32_t>(segment.first.end_ms);
-          const uint32_t length = static_cast<uint32_t>(segment.second.size());
-          std::vector<uint8_t> payload(12 + length);
+          const uint32_t start = static_cast<uint32_t>(segment.span.start_ms);
+          const uint32_t end = static_cast<uint32_t>(segment.span.end_ms);
+          const int32_t speaker = static_cast<int32_t>(segment.speaker);
+          const uint32_t length = static_cast<uint32_t>(segment.text.size());
+          std::vector<uint8_t> payload(16 + length);
           std::memcpy(payload.data(), &start, sizeof(start));
           std::memcpy(payload.data() + 4, &end, sizeof(end));
-          std::memcpy(payload.data() + 8, &length, sizeof(length));
-          std::memcpy(payload.data() + 12, segment.second.data(), length);
+          std::memcpy(payload.data() + 8, &speaker, sizeof(speaker));
+          std::memcpy(payload.data() + 12, &length, sizeof(length));
+          std::memcpy(payload.data() + 16, segment.text.data(), length);
           send_frame(client, 0x83, payload.data(), static_cast<uint32_t>(payload.size()));
         }
       } else {
@@ -1609,14 +1910,16 @@ int serve_tcp_audio(int port,
         std::memcpy(result.data() + 12, &text_length, sizeof(uint32_t));
         std::memcpy(result.data() + 16, session->text().data(), text_length);
         for (const auto& segment : session->take_segments()) {
-          const uint32_t start = static_cast<uint32_t>(segment.first.start_ms);
-          const uint32_t end = static_cast<uint32_t>(segment.first.end_ms);
-          const uint32_t length = static_cast<uint32_t>(segment.second.size());
-          std::vector<uint8_t> payload(12 + length);
+          const uint32_t start = static_cast<uint32_t>(segment.span.start_ms);
+          const uint32_t end = static_cast<uint32_t>(segment.span.end_ms);
+          const int32_t speaker = static_cast<int32_t>(segment.speaker);
+          const uint32_t length = static_cast<uint32_t>(segment.text.size());
+          std::vector<uint8_t> payload(16 + length);
           std::memcpy(payload.data(), &start, sizeof(start));
           std::memcpy(payload.data() + 4, &end, sizeof(end));
-          std::memcpy(payload.data() + 8, &length, sizeof(length));
-          std::memcpy(payload.data() + 12, segment.second.data(), length);
+          std::memcpy(payload.data() + 8, &speaker, sizeof(speaker));
+          std::memcpy(payload.data() + 12, &length, sizeof(length));
+          std::memcpy(payload.data() + 16, segment.text.data(), length);
           send_frame(client, 0x83, payload.data(), static_cast<uint32_t>(payload.size()));
         }
         send_frame(client, 0x82, result.data(), static_cast<uint32_t>(result.size()));

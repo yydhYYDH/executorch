@@ -141,7 +141,8 @@ function openEvents() {
   eventSource.addEventListener("segment", (event) => {
     const data = JSON.parse(event.data);
     sawSegments = true;
-    const line = `[${(data.start_ms / 1000).toFixed(2)}-${(data.end_ms / 1000).toFixed(2)}s] ${data.text}`;
+    const who = data.speaker >= 0 ? `说话人${data.speaker} ` : "";
+    const line = `[${(data.start_ms / 1000).toFixed(2)}-${(data.end_ms / 1000).toFixed(2)}s] ${who}${data.text}`;
     segmentText += (segmentText ? "\n" : "") + line;
     resultEl.value = segmentText;
     setStatus("识别中…");

@@ -61,7 +61,7 @@ and payload (maximum 256 MiB per session):
 | `3` | client -> runner | `END`, empty payload |
 | `0x80` | runner -> client | start status, little-endian `uint32` |
 | `0x81` | runner -> client | UTF-8 partial text |
-| `0x83` | runner -> client | segment: `start_ms`, `end_ms`, `text_length`, text |
+| `0x83` | runner -> client | segment: `start_ms`, `end_ms`, `speaker`, `text_length`, text |
 | `0x82` | runner -> client | final payload: status, elapsed_ms, audio_ms, text_length, text |
 | `0x7f` | runner -> client | error status, little-endian `uint32` |
 
