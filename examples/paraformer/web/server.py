@@ -10,6 +10,7 @@ framed as one type byte, a little-endian uint32 payload length and the payload:
                        0x03 END (empty)
     runner -> client   0x80 start status (uint32)
                        0x81 cumulative UTF-8 partial text
+                       0x83 segment: start_ms, end_ms, text_length, text
                        0x82 final: status, elapsed_ms, audio_ms, text_length, text
                        0x7f error status (uint32)
 
@@ -29,10 +30,10 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-MAX_AUDIO_BYTES = 64 * 1024 * 1024
+MAX_AUDIO_BYTES = 256 * 1024 * 1024
 PCM_CHUNK_BYTES = 4096
 START, PCM, END = 0x01, 0x02, 0x03
-START_OK, PARTIAL, FINAL, ERROR = 0x80, 0x81, 0x82, 0x7F
+START_OK, PARTIAL, SEGMENT, FINAL, ERROR = 0x80, 0x81, 0x83, 0x82, 0x7F
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -99,6 +100,12 @@ def _parse_final(payload):
     return {"status": status, "text": text, "elapsed_ms": elapsed_ms, "audio_ms": audio_ms, "rtf": rtf}
 
 
+def _parse_segment(payload):
+    start_ms, end_ms, text_length = struct.unpack("<III", payload[:12])
+    text = payload[12:12 + text_length].decode("utf-8", "replace")
+    return {"start_ms": start_ms, "end_ms": end_ms, "text": text}
+
+
 class Session:
     def __init__(self, runner):
         self.sock = socket.create_connection((runner.host, runner.port), runner.timeout)
@@ -125,6 +132,8 @@ class Session:
                 frame_type, payload = _recv_frame(self.sock)
                 if frame_type == PARTIAL:
                     self.events.put(("partial", {"text": payload.decode("utf-8", "replace")}))
+                elif frame_type == SEGMENT:
+                    self.events.put(("segment", _parse_segment(payload)))
                 elif frame_type == FINAL:
                     self.events.put(("done", _parse_final(payload)))
                     return
@@ -174,7 +183,7 @@ class RunnerClient:
         if not pcm or len(pcm) % 2:
             raise ValueError("audio must be nonempty 16-bit PCM")
         if len(pcm) > MAX_AUDIO_BYTES:
-            raise ValueError("audio exceeds the 64 MiB runner limit")
+            raise ValueError("audio exceeds the 256 MiB runner limit")
         with socket.create_connection((self.host, self.port), self.timeout) as sock:
             sock.settimeout(self.timeout)
             _send_frame(sock, START, b"")
@@ -183,14 +192,18 @@ class RunnerClient:
                 raise RuntimeError("runner rejected the session start")
             for offset in range(0, len(pcm), PCM_CHUNK_BYTES):
                 _send_frame(sock, PCM, pcm[offset:offset + PCM_CHUNK_BYTES])
-                frame_type, payload = _recv_frame(sock)
+                while True:
+                    frame_type, payload = _recv_frame(sock)
+                    if frame_type == SEGMENT:
+                        continue
+                    break
                 if frame_type != PARTIAL:
                     status = struct.unpack("<I", payload[:4])[0] if len(payload) >= 4 else -1
                     raise RuntimeError("runner error %d" % status)
             _send_frame(sock, END, b"")
             while True:
                 frame_type, payload = _recv_frame(sock)
-                if frame_type == PARTIAL:
+                if frame_type == PARTIAL or frame_type == SEGMENT:
                     continue
                 if frame_type == FINAL:
                     return _parse_final(payload)

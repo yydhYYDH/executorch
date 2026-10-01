@@ -16,6 +16,8 @@ let busy = false;
 let recording = false;
 let sessionId = null;
 let eventSource = null;
+let segmentText = "";
+let sawSegments = false;
 let audioContext = null;
 let sourceNode = null;
 let processor = null;
@@ -130,12 +132,23 @@ function openEvents() {
   eventSource = new EventSource(api(`api/session/${sessionId}/events`));
   eventSource.addEventListener("partial", (event) => {
     const data = JSON.parse(event.data);
+    if (sawSegments) {
+      return;
+    }
     resultEl.value = data.text || "";
+    setStatus("识别中…");
+  });
+  eventSource.addEventListener("segment", (event) => {
+    const data = JSON.parse(event.data);
+    sawSegments = true;
+    const line = `[${(data.start_ms / 1000).toFixed(2)}-${(data.end_ms / 1000).toFixed(2)}s] ${data.text}`;
+    segmentText += (segmentText ? "\n" : "") + line;
+    resultEl.value = segmentText;
     setStatus("识别中…");
   });
   eventSource.addEventListener("done", (event) => {
     const data = JSON.parse(event.data);
-    resultEl.value = data.text || "";
+    resultEl.value = sawSegments ? segmentText : (data.text || "");
     copyButton.disabled = !resultEl.value;
     showSpeed(data);
     setStatus(data.status === 0 ? "完成" : `识别失败（status ${data.status}）`, data.status !== 0);
@@ -183,6 +196,8 @@ async function startRecording() {
   setBusy(true);
   setStatus("请求麦克风…");
   resultEl.value = "";
+  segmentText = "";
+  sawSegments = false;
   speedEl.textContent = "";
   copyButton.disabled = true;
   finished = false;
@@ -305,6 +320,8 @@ async function transcribeFile(file) {
   setBusy(true);
   setStatus(`读取 ${file.name} …`);
   resultEl.value = "";
+  segmentText = "";
+  sawSegments = false;
   speedEl.textContent = "";
   copyButton.disabled = true;
   try {

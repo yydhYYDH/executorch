@@ -90,6 +90,11 @@ DEFINE_string(
     "continuous",
     "continuous: never reset Paraformer and split tokens into segments by chunk "
     "time. reset: flush accumulated text at each VAD endpoint and reset.");
+DEFINE_bool(
+    vad_realtime,
+    true,
+    "In continuous mode, print each segment as soon as VAD closes it instead of "
+    "assigning all chunks after the run.");
 
 const char* dtype_name(ScalarType t) {
   switch (t) {
@@ -268,6 +273,35 @@ uint16_t half_bits(float value) {
 float half_value(uint16_t bits) {
   return static_cast<float>(executorch::aten::Half(
       bits, executorch::aten::Half::from_bits()));
+}
+
+// Branch-based fp16 -> fp32, used in the per-chunk argmax where the tensor
+// holds millions of values and the Half constructor dominates.
+static inline float fp16_to_float(uint16_t h) {
+  const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+  uint32_t exponent = (h >> 10) & 0x1fu;
+  uint32_t mantissa = h & 0x3ffu;
+  uint32_t bits;
+  if (exponent == 0) {
+    if (mantissa == 0) {
+      bits = sign;
+    } else {
+      exponent = 127 - 15 + 1;
+      while (!(mantissa & 0x400u)) {
+        mantissa <<= 1;
+        --exponent;
+      }
+      mantissa &= 0x3ffu;
+      bits = sign | (exponent << 23) | (mantissa << 13);
+    }
+  } else if (exponent == 31) {
+    bits = sign | 0x7f800000u | (mantissa << 13);
+  } else {
+    bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+  }
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
 }
 
 uint16_t read_half(const std::vector<uint8_t>& data, size_t index) {
@@ -493,6 +527,11 @@ class AudioReader {
   bool valid_ = false;
 };
 
+// Fixed part of the encoder input before the appended position encoding and
+// mask: three scalars, ten feature rows, the encoder state, and the overlap.
+constexpr size_t kEncoderBaseValues =
+    3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4;
+
 int transcribe_audio(
     const std::string& audio_path,
     std::unordered_map<std::string, std::unique_ptr<Module>>& modules,
@@ -537,6 +576,8 @@ int transcribe_audio(
   StageTiming decoder_next_timing;
   size_t chunk_index = 0;
   std::string text;
+  std::vector<uint16_t> enc_input;
+  enc_input.reserve(kEncoderBaseValues + 10 * 560 + 65);
   std::vector<float> samples;
   bool final = false;
   while (audio.next(samples, final)) {
@@ -548,7 +589,7 @@ int transcribe_audio(
       ET_LOG(Error, "audio chunk exceeds current encoder PTE contract");
       return 6;
     }
-    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    enc_input.resize(kEncoderBaseValues);
     const int64_t position = static_cast<int64_t>(chunk_index * 10);
     if (position >= (int64_t{1} << 40)) {
       ET_LOG(Error, "audio position exceeds packed encoder range");
@@ -635,10 +676,12 @@ int transcribe_audio(
       }
       decoder_started = true;
       for (size_t row = 0; row < nvalid; ++row) {
+        const uint16_t* logits = reinterpret_cast<const uint16_t*>(
+            dec[0].data() + row * 8404 * sizeof(uint16_t));
         size_t best = 0;
         float score = -INFINITY;
         for (size_t col = 0; col < 8404; ++col) {
-          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          const float value = fp16_to_float(logits[col]);
           if (value > score) {
             score = value;
             best = col;
@@ -695,6 +738,21 @@ constexpr int kVadFeat = 400;
 constexpr int kVadProj = 128;
 constexpr int kVadCacheFrames = 19;
 constexpr int kVadClasses = 248;
+
+struct PfChunk {
+  int64_t center_ms;
+  std::string text;
+};
+
+float decibel_at(const std::vector<float>& samples, int64_t frame) {
+  const int64_t begin = frame * 160;
+  const int64_t end = std::min<int64_t>(begin + 400, samples.size());
+  double acc = 0.0;
+  for (int64_t j = begin; j < end; ++j) {
+    acc += static_cast<double>(samples[j]) * samples[j];
+  }
+  return static_cast<float>(10.0 * std::log10(acc + 1e-6));
+}
 
 bool run_vad_encoder(
     Module& module,
@@ -829,19 +887,17 @@ int transcribe_audio_vad(
   std::vector<float> vad_caches(4 * kVadProj * kVadCacheFrames, 0);
   std::vector<std::array<float, kVadFeat>> vad_pending;
   std::deque<std::pair<int64_t, std::vector<std::array<float, 560>>>> pf_queue;
-  struct PfChunk {
-    int64_t center_ms;
-    std::string text;
-  };
   std::vector<PfChunk> pf_chunks;
   std::vector<float> all_samples;
   int64_t vad_frames = 0;
   int64_t audio_chunks = 0;
 
   const bool b_reset = FLAGS_vad_mode == "reset";
+  const bool b_realtime = !b_reset && FLAGS_vad_realtime;
   std::string cur_text;
   std::vector<fsmn_vad::VadSegment> segments;
   std::vector<std::string> segment_texts;
+  size_t pf_flush = 0;
 
   auto reset_paraformer = [&]() {
     std::fill(enc_state.begin(), enc_state.end(), 0);
@@ -853,16 +909,8 @@ int transcribe_audio_vad(
     chunk_index = 0;
   };
 
-  auto decibel_at = [&](int64_t frame) {
-    const int64_t begin = frame * 160;
-    const int64_t end = std::min<int64_t>(begin + 400, all_samples.size());
-    double acc = 0.0;
-    for (int64_t j = begin; j < end; ++j) {
-      acc += static_cast<double>(all_samples[j]) * all_samples[j];
-    }
-    return static_cast<float>(10.0 * std::log10(acc + 1e-6));
-  };
-
+  std::vector<uint16_t> enc_input;
+  enc_input.reserve(kEncoderBaseValues + 10 * 560 + 65);
   auto process_paraformer_chunk =
       [&](const std::vector<std::array<float, 560>>& features,
           bool final,
@@ -875,7 +923,7 @@ int transcribe_audio_vad(
       ET_LOG(Error, "audio chunk exceeds current encoder PTE contract");
       return 6;
     }
-    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    enc_input.resize(kEncoderBaseValues);
     const int64_t position = static_cast<int64_t>(chunk_index * 10);
     if (position >= (int64_t{1} << 40)) {
       ET_LOG(Error, "audio position exceeds packed encoder range");
@@ -956,10 +1004,12 @@ int transcribe_audio_vad(
       }
       decoder_started = true;
       for (size_t row = 0; row < nvalid; ++row) {
+        const uint16_t* logits = reinterpret_cast<const uint16_t*>(
+            dec[0].data() + row * 8404 * sizeof(uint16_t));
         size_t best = 0;
         float score = -INFINITY;
         for (size_t col = 0; col < 8404; ++col) {
-          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          const float value = fp16_to_float(logits[col]);
           if (value > score) {
             score = value;
             best = col;
@@ -1024,7 +1074,7 @@ int transcribe_audio_vad(
       vad_pending.erase(vad_pending.begin(), vad_pending.begin() + valid);
       std::vector<float> decibel(valid);
       for (size_t j = 0; j < valid; ++j) {
-        decibel[j] = decibel_at(vad_frames + j);
+        decibel[j] = decibel_at(all_samples, vad_frames + j);
       }
       const bool is_last = final && vad_pending.empty();
       auto got = vad_decoder.Accept(decibel.data(), psil.data(), valid, is_last);
@@ -1034,6 +1084,20 @@ int transcribe_audio_vad(
           segment_texts.push_back(cur_text);
           cur_text.clear();
           reset_paraformer();
+        } else if (b_realtime) {
+          std::string seg_text;
+          while (pf_flush < pf_chunks.size() &&
+                 pf_chunks[pf_flush].center_ms < seg.end_ms) {
+            seg_text += pf_chunks[pf_flush].text;
+            ++pf_flush;
+          }
+          segment_texts.push_back(seg_text);
+          std::printf(
+              "SEG %lld %lld %s\n",
+              (long long)seg.start_ms,
+              (long long)seg.end_ms,
+              seg_text.c_str());
+          std::fflush(stdout);
         }
       }
       vad_frames += valid;
@@ -1060,7 +1124,11 @@ int transcribe_audio_vad(
     pf_queue.pop_front();
   }
 
-  if (!b_reset) {
+  if (b_realtime) {
+    for (; pf_flush < pf_chunks.size(); ++pf_flush) {
+      cur_text += pf_chunks[pf_flush].text;
+    }
+  } else if (!b_reset) {
     segment_texts.assign(segments.size(), std::string());
     if (segments.empty()) {
       for (const PfChunk& chunk : pf_chunks) {
@@ -1088,7 +1156,7 @@ int transcribe_audio_vad(
     }
   }
 
-  if (!segments.empty()) {
+  if (!b_realtime && !segments.empty()) {
     for (size_t i = 0; i < segments.size(); ++i) {
       std::printf(
           "SEG %lld %lld %s\n",
@@ -1127,6 +1195,22 @@ class StreamingSession {
     }
     tokens_ = nlohmann::json::parse(token_file).get<std::vector<std::string>>();
     frontend_ = std::make_unique<paraformer::AudioFrontend>(cmvn);
+    if (!FLAGS_vad_model.empty()) {
+      std::vector<uint8_t> vad_cmvn_bytes;
+      if (!read_file(FLAGS_cmvn_vad, vad_cmvn_bytes) ||
+          vad_cmvn_bytes.size() != 800 * sizeof(float)) {
+        return;
+      }
+      std::vector<float> vad_cmvn(800);
+      std::memcpy(vad_cmvn.data(), vad_cmvn_bytes.data(), vad_cmvn_bytes.size());
+      vad_module_ = std::make_unique<Module>(FLAGS_vad_model, Module::LoadMode::Mmap);
+      if (vad_module_->load() != Error::Ok || vad_module_->load_forward() != Error::Ok) {
+        return;
+      }
+      vad_frontend_ = std::make_unique<fsmn_vad::VadFrontend>(vad_cmvn);
+      vad_caches_.assign(4 * kVadProj * kVadCacheFrames, 0);
+      vad_enabled_ = true;
+    }
     valid_ = true;
   }
 
@@ -1134,6 +1218,14 @@ class StreamingSession {
   const std::string& text() const { return text_; }
   size_t audio_bytes() const { return audio_bytes_; }
   size_t chunks() const { return chunk_index_; }
+
+  // Completed VAD segments (start/end ms and the text assigned to them), in
+  // order. Drained by the TCP loop after each feed.
+  std::vector<std::pair<fsmn_vad::VadSegment, std::string>> take_segments() {
+    std::vector<std::pair<fsmn_vad::VadSegment, std::string>> out;
+    out.swap(segments_out_);
+    return out;
+  }
 
   int feed(const uint8_t* pcm_bytes, size_t byte_count, bool final) {
     if (!valid_ || finalized_ || (byte_count & 1)) {
@@ -1159,23 +1251,33 @@ class StreamingSession {
       auto features = frontend_->Accept(samples.data() + offset, count, sub_final);
       pending_features_.insert(pending_features_.end(), features.begin(), features.end());
       while (pending_features_.size() >= 10) {
-        std::vector<std::array<float, 560>> batch(pending_features_.begin(), pending_features_.begin() + 10);
+        std::vector<std::array<float, 560>> batch(
+            pending_features_.begin(), pending_features_.begin() + 10);
         pending_features_.erase(pending_features_.begin(), pending_features_.begin() + 10);
-        if (process_features(batch, false) != 0) {
-          return 3;
+        const int status = record_chunk(batch, false);
+        if (status != 0) {
+          return status;
         }
       }
       if (sub_final) {
         if (!pending_features_.empty()) {
-          std::vector<std::array<float, 560>> batch(pending_features_.begin(), pending_features_.end());
+          std::vector<std::array<float, 560>> batch(
+              pending_features_.begin(), pending_features_.end());
           pending_features_.clear();
-          if (process_features(batch, true) != 0) {
-            return 3;
+          const int status = record_chunk(batch, true);
+          if (status != 0) {
+            return status;
           }
         }
         break;
       }
       offset += count;
+    }
+
+    if (vad_enabled_) {
+      if (feed_vad(samples, final) != 0) {
+        return 3;
+      }
     }
     return 0;
   }
@@ -1188,7 +1290,8 @@ class StreamingSession {
     if (chunk_index_ * 10 >= (size_t{1} << 40)) {
       return 1;
     }
-    std::vector<uint16_t> enc_input(3 + 10 * 560 + 2 * 50 * 4 * 50 * 128 + 5 * 560 + 4);
+    enc_input_.resize(kEncoderBaseValues);
+    std::vector<uint16_t>& enc_input = enc_input_;
     const int64_t position = static_cast<int64_t>(chunk_index_ * 10);
     enc_input[0] = half_bits(static_cast<float>(std::min<int64_t>(position, 2048)));
     enc_input[1] = half_bits(static_cast<float>(features.size()));
@@ -1256,10 +1359,12 @@ class StreamingSession {
       }
       decoder_started_ = true;
       for (size_t row = 0; row < nvalid; ++row) {
+        const uint16_t* logits = reinterpret_cast<const uint16_t*>(
+            dec[0].data() + row * 8404 * sizeof(uint16_t));
         size_t best = 0;
         float score = -INFINITY;
         for (size_t col = 0; col < 8404; ++col) {
-          const float value = half_value(read_half(dec[0], row * 8404 + col));
+          const float value = fp16_to_float(logits[col]);
           if (value > score) {
             score = value;
             best = col;
@@ -1285,15 +1390,80 @@ class StreamingSession {
     return 0;
   }
 
+  int record_chunk(const std::vector<std::array<float, 560>>& batch, bool final) {
+    const int64_t center = static_cast<int64_t>(chunk_index_) * 600 + 300;
+    const size_t before = text_.size();
+    const int status = process_features(batch, final);
+    if (status != 0) {
+      return status;
+    }
+    if (vad_enabled_) {
+      pf_chunks_.push_back({center, text_.substr(before)});
+    }
+    return 0;
+  }
+
+  int feed_vad(const std::vector<float>& samples, bool final) {
+    all_samples_.insert(all_samples_.end(), samples.begin(), samples.end());
+    for (size_t offset = 0; offset < samples.size() || (final && offset == samples.size());) {
+      const size_t count = std::min<size_t>(9600, samples.size() - offset);
+      const bool sub_final = final && offset + count == samples.size();
+      auto features = vad_frontend_->Accept(samples.data() + offset, count, sub_final);
+      vad_pending_.insert(vad_pending_.end(), features.begin(), features.end());
+      while (vad_pending_.size() >= static_cast<size_t>(FLAGS_vad_chunk) ||
+             (sub_final && !vad_pending_.empty())) {
+        const size_t valid = std::min<size_t>(FLAGS_vad_chunk, vad_pending_.size());
+        std::vector<float> psil;
+        if (!run_vad_encoder(*vad_module_, vad_caches_, vad_pending_, valid, psil)) {
+          return 1;
+        }
+        vad_pending_.erase(vad_pending_.begin(), vad_pending_.begin() + valid);
+        std::vector<float> decibel(valid);
+        for (size_t j = 0; j < valid; ++j) {
+          decibel[j] = decibel_at(all_samples_, vad_frames_ + j);
+        }
+        const bool is_last = sub_final && vad_pending_.empty();
+        auto got = vad_decoder_.Accept(decibel.data(), psil.data(), valid, is_last);
+        for (const auto& seg : got) {
+          std::string seg_text;
+          while (pf_flush_ < pf_chunks_.size() &&
+                 pf_chunks_[pf_flush_].center_ms < seg.end_ms) {
+            seg_text += pf_chunks_[pf_flush_].text;
+            ++pf_flush_;
+          }
+          segments_out_.emplace_back(seg, seg_text);
+        }
+        vad_frames_ += valid;
+      }
+      if (sub_final) {
+        break;
+      }
+      offset += count;
+    }
+    return 0;
+  }
+
   std::unordered_map<std::string, std::unique_ptr<Module>>& modules_;
   bool valid_ = false;
   bool finalized_ = false;
+  bool vad_enabled_ = false;
+  std::unique_ptr<Module> vad_module_;
+  std::unique_ptr<fsmn_vad::VadFrontend> vad_frontend_;
+  std::vector<float> vad_caches_;
+  std::vector<std::array<float, kVadFeat>> vad_pending_;
+  fsmn_vad::VadDecoder vad_decoder_;
+  int64_t vad_frames_ = 0;
+  std::vector<float> all_samples_;
+  std::vector<PfChunk> pf_chunks_;
+  size_t pf_flush_ = 0;
+  std::vector<std::pair<fsmn_vad::VadSegment, std::string>> segments_out_;
   bool decoder_started_ = false;
   size_t audio_bytes_ = 0;
   size_t chunk_index_ = 0;
   std::unique_ptr<paraformer::AudioFrontend> frontend_;
   std::vector<std::string> tokens_;
   std::vector<std::array<float, 560>> pending_features_;
+  std::vector<uint16_t> enc_input_;
   std::vector<uint8_t> enc_state_ = std::vector<uint8_t>(2 * 50 * 4 * 50 * 128 * 2);
   std::vector<uint8_t> overlap_ = std::vector<uint8_t>(5 * 560 * 2);
   std::vector<uint8_t> fsmn_ = std::vector<uint8_t>(16 * 512 * 26 * 2);
@@ -1366,7 +1536,7 @@ int serve_tcp_audio(int port,
   }
   std::printf("READY tcp=127.0.0.1:%d\n", port);
   std::fflush(stdout);
-  constexpr uint32_t kMaxAudioBytes = 64u * 1024u * 1024u;
+  constexpr uint32_t kMaxAudioBytes = 256u * 1024u * 1024u;
   while (true) {
     const int client = accept(listener, nullptr, nullptr);
     if (client < 0) {
@@ -1410,6 +1580,17 @@ int serve_tcp_audio(int port,
         }
         const uint32_t text_length = static_cast<uint32_t>(session->text().size());
         send_frame(client, 0x81, session->text().data(), text_length);
+        for (const auto& segment : session->take_segments()) {
+          const uint32_t start = static_cast<uint32_t>(segment.first.start_ms);
+          const uint32_t end = static_cast<uint32_t>(segment.first.end_ms);
+          const uint32_t length = static_cast<uint32_t>(segment.second.size());
+          std::vector<uint8_t> payload(12 + length);
+          std::memcpy(payload.data(), &start, sizeof(start));
+          std::memcpy(payload.data() + 4, &end, sizeof(end));
+          std::memcpy(payload.data() + 8, &length, sizeof(length));
+          std::memcpy(payload.data() + 12, segment.second.data(), length);
+          send_frame(client, 0x83, payload.data(), static_cast<uint32_t>(payload.size()));
+        }
       } else {
         if (!session || session->feed(nullptr, 0, true) != 0 || session->audio_bytes() == 0) {
           const uint32_t status = 8;
@@ -1427,6 +1608,17 @@ int serve_tcp_audio(int port,
         std::memcpy(result.data() + 8, &audio_ms, sizeof(uint32_t));
         std::memcpy(result.data() + 12, &text_length, sizeof(uint32_t));
         std::memcpy(result.data() + 16, session->text().data(), text_length);
+        for (const auto& segment : session->take_segments()) {
+          const uint32_t start = static_cast<uint32_t>(segment.first.start_ms);
+          const uint32_t end = static_cast<uint32_t>(segment.first.end_ms);
+          const uint32_t length = static_cast<uint32_t>(segment.second.size());
+          std::vector<uint8_t> payload(12 + length);
+          std::memcpy(payload.data(), &start, sizeof(start));
+          std::memcpy(payload.data() + 4, &end, sizeof(end));
+          std::memcpy(payload.data() + 8, &length, sizeof(length));
+          std::memcpy(payload.data() + 12, segment.second.data(), length);
+          send_frame(client, 0x83, payload.data(), static_cast<uint32_t>(payload.size()));
+        }
         send_frame(client, 0x82, result.data(), static_cast<uint32_t>(result.size()));
         ended = true;
       }

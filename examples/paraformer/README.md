@@ -52,7 +52,7 @@ Set `PORT` or `LOG` in the environment to override the defaults (`9000` and
 
 The TCP service is streaming and permits only one active connection. Every
 message is a one-byte type followed by a little-endian `uint32` payload length
-and payload (maximum 64 MiB per request):
+and payload (maximum 256 MiB per session):
 
 | Type | Direction | Payload |
 | --- | --- | --- |
@@ -61,8 +61,17 @@ and payload (maximum 64 MiB per request):
 | `3` | client -> runner | `END`, empty payload |
 | `0x80` | runner -> client | start status, little-endian `uint32` |
 | `0x81` | runner -> client | UTF-8 partial text |
+| `0x83` | runner -> client | segment: `start_ms`, `end_ms`, `text_length`, text |
 | `0x82` | runner -> client | final payload: status, elapsed_ms, audio_ms, text_length, text |
 | `0x7f` | runner -> client | error status, little-endian `uint32` |
+
+When the FSMN-VAD PTE is passed (`--vad_model` plus `--cmvn_vad`), the runner
+also endpoints the stream and emits one `0x83` frame per detected utterance,
+carrying its start and end in milliseconds and the text assigned to it. The
+Paraformer state is not reset at a boundary; each 600 ms chunk's tokens go to the
+segment nearest its center, so the concatenated segment text matches the
+continuous transcript. Without the VAD arguments the runner sends no `0x83`
+frames and the client sees only partial and final text.
 
 The runner emits a partial-text frame whenever an audio frame produces a new
 acoustic chunk. The final response contains recognition wall time and audio
