@@ -218,7 +218,7 @@ class RunnerClient:
             _send_frame(sock, END, b"")
             while True:
                 frame_type, payload = _recv_frame(sock)
-                if frame_type == PARTIAL or frame_type == SEGMENT:
+                if frame_type in (PARTIAL, SEGMENT, DIAR):
                     continue
                 if frame_type == FINAL:
                     return _parse_final(payload)
