@@ -1002,6 +1002,12 @@ _BINARY = {
         / (1.0 + np.exp(-b.astype(np.float32)))
     ).astype(np.float16),
     8: lambda a, b: np.maximum(a + b, np.float16(0)),  # add_relu
+    # greater and less are the kernel's compare, whose result the
+    # CMP_FP16_TO_INT32 task writes as an int32 0/1 mask (eltwise_ops.cc:55).
+    # They are returned as bool here and cast to the output slot's width in
+    # _run_binary, so a graph that keeps the mask in fp16 still works.
+    9: lambda a, b: a > b,
+    10: lambda a, b: a < b,
     11: lambda a, b: ((a.astype(np.float32) - b.astype(np.float32)) ** 2).astype(
         np.float16
     ),
@@ -1058,7 +1064,16 @@ def _run_binary(command: Command, params: List[int], arena: Arena) -> None:
         off0 += coord * in0_strides[d]
         off1 += coord * in1_strides[d]
 
-    out = _BINARY[op_type](in0[off0], in1[off1])
+    raw = _BINARY[op_type](in0[off0], in1[off1])
+    # The compare tasks write int32 while the arithmetic ones write fp16; the
+    # output slot's width, not the op, is what says which.
+    width = (refs[2].size // out_size) if out_size else FP16_BYTES
+    if raw.dtype == np.bool_:
+        out = raw.astype(np.int32) if width == 4 else raw.astype(np.float16)
+    elif width == 4:
+        out = raw.astype(np.float32)
+    else:
+        out = raw.astype(np.float16)
     _store(arena, arena.address(refs[2]), out.tobytes())
 
 
@@ -1120,6 +1135,9 @@ def _run_zero(command: Command, params: List[int], arena: Arena) -> None:
 #: condBytes param. The kernel tests one whole element against zero, so a
 #: one-byte condition is a byte per flag and nothing wider (eltwise_ops.cc:2116).
 _COND_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32}
+#: The true/false operand widths a select may carry: fp16, and the one-byte
+#: torch.bool a mask-changing where leaves behind.
+_VALUE_DTYPES = {1: np.uint8, 2: np.uint16, 4: np.uint32}
 
 
 def _run_select(command: Command, params: List[int], arena: Arena) -> None:
@@ -1149,7 +1167,7 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
     if out_size <= 0:
         # The kernel returns before it walks anything.
         return
-    if bytes_ != FP16_BYTES or cond_bytes not in _COND_DTYPES:
+    if bytes_ not in _VALUE_DTYPES or cond_bytes not in _COND_DTYPES:
         raise UnsupportedOp(
             f"blob: a select over {bytes_}-byte values with {cond_bytes}-byte "
             "conditions is not modelled"
@@ -1182,13 +1200,16 @@ def _run_select(command: Command, params: List[int], arena: Arena) -> None:
     cond_at = walk(cond_size, "condition")
     in1_at = walk(in1_size, "true value")
     in2_at = walk(in2_size, "false value")
+    value_dtype = _VALUE_DTYPES[bytes_]
     cond = read(cond_ref, _COND_DTYPES[cond_bytes], int(cond_at.max()) + 1)
-    in1 = read(in1_ref, np.uint16, int(in1_at.max()) + 1)
-    in2 = read(in2_ref, np.uint16, int(in2_at.max()) + 1)
+    in1 = read(in1_ref, value_dtype, int(in1_at.max()) + 1)
+    in2 = read(in2_ref, value_dtype, int(in2_at.max()) + 1)
     _store(
         arena,
         arena.address(out_ref),
-        np.where(cond[cond_at] != 0, in1[in1_at], in2[in2_at]).tobytes(),
+        np.where(cond[cond_at] != 0, in1[in1_at], in2[in2_at])
+        .astype(value_dtype)
+        .tobytes(),
     )
 
 
