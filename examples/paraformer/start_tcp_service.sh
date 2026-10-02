@@ -4,10 +4,27 @@ set -eu
 
 BASE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PORT=${PORT:-9000}
-RUNNER=${RUNNER:-"$BASE_DIR/paraformer_runner_vad"}
 LOG=${LOG:-"$BASE_DIR/paraformer_tcp_stream.log"}
 VAD_MODEL=${VAD_MODEL:-"$BASE_DIR/fsmn/fsmn_vad_enc_T20.pte"}
 VAD_CMVN=${VAD_CMVN:-"$BASE_DIR/fsmn/cmvn.bin"}
+
+# Prefer the VAD+CAM++ build, then the VAD build.
+if [ -z "${RUNNER:-}" ]; then
+  if [ -x "$BASE_DIR/paraformer_runner_spk" ]; then
+    RUNNER="$BASE_DIR/paraformer_runner_spk"
+  else
+    RUNNER="$BASE_DIR/paraformer_runner_vad"
+  fi
+fi
+# Prefer the encoder with the fp16 score clamp; it is the one that does not
+# overflow on loud far-field meetings.
+if [ -z "${MODEL:-}" ]; then
+  if [ -f "$BASE_DIR/encp_one_min.pte" ]; then
+    MODEL="$BASE_DIR/encp_one_min.pte"
+  else
+    MODEL="$BASE_DIR/encp_one.pte"
+  fi
+fi
 RUNNER_NAME=${RUNNER##*/}
 
 if [ ! -x "$RUNNER" ]; then
@@ -15,12 +32,16 @@ if [ ! -x "$RUNNER" ]; then
   exit 1
 fi
 
-for path in cmvn.bin tokens.json encp_one.pte pred15.pte decoder16_first.pte decoder16_next.pte; do
+for path in cmvn.bin tokens.json pred15.pte decoder16_first.pte decoder16_next.pte; do
   if [ ! -f "$BASE_DIR/$path" ]; then
     echo "missing asset: $BASE_DIR/$path" >&2
     exit 1
   fi
 done
+if [ ! -f "$MODEL" ]; then
+  echo "missing encoder: $MODEL" >&2
+  exit 1
+fi
 
 # FSMN-VAD endpointing is enabled when its PTE and CMVN are present.
 VAD_FLAGS=""
@@ -52,7 +73,7 @@ nohup "$RUNNER" \
   --tcp_tmp_dir "$BASE_DIR" \
   --cmvn "$BASE_DIR/cmvn.bin" \
   --tokens "$BASE_DIR/tokens.json" \
-  --model_path "$BASE_DIR/encp_one.pte" \
+  --model_path "$MODEL" \
   --predictor "$BASE_DIR/pred15.pte" \
   --decoder_first "$BASE_DIR/decoder16_first.pte" \
   --decoder_next "$BASE_DIR/decoder16_next.pte" \

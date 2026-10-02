@@ -16,8 +16,9 @@ let busy = false;
 let recording = false;
 let sessionId = null;
 let eventSource = null;
-let segmentText = "";
-let sawSegments = false;
+let segments = [];
+let partialText = "";
+let flatText = "";
 let audioContext = null;
 let sourceNode = null;
 let processor = null;
@@ -47,6 +48,56 @@ function showSpeed(data) {
     return;
   }
   speedEl.textContent = `RTF ${Number(data.rtf).toFixed(3)} · 音频 ${data.audio_ms} ms · 耗时 ${data.elapsed_ms} ms`;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+}
+
+// One speaker gets one colour, so a change of voice is a change of colour.
+function speakerClass(speaker) {
+  return speaker >= 0 ? `spk-${speaker % 6}` : "";
+}
+
+function renderTranscript() {
+  const rows = [];
+  for (const seg of segments) {
+    const cls = speakerClass(seg.speaker);
+    const time =
+      seg.start_ms != null
+        ? `<span class="time">${(seg.start_ms / 1000).toFixed(1)}–${(seg.end_ms / 1000).toFixed(1)}s</span>`
+        : "";
+    const who =
+      seg.speaker >= 0 ? `<span class="who ${cls}">说话人${seg.speaker}</span>` : "";
+    rows.push(`<p class="seg ${cls ? `spk-bg-${seg.speaker % 6}` : ""}">${time}${who}${escapeHtml(seg.text)}</p>`);
+  }
+  if (!segments.length) {
+    if (flatText) {
+      rows.push(`<p class="seg">${escapeHtml(flatText)}</p>`);
+    } else if (partialText) {
+      rows.push(`<p class="seg partial">${escapeHtml(partialText)}</p>`);
+    } else {
+      rows.push(`<p class="placeholder">识别文字会显示在这里</p>`);
+    }
+  }
+  resultEl.innerHTML = rows.join("");
+  resultEl.scrollTop = resultEl.scrollHeight;
+}
+
+function transcriptText() {
+  if (segments.length) {
+    return segments
+      .map((seg) => (seg.speaker >= 0 ? `说话人${seg.speaker} ` : "") + seg.text)
+      .join("\n");
+  }
+  return flatText || "";
+}
+
+function resetTranscript() {
+  segments = [];
+  partialText = "";
+  flatText = "";
+  renderTranscript();
 }
 
 function floatToInt16(input) {
@@ -132,37 +183,43 @@ function openEvents() {
   eventSource = new EventSource(api(`api/session/${sessionId}/events`));
   eventSource.addEventListener("partial", (event) => {
     const data = JSON.parse(event.data);
-    if (sawSegments) {
+    if (segments.length) {
       return;
     }
-    resultEl.value = data.text || "";
+    partialText = data.text || "";
+    renderTranscript();
     setStatus("识别中…");
   });
   eventSource.addEventListener("segment", (event) => {
     const data = JSON.parse(event.data);
-    sawSegments = true;
-    const who = data.speaker >= 0 ? `说话人${data.speaker} ` : "";
-    const line = `[${(data.start_ms / 1000).toFixed(2)}-${(data.end_ms / 1000).toFixed(2)}s] ${who}${data.text}`;
-    segmentText += (segmentText ? "\n" : "") + line;
-    resultEl.value = segmentText;
+    segments.push({
+      start_ms: data.start_ms,
+      end_ms: data.end_ms,
+      speaker: data.speaker,
+      text: data.text,
+    });
+    partialText = "";
+    renderTranscript();
     setStatus("识别中…");
   });
   eventSource.addEventListener("diarization", (event) => {
     const data = JSON.parse(event.data);
-    const segments = data.segments || [];
-    segmentText = segments
-      .map((seg) => {
-        const who = seg.speaker >= 0 ? `说话人${seg.speaker} ` : "";
-        return `[${(seg.start_ms / 1000).toFixed(2)}-${(seg.end_ms / 1000).toFixed(2)}s] ${who}${seg.text}`;
-      })
-      .join("\n");
-    sawSegments = true;
-    resultEl.value = segmentText;
+    // The final relabelled segment list replaces the provisional online one.
+    segments = (data.segments || []).map((seg) => ({
+      start_ms: seg.start_ms,
+      end_ms: seg.end_ms,
+      speaker: seg.speaker,
+      text: seg.text,
+    }));
+    renderTranscript();
   });
   eventSource.addEventListener("done", (event) => {
     const data = JSON.parse(event.data);
-    resultEl.value = sawSegments ? segmentText : (data.text || "");
-    copyButton.disabled = !resultEl.value;
+    if (!segments.length) {
+      flatText = data.text || "";
+      renderTranscript();
+    }
+    copyButton.disabled = !transcriptText();
     showSpeed(data);
     setStatus(data.status === 0 ? "完成" : `识别失败（status ${data.status}）`, data.status !== 0);
     finished = true;
@@ -208,9 +265,7 @@ async function releaseMic() {
 async function startRecording() {
   setBusy(true);
   setStatus("请求麦克风…");
-  resultEl.value = "";
-  segmentText = "";
-  sawSegments = false;
+  resetTranscript();
   speedEl.textContent = "";
   copyButton.disabled = true;
   finished = false;
@@ -332,9 +387,7 @@ async function transcribeFile(file) {
   if (!file || busy) return;
   setBusy(true);
   setStatus(`读取 ${file.name} …`);
-  resultEl.value = "";
-  segmentText = "";
-  sawSegments = false;
+  resetTranscript();
   speedEl.textContent = "";
   copyButton.disabled = true;
   try {
@@ -348,8 +401,9 @@ async function transcribeFile(file) {
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     if (data.status !== 0) throw new Error(`识别失败（runner status ${data.status}）`);
-    resultEl.value = data.text || "";
-    copyButton.disabled = !resultEl.value;
+    flatText = data.text || "";
+    renderTranscript();
+    copyButton.disabled = !transcriptText();
     showSpeed(data);
     setStatus(data.text ? "完成" : "未识别到文字");
   } catch (error) {
@@ -382,7 +436,7 @@ drop.addEventListener("drop", (event) => {
 
 copyButton.addEventListener("click", async () => {
   try {
-    await navigator.clipboard.writeText(resultEl.value);
+    await navigator.clipboard.writeText(transcriptText());
     setStatus("已复制");
   } catch (error) {
     setStatus("复制失败：" + (error.message || error), true);

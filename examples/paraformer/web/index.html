@@ -32,7 +32,9 @@
     <section class="panel">
       <h2>识别结果</h2>
       <div id="status" class="status"></div>
-      <textarea id="result" rows="6" readonly placeholder="识别文字会显示在这里"></textarea>
+      <div id="result" class="transcript" aria-live="polite">
+        <p class="placeholder">识别文字会显示在这里</p>
+      </div>
       <div class="footer">
         <button id="copy" class="ghost" disabled>复制</button>
         <span id="speed" class="speed"></span>

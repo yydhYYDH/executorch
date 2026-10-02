@@ -129,3 +129,52 @@ textarea {
   font-variant-numeric: tabular-nums;
   text-align: right;
 }
+
+.transcript {
+  min-height: 140px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: #0c0e12;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.transcript .placeholder { color: var(--muted); margin: 0; }
+
+.transcript .seg {
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border-left: 3px solid var(--line);
+  background: rgba(255, 255, 255, .02);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.transcript .seg .time {
+  color: var(--muted);
+  font-size: 12px;
+  margin-right: 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.transcript .seg .who { font-weight: 600; margin-right: 8px; }
+.transcript .seg.partial { opacity: .55; font-style: italic; }
+
+/* A fixed colour per speaker so different voices read apart at a glance. */
+.spk-0 { color: #4f8cff; }
+.spk-1 { color: #f2a33c; }
+.spk-2 { color: #59d18c; }
+.spk-3 { color: #d76cff; }
+.spk-4 { color: #ff6b8a; }
+.spk-5 { color: #3cc9d1; }
+
+.seg.spk-bg-0 { border-left-color: #4f8cff; background: rgba(79, 140, 255, .07); }
+.seg.spk-bg-1 { border-left-color: #f2a33c; background: rgba(242, 163, 60, .07); }
+.seg.spk-bg-2 { border-left-color: #59d18c; background: rgba(89, 209, 140, .07); }
+.seg.spk-bg-3 { border-left-color: #d76cff; background: rgba(215, 108, 255, .07); }
+.seg.spk-bg-4 { border-left-color: #ff6b8a; background: rgba(255, 107, 138, .07); }
+.seg.spk-bg-5 { border-left-color: #3cc9d1; background: rgba(60, 201, 209, .07); }

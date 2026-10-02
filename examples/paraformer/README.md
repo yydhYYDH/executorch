@@ -62,6 +62,7 @@ and payload (maximum 256 MiB per session):
 | `0x80` | runner -> client | start status, little-endian `uint32` |
 | `0x81` | runner -> client | UTF-8 partial text |
 | `0x83` | runner -> client | segment: `start_ms`, `end_ms`, `speaker`, `text_length`, text |
+| `0x84` | runner -> client | diarization: `count`, then `count` records of (`start_ms`, `end_ms`, `speaker`, `text_length`, text); the final labels |
 | `0x82` | runner -> client | final payload: status, elapsed_ms, audio_ms, text_length, text |
 | `0x7f` | runner -> client | error status, little-endian `uint32` |
 
@@ -72,6 +73,26 @@ Paraformer state is not reset at a boundary; each 600 ms chunk's tokens go to th
 segment nearest its center, so the concatenated segment text matches the
 continuous transcript. Without the VAD arguments the runner sends no `0x83`
 frames and the client sees only partial and final text.
+
+### Speaker attribution
+
+Pass a CAM++ speaker PTE with `--spk_model` (a CPU/XNNPACK `.pte`) to label each
+segment. For every segment at least `--spk_min_ms` long (default 1500) the runner
+computes a speaker embedding on the CPU from the segment's 80-mel fbank with its
+time mean removed, and:
+
+- the file path clusters the embeddings offline with average-linkage
+  agglomerative clustering at `--spk_threshold` (default 0.35) and prints
+  `SEG start end SPK<n> text`;
+- the TCP session assigns each new segment to the nearest centroid online and
+  carries that speaker in the `0x83` frame, then at `END` sends one `0x84` frame
+  with the same embeddings relabelled by the offline clustering, so the client
+  can replace the provisional labels.
+
+`--vad_mode continuous` (default) keeps the Paraformer state and splits tokens by
+chunk time; `--vad_mode reset` flushes the accumulated text at each endpoint and
+resets the model. `--vad_realtime` (default on) prints file-mode segments as they
+close instead of after the run.
 
 The runner emits a partial-text frame whenever an audio frame produces a new
 acoustic chunk. The final response contains recognition wall time and audio
@@ -87,12 +108,16 @@ shared. A new connection starts a fresh recognition session.
   synchronous `POST /api/transcribe` (raw 16 kHz mono signed 16-bit PCM, or a
   WAV whose `data` chunk is used) and a streaming session API:
   `POST /api/session`, `POST /api/session/<id>/audio`, `POST /api/session/<id>/end`,
-  `GET /api/session/<id>/events` (Server-Sent Events: `partial` then `done` with
-  `elapsed_ms`, `audio_ms`, `rtf`), and `DELETE /api/session/<id>`.
+  `GET /api/session/<id>/events` (Server-Sent Events: `partial` with the running
+  text, `segment` with each closed utterance and its speaker, `diarization` with
+  the final relabelled utterance list, then `done` with `elapsed_ms`, `audio_ms`,
+  `rtf`), and `DELETE /api/session/<id>`.
 - `index.html`, `app.js`, `style.css` capture microphone PCM live, stream it to
-  the runner, and show partial text as it is recognized; uploaded files are
-  decoded to 16 kHz mono and sent in one request. Both paths display the
-  recognition speed.
+  the runner, and render each utterance as a row with its time span and speaker;
+  each speaker gets a fixed colour so a change of voice is a change of colour,
+  and the `diarization` event redraws the rows with the final labels. Uploaded
+  files are decoded to 16 kHz mono and sent in one request. Both paths display
+  the recognition speed.
 
 ```bash
 python3 examples/paraformer/web/server.py --runner-port 9000 --listen-port 8020
