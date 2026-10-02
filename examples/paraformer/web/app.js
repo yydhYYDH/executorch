@@ -71,14 +71,24 @@ function renderTranscript() {
       seg.speaker >= 0 ? `<span class="who ${cls}">说话人${seg.speaker}</span>` : "";
     rows.push(`<p class="seg ${cls ? `spk-bg-${seg.speaker % 6}` : ""}">${time}${who}${escapeHtml(seg.text)}</p>`);
   }
-  if (!segments.length) {
-    if (flatText) {
-      rows.push(`<p class="seg">${escapeHtml(flatText)}</p>`);
-    } else if (partialText) {
-      rows.push(`<p class="seg partial">${escapeHtml(partialText)}</p>`);
-    } else {
-      rows.push(`<p class="placeholder">识别文字会显示在这里</p>`);
+  if (segments.length) {
+    // The partial text is cumulative; the part past the closed segments is the
+    // utterance still in progress, shown live so it does not wait for the VAD
+    // to close it.
+    const closed = segments.map((seg) => seg.text).join("");
+    let tail = partialText;
+    if (tail.startsWith(closed)) {
+      tail = tail.slice(closed.length);
     }
+    if (tail) {
+      rows.push(`<p class="seg partial">${escapeHtml(tail)}</p>`);
+    }
+  } else if (flatText) {
+    rows.push(`<p class="seg">${escapeHtml(flatText)}</p>`);
+  } else if (partialText) {
+    rows.push(`<p class="seg partial">${escapeHtml(partialText)}</p>`);
+  } else {
+    rows.push(`<p class="placeholder">识别文字会显示在这里</p>`);
   }
   resultEl.innerHTML = rows.join("");
   resultEl.scrollTop = resultEl.scrollHeight;
@@ -183,9 +193,6 @@ function openEvents() {
   eventSource = new EventSource(api(`api/session/${sessionId}/events`));
   eventSource.addEventListener("partial", (event) => {
     const data = JSON.parse(event.data);
-    if (segments.length) {
-      return;
-    }
     partialText = data.text || "";
     renderTranscript();
     setStatus("识别中…");
