@@ -27,7 +27,10 @@ struct VadSegment {
 // the segments match FunASR.
 class VadDecoder {
  public:
-  VadDecoder();
+  // `max_end_silence_ms` is the FunASR max_end_silence_time: how long the
+  // speaker may pause before the current utterance is closed. Larger values
+  // give longer, fewer segments.
+  explicit VadDecoder(int64_t max_end_silence_ms = 800);
 
   // Feed `n` consecutive frames. `decibel[t]` is 10*log10(sum of the 25 ms
   // window squared) and `psil[t]` is the encoder's silence probability
@@ -106,6 +109,7 @@ class VadDecoder {
   Frm pre_frame_state_ = Frm::Sil;
   int sil_to_speech_frmcnt_thres_ = 0;
   int speech_to_sil_frmcnt_thres_ = 0;
+  int64_t max_end_sil_frame_cnt_thresh_ = kMaxEndSilenceMs - kSpeechToSilMs;
 
   // Stats.
   int64_t data_buf_start_frame_ = 0;

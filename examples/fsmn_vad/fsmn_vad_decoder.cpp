@@ -14,11 +14,13 @@
 
 namespace fsmn_vad {
 
-VadDecoder::VadDecoder() {
+VadDecoder::VadDecoder(int64_t max_end_silence_ms) {
   win_size_frame_ = static_cast<int>(kWindowSizeMs / kFrameInMs);
   win_state_.assign(win_size_frame_, 0);
   sil_to_speech_frmcnt_thres_ = static_cast<int>(kSilToSpeechMs / kFrameInMs);
   speech_to_sil_frmcnt_thres_ = static_cast<int>(kSpeechToSilMs2 / kFrameInMs);
+  max_end_sil_frame_cnt_thresh_ =
+      std::max<int64_t>(max_end_silence_ms - kSpeechToSilMs, 1);
 }
 
 int64_t VadDecoder::LatencyFrmNumAtStartPoint() const {
@@ -230,8 +232,8 @@ void VadDecoder::DetectOneFrame(
       }
     } else if (vad_state_ == 2) {
       if (continous_silence_frame_count_ * frm_shift_in_ms >=
-          kMaxEndSilFrameCntThresh) {
-        int64_t lookback_frame = kMaxEndSilFrameCntThresh / frm_shift_in_ms;
+          max_end_sil_frame_cnt_thresh_) {
+        int64_t lookback_frame = max_end_sil_frame_cnt_thresh_ / frm_shift_in_ms;
         if (kDoExtend) {
           lookback_frame -= kLookAheadEndMs / frm_shift_in_ms;
           lookback_frame -= 1;

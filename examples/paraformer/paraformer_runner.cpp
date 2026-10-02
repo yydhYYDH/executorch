@@ -78,6 +78,11 @@ DEFINE_string(decoder_first, "", "First decoder .pte for direct audio input.");
 DEFINE_string(decoder_next, "", "Subsequent decoder .pte for direct audio input.");
 DEFINE_string(vad_model, "", "Optional FSMN-VAD encoder .pte; enables VAD endpointing.");
 DEFINE_string(cmvn_vad, "", "Float32 CMVN asset for the VAD (2 x 400 values).");
+DEFINE_int32(
+    vad_max_end_sil_ms,
+    1600,
+    "VAD: close an utterance after this much trailing silence (ms). Larger "
+    "gives longer, fewer segments.");
 DEFINE_string(spk_model, "", "Optional CAM++ speaker .pte; tags each segment with a speaker.");
 DEFINE_double(spk_threshold, 0.35, "Cosine threshold for merging speaker embeddings.");
 DEFINE_int32(spk_min_ms, 1500, "Segments shorter than this get no own speaker decision.");
@@ -1068,7 +1073,7 @@ int transcribe_audio_vad(
 
   paraformer::AudioFrontend frontend(cmvn);
   fsmn_vad::VadFrontend vad_frontend(vad_cmvn);
-  fsmn_vad::VadDecoder vad_decoder;
+  fsmn_vad::VadDecoder vad_decoder(FLAGS_vad_max_end_sil_ms);
 
   std::vector<uint8_t> enc_state(2 * 50 * 4 * 50 * 128 * 2);
   std::vector<uint8_t> overlap(5 * 560 * 2);
@@ -1473,6 +1478,7 @@ class StreamingSession {
       }
       vad_frontend_ = std::make_unique<fsmn_vad::VadFrontend>(vad_cmvn);
       vad_caches_.assign(4 * kVadProj * kVadCacheFrames, 0);
+      vad_decoder_ = fsmn_vad::VadDecoder(FLAGS_vad_max_end_sil_ms);
       vad_enabled_ = true;
     }
     if (!FLAGS_spk_model.empty()) {
