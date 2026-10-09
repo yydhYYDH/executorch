@@ -105,8 +105,8 @@ include_directories(
   ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include
   ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/qurt
   ${HEXAGON_SDK_ROOT}/rtos/qurt/compute${SKEL_ARCH}/include/posix
-  ${IDL_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
+  ${IDL_DIR}
 )
 
 set(_dsp ${MNN_OPS_ROOT}/src/dsp)

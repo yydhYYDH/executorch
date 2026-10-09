@@ -833,7 +833,21 @@ static inline void htp_ops_binary_compute_fp16_rhs_scalar_chunk(__fp16* dst, con
   const int vec_len = 128 / (int)sizeof(__fp16);
   uint16_t v1_u16 = *(uint16_t*)&val1;
   HVX_Vector v1_vec = Q6_Vh_vsplat_R(v1_u16);
-  if (opType == HTP_OPS_BINARY_ADD) {
+  if (opType == HTP_OPS_BINARY_DIV && val1 != 0 && __builtin_isfinite((float)val1)) {
+    const float inverse = 1.0f / (float)val1;
+    uint32_t inverse_bits;
+    memcpy(&inverse_bits, &inverse, sizeof(inverse_bits));
+    const HVX_Vector inverse_vec = Q6_V_vsplat_R(inverse_bits);
+    for (; i <= size - vec_len; i += vec_len) {
+      const HVX_Vector v0 = memLoadFunc((const HVX_Vector*)(src0 + i));
+      const HVX_VectorPair wide = Q6_Wsf_vcvt_Vhf(Q6_Vh_vshuff_Vh(v0));
+      const HVX_Vector low = Q6_Vsf_equals_Vqf32(
+          Q6_Vqf32_vmpy_VsfVsf(Q6_V_lo_W(wide), inverse_vec));
+      const HVX_Vector high = Q6_Vsf_equals_Vqf32(
+          Q6_Vqf32_vmpy_VsfVsf(Q6_V_hi_W(wide), inverse_vec));
+      vmemu(dst + i) = Q6_Vh_vdeal_Vh(Q6_Vhf_vcvt_VsfVsf(low, high));
+    }
+  } else if (opType == HTP_OPS_BINARY_ADD) {
     for (; i <= size - vec_len; i += vec_len) {
       HVX_Vector v0 = memLoadFunc((const HVX_Vector*)(src0 + i));
       HVX_Vector vr = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vadd_VhfVhf(v0, v1_vec));
@@ -1054,18 +1068,22 @@ static inline bool htp_ops_binary_try_broadcast_rows_fp16(uint8_t* dst, const ui
     return false;
   }
   const int row_len = outDims[dims - 1];
-  if (row_len <= 0 || row_len % 8 != 0) {
+  if (row_len <= 0) {
     return false;
   }
-  if (in0Strides[dims - 1] != 1 || in1Strides[dims - 1] != 1) {
+  const bool dense_rows = in0Strides[dims - 1] == 1 && in1Strides[dims - 1] == 1;
+  const bool rhs_scalar_rows = in0Strides[dims - 1] == 1 && in1Strides[dims - 1] == 0;
+  const bool lhs_scalar_rows = in0Strides[dims - 1] == 0 && in1Strides[dims - 1] == 1;
+  if (!dense_rows && !rhs_scalar_rows && !lhs_scalar_rows) {
     return false;
   }
-  // Every row this walks has to be a whole row of each input: a stride that is
-  // neither broadcast nor a multiple of the row length would mean an input row
-  // shorter than the output's, and reading across it would mix rows up.
+  // A dense input must advance by whole rows; a scalar input may advance once
+  // per row regardless of its outer strides.
   for (int i = 0; i < dims - 1; ++i) {
-    if ((in0Strides[i] != 0 && in0Strides[i] % row_len != 0) ||
-        (in1Strides[i] != 0 && in1Strides[i] % row_len != 0)) {
+    if ((in0Strides[dims - 1] == 1 && in0Strides[i] != 0 &&
+         in0Strides[i] % row_len != 0) ||
+        (in1Strides[dims - 1] == 1 && in1Strides[i] != 0 &&
+         in1Strides[i] % row_len != 0)) {
       return false;
     }
   }
@@ -1083,9 +1101,19 @@ static inline bool htp_ops_binary_try_broadcast_rows_fp16(uint8_t* dst, const ui
   int32_t off0 = 0;
   int32_t off1 = 0;
   for (int r = 0; r < rows; ++r) {
-    if (!htp_ops_binary_compute_fp16_flat(d + (size_t)r * row_len, s0 + off0, s1 + off1, row_len,
-                                          opType)) {
-      return false;
+    if (dense_rows) {
+      if (!htp_ops_binary_compute_fp16_flat(d + (size_t)r * row_len, s0 + off0,
+                                            s1 + off1, row_len, opType)) {
+        return false;
+      }
+    } else if (rhs_scalar_rows) {
+      htp_ops_binary_compute_fp16_rhs_scalar_chunk(
+          d + (size_t)r * row_len, s0 + off0, s1[off1], row_len, opType,
+          htp_ops_binary_pick_load_func(s0 + off0));
+    } else {
+      htp_ops_binary_compute_fp16_lhs_scalar_chunk(
+          d + (size_t)r * row_len, s0[off0], s1 + off1, row_len, opType,
+          htp_ops_binary_pick_load_func(s1 + off1));
     }
     for (int i = dims - 2; i >= 0; --i) {
       idx[i] += 1;
@@ -1134,7 +1162,10 @@ static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src
   // offset loop below costs more than the arithmetic does: a residual add over
   // 64x1024 contiguous elements took 80 ms through it.
   if (bytes == 2 && inputBytes == 2 && !htp_ops_binary_is_compare(opType)) {
-    bool contiguous = true;
+    bool in0_contiguous = true;
+    bool in1_contiguous = true;
+    bool in0_scalar = true;
+    bool in1_scalar = true;
     int32_t stride = 1;
     for (int i = dims - 1; i >= 0; --i) {
       // A dimension of size one is walked over a single index, so its stride is
@@ -1142,15 +1173,29 @@ static inline bool htp_ops_binary_try_broadcast(uint8_t* dst, const uint8_t* src
       // a transformer activation. Treating that as non-contiguous sent every
       // residual add and SwiGLU multiply through the per-row broadcast walker
       // (1024 calls per op) instead of one flat run over the whole tensor.
-      if (outDims[i] != 1 && (in0Strides[i] != stride || in1Strides[i] != stride)) {
-        contiguous = false;
-        break;
+      if (outDims[i] != 1) {
+        in0_contiguous &= in0Strides[i] == stride;
+        in1_contiguous &= in1Strides[i] == stride;
+        in0_scalar &= in0Strides[i] == 0;
+        in1_scalar &= in1Strides[i] == 0;
       }
       stride *= outDims[i];
     }
-    if (contiguous &&
+    if (in0_contiguous && in1_contiguous &&
         htp_ops_binary_compute_fp16_flat((__fp16*)dst, (const __fp16*)src0, (const __fp16*)src1,
                                          outSize, opType)) {
+      return true;
+    }
+    if (in0_contiguous && in1_scalar) {
+      htp_ops_binary_compute_fp16_rhs_scalar_chunk(
+          (__fp16*)dst, (const __fp16*)src0, ((const __fp16*)src1)[0], outSize, opType,
+          htp_ops_binary_pick_load_func(src0));
+      return true;
+    }
+    if (in1_contiguous && in0_scalar) {
+      htp_ops_binary_compute_fp16_lhs_scalar_chunk(
+          (__fp16*)dst, ((const __fp16*)src0)[0], (const __fp16*)src1, outSize, opType,
+          htp_ops_binary_pick_load_func(src1));
       return true;
     }
     if (htp_ops_binary_try_broadcast_rows_fp16(dst, src0, src1, opType, dims, outDims, in0Strides,

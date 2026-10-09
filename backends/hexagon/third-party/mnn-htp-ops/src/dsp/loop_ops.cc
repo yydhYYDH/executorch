@@ -693,7 +693,7 @@ static inline bool htp_ops_loop_hmx_dma_copy(void* dst, const void* src, size_t 
 }
 
 // Four descriptor slots keep the live chain tail separate from the two VTCM slots.
-struct HmxWeightDmaQueue {
+struct HmxDmaQueue {
     _Alignas(64) dma_desc_1d_t descs[4] = {};
     dma_desc_1d_t* tail = nullptr;
     unsigned push_idx = 0;
@@ -1025,20 +1025,30 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     // Raw activation staging: the 32-row block is copied in as one contiguous
     // run (a single 1D DMA out of DDR), then rearranged in VTCM.
     const size_t rawBytes = (size_t)pairPacks * 32 * 64 * sizeof(__fp16);
-    // Two 32x32 accumulator tiles are buffered so a pair of adjacent column
-    // groups can be written as one full 128-byte store per row.
-    const size_t outputBytes = 2048 * sizeof(__fp16);
+    // Batch accumulator stores before HVX writeback to reduce HMX/HVX switching.
+    const bool outputPipeline = E >= 32 && N >= 64;
+    const int outputTiles = outputPipeline ? 8 : (E >= 32 ? 16 : 2);
+    const size_t outputBytes = (size_t)outputTiles * 1024 * sizeof(__fp16) * (outputPipeline ? 2 : 1);
     // Keep as many 32-column weight blocks in VTCM as it takes and no more: the
     // whole matrix is K*N*2 bytes, past the unit's capacity for every transformer
     // shape, and the allocator cannot tell when it has run off the end.
+    uint8_t* vtcmPtr = (uint8_t*)vtcm_manager_get_vtcm_base();
+    uint8_t* vtcmEnd = (uint8_t*)vtcm_manager_get_vtcm_alloc_end();
+#ifndef HTP_OPS_DISABLE_WEIGHT_DMA
+    const bool prefetchActivation = E >= 64 && E % 32 == 0 && K % 64 == 0 &&
+        lp->src0StrideXYZ[0] == K * 2 && ((uintptr_t)src0Base & 127) == 0 &&
+        rawBytes <= 0xffffff && vtcmPtr != nullptr && vtcmEnd != nullptr &&
+        vtcmEnd > vtcmPtr && (size_t)(vtcmEnd - vtcmPtr) >=
+            2 * rawBytes + 2 * blockBytes + outputBytes + 256;
+#else
+    const bool prefetchActivation = false;
+#endif
     bool prepackedWeights = false;
     int plannedTiles = 0;
     htp_ops_loop_hmx_planned(lp, &prepackedWeights, &plannedTiles);
-    uint8_t* vtcmPtr = (uint8_t*)vtcm_manager_get_vtcm_base();
-    uint8_t* vtcmEnd = (uint8_t*)vtcm_manager_get_vtcm_alloc_end();
     int ntPerPass = 1;
     if (vtcmPtr != NULL && vtcmEnd != NULL) {
-        const uint8_t* fixedEnd = vtcmPtr + blockBytes + rawBytes + outputBytes + 256;
+        const uint8_t* fixedEnd = vtcmPtr + blockBytes + rawBytes * (prefetchActivation ? 2 : 1) + outputBytes + 256;
         if (vtcmEnd > fixedEnd) {
             ntPerPass = (int)((size_t)(vtcmEnd - fixedEnd) / blockBytes);
         }
@@ -1058,7 +1068,7 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
             ntPerPass = dmaTiles;
         }
     }
-    __fp16* vtcmActivationRaw = (__fp16*)vtcm_seq_alloc(&vtcmPtr, rawBytes);
+    __fp16* vtcmActivationRaw = (__fp16*)vtcm_seq_alloc(&vtcmPtr, rawBytes * (prefetchActivation ? 2 : 1));
     __fp16* vtcmActivation = (__fp16*)vtcm_seq_alloc(&vtcmPtr, blockBytes);
     // Every operand the unit loads has to be in VTCM: its loads address VTCM and
     // a weights-section pointer hangs the command instead of reading it, so the
@@ -1082,7 +1092,7 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
     unsigned long long mm_t0 = MM_T0(), mm_t = 0, mm_wfill = 0, mm_act = 0, mm_hmx = 0, mm_store = 0;
 #endif
 
-    HmxWeightDmaQueue weightQueue;
+    HmxDmaQueue weightQueue;
     __fp16* weightSlots = vtcmWeight;
     if (doubleBuffered) {
         dma_wait_for_idle();
@@ -1120,6 +1130,12 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 #if HTP_MM_PHASE_PROFILE
         mm_wfill += MM_T0() - mm_t;
 #endif
+        // Fill the next raw tile while transforming and computing the current one.
+        HmxDmaQueue activationQueue;
+        if (prefetchActivation) {
+            dma_wait_for_idle();
+            activationQueue.push(vtcmActivationRaw, src0Base, rawBytes);
+        }
         for (int eBase = 0; eBase < E; eBase += 32) {
             int validRows = E - eBase;
             if (validRows > 32) {
@@ -1128,7 +1144,16 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
 #if HTP_MM_PHASE_PROFILE
             mm_t = MM_T0();
 #endif
-            if (!doubleBuffered || nt0 == 0) {
+            if (prefetchActivation) {
+                activationQueue.pop();
+                const int slot = (eBase / 32) & 1;
+                __fp16* currentRaw = vtcmActivationRaw + (size_t)slot * rawBytes / sizeof(__fp16);
+                if (eBase + 32 < E) {
+                    activationQueue.push(vtcmActivationRaw + (size_t)(slot ^ 1) * rawBytes / sizeof(__fp16),
+                                         src0Base + (int64_t)(eBase + 32) * lp->src0StrideXYZ[0], rawBytes);
+                }
+                htp_ops_loop_hmx_transform_activation_block(vtcmActivation, currentRaw, K, validRows);
+            } else if (!doubleBuffered || nt0 == 0) {
                 const bool contiguousCols = lp->src0StrideXYZ[1] == 2;
                 if (contiguousCols && lp->src0StrideXYZ[0] == K * 2) {
                     const __fp16* src0Tile =
@@ -1156,12 +1181,26 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
             }
             int nt = nt0;
             const bool contiguous = lp->dstStrideXYZ[2] == 2 && lp->dstStrideXYZ[0] >= 0;
-            for (; contiguous && nt + 1 < ntEnd && N - nt * 32 >= 64; nt += 2) {
+            int batchTiles = 2;
+            int outputSlot = 0;
+            __fp16* pendingOutput = nullptr;
+            int pendingTiles = 0;
+            int pendingNt = 0;
+            for (; contiguous && nt + 1 < ntEnd && N - nt * 32 >= 64; nt += batchTiles) {
+                batchTiles = ntEnd - nt;
+                if (batchTiles > outputTiles) {
+                    batchTiles = outputTiles;
+                }
+                if (batchTiles > (N - nt * 32) / 32) {
+                    batchTiles = (N - nt * 32) / 32;
+                }
+                batchTiles &= ~1;
+                __fp16* currentOutput = vtcmOutput + (size_t)outputSlot * outputTiles * 1024;
 #if HTP_MM_PHASE_PROFILE
                 mm_act += MM_T0() - mm_t;
                 mm_t = MM_T0();
 #endif
-                for (int which = 0; which < 2; ++which) {
+                for (int which = 0; which < batchTiles; ++which) {
                     // One 32-column group of a pre-packed weight is contiguous, so
                     // the unit's own loads run straight down the weights section.
                     const __fp16* weightBlock = vtcmWeight + (size_t)(nt + which - nt0) * kp * 1024;
@@ -1172,18 +1211,44 @@ static inline bool htp_ops_loop_matmul_hmx_general(uint8_t* dstBase, const uint8
                         }
                         hmx_load_tiles_fp16(vtcmActivation + (size_t)k * 1024, weightBlock + (size_t)k * 1024, tiles);
                     }
-                    hmx_consume_accumulator_fp16(vtcmOutput + (size_t)which * 1024);
+                    hmx_consume_accumulator_fp16(currentOutput + (size_t)which * 1024);
                 }
 #if HTP_MM_PHASE_PROFILE
                 mm_hmx += MM_T0() - mm_t;
                 mm_t = MM_T0();
 #endif
-                htp_ops_loop_hmx_store_output_pair(dstBase, vtcmOutput, lp, eBase, validRows, N, nt);
+                // Submit the next HMX batch before HVX reads the previous buffer.
+                if (outputPipeline) {
+                    for (int which = 0; which < pendingTiles; which += 2) {
+                        htp_ops_loop_hmx_store_output_pair(dstBase, pendingOutput + (size_t)which * 1024,
+                                                           lp, eBase, validRows, N, pendingNt + which);
+                    }
+                    pendingOutput = currentOutput;
+                    pendingTiles = batchTiles;
+                    pendingNt = nt;
+                    outputSlot ^= 1;
+                } else {
+                    for (int which = 0; which < batchTiles; which += 2) {
+                        htp_ops_loop_hmx_store_output_pair(dstBase, currentOutput + (size_t)which * 1024,
+                                                           lp, eBase, validRows, N, nt + which);
+                    }
+                }
 #if HTP_MM_PHASE_PROFILE
                 mm_store += MM_T0() - mm_t;
                 mm_t = MM_T0();
 #endif
             }
+#if HTP_MM_PHASE_PROFILE
+            mm_t = MM_T0();
+#endif
+            for (int which = 0; which < pendingTiles; which += 2) {
+                htp_ops_loop_hmx_store_output_pair(dstBase, pendingOutput + (size_t)which * 1024,
+                                                   lp, eBase, validRows, N, pendingNt + which);
+            }
+#if HTP_MM_PHASE_PROFILE
+            mm_store += MM_T0() - mm_t;
+            mm_t = MM_T0();
+#endif
             for (; nt < ntEnd; ++nt) {
                 // One 32-column group of a pre-packed weight is contiguous, so
                 // the unit's own loads run straight down the weights section.

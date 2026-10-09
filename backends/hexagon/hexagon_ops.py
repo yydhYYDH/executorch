@@ -874,6 +874,8 @@ def slice_region(node: torch.fx.Node) -> Optional[SliceRegion]:
             return None
         offset = 0
     elif isinstance(start, int) and not isinstance(start, bool):
+        if start < 0:
+            start += shape[dim]
         start = max(start, 0)
         if start + result[dim] > shape[dim]:
             return None
@@ -2888,20 +2890,14 @@ def select_condition_plane(
 
     htp_ops_select reads its third mode as (index / innerSize) % channelSize, so
     the question is whether torch's own broadcast of this condition into the
-    output shape is that walk. It is exactly when the axes the condition is
-    broadcast over -- the ones its own shape pins to one -- are a suffix of the
-    output's axes: the walk then reduces to the output's flat index divided by
-    the repeat, and the remainder never bites because the axes left over carry
-    the whole extent. A staircase mask is that shape, with the repeat on the
-    context axis. A condition broadcast over a middle axis as well, such as
-    (1,1,3,1) against (1,2,3,4), is not: its index is not a function of
-    index/innerSize alone, and no plane describes it.
+    output shape is that walk. Nontrivial condition axes must form a contiguous
+    block without broadcast holes. Leading broadcast repeats the block, while
+    trailing broadcast repeats each flag. For example, (1,1,1,65) against
+    (1,4,15,65) uses (65,1), and (1,1,3,1) against (1,2,3,4) uses (3,4).
+    (1,2,1,4) against (1,2,3,4) has a hole and cannot use this walk.
 
-    A one-element condition and a whole-output condition are the two walks that
-    name no plane, and (0, 0) is what the kernel reads as "none asked for". A
-    condition that is neither, and whose narrow axes are an empty suffix, is the
-    third refusal: the kernel would ask for a plane and find none, so answering
-    "no plane needed" here would be a descriptor it refuses with -2.
+    Single-element and whole-output conditions use (0,0), since the kernel
+    chooses their indexing modes from the element count alone.
 
     A symbolic extent is refused rather than read off the example. The plane is
     a ratio of extents, and the ratio of two symbols is not a number the export
@@ -2923,26 +2919,13 @@ def select_condition_plane(
         # neither consults the plane. Naming one here would put two numbers in a
         # command that does not read them.
         return NO_SELECT_PLANE
-    inner = 1
-    axis = rank
-    while axis > 0 and padded[axis - 1] == 1:
-        inner *= out_shape[axis - 1]
-        axis -= 1
-    if axis == rank:
-        # Neither of those two sizes, and narrow on no axis: the only walk that
-        # fits is the output's own index, which the kernel will not take at this
-        # size. No plane describes it, so there is nothing to name.
+    active = [i for i, extent in enumerate(padded) if extent != 1]
+    first, last = active[0], active[-1]
+    # Leading broadcast repeats the plane; trailing broadcast repeats each
+    # flag. A broadcast hole inside the plane cannot use this flat walk.
+    if any(c != o for c, o in zip(padded[first:last + 1], out_shape[first:last + 1])):
         return None
-    for c, o in zip(padded[:axis], out_shape[:axis]):
-        if c != o:
-            return None
-    # The axes left over are the ones that carry extent one, so this product is
-    # the condition's own element count -- which is what the kernel's guard asks
-    # a per-channel operand to name.
-    channel = 1
-    for extent in padded[:axis]:
-        channel *= extent
-    return (channel, inner)
+    return (_product(padded), _product(out_shape[last + 1:]))
 
 
 def _product(extents: Tuple[int, ...]) -> int:
@@ -6403,6 +6386,9 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         source = _emit_zero_insert(ctx, node, source, spec)
     weight_node = node.args[1]
     bias_node = node.args[2] if len(node.args) > 2 else None
+    # The folded relu6 is this node's value, so when that relu6 is a method
+    # output the convolution has to write into the output's slot rather than an
+    # activation of its own.
     out = ctx.result_for(node, _numel(node))
     if not spec.depthwise:
         if spec.groups > 1:

@@ -357,6 +357,7 @@ struct HexagonDelegate {
   Arena probe;
   // Block-relative location of each method input/output, in signature order.
   std::vector<Region> inputs;
+  std::vector<Region> input_copy_ranges;
   std::vector<Region> outputs;
 
   // Params the emitter could not know, resolved from an input on every
@@ -2004,6 +2005,59 @@ Result<DelegateHandle*> HexagonBackend::init(
   ET_CHECK_OK_OR_RETURN_ERROR(BuildSyncGroups(delegate));
 
   stamp("sync_built");
+  delegate->input_copy_ranges.assign(header->n_inputs, Region{});
+  if (delegate->dynamic_max_length == 0 && delegate->patches.empty() &&
+      delegate->dynamic_patches.empty()) {
+    for (uint32_t input = 0; input < header->n_inputs; ++input) {
+      const size_t size = delegate->inputs[input].size;
+      if (size < 1024 * 1024) {
+        continue;
+      }
+      if (std::find(delegate->in_place_inputs.begin(), delegate->in_place_inputs.end(), input) !=
+          delegate->in_place_inputs.end()) {
+        continue;
+      }
+      size_t begin = size;
+      size_t end = 0;
+      bool eligible = true;
+      for (uint32_t op_index = 0; op_index < header->n_ops && eligible; ++op_index) {
+        const auto& op = ops[op_index];
+        for (uint32_t operand = 0; operand < op.n_inputs; ++operand) {
+          const auto& ref = op.inputs[operand];
+          if (ref.space != static_cast<uint32_t>(HexagonTensorSpace::kInput) ||
+              ref.index != input) {
+            continue;
+          }
+          // Only a single static raster region has a bounded read footprint here.
+          if (op.type != kRasterBlitOp || op.n_inputs != 1 || op.n_params != 15 ||
+              op.params[0] != 1 || op.params[1] != 2 || op.params[2] != 1 ||
+              op.params[3] != 0 || op.params[4] < 0 || ref.size != size ||
+              delegate->input_section.offset + ref.offset != delegate->inputs[input].offset) {
+            eligible = false;
+            break;
+          }
+          int64_t last = op.params[4];
+          for (int axis = 0; axis < 3; ++axis) {
+            if (op.params[6 + axis] <= 0 || op.params[9 + axis] < 0) {
+              eligible = false;
+              break;
+            }
+            last += static_cast<int64_t>(op.params[6 + axis] - 1) *
+                op.params[9 + axis];
+          }
+          if (!eligible || last >= static_cast<int64_t>(size / 2)) {
+            eligible = false;
+            break;
+          }
+          begin = std::min(begin, static_cast<size_t>(op.params[4]) * 2);
+          end = std::max(end, static_cast<size_t>(last + 1) * 2);
+        }
+      }
+      if (eligible && end > begin) {
+        delegate->input_copy_ranges[input] = Region{begin, end - begin};
+      }
+    }
+  }
   delegate->n_ops = header->n_ops;
   delegate->activations_bytes = header->activations_bytes;
 
@@ -2241,8 +2295,16 @@ Error HexagonBackend::execute(
           delegate->inputs[i].size);
       return Error::InvalidArgument;
     }
-    std::memcpy(dst, tensor.const_data_ptr(), nbytes);
-    input_bytes += nbytes;
+    const auto& range = delegate->input_copy_ranges[i];
+    if (range.size != 0 && nbytes == delegate->inputs[i].size) {
+      std::memcpy(dst + range.offset,
+                  static_cast<const uint8_t*>(tensor.const_data_ptr()) + range.offset,
+                  range.size);
+      input_bytes += range.size;
+    } else {
+      std::memcpy(dst, tensor.const_data_ptr(), nbytes);
+      input_bytes += nbytes;
+    }
   }
 
   const double t_input = acct ? AcctNowMs() : 0.0;
