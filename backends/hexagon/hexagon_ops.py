@@ -7403,13 +7403,26 @@ def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
 # its own partial sort lands on and this one returns the first. Measured:
 # `[1, 1, .5, -2, 1, .5, 0]` comes back as 1 from torch and 0 from the kernel,
 # a row of four equal values comes back as 2 from torch and 0 from the kernel,
-# and over 200 rows of quantized values torch matches neither the first nor the
-# last occurrence on 175 of them. Handing the graph's indices that answer would
-# put a position torch never produced into a tensor the model reads, which is
-# what a refusal is for; the values, which are the row's maximum either way, are
-# the half this emitter takes. The kernel dereferences both pointers, so the
-# other half gets a scratch slot nothing reads rather than being left ABSENT,
-# which would fail the command.
+# and over 200 rows of quantized values torch's answer is not the first
+# occurrence on 188 of them -- 175 neither the first nor the last, and 13 the
+# last, which are wrong by as much as the other 175. Handing the graph's
+# indices that answer would put a position torch never produced into a tensor
+# the model reads, which is what a refusal is for; the values, which are the
+# row's maximum either way, are the half this emitter takes. The kernel
+# dereferences both pointers, so the other half gets a scratch slot nothing
+# reads rather than being left ABSENT, which would fail the command.
+#
+# That figure is this family's reason and not the arg reductions': on the same
+# rows `torch.argmax` and `torch.max(x, -1).indices` agree with a strict
+# first-occurrence walk on 200 of 200, so a strict DSP walk agrees with torch by
+# construction there and disagrees here.
+#
+# The second width -- the node declares int64 and this kernel writes one int32 a
+# row -- is a hazard and not a second reason: no clause anywhere refuses on it,
+# and the scratch slot is sized for what the kernel writes. Widening it into an
+# int64 slot is one RASTER_BLIT region, whose per-side stride carries a pitch of
+# 4 on the source and 8 on the destination, so the width is repairable where the
+# position is not.
 #
 # The values carry the caveat max and amax already carry -- a NaN row and the
 # sign of a zero are where the DSP's maximum and torch's differ.
@@ -7566,13 +7579,19 @@ def topk_is_emittable(node: torch.fx.Node) -> bool:
 
     The same all-readers-take-the-values rule the pool and max.dim are under, for
     the reason topk_getitem gives; a graph that reads the positions keeps the
-    values reader portable with the node it reads. The rule is not only about what
-    the kernel computes: the node declares its positions as int64 and this kernel
-    writes one int32 per row (topk_ops.cc:54), so a slot wide enough for the
-    declared dtype would have its upper half left as the arena held it. The width
-    is the smaller of the two reasons -- the position itself is the wrong number
-    -- and it is the one that would still stand if a future kernel broke ties
-    torch's way.
+    values reader portable with the node it reads. That reader rule is the whole
+    of the gate -- the two clauses below it are the target test and the spec, and
+    neither one looks at a width.
+
+    This used to describe two reasons, the second being that the node declares
+    its positions int64 where the kernel writes one int32 per row
+    (topk_ops.cc:54), so a slot wide enough for the declared dtype would have
+    its upper half left as the arena held it. The fact is true and it is a
+    hazard, but it is not a reason: no clause in this body refuses on a width,
+    so the gate never applied it, and the widening is one RASTER_BLIT region
+    (a per-side stride of 4 in and 8 out). What refuses the node is that the
+    position the kernel writes is not the position torch writes -- 188 of 200
+    rows -- and that one no emitter can repair.
     """
     if node.target is not TOPK:
         return True
@@ -7682,6 +7701,193 @@ def _emit_mean_default(node: torch.fx.Node, ctx) -> TensorRef:
     if not mean_result_width_is_emittable(node):
         raise RuntimeError("hexagon: this mean asks for another width")
     return _emit_reduction(node, ctx, REDUCTION_MEAN)
+
+
+VAR_CORRECTION = exir_ops.edge.aten.var.correction
+VAR_TARGETS = frozenset({VAR_CORRECTION})
+
+
+def var_correction_count(node: torch.fx.Node) -> Optional[int]:
+    """The number of elements this variance reduces, or None when it is not a
+    constant the n/(n-correction) scale can be written from.
+
+    The scale is baked into a command param, so a span whose length the export
+    only knows at run time has no number to bake: answering with the traced
+    examples length would be a wrong answer rather than a slow one, which is the
+    rule the vision attention gate states for its own params.
+    """
+    dims = reduction_dims(node)
+    if dims is None:
+        return None
+    shape = node.args[0].meta["val"].shape
+    count = 1
+    for dim in range(dims[0], dims[-1] + 1):
+        extent = shape[dim]
+        if isinstance(extent, torch.SymInt) or not isinstance(extent, int):
+            return None
+        count *= int(extent)
+    return count
+
+
+def var_correction_scale(node: torch.fx.Node) -> Optional[float]:
+    """n / (n - correction), or None when the node is not this composition.
+
+    torch default correction is 1 and an absent one means the same, so a graph
+    that says nothing and a graph that says 1 are one op. A correction at or past
+    n has no answer at all.
+    """
+    if node.target is not VAR_CORRECTION:
+        return None
+    count = var_correction_count(node)
+    if count is None or count < 1:
+        return None
+    correction = _scalar_arg(node, "correction", 2, 1.0)
+    if isinstance(correction, bool) or not isinstance(correction, (int, float)):
+        return None
+    denominator = count - float(correction)
+    if denominator <= 0.0:
+        return None
+    return float(count / denominator)
+
+
+def var_correction_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this variance is the two-pass composition the DSP already has.
+
+    Three things have to hold, and each is refused here rather than raised at the
+    emitter so the caller gets a portable kernel instead of a failed export. The
+    dims have to be the one contiguous span REDUCTION collapses, which is means
+    rule and the reason the two are the same shape question. The span length has
+    to be a number, because the n/(n-correction) scale is a command param and a
+    symbolic extent has none to write. And keepdim has to be the bool the graph
+    stated, because a variance of another width is a different op: the kernel
+    accumulates in fp32 and stores fp16, which is the rule
+    mean_result_width_is_emittable already enforces on the mean half.
+    """
+    if node.target is not VAR_CORRECTION:
+        return False
+    if reduction_dims(node) is None:
+        return False
+    keepdim = node.kwargs.get("keepdim")
+    if keepdim is None and len(node.args) > 3:
+        keepdim = node.args[3]
+    if keepdim is not None and not isinstance(keepdim, bool):
+        return False
+    return var_correction_scale(node) is not None
+
+
+def _emit_var_correction(node: torch.fx.Node, ctx) -> TensorRef:
+    """The two-pass variance, in the five commands the table already has.
+
+    mean over the span, the deviation as a binary subtract against it, the
+    square as the unary tables own entry, mean again, and -- only when the
+    correction is not zero -- the n/(n-correction) scale as the unary multiply
+    torch own mul.Scalar writes. Nothing here is a new kernel: the four commands
+    the correction-zero case spends are the ones a mean, a subtract and a square
+    are already made of, and the fifth is a constant multiply.
+
+    The accuracy is the two-passes and not a second-moment ones, and that is the
+    whole of what this row may claim. The squared deviation is a buffer, so it is
+    fp16, and the mean that follows reads those fp16 values: the DSP does
+    accumulate the mean in fp32, but what it accumulates is already rounded, and
+    the mean that fed the subtraction is fp16 as well. Over centred data the
+    whole gap to a fp32 answer is a few times 2**-11; over data with a mean of
+    200 it is 3.8e-03, because x - mean is a subtraction of two numbers of the
+    data own size whose difference is the answer size. The fp32 accumulator the
+    layer norm command uses (layer_norm_ops.cc:573-609) is the only variance on
+    this DSP accumulated in fp32 throughout, and it is not reachable as a value:
+    that command writes the normalized tensor.
+    """
+    if not var_correction_is_emittable(node):
+        raise RuntimeError("hexagon: this variance is not the two-pass form")
+    src = node.args[0]
+    _require_arena_dtype(node, "var input")
+    dims = reduction_dims(node)
+    shape = list(src.meta["val"].shape)
+    outside_shape = shape[: dims[0]]
+    span_shape = shape[dims[0] : dims[-1] + 1]
+    inside_shape = shape[dims[-1] + 1 :]
+    reduced_shape = outside_shape + [1] * len(span_shape) + inside_shape
+    keepdim = node.kwargs.get("keepdim")
+    if keepdim is None and len(node.args) > 3:
+        keepdim = node.args[3]
+    result_shape = list(reduced_shape if keepdim else outside_shape + inside_shape)
+
+    outside = _upper_product(outside_shape, ctx)
+    span_upper = _upper_product(span_shape, ctx)
+    inside = _upper_product(inside_shape, ctx)
+
+    def reduce_spans(kind: int, source, out) -> int:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_REDUCTION,
+                inputs=[source],
+                outputs=[out],
+                params=[outside, span_upper, inside, kind, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, outside_shape, 0)
+        _patch_dynamic_product(ctx, index, span_shape, 1)
+        _patch_dynamic_product(ctx, index, inside_shape, 2)
+        return index
+
+    def unary(kind: str, source, out, count, count_shape) -> None:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_UNARY,
+                inputs=[source],
+                outputs=[out],
+                params=[count, UNARY_OP_TYPES[kind], FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, count_shape, 0)
+
+    # The mean the deviation is taken from, kept at the reduced shape so the
+    # subtract broadcasts it back over the span.
+    mean = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_MEAN, ctx.operand(src), mean)
+
+    deviations = ctx.activation_for_shape(shape)
+    _emit_elementwise(
+        node, ctx, ctx.operand(src), mean, "sub", shape, reduced_shape, shape, deviations
+    )
+
+    squares = ctx.activation_for_shape(shape)
+    unary("square", deviations, squares, _upper_product(shape, ctx), shape)
+
+    scale = var_correction_scale(node)
+    # A correction of zero makes the scale exactly 1.0, and multiplying by it is
+    # a command that cannot change the answer, so the four-command form is the
+    # biased variance and the fifth is only spent when it is needed.
+    scaled = scale != 1.0
+    target = (
+        ctx.activation_for_shape(result_shape)
+        if scaled
+        else ctx.result_for(node, _numel(node))
+    )
+    reduce_spans(REDUCTION_MEAN, squares, target)
+    if not scaled:
+        return ctx.record(node, target)
+
+    out = ctx.result_for(node, _numel(node))
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[target],
+            outputs=[out],
+            params=[
+                _upper_product(result_shape, ctx),
+                UNARY_OP_TYPES["mul_scalar"],
+                FP16_BYTES,
+                _float_bits(scale),
+                0,
+            ],
+        ),
+    )
+    _patch_dynamic_product(ctx, op_index, result_shape, 0)
+    return ctx.record(node, out)
 
 
 def _emit_middle_axis_softmax(node: torch.fx.Node, ctx, src, shape):
@@ -8990,6 +9196,42 @@ def vision_attention_is_emittable(node: torch.fx.Node) -> bool:
         return False
     if any(not int(dim) > 0 for dim in (shape[0], shape[2], shape[3])):
         return False
+    # The mask is the optional fifth operand. The kernel reads
+    # `mask[(b * tokens + q) * maskStride + k]` (attention_entry.cc:50) -- a
+    # batch, a row and a column, with no head term anywhere in it -- so rank two
+    # (broadcast over the batch) and rank three (naming it) are the only shapes
+    # it can index, and a stride below the token count would mask the last
+    # `stride` keys and leave the ones before them attendable.
+    mask = node.args[4] if len(node.args) > 4 else None
+    if mask is not None:
+        if not isinstance(mask, torch.fx.Node):
+            return False
+        mask_shape = _shape_of(mask)
+        if any(isinstance(dim, torch.SymInt) for dim in mask_shape):
+            return False
+        # The kernel casts the pointer to `const __fp16 *`, so an fp32 operand
+        # is read as half floats. This is checked here as well as in the fusion
+        # pass because the predicate is the last thing standing between a graph
+        # and the command.
+        mask_meta = getattr(mask, "meta", {}).get("val")
+        if not isinstance(mask_meta, torch.Tensor) or mask_meta.dtype != torch.float16:
+            return False
+        # The batch pitch in `mask[(b * tokens + q) * maskStride + k]` is
+        # `tokens * maskStride` with no broadcast case, so a rank two mask only
+        # covers a single batch item and a rank three one has to name them all.
+        if len(mask_shape) == 2:
+            if int(shape[0]) != 1:
+                return False
+        elif len(mask_shape) == 3:
+            if int(mask_shape[0]) != int(shape[0]):
+                return False
+        else:
+            return False
+        if len(mask_shape) > 2 and int(mask_shape[-2]) != int(shape[1]):
+            return False
+        stride = mask_shape[-1]
+        if not int(stride) >= int(shape[1]) or isinstance(shape[1], torch.SymInt):
+            return False
     # The scale is a param rather than an operand, so it has to be a number the
     # pass could read out of the graph at export time.
     scale = node.args[3]
@@ -9003,10 +9245,13 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
     value, slot three as the mask, the first output as the result and the second
     as the workspace, with `intParams[0..3]` the batch, token count, head count
     and head width, `floatParams[4]` the scale, `intParams[5]` the mask stride
-    and `intParams[6]` the workspace size. Only three operands are bound, so the
-    dispatcher passes a null mask pointer and the kernel's `maskStride > 0` test
-    never reads one (`attention_entry.cc:49`) -- a mask has no operand to hide
-    in, which is the mistake the FLASH_ATTN emitter made with `-1`.
+    and `intParams[6]` the workspace size. The mask is bound only when the op
+    carries one, and `maskStride` is zero exactly when it does not, so the
+    kernel's `pMask != NULL && maskStride > 0` test (`attention_entry.cc:50`)
+    never sees a positive stride without a buffer behind it -- the mistake the
+    FLASH_ATTN emitter made with `-1`. The kernel adds the mask to the score
+    before the row max rather than gating the probabilities after them, which is
+    what `logits + mask` in the graph means.
 
     The operands are bound as the graph carries them: `[batch, tokens, heads,
     headDim]`, which `attention_entry.cc:36,41,57` strides by `heads * headDim`
@@ -9016,6 +9261,7 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
         raise RuntimeError(f"hexagon: vision attention shape {_shape_of(node.args[0])}")
     query, key, value = node.args[0], node.args[1], node.args[2]
     scale = float(node.args[3])
+    mask = node.args[4] if len(node.args) > 4 else None
     batch, tokens, heads, head_dim = _shape_of(query)
     batch, heads, head_dim = int(batch), int(heads), int(head_dim)
     # The token count is a param the run-time length recomputes, so the value
@@ -9034,7 +9280,8 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
         node,
         Op(
             type=DSP_OP_VISION_ATTENTION_FP16,
-            inputs=[ctx.operand(query), ctx.operand(key), ctx.operand(value)],
+            inputs=[ctx.operand(query), ctx.operand(key), ctx.operand(value)]
+            + ([] if mask is None else [ctx.operand(mask)]),
             outputs=[out, workspace],
             params=[
                 batch,  # batch
@@ -9042,7 +9289,11 @@ def _emit_vision_attention(node: torch.fx.Node, ctx) -> TensorRef:
                 heads,  # heads
                 head_dim,  # headDim
                 _float_bits(scale),  # scale, read through a float* cast
-                0,  # maskStride, which no operand lets the kernel read
+                # The mask's own row pitch. The kernel reads a row only when
+                # both this and the pointer are present (attention_entry.cc:50),
+                # so zero with no operand means "no mask" and a positive stride
+                # always travels with a bound fourth input.
+                0 if mask is None else int(_shape_of(mask)[-1]),
                 workspace_bytes,  # providedWorkspaceBytes
             ],
         ),
@@ -9379,6 +9630,10 @@ EMITTERS = {
     DQ_PER_CHANNEL: _emit_dequantize,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     MEAN_DEFAULT: _emit_mean_default,
+    # The variance the mean half already computes, with the two steps between
+    # the two means spelled out as commands. See _emit_var_correction for what
+    # the composition is and is not accurate to.
+    VAR_CORRECTION: _emit_var_correction,
     MAX_DEFAULT: _emit_max_default,
     MAX_DIM: _emit_max_dim,
     SUM_DIM: _emit_sum_dim,

@@ -1897,8 +1897,13 @@ def _run_vision_attention(command: Command, params: List[int], arena: Arena) -> 
     batch, tokens, heads, head_dim = params[:4]
     scale = struct.unpack("<f", struct.pack("<i", params[4]))[0]
     mask_stride, workspace_bytes = params[5], params[6]
-    if mask_stride > 0:
-        raise UnsupportedOp("blob: a masked vision attention is not modelled")
+    if mask_stride > 0 and len(command.inputs) < 4:
+        # The kernel reads a row only when the pointer and the stride are both
+        # present (attention_entry.cc:50), so a positive stride with no fourth
+        # input is a command no emitter here can produce.
+        raise UnsupportedOp(
+            "blob: a vision attention has a mask stride but no mask operand"
+        )
     # The kernel refuses the command below this (`attention_entry.cc:26-29`),
     # because it aligns the buffer up by 127 bytes and then writes `tokens`
     # fp32 scores into it.
@@ -1909,7 +1914,10 @@ def _run_vision_attention(command: Command, params: List[int], arena: Arena) -> 
         )
     count = batch * tokens * heads * head_dim
     refs = list(command.inputs) + list(command.outputs)
-    if any(arena.view(ref).nbytes < count * FP16_BYTES for ref in refs[:4]):
+    # Only the three data operands are count long. The fourth is the mask,
+    # which the kernel indexes at its own stride, so it is checked against that
+    # below rather than against the attention's own element count.
+    if any(arena.view(ref).nbytes < count * FP16_BYTES for ref in refs[:3]):
         raise UnsupportedOp(
             f"blob: a vision attention operand is short of {count} values"
         )
@@ -1935,14 +1943,36 @@ def _run_vision_attention(command: Command, params: List[int], arena: Arena) -> 
     key = rows(refs[1]).reshape(batch * tokens, heads, head_dim)
     value = rows(refs[2]).reshape(batch * tokens, heads, head_dim)
 
+    mask = None
+    if mask_stride > 0:
+        # The kernel casts the fourth input to `const __fp16 *` and indexes it
+        # at `mask[(b * tokens + q) * maskStride + k]` (attention_entry.cc:50),
+        # so the batch pitch is `tokens` rows and there is no head term at all.
+        flat_mask = np.frombuffer(bytes(arena.view(refs[3])), dtype=np.float16)
+        needed = batch * tokens * mask_stride
+        if flat_mask.size < needed:
+            raise UnsupportedOp(
+                f"blob: a vision attention mask holds {flat_mask.size} halves, "
+                f"which is short of the {needed} its stride indexes"
+            )
+        mask = flat_mask.astype(np.float32)
+
     result = np.zeros((batch * tokens, heads, head_dim), dtype=np.float32)
     for row in range(batch * tokens):
         # The kernel's outer loop is over the batch (`attention_entry.cc:37`),
         # so a query row reads the keys of its own batch and no others.
         batch_index = row // tokens
         window = slice(batch_index * tokens, (batch_index + 1) * tokens)
+        # The mask is read before the row maximum, so it belongs to the score
+        # rather than to the weights: the same place the graph puts its add.
+        bias = None
+        if mask is not None:
+            base = (batch_index * tokens + (row % tokens)) * mask_stride
+            bias = mask[base : base + tokens]
         for head in range(heads):
             scores = (query[row, head] @ key[window, head].T) * scale
+            if bias is not None:
+                scores = scores + bias
             weights = np.exp(scores - scores.max())
             weights /= weights.sum()
             result[row, head] = weights @ value[window, head]

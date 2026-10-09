@@ -53,20 +53,25 @@ NAMESPACE = "et_hexagon"
 _library = torch.library.Library(NAMESPACE, "FRAGMENT")
 
 
-def _vision_attention(q, k, v, scale):
+def _vision_attention(q, k, v, scale, mask=None):
     """The same attention, written out for anywhere the DSP cannot reach.
 
     The operands are `[batch, seq, heads, headDim]`; `transpose(1, 2)` is what
     turns one into the `[batch, heads, seq, headDim]` torch's matmul wants, and
-    the last transpose is what turns the result back.
+    the last transpose is what turns the result back. A mask is added to the
+    logits, which is what `attention_entry.cc:50` does with it.
     """
     query, key, value = (tensor.transpose(1, 2).float() for tensor in (q, k, v))
     scores = (query @ key.transpose(-1, -2)) * scale
+    if mask is not None:
+        scores = scores + mask
     weights = scores.softmax(dim=-1)
     return (weights @ value).transpose(1, 2).to(q.dtype)
 
 
-_library.define("vision_attention(Tensor q, Tensor k, Tensor v, float scale) -> Tensor")
+_library.define(
+    "vision_attention(Tensor q, Tensor k, Tensor v, float scale, Tensor? mask=None) -> Tensor"
+)
 _library.impl("vision_attention", _vision_attention, "CompositeExplicitAutograd")
 
 #: The op the emitter table registers, exactly as the pass inserts it.
@@ -85,6 +90,7 @@ _DIV_TENSOR = exir_ops.edge.aten.div.Tensor
 #: side of a mul, and a division says the same thing the other way round.
 _MULS = frozenset({_MUL_TENSOR, _MUL_SCALAR})
 _DIVISIONS = frozenset({_DIV_TENSOR})
+_ADD_TENSOR = exir_ops.edge.aten.add.Tensor
 
 #: The copies an export puts around a scalar constant. They name a layout for a
 #: tensor with one element, so following one to its source keeps the value.
@@ -116,6 +122,10 @@ class VisionAttention(NamedTuple):
     #: The multiplier the graph applies to the logits, as the kernel wants it.
     scale: float
     shape: tuple
+    #: The additive mask, or None. `attention_entry.cc:50` adds it to the score
+    #: before the max, so it is the same function torch writes as
+    #: `logits + mask` rather than a post-softmax gate.
+    mask: Optional[torch.fx.Node]
 
 
 def _value(node):
@@ -315,8 +325,60 @@ def _constant_scalar(ep: Optional[ExportedProgram], node) -> Optional[float]:
     return None
 
 
-def _scaled_logits(ep, node):
-    """The logits under the logits-times-scale, and what that scale was."""
+def _mask_fits_kernel(node, batch) -> bool:
+    """Whether a mask operand is one `htp_ops_vision_attention_fp16` can read.
+
+    The kernel indexes the mask at `mask[(b * tokens + q) * maskStride + k]`
+    (`attention_entry.cc:50`), which is a batch axis, a query row and a key
+    column and nothing else -- there is no head term anywhere in it. A mask
+    carrying a head axis would therefore be read as the wrong plane, so a
+    [batch, heads, q, k] mask is refused rather than folded.
+
+    What survives is a mask broadcast over heads: rank two, or rank three with
+    a real batch axis. Both are contiguous [*, q, stride] with stride the last
+    extent, and the kernel's row pitch, so a stride at or above the key count
+    is what makes column `k` the mask of key `k`; a narrower one would index
+    the wrong row and a wider one leaves the tail unmasked on the device while
+    the host reference -- which broadcasts over keys -- would not.
+
+    Rank two is only a broadcast when there is one batch item to broadcast
+    over. The batch pitch in the kernel's index is `tokens * maskStride`
+    unconditionally, so a second batch item starts `tokens` rows past a
+    rank-two mask's end and reads whatever follows it in the arena. A rank
+    three mask is the only form that can name more than one.
+    """
+    value = _value(node)
+    if value is None or not value.is_contiguous():
+        return False
+    if value.dtype != torch.float16:
+        # The kernel casts the pointer to `const __fp16 *`; an fp32 operand
+        # would be read as half floats and the fp64 of a host test is not a
+        # geometry the command ever carries.
+        return False
+    if value.dim() == 2:
+        if batch != 1:
+            return False
+    elif value.dim() == 3:
+        if not isinstance(batch, int) or int(value.shape[0]) != batch:
+            return False
+    else:
+        return False
+    return isinstance(value.shape[-1], int) and int(value.shape[-1]) > 0
+
+
+def _scaled_logits(ep, node, batch):
+    """The logits under a scale, an optional mask, and what that scale was."""
+    mask = None
+    if node.target is _ADD_TENSOR:
+        # A mask is added to the logits, on either side. The side that is the
+        # scaled dot product is the one the pattern can carry; the other has to
+        # be something the kernel can index, so a pair of two computed tensors
+        # is not this pattern and stays unmatched.
+        for left, right in (node.args[0], node.args[1]), (node.args[1], node.args[0]):
+            scored = _scaled_logits(ep, left, batch)
+            if scored is not None and _mask_fits_kernel(right, batch):
+                return scored[0], scored[1], right
+        return None
     if node.target in _MULS:
         left, right = node.args[0], node.args[1]
         tensor, scalar = (
@@ -327,13 +389,13 @@ def _scaled_logits(ep, node):
         if _dot(tensor) is None:
             return None
         scale = _constant_scalar(ep, scalar)
-        return None if scale is None else (tensor, float(scale))
+        return None if scale is None else (tensor, float(scale), None)
     if node.target in _DIVISIONS:
         left, right = node.args[0], node.args[1]
         scalar = _constant_scalar(ep, right)
         if _dot(left) is None or scalar is None or scalar == 0.0:
             return None
-        return left, 1.0 / float(scalar)
+        return left, 1.0 / float(scalar), None
     return None
 
 
@@ -393,9 +455,21 @@ def vision_attention_pattern(
     if not isinstance(logits, torch.fx.Node):
         return None
     scale = 1.0
-    scored = _scaled_logits(exported_program, logits)
+    mask = None
+    scored = _scaled_logits(exported_program, logits, batch)
     if scored is not None:
-        logits, scale = scored
+        logits, scale, mask = scored
+    if mask is not None:
+        # The kernel's mask row pitch is a command word, and a mask narrower
+        # than the key count would silently mask the last `stride` keys and
+        # leave the ones before them attendable. The probabilities already
+        # pinned `key_len == query_len`, so this is the count the mask has to
+        # cover.
+        if not _mask_fits_kernel(mask, batch):
+            return None
+        stride = int(_value(mask).shape[-1])
+        if isinstance(key_len, int) and stride < key_len:
+            return None
     dot = _underneath(logits)
     if not isinstance(dot, torch.fx.Node) or dot.target is not _BMM:
         return None
@@ -426,7 +500,7 @@ def vision_attention_pattern(
     output = _tail(second, shape)
     if output is None:
         return None
-    return VisionAttention(query, key, value, output, scale, shape)
+    return VisionAttention(query, key, value, output, scale, shape, mask)
 
 
 class FuseVisionAttention(ExportedProgramPassBase):
@@ -446,17 +520,34 @@ class FuseVisionAttention(ExportedProgramPassBase):
         if not matches:
             return ExportedProgramPassResult(exported_program, False)
 
+        renamed = []
         for _node, match in matches:
             with graph.inserting_before(match.output):
                 fused = graph.call_function(
-                    VISION_ATTENTION, (match.query, match.key, match.value, match.scale)
+                    VISION_ATTENTION,
+                    (
+                        match.query,
+                        match.key,
+                        match.value,
+                        match.scale,
+                        match.mask,
+                    ),
                 )
             # The transpose this replaces had already materialized, so the result
             # is contiguous and the copies after it stay aliases.
             fused.meta["val"] = match.output.meta["val"]
             match.output.replace_all_uses_with(fused)
+            renamed.append((fused, match.output.name))
         # The head splits and both matmul wrappers have no readers now: the walk
         # went through them, and the fused op reads their inputs directly.
         graph.eliminate_dead_code()
+        # A graph signature names a user output by node name, and the transpose
+        # is the user output whenever the attention's result is handed straight
+        # back, which is the usual shape for a vision tower. The name is only
+        # free after the dead-code sweep, so the swap happens here: before it the
+        # name is still held and the new node would be uniquified to a different
+        # one, and validation then fails naming the output rather than this pass.
+        for fused, name in renamed:
+            fused.name = name
         exported_program.graph_module.recompile()
         return ExportedProgramPassResult(exported_program, True)

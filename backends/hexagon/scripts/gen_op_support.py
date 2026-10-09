@@ -515,6 +515,26 @@ SUPPORTED: List[OpSupport] = [
         "dtype rule is mean.dim's.",
     ),
     OpSupport(
+        "aten.var.correction",
+        REDUCTION + " / " + BINARY + " / " + UNARY,
+        ARENA_FP16,
+        "The two-pass variance, in the five commands the mean half is already "
+        "made of: a mean over the span, the deviation as a binary subtract "
+        "against it, the square as the unary table own entry, a second mean, "
+        "and -- only when the correction is not zero -- the n/(n-correction) "
+        "scale as the unary multiply aten.mul.Scalar writes. The reduced dims "
+        "must be one contiguous span, as on mean.dim, the span length must be "
+        "a number because the scale is a command param, and the correction "
+        "must leave a positive denominator. A correction of zero scales by "
+        "exactly 1.0, so that form is four commands and any other is five. "
+        "The accuracy is the two-pass own: the squared deviation is a buffer, "
+        "so it is fp16 and the mean that follows reads those fp16 values, "
+        "which is a few times 2**-11 from a fp32 answer on centred data and "
+        "3.8e-03 on data with a mean of 200. The fp32-accumulated variance "
+        "the layer norm command computes is not reachable as a value here, "
+        "because that command writes the normalized tensor.",
+    ),
+    OpSupport(
         "aten.sum.dim_IntList",
         REDUCTION + " / " + MASKED_REDUCTION,
         ARENA_FP16,
@@ -607,12 +627,15 @@ SUPPORTED: List[OpSupport] = [
         "is in order either way. The node answers (values, indices) and the "
         "kernel writes both, but the position it writes is the *first* occurrence "
         "of the maximum while torch's own kernel returns whichever index its "
-        "partial sort lands on -- neither the first nor the last of a tie in "
-        "general -- so it is placed only when every reader takes getitem 0 "
-        "(topk_is_emittable, the rule max_pool2d and max.dim are under). The "
+        "partial sort lands on -- 188 of 200 rows of quantized values are not the "
+        "first occurrence, against 0 of 200 for argmax -- so it is placed only "
+        "when every reader takes getitem 0 (topk_is_emittable, the rule "
+        "max_pool2d and max.dim are under). The "
         "other half goes to a scratch activation the kernel dereferences and "
-        "nothing reads. The values carry the signed-zero and NaN caveat "
-        "max.default has.",
+        "nothing reads; it is int32, which is the width the kernel writes and not "
+        "the int64 the node declares, so a graph that did read it would need one "
+        "widening region before the number meant anything. The values carry the "
+        "signed-zero and NaN caveat max.default has.",
     ),
     OpSupport(
         "aten.argmax.default",
@@ -882,9 +905,10 @@ SUPPORTED: List[OpSupport] = [
         "aten.layer_norm.default",
         LAYER_NORM,
         "src fp16; gamma/beta fp32",
-        "Normalized shape must be the trailing dims; eps must be a compile-time "
-        "scalar. The kernel reads gamma and beta as fp32, which no delegate input "
-        "holds, so the affine is emitted as separate elementwise mul/add.",
+        "Normalized shape must be the trailing dims and a compile-time one; eps "
+        "must be a compile-time scalar. The kernel reads gamma and beta as fp32, "
+        "which no delegate input holds, so the affine is emitted as separate "
+        "elementwise mul/add.",
     ),
     OpSupport(
         "aten.native_layer_norm.default",
@@ -1347,15 +1371,23 @@ NOT_SUPPORTED = [
         "The one kernel that writes positions writes the *first* occurrence of the "
         "row maximum, and torch's own kernel returns whatever index its partial "
         "sort lands on -- for a row of equal values torch answers 2 where this "
-        "answers 0, and over 200 rows of quantized values it lands on something "
-        "other than the first occurrence on 188 of them -- 175 that are neither "
-        "the first nor the last, and the 13 that are the last, which are wrong by "
-        "exactly as much. A graph that reads the "
-        "positions would therefore be reading a number torch never produced, which "
-        "is what the all-readers-are-getitem-0 rule refuses. k != 1, another dim "
-        "and largest=False are refused by the same gate, because the kernel has "
-        "no argument for any of them. `torch.topk(x, 1).values`, `torch.amax(x, "
-        "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
+        "answers 0, and over 200 rows of quantized values it answers something "
+        "else on 188 of them: 175 that are neither the first nor the last "
+        "occurrence, and 13 that are the last, which are wrong by exactly as "
+        "much. A graph that reads the positions would therefore be reading a "
+        "number torch never produced, which is what the all-readers-are-getitem-0 "
+        "rule refuses. That figure is the topk reason and not the arg reductions' "
+        "one: on the same 200 rows `torch.argmax` and `torch.max(x, -1).indices` "
+        "agree with a strict first-occurrence walk on every one, so a strict walk "
+        "is a correct answer for a reduction and the wrong one for a partial "
+        "sort. k != 1, another dim and largest=False are refused by the same gate, "
+        "because the kernel has no argument for any of them. `torch.topk(x, 1)."
+        "values`, `torch.amax(x, dim)` and `torch.max(x, dim).values` reach the "
+        "covered targets instead. The int64 the node declares for the positions is "
+        "a second hazard rather than a second reason: the gate names no width, so "
+        "nothing refuses on it, and widening the kernel's int32 into that slot is "
+        "one `RASTER_BLIT` region with a pitch of 4 on the source side and 8 on the "
+        "destination.",
     ),
     (
         "aten.eq / ne / ge / le, and a bool operand anywhere else",
@@ -1417,18 +1449,6 @@ NOT_SUPPORTED = [
         "running product is a different walk. The log/sum/exp substitute that "
         "stands in for it is inexact as well, and a sixteen-element product of "
         "values in [2, 3] already reaches 2**16 and overflows fp16 to infinity.",
-    ),
-    (
-        "aten.var.correction",
-        "No kernel, and no composition of the existing commands is a substitute "
-        "for it. The two-pass form -- mean, subtract, square, mean, scale -- is "
-        "four or five commands of types the table already has and reproduces the "
-        "fp16 two-pass bit for bit, but it is not `torch.var`: measured against "
-        "torch on fp16 the two differ by 6.2e-04 relative on centred data and "
-        "2.5e-03 on data with a mean of 200, and the square is materialised in "
-        "fp16, so a deviation past 256 overflows to infinity where torch's "
-        "accumulator, which is fp32 throughout, does not. The export cannot bound "
-        "the deviation, so the node keeps a portable kernel.",
     ),
     (
         "aten.pow.Tensor_Tensor outside {-1, 0, 1, 2, 3, 4}",
@@ -1516,6 +1536,7 @@ PREDICATES = [
     "reduction_dims",
     "sum_dim_is_emittable",
     "mean_result_width_is_emittable",
+    "var_correction_is_emittable",
     "pow_is_square",
     "max_pool_is_emittable",
     "max_dim_is_emittable",

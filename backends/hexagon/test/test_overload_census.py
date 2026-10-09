@@ -328,10 +328,27 @@ _ROWS = [
         [("aten.prod.default", "unwired")],
     ),
     (
-        "var",
+        # var was an unwired row in this table until the two-pass variance landed:
+        # the target had no emitter, so the partitioner never considered it and
+        # the portable kernel answered it. It is the mean command twice, so it
+        # moved to the wired side the way max.dim and split did, and the row kept
+        # its place here so the census reads as a rate rather than a list of
+        # what is still missing.
+        "var over every dim delegates",
         lambda a: torch.var(a),
         (_x(2, 3),),
-        [("aten.var.correction", "unwired")],
+        [("aten.var.correction", "wired")],
+    ),
+    (
+        # The clause that is var own rather than mean own. The n/(n-correction)
+        # scale is a command param, so a correction at the span has no positive
+        # denominator to write and the node stays portable. Without this row the
+        # wired row above would be satisfied by an emitter that accepted
+        # everything.
+        "var whose correction is the span",
+        lambda a: torch.var(a, dim=1, correction=3),
+        (_x(2, 3),),
+        [("aten.var.correction", "refused")],
     ),
     (
         # A prefix scan reaches the DSP only as et_hexagon.cumsum.default, which
@@ -982,6 +999,10 @@ def test_each_overload_row_matches_its_recorded_verdict(label, forward, inputs, 
         # unwired plus a refused getitem is now one delegate, and it is the
         # positive half of that move rather than a deletion.
         ("split's first piece", lambda a: torch.split(a, 2, dim=0)[0], (_x(6, 3),)),
+        # var, for the same reason as the row it moved from: the two-pass
+        # variance is the mean command twice, so the whole node is one delegate
+        # and there is no portable kernel left standing beside it.
+        ("var over every dim", lambda a: torch.var(a), (_x(2, 3),)),
     ],
 )
 def test_the_closed_gaps_are_one_delegate_end_to_end(label, forward, inputs):
