@@ -3,6 +3,7 @@
 
 #include "dsp/hvx_utils.h"
 #include "dsp/ops.h"
+#include "dsp/vtcm_mgr.h"
 
 
 
@@ -19,10 +20,30 @@ int hvx_conv_depthwise2d_fp16(__fp16* restrict dst, const __fp16* restrict src, 
     __fp16 relu6_val = (__fp16)6.0f;
     const HVX_Vector vRelu6 = Q6_Vh_vsplat_R(fp16_to_bits(&relu6_val));
 
+    /* The kernel reads each input vector once per tap, so reading it from the
+     * (uncached) arena is a kernelY * kernelX-fold read amplification at DDR
+     * bandwidth. One channel block fits VTCM, so it is copied in once and the
+     * taps read the on-chip copy; the block is left on the arena only when it
+     * does not fit. */
+    uint8_t* vtcm_base = (uint8_t*)vtcm_manager_get_vtcm_base();
+    const size_t block_elems = (size_t)ih * iw * pack;
+    const bool stage = vtcm_base != NULL &&
+        block_elems * sizeof(__fp16) <= (size_t)vtcm_manager_get_vtcm_size();
+
     for (int b = 0; b < batch; ++b) {
         for (int cb = 0; cb < c4; ++cb) {
             const __fp16* srcBase = src + ((size_t)(cb * batch + b) * ih * iw * pack);
             __fp16* dstBase = dst + ((size_t)(cb * batch + b) * oh * ow * pack);
+
+            const __fp16* srcBlock = srcBase;
+            if (stage) {
+                __fp16* on_chip = (__fp16*)vtcm_base;
+                for (size_t i = 0; i < block_elems; i += pack) {
+                    vmemu((HVX_Vector*)(on_chip + i)) =
+                        vmemu((const HVX_Vector*)(srcBase + i));
+                }
+                srcBlock = on_chip;
+            }
 
             const __fp16* wBase = weight + (cb * kernelY * kernelX * pack);
             const __fp16* biasPtr = bias + (cb * pack);
@@ -45,7 +66,7 @@ int hvx_conv_depthwise2d_fp16(__fp16* restrict dst, const __fp16* restrict src, 
                             if (inX < 0 || inX >= iw) {
                                 continue;
                             }
-                            const __fp16* inPtr = srcBase + (inY * iw + inX) * pack;
+                            const __fp16* inPtr = srcBlock + (inY * iw + inX) * pack;
                             const __fp16* wPtr = wBase + ((ky * kernelX + kx) * pack);
                             HVX_Vector vIn = vmemu((const HVX_Vector*)inPtr);
                             HVX_Vector vW = vmemu((const HVX_Vector*)wPtr);
