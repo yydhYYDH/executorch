@@ -33,6 +33,7 @@
 #include <executorch/backends/hexagon/serialization/hexagon_schema.h>
 #include <executorch/backends/hexagon/runtime/HexagonBackendOptions.h>
 #include <executorch/backends/hexagon/runtime/hexagon_compat.h>
+#include <executorch/backends/hexagon/runtime/hexagon_weight_sync.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/core/event_tracer_hooks_delegate.h>
 #include <executorch/runtime/core/exec_aten/exec_aten.h>
@@ -329,7 +330,10 @@ struct HexagonDelegate {
   // Host-written once at init.
   Region group; // command group array
   Region commands; // the command descriptors
-  Region sync; // SyncGroup flatbuffer
+  Region sync; // First-execution SyncGroup flatbuffer
+  Region steady_sync;
+  size_t sync_capacity = 0;
+  bool weights_synced = false;
 
   // The four tensor sections, in blob order. An offset is measured from the
   // start of the block its section lives in: weights in resident, the other
@@ -978,6 +982,59 @@ const HexagonDelegate::RuntimeLayout* FindRuntimeLayout(
   return nullptr;
 }
 
+Error BuildSyncGroups(HexagonDelegate* delegate) {
+  delegate->weights_synced = false;
+  flatbuffers::FlatBufferBuilder builder(1u << 20);
+  const HexagonWeightSyncPolicy policy(
+      delegate->ops.data(), delegate->ops.size());
+  auto sync_tensor = [&](const HexagonTensorRef& ref) {
+    const auto space = static_cast<HexagonTensorSpace>(ref.space);
+    const auto* layout = FindRuntimeLayout(*delegate, space, ref.index);
+    const size_t offset = layout == nullptr ? ref.offset : layout->offset;
+    const size_t size = layout == nullptr ? ref.size : layout->size;
+    size_t resolved = 0;
+    const Arena* block =
+        ResolveBlock(*delegate, space, ref.index, offset, &resolved);
+    return DSPCOMMAND::CreateTensor(
+        builder,
+        block->fd,
+        static_cast<int32_t>(resolved + block->bias),
+        static_cast<int32_t>(size));
+  };
+  for (bool first_execution : {true, false}) {
+    builder.Clear();
+    std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
+    std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
+    for (const auto& op : delegate->ops) {
+      for (uint32_t j = 0; j < op.n_inputs; ++j) {
+        if (policy.should_sync(op.inputs[j], first_execution)) {
+          sync_in.push_back(sync_tensor(op.inputs[j]));
+        }
+      }
+      for (uint32_t j = 0; j < op.n_outputs; ++j) {
+        if (!IsAbsent(op.outputs[j])) {
+          sync_out.push_back(sync_tensor(op.outputs[j]));
+        }
+      }
+    }
+    builder.Finish(DSPCOMMAND::CreateSyncGroup(
+        builder,
+        builder.CreateVector(sync_in),
+        builder.CreateVector(sync_out)));
+    if (builder.GetSize() > delegate->sync_capacity) {
+      ET_LOG(Error, "hexagon: sync group exceeds budget");
+      return Error::Internal;
+    }
+    Region& region = first_execution ? delegate->sync : delegate->steady_sync;
+    region.size = builder.GetSize();
+    std::memcpy(
+        static_cast<uint8_t*>(delegate->resident.ptr) + region.offset,
+        builder.GetBufferPointer(),
+        region.size);
+  }
+  return Error::Ok;
+}
+
 bool AddLayoutBlock(
     std::vector<std::pair<size_t, size_t>>& free,
     size_t requested,
@@ -1240,44 +1297,10 @@ Error ResizeDynamicDelegate(HexagonDelegate* delegate, int64_t length) {
     }
   }
 
-  flatbuffers::FlatBufferBuilder builder(1u << 20);
-  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
-  std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
-  auto sync_tensor = [&](const HexagonTensorRef& ref) {
-    const auto space = static_cast<HexagonTensorSpace>(ref.space);
-    const auto* layout = FindRuntimeLayout(*delegate, space, ref.index);
-    const size_t offset = layout == nullptr ? ref.offset : layout->offset;
-    const size_t size = layout == nullptr ? ref.size : layout->size;
-    size_t resolved = 0;
-    const Arena* block = ResolveBlock(*delegate, space, ref.index, offset, &resolved);
-    return DSPCOMMAND::CreateTensor(
-        builder,
-        block->fd,
-        static_cast<int32_t>(resolved + block->bias),
-        static_cast<int32_t>(size));
-  };
-  for (const auto& op : delegate->ops) {
-    for (uint32_t j = 0; j < op.n_inputs; j++) {
-      if (!IsAbsent(op.inputs[j])) {
-        sync_in.push_back(sync_tensor(op.inputs[j]));
-      }
-    }
-    for (uint32_t j = 0; j < op.n_outputs; j++) {
-      if (!IsAbsent(op.outputs[j])) {
-        sync_out.push_back(sync_tensor(op.outputs[j]));
-      }
-    }
-  }
-  builder.Finish(DSPCOMMAND::CreateSyncGroup(
-      builder, builder.CreateVector(sync_in), builder.CreateVector(sync_out)));
-  if (builder.GetSize() > delegate->sync.size) {
-    ET_LOG(Error, "hexagon: resized sync group exceeds budget");
-    return Error::Internal;
-  }
-  delegate->sync.size = builder.GetSize();
-  std::memcpy(
+  ET_CHECK_OK_OR_RETURN_ERROR(BuildSyncGroups(delegate));
+  ET_CHECK_OK_OR_RETURN_ERROR(delegate->driver.Flush(
       static_cast<uint8_t*>(delegate->resident.ptr) + delegate->sync.offset,
-      builder.GetBufferPointer(), delegate->sync.size);
+      2 * delegate->sync_capacity));
   delegate->activations_bytes = activation_bytes;
   return Error::Ok;
 }
@@ -1419,7 +1442,7 @@ Result<DelegateHandle*> HexagonBackend::init(
       (header->n_ops * (kMaxOpInputs + kMaxOpOutputs) + 16) * 32, kHexagonAlignment);
   const size_t group_bytes = 8 + header->n_ops * 3 * sizeof(int32_t);
 
-  size_t resident_bytes = command_budget + sync_budget;
+  size_t resident_bytes = command_budget + 2 * sync_budget;
   // The weights section in the arena is the file's own bytes followed by every
   // weight the file left out: they are filled in below, from the named data
   // map, but they need room in the same block the DSP reads.
@@ -1657,6 +1680,10 @@ Result<DelegateHandle*> HexagonBackend::init(
 
   delegate->sync.offset = cursor;
   delegate->sync.size = sync_budget;
+  cursor += sync_budget;
+  delegate->steady_sync.offset = cursor;
+  delegate->steady_sync.size = sync_budget;
+  delegate->sync_capacity = sync_budget;
   cursor += sync_budget;
 
   auto place = [&](Region& region, size_t bytes) {
@@ -1974,49 +2001,7 @@ Result<DelegateHandle*> HexagonBackend::init(
 
   stamp("commands_built");
 
-  // The sync group names everything the DSP invalidates on the way in and
-  // flushes on the way out.
-  {
-    // Reset before the tensors are built, for the same reason as the command
-    // loop: CreateSyncGroup takes offsets into this builder, and a later Clear
-    // leaves them dangling, which silently corrupts the cache maintenance the
-    // DSP derives from this group.
-    builder.Clear();
-
-    std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_in;
-    std::vector<flatbuffers::Offset<DSPCOMMAND::Tensor>> sync_out;
-    // Only real buffers need invalidating or flushing; an absent operand has
-    // nothing to reconcile.
-    for (uint32_t i = 0; i < header->n_ops; i++) {
-      for (uint32_t j = 0; j < ops[i].n_inputs; j++) {
-        if (!IsAbsent(ops[i].inputs[j])) {
-          sync_in.push_back(MakeTensor(builder, *delegate, ops[i].inputs[j]));
-        }
-      }
-      for (uint32_t j = 0; j < ops[i].n_outputs; j++) {
-        if (!IsAbsent(ops[i].outputs[j])) {
-          sync_out.push_back(MakeTensor(builder, *delegate, ops[i].outputs[j]));
-        }
-      }
-    }
-
-    builder.Finish(DSPCOMMAND::CreateSyncGroup(
-        builder, builder.CreateVector(sync_in), builder.CreateVector(sync_out)));
-
-    if (builder.GetSize() > delegate->sync.size) {
-      ET_LOG(
-          Error,
-          "hexagon: sync group needs %zu bytes, budget is %zu",
-          static_cast<size_t>(builder.GetSize()),
-          delegate->sync.size);
-      return Error::Internal;
-    }
-    delegate->sync.size = builder.GetSize();
-    std::memcpy(
-        static_cast<uint8_t*>(delegate->resident.ptr) + delegate->sync.offset,
-        builder.GetBufferPointer(),
-        delegate->sync.size);
-  }
+  ET_CHECK_OK_OR_RETURN_ERROR(BuildSyncGroups(delegate));
 
   stamp("sync_built");
   delegate->n_ops = header->n_ops;
@@ -2357,6 +2342,9 @@ Error HexagonBackend::execute(
   }
   PhaseEvent call_event(tracer, "HEXAGON_DSP_CALL");
   const et_timestamp_t call_start_ticks = runtime::pal_current_ticks();
+  // Both descriptors were published at init; execute never rewrites them.
+  const Region& sync =
+      delegate->weights_synced ? delegate->steady_sync : delegate->sync;
   Error group_error = Error::Ok;
   {
     ProbeWatchdog watchdog(delegate, traced);
@@ -2366,8 +2354,8 @@ Error HexagonBackend::execute(
           group_offset,
           count,
           delegate->resident.fd,
-          (int)(delegate->sync.offset + delegate->resident.bias),
-          (int)delegate->sync.size,
+          (int)(sync.offset + delegate->resident.bias),
+          (int)sync.size,
           delegate->probe.fd,
           (int)delegate->probe.bias,
           kProbeBytes);
@@ -2377,8 +2365,8 @@ Error HexagonBackend::execute(
           group_offset,
           count,
           delegate->resident.fd,
-          (int)(delegate->sync.offset + delegate->resident.bias),
-          (int)delegate->sync.size);
+          (int)(sync.offset + delegate->resident.bias),
+          (int)sync.size);
     }
   }
 
@@ -2428,6 +2416,7 @@ Error HexagonBackend::execute(
     std::exit(0);
   }
   if (group_error != Error::Ok) {
+    delegate->weights_synced = false;
     // A failed group leaves the DSP side of this session unusable, and the
     // caller may abort before destroy() runs, so the session is released here:
     // the skel's global backend keeps its VTCM context until htp_ops_close.
@@ -2436,6 +2425,9 @@ Error HexagonBackend::execute(
     delegate->driver.Close();
   }
   ET_CHECK_OK_OR_RETURN_ERROR(group_error);
+  if (count > 0) {
+    delegate->weights_synced = true;
+  }
 
   PhaseEvent copy_out_event(tracer, "HEXAGON_COPY_OUT");
   // A subgraph that advances a KV cache in place has to hand the updated buffer

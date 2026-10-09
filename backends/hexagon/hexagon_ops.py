@@ -3399,7 +3399,7 @@ def pack_hmx_weight(weight, k: int, n: int) -> bytes:
     return np.ascontiguousarray(tiles).tobytes()
 
 
-def _weight_operand(ctx, rhs, m: int, k: int, n: int):
+def _weight_operand(ctx, rhs, m, k: int, n: int):
     """The matmul's weight operand, in the unit's tile order where that pays.
 
     Returns (ref, prepacked) so the command can say which one its operand holds.
@@ -3412,11 +3412,13 @@ def _weight_operand(ctx, rhs, m: int, k: int, n: int):
     so a batch of small tiles is a batch of small regions, and the bar is m*K*N
     rather than the batch's total work.
     """
+    # Dynamic rows may fall below the HMX threshold; HVX needs row-major weights.
     value = ctx.constant_value(rhs)
+    minimum_rows = 1 if ctx.is_dynamic_dim(m) else ctx.upper_bound(m)
     if (
         ctx.options.hmx_prepack
         and hmx_prefers_general(k, n)
-        and hmx_general_eligible(m, k, n)
+        and hmx_general_eligible(minimum_rows, k, n)
         and value is not None
         and value.dim() == 2
         and tuple(value.shape) == (k, n)
@@ -4339,7 +4341,7 @@ def _matmul_command(
         m_scale = _dynamic_scale(ctx, m)
         ctx.add_dynamic_patch(op_index, 2, m_scale, 0)
         ctx.add_dynamic_patch(op_index, 20, batches * n * m_scale, 0)
-        ctx.add_dynamic_patch(op_index, 21, batches * k * m_scale, 0)
+        ctx.add_dynamic_patch(op_index, 22, batches * k * m_scale, 0)
 
 
 def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
@@ -4360,7 +4362,7 @@ def _emit_mm(node: torch.fx.Node, ctx) -> TensorRef:
         raise RuntimeError(f"hexagon: mm contracts {k} against {contracted}")
 
     weight, prepacked = _weight_operand(
-        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+        ctx, rhs, m, ctx.upper_bound(k), ctx.upper_bound(n)
     )
     out = ctx.result_for(node, m * n)
     _matmul_command(
@@ -4399,7 +4401,7 @@ def _emit_bmm(node: torch.fx.Node, ctx) -> TensorRef:
         )
 
     weight, prepacked = _weight_operand(
-        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+        ctx, rhs, m, ctx.upper_bound(k), ctx.upper_bound(n)
     )
     out = ctx.result_for(node, batches * m * n)
     _matmul_command(
@@ -4447,7 +4449,7 @@ def _emit_addmm(node: torch.fx.Node, ctx) -> TensorRef:
     # beta == 0 folds the bias away and leaves mm, so there is nothing to add.
     target = out if beta == 0.0 else ctx.activation_for_shape((m, n))
     weight, prepacked = _weight_operand(
-        ctx, rhs, ctx.upper_bound(m), ctx.upper_bound(k), ctx.upper_bound(n)
+        ctx, rhs, m, ctx.upper_bound(k), ctx.upper_bound(n)
     )
     _matmul_command(
         node,
