@@ -1351,6 +1351,11 @@ def _emit_clamp(node: torch.fx.Node, ctx) -> TensorRef:
     min= that bound, and a clamp with no bounds at all is the identity, which
     the infinities in _clamp_bound_bits express on their own.
     """
+    absorbed = ctx.absorbed.get(node)
+    if absorbed is not None:
+        # A convolution already applied this relu6 in its store; the node is
+        # that buffer, so there is no command to add.
+        return ctx.record(node, absorbed)
     lower = node.args[1] if len(node.args) > 1 else None
     upper = node.args[2] if len(node.args) > 2 else None
     return _emit_clamp_bounds(node, ctx, lower, upper)
@@ -4018,15 +4023,101 @@ def _emit_upsample(node: torch.fx.Node, ctx) -> TensorRef:
     return ctx.record(node, out)
 
 
+def _fusable_relu6(node: torch.fx.Node) -> Optional[torch.fx.Node]:
+    """The relu6 this convolution's output feeds, when fusing it is safe.
+
+    Both convolution kernels apply the rectifier to the biased accumulator
+    before the store, so a relu6 written as its own node can be folded into the
+    command and the node -- and its command -- dropped. That is only the same
+    function when the convolution has no other reader: a second consumer of the
+    unrectified output would be handed a clamped value instead. The relu6 also
+    has to be exactly `hardtanh(0, 6)`, which is what `F.relu6` lowers to, and
+    to read this convolution rather than a cast of it.
+    """
+    users = list(node.users)
+    if len(users) != 1:
+        return None
+    user = users[0]
+    if user.target is not exir_ops.edge.aten.hardtanh.default:
+        return None
+    if len(user.args) < 3 or user.args[0] is not node:
+        return None
+    if not isinstance(user.args[1], (int, float)) or not isinstance(
+        user.args[2], (int, float)
+    ):
+        return None
+    if float(user.args[1]) != 0.0 or float(user.args[2]) != 6.0:
+        return None
+    return user
+
+
+def _conv_consumers(node: torch.fx.Node, ctx) -> List[torch.fx.Node]:
+    """The readers of a convolution's output, with a folded relu6 skipped.
+
+    A relu6 this convolution folds into its store holds the convolution's own
+    buffer, so a reader of the relu6 reads the convolution's output; for
+    deciding whether that buffer may stay blocked, the relu6 is not a consumer
+    of its own. The decision is made before the relu6 is recorded as absorbed,
+    so it is recognised here by the same test the fusion uses.
+    """
+    users = list(node.users)
+    if len(users) == 1 and _fusable_relu6(node) is not None:
+        return list(users[0].users)
+    return users
+
+
+def _conv_output_stays_blocked(node, geom, ctx) -> bool:
+    """Whether this convolution may leave its output in the blocked layout.
+
+    Only when a single reader is another convolution that reads this value
+    directly and wants exactly this geometry: the reader then takes the blocked
+    buffer, and neither this unpack nor the reader's own pack is emitted. A
+    graph output, a second reader, or a reader that is not a convolution all
+    mean the output has to be unpacked, because nothing else in the graph reads
+    the blocked layout.
+
+    The channel count also has to be a whole number of 64-lane blocks. A ragged
+    one leaves lanes past the last channel that the producer never wrote, and
+    the reader's im2col fill reads whole 64-lane groups -- which is why the pack
+    path zeroes them. Handing the reader the producer's buffer would hand it
+    whatever those lanes happened to hold.
+    """
+    if ctx.is_method_output(node):
+        return False
+    if geom[3] % POOL_CHANNEL_BLOCK:
+        return False
+    consumers = _conv_consumers(node, ctx)
+    if len(consumers) != 1:
+        return False
+    user = consumers[0]
+    if user.op != "call_function" or user.target not in CONV_TARGETS:
+        return False
+    source = user.args[0]
+    if source is not node and source not in node.users:
+        return False
+    user_spec = conv_spec(user, lambda operand: ctx.constant_value(operand) is not None)
+    if user_spec is None:
+        return False
+    return (
+        user_spec.batch,
+        user_spec.in_h,
+        user_spec.in_w,
+        user_spec.in_channels,
+    ) == geom
+
+
 def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     """A convolution as the DSP's depthwise walk or its im2col convolution.
 
     Both take the same blocked activation, so both are three commands: the blit
     in, the convolution, and the blit out of its result. A transposed
     convolution is the same three with an interleaving blit ahead of them and a
-    flipped weight.
+    flipped weight. A relu6 the convolution feeds is folded into the command
+    rather than emitted as its own, which removes the unary command and the
+    blit that would have followed the convolution.
     """
     spec = conv_spec(node, lambda operand: ctx.constant_value(operand) is not None)
+    relu6_user = _fusable_relu6(node)
     if spec is None:
         raise RuntimeError(
             "hexagon: this convolution is not one the DSP kernels can run (see conv_spec)"
@@ -4037,7 +4128,10 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
         source = _emit_zero_insert(ctx, node, source, spec)
     weight_node = node.args[1]
     bias_node = node.args[2] if len(node.args) > 2 else None
-    out = ctx.result_for(node, _numel(node))
+    # The folded relu6 is this node's value, so when that relu6 is a method
+    # output the convolution has to write into the output's slot rather than an
+    # activation of its own.
+    out = ctx.result_for(relu6_user if relu6_user is not None else node, _numel(node))
 
     # The packed input holds the plane the kernel walks, and for a transposed
     # convolution that is the interleaved plane the zero-insert writes, so its
@@ -4053,7 +4147,13 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
     in_area = spec.in_h * spec.in_w
     out_area = spec.out_h * spec.out_w
     packed_in = source
-    if not _conv_layouts_agree(in_area, spec.in_channels):
+    in_geom = (spec.batch, spec.in_h, spec.in_w, spec.in_channels)
+    if ctx.blocked.get(node.args[0]) == in_geom:
+        # The producer left this buffer blocked for exactly the geometry this
+        # convolution reads, so the pack is the buffer itself and no blit or
+        # zero-fill is emitted.
+        pass
+    elif not _conv_layouts_agree(in_area, spec.in_channels):
         packed_in = _blocked_activation(
             ctx, spec.batch, in_h_dim, spec.in_w, spec.in_channels
         )
@@ -4089,6 +4189,8 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             True,
             dynamic_area=spec.in_w if spec.dynamic_h else 0,
         )
+    out_geom = (spec.batch, spec.out_h, spec.out_w, spec.out_channels)
+    keep_blocked = _conv_output_stays_blocked(node, out_geom, ctx)
     packed_out = out
     if not _conv_layouts_agree(out_area, spec.out_channels):
         packed_out = _blocked_activation(
@@ -4131,11 +4233,11 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
                     spec.pad_x,
                     spec.dilate_y,
                     spec.dilate_x,
-                    # The kernel fuses relu and relu6 after the bias, and to_edge
-                    # leaves a relu as its own node rather than folding it in, so
-                    # both are always off here.
+                    # relu is left off: to_edge emits a relu as its own node and
+                    # the unary kernel runs it. relu6 is folded in when this
+                    # convolution is the only reader of the rectifier.
                     0,
-                    0,
+                    1 if relu6_user is not None else 0,
                 ],
             ),
         )
@@ -4199,10 +4301,11 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
                     # the error on the simulator.
                     1,
                     2,
-                    # relu and relu6 are fused into the store, and to_edge
-                    # leaves a relu as its own node, so both are off here.
+                    # relu stays off: to_edge emits a relu as its own node and
+                    # the unary kernel runs it. relu6 is folded into the store
+                    # when this convolution is the only reader of the rectifier.
                     0,
-                    0,
+                    1 if relu6_user is not None else 0,
                     spec.batch,
                     # outputBytes turns the store's own bounds check off.
                     0,
@@ -4212,7 +4315,7 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             ),
         )
         _patch_conv_extents(ctx, op_index, spec, im2col=True)
-    if packed_out is not out:
+    if packed_out is not out and not keep_blocked:
         _emit_channel_block_blit(
             ctx,
             node,
@@ -4224,7 +4327,16 @@ def _emit_convolution(node: torch.fx.Node, ctx) -> TensorRef:
             False,
             dynamic_area=spec.out_w if spec.dynamic_h else 0,
         )
-    return ctx.record(node, out)
+    final = packed_out if keep_blocked else out
+    ctx.record(node, final)
+    if keep_blocked:
+        ctx.blocked[node] = out_geom
+    if relu6_user is not None:
+        # The relu6 holds this same buffer, blocked when the convolution's is.
+        ctx.absorbed[relu6_user] = final
+        if keep_blocked:
+            ctx.blocked[relu6_user] = out_geom
+    return final
 
 
 def _conv_bias_ref(ctx, bias_node, channels: int, lanes: int, kind: str) -> TensorRef:

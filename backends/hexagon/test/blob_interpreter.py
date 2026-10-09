@@ -1086,11 +1086,6 @@ def _run_im2col_convolution(command: Command, params: List[int], arena: Arena) -
         _scale_block_num,
         _scale_asymmetric,
     ) = params[20:29]
-    if relu or relu6:
-        # The emitters leave the fused activations off and let to_edge's own
-        # relu node reach the unary kernel, so a nonzero one here is a command
-        # this model has never been asked to reproduce.
-        raise UnsupportedOp("blob: the im2col convolution's fused relu is not modelled")
 
     source = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
     weight = np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16)
@@ -1150,6 +1145,12 @@ def _run_im2col_convolution(command: Command, params: List[int], arena: Arena) -
         np.float32
     )
     values = narrowed.astype(np.float16)
+    if relu or relu6:
+        # The store applies the rectifier to the biased result, the same place
+        # the depthwise kernel does.
+        values = np.maximum(values, np.float16(0))
+        if relu6:
+            values = np.minimum(values, np.float16(6))
 
     out_blocks = -(-oc // 64)
     blocked = np.zeros((out_blocks, batch, area, POOL_PACK), dtype=np.float16)

@@ -57,6 +57,7 @@ from torch.export import export  # noqa: E402
 _DEPTHWISE = 2
 _IM2COL = 12
 _BLIT = 3
+_UNARY = 4
 _ZERO = 24
 
 #: One HVX vector of fp16 -- the channel count a block of the blocked layout
@@ -836,15 +837,36 @@ def test_the_host_interpreter_convolves_the_way_the_kernels_do():
         assert got.tobytes() == want.tobytes(), (in_channels, out_channels, groups)
 
 
-def test_the_interpreter_refuses_a_command_it_cannot_model():
-    """The fused activations are ones the emitters never set, and it says so."""
-    params = [0] * 29
-    params[20] = 64  # oc
-    params[22] = 2  # np
-    params[23] = 1  # relu
-    params[25] = 1  # batch
-    with pytest.raises(blob_interpreter.UnsupportedOp):
-        blob_interpreter._run_im2col_convolution(None, params, None)
+def test_a_convolution_folds_the_relu6_that_reads_it():
+    """The relu6 a convolution feeds is that convolution's own command.
+
+    The im2col store applies the rectifier after the bias, so a relu6 whose only
+    reader the convolution is is folded into the command: the node and its unary
+    command both disappear and the convolution carries the flag. The result is
+    the clamped convolution, which is what the comparison against torch checks.
+    """
+
+    class _ConvRelu6(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Conv2d(64, 64, 3, padding=1)
+
+        def forward(self, x):
+            return torch.nn.functional.hardtanh(self.conv(x), 0.0, 6.0)
+
+    model = _whole(_ConvRelu6(), 7).half()
+    # Weights in [-1, 1] over 64 channels leave the sum well past 6, so the
+    # rectifier is what decides the output rather than a pass-through.
+    x = _exact((1, 64, 8, 8), 11, -20, 20)
+    data, commands = _blob(_lower(model, (x,)))
+    convs = [c for c in commands if c.type in (_DEPTHWISE, _IM2COL)]
+    assert len(convs) == 1, "the convolution did not reach the delegate alone"
+    # relu6 is params[24] of the im2col command (params[15] of the depthwise).
+    assert convs[0].params[24] == 1, "the fused relu6 flag is not set"
+    assert all(c.type != _UNARY for c in commands), "a unary command survived"
+    got = _run(data, [x.numpy()])
+    want = model(x).detach().numpy().reshape(-1)
+    assert got.tobytes() == want.tobytes()
 
 
 def test_pack_conv_weight_is_the_tiling_the_kernel_reads():

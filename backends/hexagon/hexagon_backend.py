@@ -243,6 +243,15 @@ class BlobContext:
         )
         self.producer: Dict[torch.fx.Node, TensorRef] = {}
         self._constants: Dict[torch.fx.Node, TensorRef] = {}
+        # Nodes a command already computed and dropped, keyed to the buffer
+        # holding their value. The relu6 a convolution folds into its store is
+        # the only one; its emitter returns this ref instead of a command.
+        self.absorbed: Dict[torch.fx.Node, TensorRef] = {}
+        # Nodes whose value is in the DSP's 64-channel blocked layout, keyed to
+        # the geometry (batch, height, width, channels) it is blocked for. A
+        # convolution whose reader wants exactly this geometry leaves its output
+        # blocked, and that reader uses the buffer instead of packing its own.
+        self.blocked: Dict[torch.fx.Node, Tuple[int, int, int, int]] = {}
         # Placeholder targets whose stored bytes were rewritten into the HMX tile
         # order; their matmul has to say so, because no other kernel reads that.
         self.packed_targets: set = set()
