@@ -7199,13 +7199,26 @@ def _emit_max_dim(node: torch.fx.Node, ctx) -> TensorRef:
 # its own partial sort lands on and this one returns the first. Measured:
 # `[1, 1, .5, -2, 1, .5, 0]` comes back as 1 from torch and 0 from the kernel,
 # a row of four equal values comes back as 2 from torch and 0 from the kernel,
-# and over 200 rows of quantized values torch matches neither the first nor the
-# last occurrence on 175 of them. Handing the graph's indices that answer would
-# put a position torch never produced into a tensor the model reads, which is
-# what a refusal is for; the values, which are the row's maximum either way, are
-# the half this emitter takes. The kernel dereferences both pointers, so the
-# other half gets a scratch slot nothing reads rather than being left ABSENT,
-# which would fail the command.
+# and over 200 rows of quantized values torch's answer is not the first
+# occurrence on 188 of them -- 175 neither the first nor the last, and 13 the
+# last, which are wrong by as much as the other 175. Handing the graph's
+# indices that answer would put a position torch never produced into a tensor
+# the model reads, which is what a refusal is for; the values, which are the
+# row's maximum either way, are the half this emitter takes. The kernel
+# dereferences both pointers, so the other half gets a scratch slot nothing
+# reads rather than being left ABSENT, which would fail the command.
+#
+# That figure is this family's reason and not the arg reductions': on the same
+# rows `torch.argmax` and `torch.max(x, -1).indices` agree with a strict
+# first-occurrence walk on 200 of 200, so a strict DSP walk agrees with torch by
+# construction there and disagrees here.
+#
+# The second width -- the node declares int64 and this kernel writes one int32 a
+# row -- is a hazard and not a second reason: no clause anywhere refuses on it,
+# and the scratch slot is sized for what the kernel writes. Widening it into an
+# int64 slot is one RASTER_BLIT region, whose per-side stride carries a pitch of
+# 4 on the source and 8 on the destination, so the width is repairable where the
+# position is not.
 #
 # The values carry the caveat max and amax already carry -- a NaN row and the
 # sign of a zero are where the DSP's maximum and torch's differ.
@@ -7362,13 +7375,19 @@ def topk_is_emittable(node: torch.fx.Node) -> bool:
 
     The same all-readers-take-the-values rule the pool and max.dim are under, for
     the reason topk_getitem gives; a graph that reads the positions keeps the
-    values reader portable with the node it reads. The rule is not only about what
-    the kernel computes: the node declares its positions as int64 and this kernel
-    writes one int32 per row (topk_ops.cc:54), so a slot wide enough for the
-    declared dtype would have its upper half left as the arena held it. The width
-    is the smaller of the two reasons -- the position itself is the wrong number
-    -- and it is the one that would still stand if a future kernel broke ties
-    torch's way.
+    values reader portable with the node it reads. That reader rule is the whole
+    of the gate -- the two clauses below it are the target test and the spec, and
+    neither one looks at a width.
+
+    This used to describe two reasons, the second being that the node declares
+    its positions int64 where the kernel writes one int32 per row
+    (topk_ops.cc:54), so a slot wide enough for the declared dtype would have
+    its upper half left as the arena held it. The fact is true and it is a
+    hazard, but it is not a reason: no clause in this body refuses on a width,
+    so the gate never applied it, and the widening is one RASTER_BLIT region
+    (a per-side stride of 4 in and 8 out). What refuses the node is that the
+    position the kernel writes is not the position torch writes -- 188 of 200
+    rows -- and that one no emitter can repair.
     """
     if node.target is not TOPK:
         return True

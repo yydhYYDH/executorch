@@ -610,12 +610,15 @@ SUPPORTED: List[OpSupport] = [
         "is in order either way. The node answers (values, indices) and the "
         "kernel writes both, but the position it writes is the *first* occurrence "
         "of the maximum while torch's own kernel returns whichever index its "
-        "partial sort lands on -- neither the first nor the last of a tie in "
-        "general -- so it is placed only when every reader takes getitem 0 "
-        "(topk_is_emittable, the rule max_pool2d and max.dim are under). The "
+        "partial sort lands on -- 188 of 200 rows of quantized values are not the "
+        "first occurrence, against 0 of 200 for argmax -- so it is placed only "
+        "when every reader takes getitem 0 (topk_is_emittable, the rule "
+        "max_pool2d and max.dim are under). The "
         "other half goes to a scratch activation the kernel dereferences and "
-        "nothing reads. The values carry the signed-zero and NaN caveat "
-        "max.default has.",
+        "nothing reads; it is int32, which is the width the kernel writes and not "
+        "the int64 the node declares, so a graph that did read it would need one "
+        "widening region before the number meant anything. The values carry the "
+        "signed-zero and NaN caveat max.default has.",
     ),
     OpSupport(
         "aten.argmax.default",
@@ -1351,15 +1354,23 @@ NOT_SUPPORTED = [
         "The one kernel that writes positions writes the *first* occurrence of the "
         "row maximum, and torch's own kernel returns whatever index its partial "
         "sort lands on -- for a row of equal values torch answers 2 where this "
-        "answers 0, and over 200 rows of quantized values it lands on something "
-        "other than the first occurrence on 188 of them -- 175 that are neither "
-        "the first nor the last, and the 13 that are the last, which are wrong by "
-        "exactly as much. A graph that reads the "
-        "positions would therefore be reading a number torch never produced, which "
-        "is what the all-readers-are-getitem-0 rule refuses. k != 1, another dim "
-        "and largest=False are refused by the same gate, because the kernel has "
-        "no argument for any of them. `torch.topk(x, 1).values`, `torch.amax(x, "
-        "dim)` and `torch.max(x, dim).values` reach the covered targets instead.",
+        "answers 0, and over 200 rows of quantized values it answers something "
+        "else on 188 of them: 175 that are neither the first nor the last "
+        "occurrence, and 13 that are the last, which are wrong by exactly as "
+        "much. A graph that reads the positions would therefore be reading a "
+        "number torch never produced, which is what the all-readers-are-getitem-0 "
+        "rule refuses. That figure is the topk reason and not the arg reductions' "
+        "one: on the same 200 rows `torch.argmax` and `torch.max(x, -1).indices` "
+        "agree with a strict first-occurrence walk on every one, so a strict walk "
+        "is a correct answer for a reduction and the wrong one for a partial "
+        "sort. k != 1, another dim and largest=False are refused by the same gate, "
+        "because the kernel has no argument for any of them. `torch.topk(x, 1)."
+        "values`, `torch.amax(x, dim)` and `torch.max(x, dim).values` reach the "
+        "covered targets instead. The int64 the node declares for the positions is "
+        "a second hazard rather than a second reason: the gate names no width, so "
+        "nothing refuses on it, and widening the kernel's int32 into that slot is "
+        "one `RASTER_BLIT` region with a pitch of 4 on the source side and 8 on the "
+        "destination.",
     ),
     (
         "aten.eq / ne / ge / le, and a bool operand anywhere else",
