@@ -6842,6 +6842,9 @@ def _conv_bias_ref(ctx, bias_node, channels: int, lanes: int, kind: str) -> Tens
 # REDUCTION collapses one contiguous span, so the reduced dims have to be
 # adjacent; the callers' support checks enforce that before an emitter runs.
 SUM_DIM = exir_ops.edge.aten.sum.dim_IntList
+# The multiply the masked reduction folds onto is the plain element-wise one, so
+# the same name is a row of its own below and the operand of a fused sum.
+MUL_TENSOR = exir_ops.edge.aten.mul.Tensor
 AMAX = exir_ops.edge.aten.amax.default
 MAX_DEFAULT = exir_ops.edge.aten.max.default
 MIN_DEFAULT = exir_ops.edge.aten.min.default
@@ -7141,9 +7144,222 @@ def _emit_reduction(node: torch.fx.Node, ctx, kind: int) -> TensorRef:
     return ctx.record(node, out)
 
 
+# The one kernel here that reads a predicate operand. htp_ops_masked_reduction
+# (eltwise_ops.cc:2961) sums `src[o][r][i]` over the `r` whose `mask[o][r]` is
+# nonzero, for an fp16 `src` of `[outside][reduce][inside]` and a mask of exactly
+# `outside * reduce` fp16 entries (eltwise_ops.cc:2901-2935). It is SUM only:
+# `opType` and `bytes` are rejected unless they are 1 and 2
+# (eltwise_ops.cc:2964-2969).
+DSP_OP_MASKED_REDUCTION = 31
+
+#: The fp16 patterns a mask operand may hold. The kernel tests the mask against
+#: zero (eltwise_ops.cc:2918, :2929) and nothing else, so 1.0 keeps its row,
+#: either zero skips it, and every other pattern is kept *whole*: a 0.5 mask
+#: would sum the row at full weight rather than at half. That is the soundness
+#: precondition, and a set of bits is the only form of it that can be checked
+#: once, at export.
+_MASK_BITS = frozenset({0x0000, 0x8000, 0x3C00})
+
+#: The row width the fusion is exact below, and it is 32 rather than the masked
+#: kernel's own vector width of 64. Two conditions meet here, both measured on
+#: hexagon-sim (`test/test_masked_reduction_sim.py`): the masked kernel's scalar
+#: tail covers every lane of a row below 64, and the reduction this command
+#: replaces walks its row with the scalar path only below 32. Between the two --
+#: `32 <= inside < 64` -- `htp_ops_reduction` takes its small-vector walk, whose
+#: fp32 accumulate is the qf32 add-then-normalize pair rather than a plain fp32
+#: add (`eltwise_ops.cc:2737-2740`) and loses up to 1.4 ULP; there the merged
+#: command is the *more* accurate of the two, which is a different lowering and
+#: not a merge. Above 64 the masked kernel's own vector path rounds to fp16 after
+#: every unmasked row, so that end trades precision for the command as well.
+MASKED_REDUCTION_INSIDE = 32
+
+
+def mask_is_exactly_zero_or_one(value) -> bool:
+    """Whether every element of a fp16 tensor is a 0.0 or a 1.0, by bit pattern.
+
+    `value` has to be the tensor the kernel itself will read: the kernel reads
+    fp16, so an operand of another width cannot be checked here at all -- the
+    bytes it would be narrowed to are not the values the graph carries.
+    """
+    import numpy as np
+
+    if not isinstance(value, torch.Tensor) or value.dtype is not torch.float16:
+        return False
+    bits = np.ascontiguousarray(value.detach().cpu().numpy()).view(np.uint16)
+    return set(int(bit) for bit in np.unique(bits)) <= _MASK_BITS
+
+
+class MaskedReduction(NamedTuple):
+    """One `sum` folded onto the mask kernel, and the three extents it walks.
+
+    `product` is the multiply both commands replace, which is what the
+    multiply's own emitter asks about; `src` is the activation the kernel sums,
+    which is that multiply's other operand.
+    """
+
+    product: torch.fx.Node
+    src: torch.fx.Node
+    mask: torch.fx.Node
+    outside: int
+    reduce: int
+    inside: int
+
+
+def _mask_constant(operand: torch.fx.Node, expected: tuple, ctx):
+    """The constant behind a mask operand, with the value it holds.
+
+    The graph spells the mask `m.unsqueeze(-1)`, so the bytes the kernel reads
+    are one view below the operand and that one level is unwrapped. Only a view
+    that keeps the bytes is unwrapped (`_emit_alias` admits nothing else), and
+    the constant behind it has to be exactly `expected` -- the mask's own
+    `[outside][reduce]` shape -- so that the operand's element count and the
+    constant's agree. What the backend cannot read now is a mask whose values
+    nothing can prove, a method input most of all.
+    """
+    candidates = [(operand, None)]
+    if operand.target in ALIAS_TARGETS and operand.args:
+        candidates.append((operand.args[0], expected))
+    for candidate, shape in candidates:
+        if not isinstance(candidate, torch.fx.Node):
+            continue
+        value = ctx.constant_value(candidate)
+        if value is None or not mask_is_exactly_zero_or_one(value):
+            continue
+        if shape is not None and tuple(value.shape) != shape:
+            continue
+        return candidate, value
+    return None, None
+
+
+def masked_reduction_spec(node: torch.fx.Node, ctx) -> Optional[MaskedReduction]:
+    """The one-command form of `(a * m.unsqueeze(-1)).sum(-2)`, or None.
+
+    `node` is the sum. Every clause below is a condition the kernel or the
+    arithmetic imposes rather than a preference:
+
+    - the sum is one axis, the axis before the last, with no `keepdim` and no
+      `dtype`, so the result is the `[outside][inside]` buffer the kernel writes;
+    - its operand is a multiply whose other operand is the source's shape with
+      one trailing axis of extent 1 -- what `m.unsqueeze(-1)` is, and what the
+      kernel's `[outside][reduce]` operand becomes once that axis is dropped;
+    - that multiply is the sum's only reader, because the fused command replaces
+      both commands: a second reader would be left with nothing that produced it;
+    - the three extents are static positive integers, since the kernel takes them
+      as three int32s and indexes the mask by `(outside, reduce)`. A run-time
+      extent of either would walk the constant at the stride it was lifted at
+      rather than the one the call asks for, which is why a genuine `int` is
+      required and a `SymInt` is not one;
+    - the mask is a fp16 constant of exactly that many entries that are 0.0 or
+      1.0 (`mask_is_exactly_zero_or_one`). This is the precondition: the kernel
+      tests `mask != 0`, so anything else in the operand is summed at full
+      weight. A constant can be checked at export and a run-time mask cannot, so
+      a run-time mask is refused here;
+    - the row is narrower than `MASKED_REDUCTION_INSIDE`, which is the width at
+      which the fused kernel's accumulation is the two-command path's. Past it
+      the two differ -- fp16 rounding after every row above 64, and the plain
+      reduction's less accurate small-vector walk between 32 and 64 -- so the
+      merge would move the answer, which is a decision for a profile rather than
+      for a support predicate.
+    """
+    if node.target is not SUM_DIM or not sum_dim_is_emittable(node):
+        return None
+    if node.kwargs.get("keepdim") or (len(node.args) > 3 and node.args[3]):
+        return None
+    src = node.args[0] if node.args else None
+    if not isinstance(src, torch.fx.Node) or src.target is not MUL_TENSOR:
+        return None
+    if list(src.users) != [node]:
+        return None
+    # The extents are the source's, not the sum's: the kernel walks the buffer
+    # the multiply produced, and the sum's own value has already lost a rank.
+    value = src.meta.get("val")
+    if not isinstance(value, torch.Tensor) or value.dim() < 3:
+        return None
+    shape = tuple(value.shape)
+    if reduction_dims(node) != [len(shape) - 2]:
+        return None
+    if not all(isinstance(extent, int) for extent in shape):
+        return None
+    outside = 1
+    for extent in shape[:-2]:
+        outside *= extent
+    reduce, inside = shape[-2], shape[-1]
+    if outside <= 0 or reduce <= 0 or inside < 1:
+        return None
+    if inside >= MASKED_REDUCTION_INSIDE:
+        return None
+    for source, masked in ((src.args[0], src.args[1]), (src.args[1], src.args[0])):
+        if not isinstance(source, torch.fx.Node) or not isinstance(
+            masked, torch.fx.Node
+        ):
+            continue
+        held = source.meta.get("val")
+        if not isinstance(held, torch.Tensor) or tuple(held.shape) != shape:
+            continue
+        operand = masked.meta.get("val")
+        if not isinstance(operand, torch.Tensor):
+            continue
+        if tuple(operand.shape) not in (shape[:-1], shape[:-1] + (1,)):
+            continue
+        constant, _value = _mask_constant(masked, shape[:-1], ctx)
+        if constant is not None:
+            return MaskedReduction(src, source, constant, outside, reduce, inside)
+    return None
+
+
+def _emit_masked_reduction(
+    node: torch.fx.Node, ctx, spec: MaskedReduction
+) -> TensorRef:
+    """The one command the masked multiply and the sum fold onto.
+
+    The three params are the span `_emit_reduction` would write for the same
+    sum, and they are written from the static extents the spec established, so
+    there is nothing here for the trailer to patch. The second operand is the
+    mask rather than another activation: the kernel applies the predicate to the
+    sum itself, which is what makes dropping the multiply a fusion rather than a
+    re-lowering.
+    """
+    out = ctx.result_for(_values_sink(node), _numel(node))
+    ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_MASKED_REDUCTION,
+            inputs=[ctx.operand(spec.src), ctx.operand(spec.mask)],
+            outputs=[out],
+            params=[
+                spec.outside,
+                spec.reduce,
+                spec.inside,
+                REDUCTION_SUM,
+                FP16_BYTES,
+            ],
+        ),
+    )
+    return ctx.record(node, out)
+
+
+def _emit_mul(node: torch.fx.Node, ctx) -> TensorRef:
+    """A multiply, unless the masked reduction above has taken it over.
+
+    The fused command reads the source and the mask itself, so the product it
+    replaces must have no producer: a command for it would write a buffer
+    nothing reads. This asks the same function the sum's emitter asks, so the
+    two decisions cannot disagree -- and it is asked here rather than made here
+    because the multiply is emitted first.
+    """
+    for reader in node.users:
+        spec = masked_reduction_spec(reader, ctx)
+        if spec is not None and spec.product is node:
+            return ctx.record(node, ABSENT)
+    return _binary("mul")(node, ctx)
+
+
 def _emit_sum_dim(node: torch.fx.Node, ctx) -> TensorRef:
     if not sum_dim_is_emittable(node):
         raise RuntimeError("hexagon: this sum reduces into another dtype")
+    spec = masked_reduction_spec(node, ctx)
+    if spec is not None:
+        return _emit_masked_reduction(node, ctx, spec)
     return _emit_reduction(node, ctx, REDUCTION_SUM)
 
 
@@ -9148,7 +9364,7 @@ EMITTERS = {
     MIN_DEFAULT: _emit_min_default,
     exir_ops.edge.aten.add.Tensor: _binary("add"),
     exir_ops.edge.aten.sub.Tensor: _binary("sub"),
-    exir_ops.edge.aten.mul.Tensor: _binary("mul"),
+    MUL_TENSOR: _emit_mul,
     exir_ops.edge.aten.div.Tensor: _binary("div"),
     exir_ops.edge.aten.maximum.default: _binary("max"),
     exir_ops.edge.aten.minimum.default: _binary("min"),

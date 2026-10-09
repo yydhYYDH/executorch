@@ -67,6 +67,7 @@ MATMUL_W8A16_BLOCK_FP16 = 42
 MATMUL_Q4A16_GEMV_I8 = 41
 MATMUL_W8A16_GEMV_I8 = 45
 SHARED_GATHER = 23
+MASKED_REDUCTION = 31
 VISION_ATTENTION_FP16 = 43
 SELECT = 26
 
@@ -1541,6 +1542,65 @@ def _run_reduction(command: Command, params: List[int], arena: Arena) -> None:
     )
 
 
+def _run_masked_reduction(command: Command, params: List[int], arena: Arena) -> None:
+    """htp_ops_masked_reduction: the predicate applies to the sum, not to a row.
+
+    `src` is `[outside][reduce][inside]`, the mask carries one fp16 entry per
+    (outside, reduce) pair and is broadcast over `inside`, and the result is
+    `[outside][inside]`; the kernel rejects every op type but SUM
+    (eltwise_ops.cc:2964-2969).
+
+    Both of the kernel's accumulation paths are modelled, because they are the
+    difference between this command and the two it replaces. Lanes below
+    `inside & -64` take the vector path, which rounds to fp16 after every
+    unmasked row (`Q6_Vqf16_vadd_VhfVhf` then `Q6_Vhf_equals_Vqf16`,
+    eltwise_ops.cc:2919-2925); the lanes past that take the scalar tail, which
+    accumulates in fp32 and is the arithmetic `_run_reduction` models for every
+    lane. A row narrower than 64 elements is the whole of the tail, which is why
+    that is where the fusion is exact.
+    """
+    outside, reduce, inside = params[0], params[1], params[2]
+    op_type, unit = params[3], params[4]
+    if op_type != REDUCTION_SUM:
+        raise UnsupportedOp(f"blob: masked reduction kind {op_type} is not modelled")
+    if unit != FP16_BYTES:
+        raise UnsupportedOp(
+            f"blob: a masked reduction over {unit}-byte values is not modelled"
+        )
+    src = np.frombuffer(bytes(arena.view(command.inputs[0])), dtype=np.float16)
+    mask = np.frombuffer(bytes(arena.view(command.inputs[1])), dtype=np.float16)
+    if src.size < outside * reduce * inside:
+        raise UnsupportedOp(
+            f"blob: {src.size} values do not fill [{outside}][{reduce}][{inside}]"
+        )
+    if mask.size < outside * reduce:
+        # The kernel reads outside*reduce entries and never checks the count, so
+        # a shorter mask is an over-read rather than a wrong answer. The gate
+        # that admits this command requires the count, and this is what catches
+        # a blob that reached the arena another way.
+        raise UnsupportedOp(
+            f"blob: {mask.size} mask entries do not fill [{outside}][{reduce}]"
+        )
+    rows = src[: outside * reduce * inside].reshape(outside, reduce, inside)
+    kept = mask[: outside * reduce].reshape(outside, reduce) != 0.0
+    flat = np.where(kept[:, :, None], rows.astype(np.float32), np.float32(0.0))
+    out = flat.sum(axis=1)
+    tail = inside & -64
+    if tail:
+        vector = np.zeros((outside, inside), dtype=np.float16)
+        for r in range(reduce):
+            keep = kept[:, r][:, None]
+            vector = np.where(
+                keep, (vector + rows[:, r, :]).astype(np.float16), vector
+            ).astype(np.float16)
+        out[:, :tail] = vector[:, :tail].astype(np.float32)
+    _store(
+        arena,
+        arena.address(command.outputs[0]),
+        out.astype(np.float16).tobytes(),
+    )
+
+
 def _run_topk(command: Command, params: List[int], arena: Arena) -> None:
     """htp_ops_topkv2_k1_fp16: each row's maximum, and the first index holding it.
 
@@ -2296,6 +2356,7 @@ _EXECUTORS = {
     RASTER_BLIT: _run_raster_blit,
     SOFTMAX: _run_softmax,
     REDUCTION: _run_reduction,
+    MASKED_REDUCTION: _run_masked_reduction,
     TOPKV2_K1_FP16: _run_topk,
     ARGMAX_FP16: _run_arg_reduction,
     UPSAMPLE_BILINEAR2D_FP16: _run_upsample_bilinear2d,

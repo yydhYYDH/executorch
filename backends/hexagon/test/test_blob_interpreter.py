@@ -740,6 +740,25 @@ def _permute_copy(shape, dims):
     return node
 
 
+def _slice_copy(shape, dim, start, result_shape):
+    """A static slice_copy node, holding the extents its region is built from."""
+    graph = torch.fx.Graph()
+    source = graph.placeholder("x")
+    source.meta["val"] = torch.empty(shape, dtype=torch.float16)
+    node = graph.call_function(
+        exir_ops.edge.aten.slice_copy.Tensor,
+        args=(source, dim, start, 2**63 - 1, 1),
+    )
+    node.meta["val"] = torch.empty(result_shape, dtype=torch.float16)
+    return node
+
+
+def test_a_negative_slice_start_is_relative_to_the_source_extent():
+    region = hexagon_ops.slice_region(_slice_copy((1, 512, 41), 2, -26, (1, 512, 26)))
+    assert region is not None
+    assert region.region == [0, 15, 0, 1, 512, 26, 0, 41, 1, 0, 26, 1]
+
+
 def _regions_reproduce(regions, shape, dims):
     """Whether the regions write the permutation, checked against torch."""
     src = torch.arange(1, 1 + int(torch.tensor(shape).prod()), dtype=torch.float32)
@@ -807,7 +826,6 @@ def test_a_head_split_on_a_batch_of_one_is_three_loops():
     one = hexagon_ops.permute_region(_permute_copy((1, 16, 8, 40), (0, 2, 1, 3)))
     assert len(one) == 1, one
 
-
 #: Nothing is excused. FLASH_ATTN was, on the grounds that modelling it needed
 #: the kernel's approximated exponential; it turned out to need only the causal
 #: rule and the head grouping, so the interpreter covers it and the set below is
@@ -850,7 +868,8 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
     # 1 pool2d, 2 depthwise convolution, 3 blit, 4 unary, 8 layer norm, 12 im2col
     # convolution, 14 rope, 16 add+fused norm, 17 1x1 direct convolution, 18
     # flash attention, 19 element-wise, 22 q4a16 prefill, 23 shared gather, 24
-    # zero, 26 select, 27 topk, 28 softmax, 29 reduction, 37 Leaky ReLU, 38 batch
+    # zero, 26 select, 27 topk, 28 softmax, 29 reduction, 31 masked reduction, 37 Leaky
+    # ReLU, 38 batch
     # matmul, 39 PReLU, 41 q4a16 GEMV, 42 w8a16 prefill, 43 vision attention,
     # 45 w8a16 GEMV, 46 bilinear upsample, 47 argmax/argmin.
     # Tensor convert (7) is in the DSP's enum but no emitter here produces it.
@@ -873,6 +892,7 @@ def test_the_ops_actually_emitted_are_the_ones_we_think():
         27,
         28,
         29,
+        31,
         37,
         38,
         39,

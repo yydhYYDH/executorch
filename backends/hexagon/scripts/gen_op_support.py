@@ -89,6 +89,12 @@ ZERO = "DSP_OP_ZERO"
 # the first position holding it. The emitter takes the first and puts the second
 # in scratch the graph never reads.
 TOPKV2_K1 = "DSP_OP_TOPKV2_K1_FP16"
+# The masked reduction. No emitter carries it: the multiply and the sum that
+# reach it are each emitted by their own rule, and this is the op the pair
+# becomes when the mask is a constant the gate can prove and the row is short
+# enough that the merge does not move the answer. That is why the sum row below
+# is the one that names it.
+MASKED_REDUCTION = "DSP_OP_MASKED_REDUCTION"
 # The element-wise select. It is the one command whose operand is not the arena's
 # width: the condition is a torch.bool, and the kernel reads it one byte at a
 # time from the slot the blob sizes for it, which is why a comparison's result
@@ -510,12 +516,23 @@ SUPPORTED: List[OpSupport] = [
     ),
     OpSupport(
         "aten.sum.dim_IntList",
-        REDUCTION,
+        REDUCTION + " / " + MASKED_REDUCTION,
         ARENA_FP16,
         "Same single-span rule as mean.dim, with a missing or empty dim read as "
         "every dim. The dtype argument must be absent: the kernel's accumulator is "
         "fp32 and its result fp16, so summing into any other width is a different "
-        "op rather than a narrower command.",
+        "op rather than a narrower command. The one shape that emits the masked "
+        "reduction instead is a sum over the axis before the last whose operand is "
+        "a multiply by m.unsqueeze(-1): the mask kernel takes that multiply's "
+        "factor as an operand, so the pair becomes one command and the product "
+        "between them is never written. It fires only for a fp16 constant mask of "
+        "one entry per (outside, reduce) that is exactly 0.0 or 1.0 -- the kernel "
+        "tests mask != 0 rather than mask == 1, so any other value would be summed "
+        "at full weight, and a run-time mask cannot be checked -- for a multiply "
+        "with no other reader, and for a row narrower than 32 elements, which is "
+        "the width at which the fused command and the two it replaces are the same "
+        "arithmetic rather than merely both correct. Everything else is the two "
+        "commands.",
     ),
     OpSupport(
         "aten.amax.default",

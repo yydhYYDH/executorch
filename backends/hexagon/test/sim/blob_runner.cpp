@@ -51,6 +51,12 @@ extern "C" int htp_ops_softmax(uint8_t *dst, const uint8_t *src, int32_t outside
 extern "C" int htp_ops_reduction(uint8_t *dst, const uint8_t *src, int32_t outside,
                                  int32_t reduce, int32_t inside, int32_t opType,
                                  int32_t bytes);
+/* One entry per (outside, reduce) pair in the second operand, broadcast over the
+ * row: the predicate is a tensor the command carries rather than a param. */
+extern "C" int htp_ops_masked_reduction(uint8_t *dst, const uint8_t *src,
+                                        const uint8_t *mask, int32_t outside,
+                                        int32_t reduce, int32_t inside,
+                                        int32_t opType, int32_t bytes);
 extern "C" int htp_ops_layer_norm(uint8_t *dst, uint8_t *src, uint8_t *gamma,
                                   uint8_t *beta, int32_t outterSize,
                                   int32_t innerSize, float epsilon,
@@ -172,6 +178,7 @@ enum {
   kTopkV2K1 = 27,
   kSoftmax = 28,
   kReduction = 29,
+  kMaskedReduction = 31,
   kBatchMatmul = 38,
   kRelu = 37,
   kPrelu = 39,
@@ -561,6 +568,18 @@ static void execute_op(const HexagonOp &op, const HexagonBlobHeader *header,
   if (op.type == kReduction) {
     htp_ops_reduction(address(header, op.outputs[0]), address(header, op.inputs[0]),
                       params[0], params[1], params[2], params[3], params[4]);
+    return;
+  }
+  if (op.type == kMaskedReduction) {
+    /* Two operands in the order the emitter binds them and
+     * `execute_command.cc:673-680` hands over: the activation first, the fp16
+     * predicate second. The kernel is the whole reason this op exists --
+     * `htp_ops_reduction` has no masked form -- and it refuses anything but a
+     * two-byte SUM, so a wrong param writes nothing rather than a wrong row. */
+    htp_ops_masked_reduction(address(header, op.outputs[0]),
+                             address(header, op.inputs[0]),
+                             address(header, op.inputs[1]), params[0], params[1],
+                             params[2], params[3], params[4]);
     return;
   }
   if (op.type == kLayerNorm) {
