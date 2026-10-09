@@ -885,9 +885,10 @@ SUPPORTED: List[OpSupport] = [
         "aten.layer_norm.default",
         LAYER_NORM,
         "src fp16; gamma/beta fp32",
-        "Normalized shape must be the trailing dims; eps must be a compile-time "
-        "scalar. The kernel reads gamma and beta as fp32, which no delegate input "
-        "holds, so the affine is emitted as separate elementwise mul/add.",
+        "Normalized shape must be the trailing dims and a compile-time one; eps "
+        "must be a compile-time scalar. The kernel reads gamma and beta as fp32, "
+        "which no delegate input holds, so the affine is emitted as separate "
+        "elementwise mul/add.",
     ),
     OpSupport(
         "aten.native_layer_norm.default",
