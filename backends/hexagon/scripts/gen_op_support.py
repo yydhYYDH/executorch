@@ -509,6 +509,26 @@ SUPPORTED: List[OpSupport] = [
         "dtype rule is mean.dim's.",
     ),
     OpSupport(
+        "aten.var.correction",
+        REDUCTION + " / " + BINARY + " / " + UNARY,
+        ARENA_FP16,
+        "The two-pass variance, in the five commands the mean half is already "
+        "made of: a mean over the span, the deviation as a binary subtract "
+        "against it, the square as the unary table own entry, a second mean, "
+        "and -- only when the correction is not zero -- the n/(n-correction) "
+        "scale as the unary multiply aten.mul.Scalar writes. The reduced dims "
+        "must be one contiguous span, as on mean.dim, the span length must be "
+        "a number because the scale is a command param, and the correction "
+        "must leave a positive denominator. A correction of zero scales by "
+        "exactly 1.0, so that form is four commands and any other is five. "
+        "The accuracy is the two-pass own: the squared deviation is a buffer, "
+        "so it is fp16 and the mean that follows reads those fp16 values, "
+        "which is a few times 2**-11 from a fp32 answer on centred data and "
+        "3.8e-03 on data with a mean of 200. The fp32-accumulated variance "
+        "the layer norm command computes is not reachable as a value here, "
+        "because that command writes the normalized tensor.",
+    ),
+    OpSupport(
         "aten.sum.dim_IntList",
         REDUCTION,
         ARENA_FP16,
@@ -1402,18 +1422,6 @@ NOT_SUPPORTED = [
         "values in [2, 3] already reaches 2**16 and overflows fp16 to infinity.",
     ),
     (
-        "aten.var.correction",
-        "No kernel, and no composition of the existing commands is a substitute "
-        "for it. The two-pass form -- mean, subtract, square, mean, scale -- is "
-        "four or five commands of types the table already has and reproduces the "
-        "fp16 two-pass bit for bit, but it is not `torch.var`: measured against "
-        "torch on fp16 the two differ by 6.2e-04 relative on centred data and "
-        "2.5e-03 on data with a mean of 200, and the square is materialised in "
-        "fp16, so a deviation past 256 overflows to infinity where torch's "
-        "accumulator, which is fp32 throughout, does not. The export cannot bound "
-        "the deviation, so the node keeps a portable kernel.",
-    ),
-    (
         "aten.pow.Tensor_Tensor outside {-1, 0, 1, 2, 3, 4}",
         "The supported exponents are the ones the existing unary and binary "
         "elementwise commands compute exactly, or within the elementwise "
@@ -1499,6 +1507,7 @@ PREDICATES = [
     "reduction_dims",
     "sum_dim_is_emittable",
     "mean_result_width_is_emittable",
+    "var_correction_is_emittable",
     "pow_is_square",
     "max_pool_is_emittable",
     "max_dim_is_emittable",

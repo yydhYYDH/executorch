@@ -125,6 +125,8 @@ from executorch.backends.hexagon.hexagon_ops import (
     UPSAMPLE_TARGETS,
     upsample_bilinear2d_is_emittable,
     UPSAMPLE_BILINEAR_TARGETS,
+    var_correction_is_emittable,
+    VAR_TARGETS,
     vision_attention_is_emittable,
     VISION_ATTENTION_TARGETS,
     where_is_emittable,
@@ -780,6 +782,12 @@ class HexagonOperatorSupport(OperatorSupportBase):
                 # mean overloads used to skip it, and torch.mean(x, dim=1,
                 # dtype=torch.float32) came back as fp16 values widened to fp32.
                 return False
+        if node.target in VAR_TARGETS and not var_correction_is_emittable(node):
+            # One contiguous span, a span length the n/(n-correction) scale can
+            # be written from, and no correction at or past it. Anything else is
+            # a different op rather than a narrower command, the same rule
+            # mean_result_width_is_emittable states for the mean half.
+            return False
         if node.target in SQUARE_POW_TARGETS and not pow_is_square(node):
             # Only x ** 2 maps to the unary square kernel; another exponent is a
             # different function, not a narrower command.

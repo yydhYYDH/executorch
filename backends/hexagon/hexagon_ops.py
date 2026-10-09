@@ -7480,6 +7480,193 @@ def _emit_mean_default(node: torch.fx.Node, ctx) -> TensorRef:
     return _emit_reduction(node, ctx, REDUCTION_MEAN)
 
 
+VAR_CORRECTION = exir_ops.edge.aten.var.correction
+VAR_TARGETS = frozenset({VAR_CORRECTION})
+
+
+def var_correction_count(node: torch.fx.Node) -> Optional[int]:
+    """The number of elements this variance reduces, or None when it is not a
+    constant the n/(n-correction) scale can be written from.
+
+    The scale is baked into a command param, so a span whose length the export
+    only knows at run time has no number to bake: answering with the traced
+    examples length would be a wrong answer rather than a slow one, which is the
+    rule the vision attention gate states for its own params.
+    """
+    dims = reduction_dims(node)
+    if dims is None:
+        return None
+    shape = node.args[0].meta["val"].shape
+    count = 1
+    for dim in range(dims[0], dims[-1] + 1):
+        extent = shape[dim]
+        if isinstance(extent, torch.SymInt) or not isinstance(extent, int):
+            return None
+        count *= int(extent)
+    return count
+
+
+def var_correction_scale(node: torch.fx.Node) -> Optional[float]:
+    """n / (n - correction), or None when the node is not this composition.
+
+    torch default correction is 1 and an absent one means the same, so a graph
+    that says nothing and a graph that says 1 are one op. A correction at or past
+    n has no answer at all.
+    """
+    if node.target is not VAR_CORRECTION:
+        return None
+    count = var_correction_count(node)
+    if count is None or count < 1:
+        return None
+    correction = _scalar_arg(node, "correction", 2, 1.0)
+    if isinstance(correction, bool) or not isinstance(correction, (int, float)):
+        return None
+    denominator = count - float(correction)
+    if denominator <= 0.0:
+        return None
+    return float(count / denominator)
+
+
+def var_correction_is_emittable(node: torch.fx.Node) -> bool:
+    """Whether this variance is the two-pass composition the DSP already has.
+
+    Three things have to hold, and each is refused here rather than raised at the
+    emitter so the caller gets a portable kernel instead of a failed export. The
+    dims have to be the one contiguous span REDUCTION collapses, which is means
+    rule and the reason the two are the same shape question. The span length has
+    to be a number, because the n/(n-correction) scale is a command param and a
+    symbolic extent has none to write. And keepdim has to be the bool the graph
+    stated, because a variance of another width is a different op: the kernel
+    accumulates in fp32 and stores fp16, which is the rule
+    mean_result_width_is_emittable already enforces on the mean half.
+    """
+    if node.target is not VAR_CORRECTION:
+        return False
+    if reduction_dims(node) is None:
+        return False
+    keepdim = node.kwargs.get("keepdim")
+    if keepdim is None and len(node.args) > 3:
+        keepdim = node.args[3]
+    if keepdim is not None and not isinstance(keepdim, bool):
+        return False
+    return var_correction_scale(node) is not None
+
+
+def _emit_var_correction(node: torch.fx.Node, ctx) -> TensorRef:
+    """The two-pass variance, in the five commands the table already has.
+
+    mean over the span, the deviation as a binary subtract against it, the
+    square as the unary tables own entry, mean again, and -- only when the
+    correction is not zero -- the n/(n-correction) scale as the unary multiply
+    torch own mul.Scalar writes. Nothing here is a new kernel: the four commands
+    the correction-zero case spends are the ones a mean, a subtract and a square
+    are already made of, and the fifth is a constant multiply.
+
+    The accuracy is the two-passes and not a second-moment ones, and that is the
+    whole of what this row may claim. The squared deviation is a buffer, so it is
+    fp16, and the mean that follows reads those fp16 values: the DSP does
+    accumulate the mean in fp32, but what it accumulates is already rounded, and
+    the mean that fed the subtraction is fp16 as well. Over centred data the
+    whole gap to a fp32 answer is a few times 2**-11; over data with a mean of
+    200 it is 3.8e-03, because x - mean is a subtraction of two numbers of the
+    data own size whose difference is the answer size. The fp32 accumulator the
+    layer norm command uses (layer_norm_ops.cc:573-609) is the only variance on
+    this DSP accumulated in fp32 throughout, and it is not reachable as a value:
+    that command writes the normalized tensor.
+    """
+    if not var_correction_is_emittable(node):
+        raise RuntimeError("hexagon: this variance is not the two-pass form")
+    src = node.args[0]
+    _require_arena_dtype(node, "var input")
+    dims = reduction_dims(node)
+    shape = list(src.meta["val"].shape)
+    outside_shape = shape[: dims[0]]
+    span_shape = shape[dims[0] : dims[-1] + 1]
+    inside_shape = shape[dims[-1] + 1 :]
+    reduced_shape = outside_shape + [1] * len(span_shape) + inside_shape
+    keepdim = node.kwargs.get("keepdim")
+    if keepdim is None and len(node.args) > 3:
+        keepdim = node.args[3]
+    result_shape = list(reduced_shape if keepdim else outside_shape + inside_shape)
+
+    outside = _upper_product(outside_shape, ctx)
+    span_upper = _upper_product(span_shape, ctx)
+    inside = _upper_product(inside_shape, ctx)
+
+    def reduce_spans(kind: int, source, out) -> int:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_REDUCTION,
+                inputs=[source],
+                outputs=[out],
+                params=[outside, span_upper, inside, kind, FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, outside_shape, 0)
+        _patch_dynamic_product(ctx, index, span_shape, 1)
+        _patch_dynamic_product(ctx, index, inside_shape, 2)
+        return index
+
+    def unary(kind: str, source, out, count, count_shape) -> None:
+        index = ctx.emit(
+            node,
+            Op(
+                type=DSP_OP_UNARY,
+                inputs=[source],
+                outputs=[out],
+                params=[count, UNARY_OP_TYPES[kind], FP16_BYTES],
+            ),
+        )
+        _patch_dynamic_product(ctx, index, count_shape, 0)
+
+    # The mean the deviation is taken from, kept at the reduced shape so the
+    # subtract broadcasts it back over the span.
+    mean = ctx.activation_for_shape(reduced_shape)
+    reduce_spans(REDUCTION_MEAN, ctx.operand(src), mean)
+
+    deviations = ctx.activation_for_shape(shape)
+    _emit_elementwise(
+        node, ctx, ctx.operand(src), mean, "sub", shape, reduced_shape, shape, deviations
+    )
+
+    squares = ctx.activation_for_shape(shape)
+    unary("square", deviations, squares, _upper_product(shape, ctx), shape)
+
+    scale = var_correction_scale(node)
+    # A correction of zero makes the scale exactly 1.0, and multiplying by it is
+    # a command that cannot change the answer, so the four-command form is the
+    # biased variance and the fifth is only spent when it is needed.
+    scaled = scale != 1.0
+    target = (
+        ctx.activation_for_shape(result_shape)
+        if scaled
+        else ctx.result_for(node, _numel(node))
+    )
+    reduce_spans(REDUCTION_MEAN, squares, target)
+    if not scaled:
+        return ctx.record(node, target)
+
+    out = ctx.result_for(node, _numel(node))
+    op_index = ctx.emit(
+        node,
+        Op(
+            type=DSP_OP_UNARY,
+            inputs=[target],
+            outputs=[out],
+            params=[
+                _upper_product(result_shape, ctx),
+                UNARY_OP_TYPES["mul_scalar"],
+                FP16_BYTES,
+                _float_bits(scale),
+                0,
+            ],
+        ),
+    )
+    _patch_dynamic_product(ctx, op_index, result_shape, 0)
+    return ctx.record(node, out)
+
+
 def _emit_middle_axis_softmax(node: torch.fx.Node, ctx, src, shape):
     """Copy a contiguous middle-axis reduction into the last-axis kernel.
 
@@ -9220,6 +9407,10 @@ EMITTERS = {
     DQ_PER_CHANNEL: _emit_dequantize,
     exir_ops.edge.aten.mean.dim: _emit_mean_dim,
     MEAN_DEFAULT: _emit_mean_default,
+    # The variance the mean half already computes, with the two steps between
+    # the two means spelled out as commands. See _emit_var_correction for what
+    # the composition is and is not accurate to.
+    VAR_CORRECTION: _emit_var_correction,
     MAX_DEFAULT: _emit_max_default,
     MAX_DIM: _emit_max_dim,
     SUM_DIM: _emit_sum_dim,
