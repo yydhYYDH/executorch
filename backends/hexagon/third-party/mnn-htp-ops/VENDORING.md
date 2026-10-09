@@ -266,6 +266,74 @@ to both halves of the vector it writes, the way the pair store's leftover branch
 does; nothing here changes if it does, because this checkout uses the pair either
 way.
 
+## Local modifications (matmul, `src/dsp/loop_ops.cc`)
+
+Two changes in one file, both for the fp16 `M == 1` matmul.
+
+### 1. Chained DMA in `htp_ops_loop_hmx_dma_copy`
+
+`htp_ops_loop_hmx_dma_copy` copied a weight block with a fully synchronous
+single-descriptor DMA -- a stack descriptor rebuilt for every 256 KB chunk,
+`dma_wait_for_idle(); dmstart(&desc); dma_wait_for_idle();`, and no
+`src_bypass`/`dst_bypass` bits. On the `M == 1` matmul this measured **~40 GB/s**,
+while an equivalent back-to-back read reaches ~60 GB/s from the same memory --
+which is also what QNN does on the same phone.
+
+It now builds every descriptor into one **stack** array, links them, and submits
+the chain once:
+
+    _Alignas(64) dma_desc_1d_t descs[64];
+    for (i = 0; i < nc; ++i) {
+        dma_desc_1d_t* d = &descs[i];
+        memset(d, 0, sizeof(*d));
+        d->length = chunk; d->type = DMA_DESC_TYPE_1D;
+        d->src_bypass = 1; d->dst_bypass = 1; d->ordered = 1;
+        d->dstate = DMA_DESC_DSTATE_PENDING;
+        d->src = ...; d->dst = ...;
+    }
+    for (i = 0; i + 1 < nc; ++i) descs[i].next = (uint32_t)(uintptr_t)&descs[i + 1];
+    descs[nc - 1].next = 0;
+    dma_wait_for_idle(); dmstart(&descs[0]); dma_wait_for_idle();
+
+Two things matter when re-vendoring:
+
+- The descriptor array must be on the **stack**, not `static`. A `static` array
+  (in `.bss`) produced *deterministic* wrong outputs on large weights -- the
+  engine read stale descriptors and copied only part of the weight -- while small
+  weights happened to stay correct. The stack pattern matches
+  `src/dsp/im2col_convolution_fp16.cc`.
+- The `src_bypass`/`dst_bypass` bits are set, as `im2col_convolution_fp16.cc` and
+  the read-BW probe set them; the old sync version left them zero.
+
+### 2. Skip the padding memsets for `validRows == 1`
+
+The activation pack zeroed a whole 32-row block twice when `validRows < 32`
+(`memset(vtcmActivationRaw, 0, rawBytes)` in the general path and
+`memset(dst, 0, kp*1024*2)` in `htp_ops_loop_hmx_transform_activation_block`) --
+1 MB of scalar `memset` to VTCM, ~680 us for a shape whose activation is a single
+`1×8192` row. When `validRows == 1` only row 0 is stored, so the padding rows
+never reach the output. Both guards now also require `validRows > 1`:
+
+    // general path
+    if ((K % 64 != 0 || validRows < 32) && validRows > 1) memset(vtcmActivationRaw, 0, rawBytes);
+    // transform
+    if (validRows < 32 && validRows > 1) memset(dst, 0, kp * 1024 * sizeof(__fp16));
+
+This relies on the padding rows never being read: today only the matmul's store
+consumes the activation block and it writes exactly `validRows` rows. A future
+consumer that read the padding rows would need the zeroing back.
+
+### Measured effect of both
+
+OnePlus 13 (SM8750), fp16: shape A (1, 8192, 8192) whole kernel 4277 -> 2504 us
+(weight fill 3398 -> 2258 us), B 7034 -> 5862, D 2575 -> 2381, E 19219 -> 17519.
+All five benchmark shapes stay **bit-identical** to baseline and to QNN. A's gap
+to QNN closes from 2.01x to 1.18x.
+
+The `htp_ops_bench_read_bw` / `htp_ops_bench_dma_pass` probe and the `mm_pack`
+slot used to find these are temporary instrumentation, removed with the phase
+profiling at the end of the effort.
+
 ## Build
 
 Built by `htp/CMakeLists.txt` as the per-arch skel, one `.so` per Hexagon arch:
@@ -280,3 +348,28 @@ Compile definitions:
     HTP_OPS_PWL_COMPANDED16=1
     HTP_OPS_PWL_LEARNED8=1          the `learned8` PWL variant, upstream default
     -mhvx-ieee-fp                   additionally required for arch < 79
+
+## Local modification: decode weight DMA double buffering
+
+`src/dsp/loop_ops.cc` adds a local asynchronous DMA queue for the prepacked
+fp16 general matmul with `M == 1`. It follows the push/pop scheduling pattern
+in llama.cpp's `ggml/src/ggml-hexagon/htp/dma-queue.h` and
+`matmul-ops.c`; the implementation uses this library's existing 1D descriptors
+and DMA intrinsics rather than copying the upstream queue.
+
+The existing weight staging budget is split into two VTCM slots. Two transfers
+are submitted in the prologue; each pass waits for its descriptor, computes,
+and submits the next transfer into the consumed slot. Four stack descriptor
+slots avoid rewriting the live chain tail. Transfers fit the descriptor's
+24-bit length. Other matmul paths retain their existing scheduling. Decode
+activation packing runs once, because its synchronous DMA must not interrupt
+the steady-state weight queue. The first activation copy drains the prologue
+transfers; overlap begins with subsequent submissions. The queue is drained
+before its stack descriptors leave scope.
+
+OnePlus 13 device validation: all five runbook shapes produced byte-identical
+outputs against the immediately saved baseline. One five-shape measurement
+reported shape A kernel probe 2449 -> 2059 us; this is one measurement per
+version, not a repeated-run statistical result. Under overlap, the weight-fill
+phase measures time waiting in pop, not total DMA service time, so it must not
+be interpreted as standalone bandwidth.
