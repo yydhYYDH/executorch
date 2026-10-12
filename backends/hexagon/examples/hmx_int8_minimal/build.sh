@@ -13,6 +13,7 @@ mkdir -p "$build_dir"
   -I "$sdk_dir/incs" -I "$sdk_dir/incs/stddef" \
   -I "$sdk_dir/rtos/qurt/computev79/include/qurt" \
   "$example_dir/matmul.c" "$example_dir/main.c" \
+  "$example_dir/../hmx_quant_params/conversion.c" \
   -o "$build_dir/libhmx_int8_example.so"
 "$tools_dir/bin/hexagon-llvm-objdump" -d --mcpu=hexagonv79 --mattr=+hmx \
   "$build_dir/libhmx_int8_example.so" > "$build_dir/example.asm"

@@ -1,5 +1,20 @@
 # 最小整数 HMX 矩阵乘与 FP32 输出
 
+## Runtime quantization parameters (2026-10-12)
+
+`hmx_matmul_u8s8_tile_quantized` now accepts new FP32 `sa/sw/sq` and `za/zw/zq`, generate conversion
+parameters and weight-sum corrections, and return Q plus `Y=(Q-zq)*sq`.
+No captured numeric constants or QNN runtime are required. Weights are logical
+int8 containers; `Wq-zw` must fit the native signed INT8 range. Unsupported
+scales/shifts or centered weights return 1 before modifying outputs/workspace.
+The fixed-parameter entry points below remain compatibility wrappers.
+
+See [the parameter API and verification report](../hmx_quant_params/README.md)
+for signatures, supported modes, reproduction commands and device evidence:
+92 parameterized cases per family, plus one newly exported unmodified QNN
+model per family, passed with zero Q/Y mismatches. The tile geometry and
+VTCM/resource ownership requirements below still apply.
+
 2026-10-11，**device tier**：在 PJZ110 / SM8750 / Hexagon v79 手机上验证。
 独立 DSP `.so`，不依赖 QNN、ExecuTorch 模型或 HexKL。
 生产后端没有改动，没有运行模拟器。
